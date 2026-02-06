@@ -16,7 +16,8 @@ Similarly, gradients and Jacobians can be user-supplied or computed
 automatically via jax.grad (reverse-mode) and jax.jacrev.
 """
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 import equinox as eqx
 import jax

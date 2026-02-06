@@ -4,7 +4,8 @@ This module contains type aliases and custom types used throughout the package.
 All types use jaxtyping for runtime type checking with beartype.
 """
 
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from jaxtyping import Array, Float
 

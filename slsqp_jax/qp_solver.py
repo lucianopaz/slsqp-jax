@@ -20,7 +20,8 @@ For inequality constraints A d >= b, the Lagrangian is:
 with lambda >= 0 for active constraints.
 """
 
-from typing import Callable, NamedTuple
+from collections.abc import Callable
+from typing import NamedTuple
 
 import equinox as eqx
 import jax

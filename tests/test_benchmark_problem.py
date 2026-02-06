@@ -174,5 +174,89 @@ class TestBenchmarkProblem:
         assert max_diff < 1e-2, f"JIT solutions differ by {max_diff} for n={n}"
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestRosenbrock:
+    """Test the Rosenbrock function at large scale."""
+
+    @pytest.mark.slow
+    def test_rosenbrock_100k_dimensions(self):
+        """Test SLSQP on 100,000 dimensional Rosenbrock function.
+
+        The Rosenbrock function is:
+            f(x) = sum_{i=1}^{n-1} [100*(x_{i+1} - x_i^2)^2 + (1 - x_i)^2]
+
+        The global minimum is at x = (1, 1, ..., 1) with f(x) = 0.
+
+        This test verifies that SLSQP can handle very high-dimensional
+        unconstrained optimization problems.
+        """
+        n = 100_000
+
+        def rosenbrock(x, args):
+            """Rosenbrock function - vectorized implementation."""
+            # f(x) = sum_{i=0}^{n-2} [100*(x_{i+1} - x_i^2)^2 + (1 - x_i)^2]
+            x_curr = x[:-1]  # x_0, ..., x_{n-2}
+            x_next = x[1:]  # x_1, ..., x_{n-1}
+            term1 = 100.0 * (x_next - x_curr**2) ** 2
+            term2 = (1.0 - x_curr) ** 2
+            return jnp.sum(term1 + term2), None
+
+        # Unconstrained SLSQP solver
+        solver = SLSQP(
+            rtol=1e-6,
+            atol=1e-6,
+            max_steps=500,
+            eq_constraint_fn=None,
+            n_eq_constraints=0,
+            ineq_constraint_fn=None,
+            n_ineq_constraints=0,
+            lbfgs_memory=20,  # More memory for large problem
+        )
+
+        # Start near the optimum to make the test tractable
+        # (Rosenbrock is notoriously difficult from far away)
+        key = jax.random.PRNGKey(42)
+        x0 = jnp.ones(n) + 0.1 * jax.random.normal(key, (n,))
+
+        # JIT-compile and solve
+        @jax.jit
+        def solve(x0, _solver=solver, _objective=rosenbrock):
+            return optx.minimise(
+                _objective,
+                _solver,
+                x0,
+                has_aux=True,
+                max_steps=500,
+                throw=False,
+            )
+
+        result = solve(x0)
+        jax_sol = np.asarray(result.value)
+        final_f = float(rosenbrock(result.value, None)[0])
+
+        # Check for NaN
+        assert not np.any(np.isnan(jax_sol)), "Solution contains NaN"
+
+        # Check solution is not diverging
+        assert np.max(np.abs(jax_sol)) < 100, (
+            f"Solution diverged: max={np.max(np.abs(jax_sol))}"
+        )
+
+        # Check that we're reasonably close to the optimum (x = 1)
+        # For such a large problem starting near the optimum, we should get close
+        mean_sol = np.mean(jax_sol)
+        assert 0.5 < mean_sol < 1.5, f"Mean solution {mean_sol} is far from 1.0"
+
+        # Check that the function value decreased significantly
+        initial_f = float(rosenbrock(x0, None)[0])
+        assert final_f < initial_f, (
+            f"Function did not decrease: {initial_f} -> {final_f}"
+        )
+
+        # The function value should be relatively small (we started close to optimum)
+        assert final_f < 1000, f"Final function value {final_f} is too large"
+
+        print("\nRosenbrock 100k test passed:")
+        print(f"  Initial f: {initial_f:.2f}")
+        print(f"  Final f:   {final_f:.2f}")
+        print(f"  Mean x:    {mean_sol:.4f}")
+        print(f"  Result:    {result.result}")

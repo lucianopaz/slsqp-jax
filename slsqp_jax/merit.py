@@ -9,7 +9,8 @@ The merit function is:
 where ρ is the penalty parameter, chosen large enough to ensure descent.
 """
 
-from typing import Any, Callable, NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
