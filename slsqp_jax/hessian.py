@@ -139,8 +139,21 @@ def lbfgs_hvp(
     #       = gamma * v - gamma * S^T @ q[:k] - Y^T @ q[k:]
     result = gamma * v - gamma * (S.T @ q[:k]) - Y.T @ q[k:]
 
-    # Guard against NaN: if result contains NaN, fall back to gamma * v (identity scaling)
-    result = jnp.where(jnp.any(jnp.isnan(result)), gamma * v, result)
+    # Guard against NaN or huge values: fall back to gamma * v (identity scaling)
+    # The HVP should produce values on the same scale as gamma * ||v||
+    # If it's much larger, the L-BFGS approximation is corrupted
+    v_norm = jnp.linalg.norm(v)
+    result_norm = jnp.linalg.norm(result)
+    expected_scale = jnp.maximum(gamma * v_norm, v_norm)  # Reasonable upper bound
+
+    is_bad = (
+        jnp.any(jnp.isnan(result))
+        | jnp.any(jnp.isinf(result))
+        | (result_norm > 1e6 * expected_scale)  # HVP is way too large
+    )
+
+    # Fall back to identity scaling if the L-BFGS approximation is bad
+    result = jnp.where(is_bad, gamma * v, result)
 
     return result
 
@@ -151,7 +164,7 @@ def lbfgs_append(
     s: Float[Array, " n"],
     y: Float[Array, " n"],
     damping_threshold: float = 0.2,
-    skip_threshold: float = 1e-12,
+    skip_threshold: float = 1e-8,
 ) -> LBFGSHistory:
     """Append a new (s, y) pair to the L-BFGS history with Powell damping.
 
@@ -165,8 +178,8 @@ def lbfgs_append(
     This is essential for constrained optimization where the standard
     curvature condition s^T y > 0 may not hold.
 
-    If ||s|| is too small, the update is skipped entirely to avoid
-    numerical issues.
+    If ||s|| is too small or the curvature ratio is too extreme,
+    the update is skipped entirely to avoid numerical issues.
 
     After appending, the initial Hessian scaling gamma is updated to
     y_damped^T s / (y_damped^T y_damped), clipped to [1e-3, 1e3].
@@ -176,12 +189,28 @@ def lbfgs_append(
         s: Step vector s = x_{k+1} - x_k.
         y: Gradient difference y = nabla L_{k+1} - nabla L_k.
         damping_threshold: Powell damping threshold (default 0.2).
-        skip_threshold: Minimum step norm for update (default 1e-12).
+        skip_threshold: Minimum step norm for update (default 1e-8).
 
     Returns:
         Updated L-BFGS history with the new pair appended.
     """
     s_norm = jnp.linalg.norm(s)
+    y_norm = jnp.linalg.norm(y)
+
+    # Skip if step is too small (absolute threshold)
+    step_too_small = s_norm < skip_threshold
+
+    # Skip if curvature ratio is too extreme (y_norm / s_norm too large)
+    # This prevents ill-conditioning when a tiny step produces large gradient change
+    curvature_ratio = y_norm / jnp.maximum(s_norm, 1e-30)
+    curvature_too_extreme = curvature_ratio > 1e8
+
+    # Also check that s^T y is not too small relative to ||s|| ||y||
+    sTy_raw = jnp.dot(s, y)
+    relative_curvature = jnp.abs(sTy_raw) / jnp.maximum(s_norm * y_norm, 1e-30)
+    curvature_too_small = relative_curvature < 1e-8
+
+    should_skip = step_too_small | curvature_too_extreme | curvature_too_small
 
     def do_append():
         # Compute B @ s using current L-BFGS approximation for damping
@@ -229,7 +258,7 @@ def lbfgs_append(
     def skip():
         return history
 
-    return jax.lax.cond(s_norm > skip_threshold, do_append, skip)
+    return jax.lax.cond(~should_skip, do_append, skip)
 
 
 @jaxtyped(typechecker=beartype)
