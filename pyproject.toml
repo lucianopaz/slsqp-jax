@@ -1,0 +1,25 @@
+[project]
+name = "slsqp-jax"
+version = "0.1.0"
+description = "Sequential Least Squares Programming (SLSQP) optimizer implemented in pure JAX"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Luciano Paz" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beartype>=0.18.0",
+    "equinox>=0.11.0",
+    "jax>=0.9.0",
+    "jaxlib>=0.9.0",
+    "jaxtyping>=0.3.7",
+    "numpy>=2.4.2",
+    "optimistix>=0.0.11",
+    "scipy>=1.17.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
