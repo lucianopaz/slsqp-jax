@@ -122,7 +122,7 @@ sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100)
 Note that you supply HVPs for the **objective and constraint functions separately**, not for the Lagrangian. The solver composes the Lagrangian HVP internally using the current KKT multipliers:
 
 $$
-\nabla^2 L(x)\,v \;=\; \nabla^2 f(x)\,v \;-\; \sum_i \lambda_i^{\text{eq}}\, \nabla^2 c_i^{\text{eq}}(x)\,v \;-\; \sum_j \mu_j^{\text{ineq}}\, \nabla^2 c_j^{\text{ineq}}(x)\,v
+\nabla^2 L(x) v = \nabla^2 f(x) v - \sum_i \lambda_i^{\text{eq}} \nabla^2 c_i^{\text{eq}}(x) v - \sum_j \mu_j^{\text{ineq}} \nabla^2 c_j^{\text{ineq}}(x) v
 $$
 
 If you provide `obj_hvp_fn` but omit the constraint HVP functions, the solver automatically computes the missing constraint HVPs via forward-over-reverse AD on the scalar function $\lambda^T c(x)$, which costs one reverse pass plus one forward pass regardless of the number of constraints.
@@ -134,8 +134,8 @@ If you provide `obj_hvp_fn` but omit the constraint HVP functions, the solver au
 Each SLSQP iteration performs four steps:
 
 1. **QP subproblem**: Construct a quadratic approximation of the objective and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
-2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho\,(\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
-3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha\, d_k$.
+2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho (\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
+3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha d_k$.
 4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history (or skip if using exact HVPs).
 
 ### Scaling considerations: why L-BFGS over BFGS
@@ -151,10 +151,10 @@ Classical SLSQP (e.g. SciPy's implementation) maintains a **dense** $n \times n$
 L-BFGS stores only the last $k$ step/gradient-difference pairs $(s_i, y_i)$ and computes Hessian-vector products in $O(kn)$ time using the compact representation (Byrd, Nocedal & Schnabel, 1994):
 
 $$
-B_k = \gamma I - [\gamma S,\; Y]\; N^{-1}\; [\gamma S,\; Y]^T
+B_k = \gamma I - W N^{-1} W^T
 $$
 
-where $N$ is a small $2k \times 2k$ matrix built from inner products of the stored vectors. The $2k \times 2k$ system is solved directly — negligible cost for $k \ll n$.
+where $W = (\gamma S, Y)$ is the horizontal concatenation of matrices $\gamma S$ and $Y$, and $N$ is a small $2k \times 2k$ matrix built from inner products of the stored vectors. The $2k \times 2k$ system is solved directly — negligible cost for $k << n$.
 
 Powell's damping is applied to each curvature pair before storage to ensure positive definiteness, which is essential for constrained problems where the standard curvature condition $s^T y > 0$ can fail.
 
@@ -162,18 +162,18 @@ Powell's damping is applied to each curvature pair before storage to ensure posi
 
 Classical SLSQP solves the QP subproblem by forming and factorising the $(n + m) \times (n + m)$ dense KKT system at $O(n^3)$ cost. This implementation instead uses **projected conjugate gradient** (CG) inside an active-set loop:
 
-1. **Projection**: For active constraints with matrix $A$ ($m_{\text{active}} \times n$), define the null-space projector $P(v) = v - A^T (A A^T)^{-1} A\,v$. The $A A^T$ system is only $m_{\text{active}} \times m_{\text{active}}$ (tiny, since $m \ll n$) and is solved directly.
+1. **Projection**: For active constraints with matrix $A$ ($m_{\text{active}} \times n$), define the null-space projector $P(v) = v - A^T (A A^T)^{-1} A v$. The $A A^T$ system is only $m_{\text{active}} \times m_{\text{active}}$ (tiny, since $m << n$) and is solved directly.
 2. **CG in null space**: Run conjugate gradient on the projected system, where each iteration requires one HVP ($O(kn)$ for L-BFGS) and one projection ($O(mn)$).
 3. **Active-set outer loop**: Add the most violated inequality or drop the most negative multiplier until KKT conditions are satisfied.
 
-Total cost per QP solve: $O(n \cdot k \cdot t)$, where $t$ is the number of CG iterations (typically $t \ll n$). Compared to $O(n^3)$ for the dense approach, this is orders of magnitude faster for $n > 1{,}000$.
+Total cost per QP solve: $O(n \cdot k \cdot t)$, where $t$ is the number of CG iterations (typically $t << n$). Compared to $O(n^3)$ for the dense approach, this is orders of magnitude faster for $n > 1000$.
 
 ### Reverse-mode AD and `while_loop`
 
 By default, the solver computes:
 
 - **Objective gradient** via `jax.grad` (reverse-mode).
-- **Constraint Jacobians** via `jax.jacrev` (reverse-mode, $O(m)$ passes — faster than `jax.jacfwd`'s $O(n)$ passes when $m \ll n$).
+- **Constraint Jacobians** via `jax.jacrev` (reverse-mode, $O(m)$ passes — faster than `jax.jacfwd`'s $O(n)$ passes when $m << n$).
 - **HVP fallback** via `jax.jvp(jax.grad(f), ...)` (forward-over-reverse).
 
 All of these require **reverse-mode differentiation** through the user's functions. JAX's reverse-mode AD does not support differentiating through `jax.lax.while_loop` or other variable-length control flow primitives. If your objective or constraint functions contain `while_loop`, `scan` with variable-length carries, or other non-reverse-differentiable operations, the AD fallback will fail.
