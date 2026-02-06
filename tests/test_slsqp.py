@@ -8,6 +8,7 @@ and projected CG QP solver.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optimistix as optx
 import pytest
 from scipy.optimize import minimize as scipy_minimize
 
@@ -426,6 +427,296 @@ class TestSLSQPModerateScale:
 
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, jnp.zeros(n), atol=1e-4)
+
+
+class TestOptimistixMinimise:
+    """Tests using the optimistix.minimise high-level interface."""
+
+    def test_unconstrained_auto_derivatives(self):
+        """Unconstrained problem with all derivatives computed by AD."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8)
+        x0 = jnp.array([3.0, -2.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [0.0, 0.0], atol=1e-5)
+
+    def test_equality_constrained_auto_derivatives(self):
+        """Equality-constrained problem with all derivatives computed by AD.
+
+        minimize x^2+y^2+z^2 s.t. x+y+z=3  =>  (1,1,1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] + x[2] - 3.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0, 1.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [1.0, 1.0, 1.0], rtol=1e-4)
+        np.testing.assert_allclose(eq_constraint(sol.value, None), 0.0, atol=1e-5)
+
+    def test_inequality_constrained_auto_derivatives(self):
+        """Inequality-constrained problem with all derivatives computed by AD.
+
+        minimize x^2+y^2 s.t. x+y>=2  =>  (1,1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [1.0, 1.0], rtol=1e-4)
+
+    def test_mixed_constraints_auto_derivatives(self):
+        """Mixed equality and inequality constraints with AD derivatives.
+
+        minimize x^2+y^2+z^2 s.t. x+y+z=3, x,y,z>=0  =>  (1,1,1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] + x[2] - 3.0])
+
+        def ineq_constraint(x, args):
+            return x
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=eq_constraint,
+            ineq_constraint_fn=ineq_constraint,
+            n_eq_constraints=1,
+            n_ineq_constraints=3,
+        )
+        x0 = jnp.array([1.0, 1.0, 1.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [1.0, 1.0, 1.0], rtol=1e-4)
+
+    def test_user_supplied_gradient(self):
+        """Test optimistix.minimise with user-supplied gradient."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def obj_grad(x, args):
+            return 2.0 * x
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8, obj_grad_fn=obj_grad)
+        x0 = jnp.array([3.0, -2.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [0.0, 0.0], atol=1e-5)
+
+    def test_user_supplied_gradient_and_jacobian(self):
+        """Test optimistix.minimise with user-supplied gradient and Jacobian.
+
+        minimize x^2+y^2 s.t. x+y=1  =>  (0.5, 0.5)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        def obj_grad(x, args):
+            return 2.0 * x
+
+        def eq_jac(x, args):
+            return jnp.array([[1.0, 1.0]])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            obj_grad_fn=obj_grad,
+            eq_jac_fn=eq_jac,
+        )
+        x0 = jnp.array([0.5, 0.5])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [0.5, 0.5], rtol=1e-4)
+
+    def test_user_supplied_hvp_unconstrained(self):
+        """Test optimistix.minimise with user-supplied HVP (exact Hessian mode)."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8, obj_hvp_fn=obj_hvp)
+        x0 = jnp.array([3.0, -2.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [0.0, 0.0], atol=1e-5)
+
+    def test_user_supplied_hvp_equality_constrained(self):
+        """Test optimistix.minimise with full user-supplied HVPs and constraints.
+
+        minimize x^2+y^2+z^2 s.t. x+y+z=3  =>  (1,1,1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] + x[2] - 3.0])
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        def eq_hvp(x, v, args):
+            return jnp.zeros((1, x.shape[0]))
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+            eq_hvp_fn=eq_hvp,
+        )
+        x0 = jnp.array([1.0, 1.0, 1.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [1.0, 1.0, 1.0], rtol=1e-4)
+        np.testing.assert_allclose(eq_constraint(sol.value, None), 0.0, atol=1e-5)
+
+    def test_user_supplied_hvp_with_ad_constraint_fallback(self):
+        """Test optimistix.minimise with user objective HVP but AD for constraints.
+
+        minimize x^2+y^2+z^2 s.t. x^2+y^2+z^2=3  =>  x=y=z=1
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([jnp.sum(x**2) - 3.0])
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        # No eq_hvp_fn — solver uses forward-over-reverse AD for constraint HVP
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+        )
+        x0 = jnp.array([1.0, 1.0, 1.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(jnp.sum(sol.value**2), 3.0, rtol=1e-4)
+
+    def test_all_derivatives_user_supplied(self):
+        """Test optimistix.minimise with every derivative function user-supplied.
+
+        minimize (x-1)^2+(y-2)^2 s.t. x+y>=2  =>  (1,2) if feasible, else on boundary
+        Unconstrained min at (1,2): x+y=3>=2, so constraint inactive.
+        """
+
+        def objective(x, args):
+            return (x[0] - 1.0) ** 2 + (x[1] - 2.0) ** 2, None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        def obj_grad(x, args):
+            return jnp.array([2.0 * (x[0] - 1.0), 2.0 * (x[1] - 2.0)])
+
+        def ineq_jac(x, args):
+            return jnp.array([[1.0, 1.0]])
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        def ineq_hvp(x, v, args):
+            return jnp.zeros((1, x.shape[0]))
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            obj_grad_fn=obj_grad,
+            ineq_jac_fn=ineq_jac,
+            obj_hvp_fn=obj_hvp,
+            ineq_hvp_fn=ineq_hvp,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [1.0, 2.0], atol=1e-4)
+
+    def test_solution_object_fields(self):
+        """Verify the optimistix.Solution object has the expected fields."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8)
+        x0 = jnp.array([1.0, 2.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        # sol.value is the optimum
+        assert sol.value.shape == (2,)
+        # sol.aux is the auxiliary output (None in our case)
+        assert sol.aux is None
+        # sol.stats should be a dict
+        assert isinstance(sol.stats, dict)
+
+    def test_throw_false_returns_result(self):
+        """Test that throw=False returns a Solution even if not converged."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(rtol=1e-15, atol=1e-15)  # impossibly tight tolerance
+        x0 = jnp.array([3.0, -2.0])
+        # Should not raise, just return with a non-successful result
+        sol = optx.minimise(
+            objective,
+            solver,
+            x0,
+            has_aux=True,
+            max_steps=2,
+            throw=False,
+        )
+
+        # Value should still be a valid array (even if not fully converged)
+        assert sol.value.shape == (2,)
 
 
 class TestSLSQPComparisonWithSciPy:
