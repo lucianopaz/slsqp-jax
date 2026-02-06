@@ -4,11 +4,11 @@ This package provides a GPU-compatible implementation of the SLSQP optimization
 algorithm using JAX and the Optimistix framework.
 """
 
-from slsqp_jax.solver import SLSQP, SLSQPState, QPResult
+from slsqp_jax.hessian import compute_lagrangian_gradient, damped_bfgs_update
+from slsqp_jax.merit import backtracking_line_search, compute_merit
+from slsqp_jax.qp_solver import solve_equality_qp, solve_qp
+from slsqp_jax.solver import SLSQP, QPResult, SLSQPState
 from slsqp_jax.types import ConstraintFn
-from slsqp_jax.qp_solver import solve_qp, solve_equality_qp
-from slsqp_jax.merit import compute_merit, backtracking_line_search
-from slsqp_jax.hessian import damped_bfgs_update, compute_lagrangian_gradient
 
 __all__ = [
     # Main solver

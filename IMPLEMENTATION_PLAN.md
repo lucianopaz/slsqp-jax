@@ -62,31 +62,31 @@ The solver state must be a JAX PyTree for compatibility with JAX transformations
 ```python
 class SLSQPState(eqx.Module):
     """State for the SLSQP solver."""
-    
+
     # Current iteration data
     step_count: Int[Array, ""]           # Current iteration number
-    
+
     # Function values and gradients
     f_val: Float[Array, ""]              # f(x_k) - objective value
     grad: Float[Array, " n"]             # ∇f(x_k) - gradient of objective
-    
-    # Constraint information  
+
+    # Constraint information
     eq_val: Float[Array, " m_eq"]        # c_eq(x_k) - equality constraint values
     ineq_val: Float[Array, " m_ineq"]    # c_ineq(x_k) - inequality constraint values
     eq_jac: Float[Array, "m_eq n"]       # Jacobian of equality constraints
     ineq_jac: Float[Array, "m_ineq n"]   # Jacobian of inequality constraints
-    
+
     # Hessian approximation
     hessian_approx: Float[Array, "n n"]  # B_k - approximate Hessian of Lagrangian
-    
+
     # Lagrange multipliers (from QP solution)
     multipliers_eq: Float[Array, " m_eq"]      # λ - equality multipliers
     multipliers_ineq: Float[Array, " m_ineq"]  # μ - inequality multipliers
-    
+
     # Previous step information (for BFGS update)
     prev_x: Float[Array, " n"]           # x_{k-1}
     prev_grad_lagrangian: Float[Array, " n"]  # ∇L(x_{k-1}, λ_{k-1}, μ_{k-1})
-    
+
     # Convergence tracking
     first_step: Bool[Array, ""]          # True if this is the first iteration
 ```
@@ -98,7 +98,7 @@ State for the QP subproblem solver (Active Set method).
 ```python
 class QPState(eqx.Module):
     """State for the QP Active Set solver."""
-    
+
     d: Float[Array, " n"]                # Current search direction
     active_set: Bool[Array, " m_ineq"]   # Which inequality constraints are active
     multipliers: Float[Array, " m"]      # KKT multipliers (m = m_eq + active inequalities)
@@ -111,19 +111,19 @@ class QPState(eqx.Module):
 ```python
 class SLSQP(optx.AbstractMinimiser[Float[Array, " n"], SLSQPState, Aux]):
     """SLSQP minimizer using Sequential Quadratic Programming."""
-    
+
     rtol: float = 1e-6
     atol: float = 1e-6
     max_steps: int = 100
-    
+
     # Constraint functions (static fields)
     eq_constraint_fn: Optional[Callable] = eqx.field(static=True, default=None)
     ineq_constraint_fn: Optional[Callable] = eqx.field(static=True, default=None)
-    
+
     def init(self, fn, y, args, options, f_struct, aux_struct, tags) -> SLSQPState:
         """Initialize solver state with first function/gradient evaluation."""
         ...
-    
+
     def step(self, fn, y, args, options, state, tags) -> tuple[Y, SLSQPState, Aux]:
         """Perform one SLSQP iteration:
         1. Solve QP subproblem for search direction
@@ -131,7 +131,7 @@ class SLSQP(optx.AbstractMinimiser[Float[Array, " n"], SLSQPState, Aux]):
         3. Update Hessian approximation (BFGS)
         """
         ...
-    
+
     def terminate(self, fn, y, args, options, state, tags) -> tuple[Bool, RESULTS]:
         """Check KKT conditions for convergence."""
         ...
@@ -159,7 +159,7 @@ def solve_qp(
     Solve: min (1/2) d^T H d + g^T d
            s.t. A_eq d = b_eq
                 A_ineq d >= b_ineq
-    
+
     Returns (d, multipliers).
     """
 ```
@@ -212,7 +212,7 @@ def bfgs_update(
 ) -> Float[Array, "n n"]:
     """
     Damped BFGS update to maintain positive definiteness.
-    
+
     Uses Powell's damping when s^T y is too small.
     """
 ```

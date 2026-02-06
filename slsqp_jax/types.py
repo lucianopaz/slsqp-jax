@@ -6,8 +6,7 @@ All types use jaxtyping for runtime type checking with beartype.
 
 from typing import Any, Callable, TypeVar
 
-import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float
 
 # Type aliases for common array shapes
 Scalar = Float[Array, ""]
@@ -25,10 +24,11 @@ ObjectiveFn = Callable[[Float[Array, " n"], Any], Float[Array, ""]]
 # Auxiliary output type (generic)
 Aux = TypeVar("Aux")
 
+
 # Result codes for solver termination
 class SolverResult:
     """Constants for solver termination status."""
-    
+
     SUCCESS = 0
     MAX_ITERATIONS = 1
     LINE_SEARCH_FAILED = 2

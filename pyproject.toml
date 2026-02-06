@@ -23,3 +23,43 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling", "hatch-vcs"]
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "F722"]
+
+[tool.pytest]
+addopts = [
+    "--cov=slsqp_jax",
+    "--cov-report=term-missing",
+    "-v",
+    "--doctest-modules"
+]
+testpaths = [
+    "slsqp_jax",
+    "tests",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: nocover",
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+ignore_errors = true
+omit = [
+  "tests/*",
+]
