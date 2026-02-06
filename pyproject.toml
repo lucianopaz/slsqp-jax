@@ -22,6 +22,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-cov",
 ]
 
 [build-system]
@@ -36,7 +37,7 @@ fallback-version = "0.0.0"
 select = ["E", "F", "I"]
 ignore = ["E501", "F722"]
 
-[tool.pytest]
+[tool.pytest.ini_options]
 addopts = [
     "--cov=slsqp_jax",
     "--cov-report=term-missing",

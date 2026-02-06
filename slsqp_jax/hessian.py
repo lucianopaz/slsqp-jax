@@ -1,172 +1,230 @@
-"""BFGS Hessian Approximation Updates for SLSQP.
+"""L-BFGS Hessian Approximation for SLSQP.
 
-This module implements the damped BFGS update for maintaining a positive
-definite approximation to the Hessian of the Lagrangian function.
+This module implements the Limited-memory BFGS (L-BFGS) algorithm for
+maintaining a matrix-free approximation to the Hessian of the Lagrangian.
 
-The damped BFGS update uses Powell's modification to ensure positive
-definiteness is preserved even when the curvature condition s^T y > 0
-is not satisfied (which can happen for constrained optimization).
+Instead of storing a dense n x n matrix (O(n^2) memory), L-BFGS stores
+the last k (s, y) pairs and computes Hessian-vector products in O(kn) time
+using the compact representation (Byrd, Nocedal, Schnabel 1994):
+
+    B = gamma * I - [gamma*S, Y] @ N^{-1} @ [gamma*S^T; Y^T]
+
+where N is a small 2k x 2k matrix built from inner products of the
+stored vectors.
+
+Powell's damping is applied to each (s, y) pair before storage to ensure
+positive definiteness is preserved even when the standard curvature
+condition s^T y > 0 is not satisfied (common in constrained optimization).
 """
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from beartype import beartype
-from jaxtyping import Array, Float, jaxtyped
+from jaxtyping import Array, Float, Int, jaxtyped
 
 
-@jaxtyped(typechecker=beartype)
-def damped_bfgs_update(
-    B: Float[Array, "n n"],
-    s: Float[Array, " n"],
-    y: Float[Array, " n"],
-    damping_threshold: float = 0.2,
-) -> Float[Array, "n n"]:
-    """Perform damped BFGS update of the Hessian approximation.
+class LBFGSHistory(eqx.Module):
+    """L-BFGS history buffer for matrix-free Hessian approximation.
 
-    The standard BFGS update is:
-        B_{k+1} = B_k - (B_k s s^T B_k) / (s^T B_k s) + (y y^T) / (s^T y)
+    Stores the last k (s, y) pairs in a circular buffer and provides
+    efficient Hessian-vector products via the compact representation.
 
-    This requires s^T y > 0 (curvature condition) for positive definiteness.
-    For constrained optimization, this may not hold, so we use Powell's
-    damped BFGS modification:
-
-        r = θ * y + (1 - θ) * B_k s
-
-    where θ ∈ [0, 1] is chosen to ensure s^T r ≥ 0.2 * s^T B_k s.
-
-    Then the update becomes:
-        B_{k+1} = B_k - (B_k s s^T B_k) / (s^T B_k s) + (r r^T) / (s^T r)
-
-    Args:
-        B: Current Hessian approximation (n x n), positive definite.
-        s: Step vector s = x_{k+1} - x_k.
-        y: Gradient difference y = ∇L_{k+1} - ∇L_k.
-        damping_threshold: Threshold for Powell damping (default 0.2).
-
-    Returns:
-        Updated Hessian approximation B_{k+1}.
+    Attributes:
+        s_history: Stored step vectors s_i = x_{i+1} - x_i.
+        y_history: Stored (damped) gradient differences y_i.
+        gamma: Initial Hessian scaling (B_0 = gamma * I).
+        count: Number of valid pairs stored (0 to memory size).
+        next_idx: Next write position in the circular buffer.
     """
 
-    # Compute key quantities
-    Bs = B @ s
-    sTBs = jnp.dot(s, Bs)
-    sTy = jnp.dot(s, y)
+    s_history: Float[Array, "memory n"]
+    y_history: Float[Array, "memory n"]
+    gamma: Float[Array, ""]
+    count: Int[Array, ""]
+    next_idx: Int[Array, ""]
 
-    # Ensure sTBs is positive (should be if B is positive definite)
-    sTBs_safe = jnp.maximum(sTBs, 1e-12)
 
-    # Powell's damping: choose θ to ensure s^T r >= threshold * s^T B s
-    # If s^T y >= threshold * s^T B s, use θ = 1 (standard BFGS)
-    # Otherwise, θ = (1 - threshold) * s^T B s / (s^T B s - s^T y)
+def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
+    """Initialize an empty L-BFGS history buffer.
 
-    use_damping = sTy < damping_threshold * sTBs_safe
+    Args:
+        n: Dimension of the parameter space.
+        memory: Maximum number of (s, y) pairs to store (typically 5-20).
 
-    theta = jax.lax.cond(
-        use_damping,
-        lambda: (1.0 - damping_threshold) * sTBs_safe / (sTBs_safe - sTy + 1e-12),
-        lambda: jnp.array(1.0),
+    Returns:
+        An initialized LBFGSHistory with no stored pairs and gamma=1.
+    """
+    return LBFGSHistory(
+        s_history=jnp.zeros((memory, n)),
+        y_history=jnp.zeros((memory, n)),
+        gamma=jnp.array(1.0),
+        count=jnp.array(0),
+        next_idx=jnp.array(0),
     )
-
-    # Ensure theta is in [0, 1]
-    theta = jnp.clip(theta, 0.0, 1.0)
-
-    # Damped gradient difference
-    r = theta * y + (1.0 - theta) * Bs
-
-    # Compute s^T r (should be positive by construction)
-    sTr = jnp.dot(s, r)
-    sTr_safe = jnp.maximum(sTr, 1e-12)
-
-    # BFGS update with damped r
-    # B_new = B - (Bs)(Bs)^T / (s^T B s) + (r)(r)^T / (s^T r)
-    B_new = B - jnp.outer(Bs, Bs) / sTBs_safe + jnp.outer(r, r) / sTr_safe
-
-    return B_new
 
 
 @jaxtyped(typechecker=beartype)
-def bfgs_update_with_skip(
-    B: Float[Array, "n n"],
-    s: Float[Array, " n"],
-    y: Float[Array, " n"],
-    skip_threshold: float = 1e-12,
-    damping_threshold: float = 0.2,
-) -> Float[Array, "n n"]:
-    """Perform BFGS update with option to skip if step is too small.
+def lbfgs_hvp(
+    history: LBFGSHistory,
+    v: Float[Array, " n"],
+) -> Float[Array, " n"]:
+    """Compute B @ v using the L-BFGS compact representation.
 
-    This is the main entry point for Hessian updates. It:
-    1. Checks if the step is too small (skip update)
-    2. Applies damped BFGS update otherwise
+    Uses the compact form (Nocedal & Wright, Theorem 7.4):
+
+        B = gamma * I - [gamma*S, Y] @ N^{-1} @ [gamma*S^T; Y^T]
+
+    where:
+        N = [[gamma * S^T S, L], [L^T, -D]]   (2k x 2k)
+        L_{ij} = s_i^T y_j for i > j           (strictly lower triangular)
+        D = diag(s_i^T y_i)                    (diagonal)
+
+    When no pairs are stored (count=0), this reduces to B = gamma * I.
+
+    Complexity: O(kn) where k is the number of stored pairs.
 
     Args:
-        B: Current Hessian approximation.
-        s: Step vector s = x_{k+1} - x_k.
-        y: Gradient difference y = ∇L_{k+1} - ∇L_k.
-        skip_threshold: Minimum step norm for update (default 1e-12).
-        damping_threshold: Powell damping threshold (default 0.2).
+        history: L-BFGS history buffer.
+        v: Vector to multiply by the Hessian approximation.
 
     Returns:
-        Updated Hessian approximation.
+        B @ v, the Hessian-vector product.
+    """
+    k = history.s_history.shape[0]
+    gamma = history.gamma
+    count = history.count
+
+    # Reorder to chronological order from the circular buffer
+    start = (history.next_idx - count + k) % k
+    indices = (start + jnp.arange(k)) % k
+    S = history.s_history[indices]  # (k, n)
+    Y = history.y_history[indices]  # (k, n)
+
+    # Zero out invalid entries (positions >= count are not valid)
+    valid_mask = (jnp.arange(k) < count)[:, None]  # (k, 1)
+    S = S * valid_mask
+    Y = Y * valid_mask
+
+    # Build compact form inner matrices
+    SY = S @ Y.T  # (k, k): SY[i,j] = s_i^T y_j
+    SS = S @ S.T  # (k, k): SS[i,j] = s_i^T s_j
+
+    L = jnp.tril(SY, k=-1)  # strictly lower triangular
+    D_diag = jnp.diag(SY)  # diagonal s_i^T y_i
+
+    # Regularize invalid entries to keep N non-singular
+    invalid_diag = jnp.where(jnp.arange(k) < count, 0.0, 1.0)
+
+    # Build N = [[gamma * S^T S, L], [L^T, -D]]  with regularization
+    N = jnp.zeros((2 * k, 2 * k))
+    N = N.at[:k, :k].set(gamma * SS + jnp.diag(invalid_diag))
+    N = N.at[:k, k:].set(L)
+    N = N.at[k:, :k].set(L.T)
+    N = N.at[k:, k:].set(-jnp.diag(D_diag) + jnp.diag(invalid_diag))
+
+    # Small regularization for numerical stability
+    N = N + 1e-12 * jnp.eye(2 * k)
+
+    # Compute p = [gamma * S @ v; Y @ v]
+    Sv = S @ v  # (k,)
+    Yv = Y @ v  # (k,)
+    p = jnp.concatenate([gamma * Sv, Yv])
+
+    # Solve N @ q = p
+    q = jnp.linalg.solve(N, p)
+
+    # B @ v = gamma * v - [gamma*S^T, Y^T] @ q
+    #       = gamma * v - gamma * S^T @ q[:k] - Y^T @ q[k:]
+    result = gamma * v - gamma * (S.T @ q[:k]) - Y.T @ q[k:]
+
+    return result
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_append(
+    history: LBFGSHistory,
+    s: Float[Array, " n"],
+    y: Float[Array, " n"],
+    damping_threshold: float = 0.2,
+    skip_threshold: float = 1e-12,
+) -> LBFGSHistory:
+    """Append a new (s, y) pair to the L-BFGS history with Powell damping.
+
+    Powell's damping modifies y to ensure the curvature condition:
+        s^T y_damped >= threshold * s^T B s
+
+    The damped gradient difference is:
+        y_damped = theta * y + (1 - theta) * B s
+
+    where theta in [0, 1] is chosen to satisfy the condition above.
+    This is essential for constrained optimization where the standard
+    curvature condition s^T y > 0 may not hold.
+
+    If ||s|| is too small, the update is skipped entirely to avoid
+    numerical issues.
+
+    After appending, the initial Hessian scaling gamma is updated to
+    y_damped^T s / (y_damped^T y_damped), clipped to [1e-3, 1e3].
+
+    Args:
+        history: Current L-BFGS history.
+        s: Step vector s = x_{k+1} - x_k.
+        y: Gradient difference y = nabla L_{k+1} - nabla L_k.
+        damping_threshold: Powell damping threshold (default 0.2).
+        skip_threshold: Minimum step norm for update (default 1e-12).
+
+    Returns:
+        Updated L-BFGS history with the new pair appended.
     """
     s_norm = jnp.linalg.norm(s)
 
-    def do_update():
-        return damped_bfgs_update(B, s, y, damping_threshold)
+    def do_append():
+        # Compute B @ s using current L-BFGS approximation for damping
+        Bs = lbfgs_hvp(history, s)
+        sTBs = jnp.dot(s, Bs)
+        sTy = jnp.dot(s, y)
+        sTBs_safe = jnp.maximum(sTBs, 1e-12)
 
-    def skip_update():
-        return B
+        # Powell's damping: choose theta to ensure s^T r >= threshold * s^T B s
+        use_damping = sTy < damping_threshold * sTBs_safe
+        theta = jax.lax.cond(
+            use_damping,
+            lambda: (1.0 - damping_threshold) * sTBs_safe / (sTBs_safe - sTy + 1e-12),
+            lambda: jnp.array(1.0),
+        )
+        theta = jnp.clip(theta, 0.0, 1.0)
+        y_damped = theta * y + (1.0 - theta) * Bs
 
-    return jax.lax.cond(
-        s_norm > skip_threshold,
-        do_update,
-        skip_update,
-    )
+        # Update gamma (initial Hessian scaling) based on new curvature
+        yTy = jnp.dot(y_damped, y_damped)
+        yTs = jnp.dot(y_damped, s)
+        gamma_new = jax.lax.cond(
+            yTy > 1e-12,
+            lambda: jnp.clip(yTs / yTy, 1e-3, 1e3),
+            lambda: history.gamma,
+        )
 
+        # Write to circular buffer at next_idx
+        k = history.s_history.shape[0]
+        idx = history.next_idx
+        new_s_history = history.s_history.at[idx].set(s)
+        new_y_history = history.y_history.at[idx].set(y_damped)
+        new_count = jnp.minimum(history.count + 1, jnp.array(k))
+        new_idx = (idx + 1) % k
 
-@jaxtyped(typechecker=beartype)
-def scale_initial_hessian(
-    B: Float[Array, "n n"],
-    s: Float[Array, " n"],
-    y: Float[Array, " n"],
-) -> Float[Array, "n n"]:
-    """Scale the initial Hessian approximation based on curvature.
+        return LBFGSHistory(
+            s_history=new_s_history,
+            y_history=new_y_history,
+            gamma=gamma_new,
+            count=new_count,
+            next_idx=new_idx,
+        )
 
-    After the first step, it's often beneficial to scale the initial
-    Hessian (typically identity) to better match the problem's curvature:
+    def skip():
+        return history
 
-        B_scaled = (y^T s) / (y^T y) * I
-
-    This scaling is applied before the first BFGS update.
-
-    Args:
-        B: Current Hessian approximation (typically identity).
-        s: First step vector.
-        y: First gradient difference.
-
-    Returns:
-        Scaled Hessian approximation.
-    """
-    n = B.shape[0]
-
-    yTy = jnp.dot(y, y)
-    yTs = jnp.dot(y, s)
-
-    # Compute scaling factor
-    # Want to scale B so that s^T B s ≈ s^T y
-    # If B = γI, then s^T B s = γ s^T s, so γ = s^T y / s^T s
-    # But standard approach uses γ = y^T s / y^T y
-
-    gamma = jax.lax.cond(
-        yTy > 1e-12,
-        lambda: yTs / yTy,
-        lambda: jnp.array(1.0),
-    )
-
-    # Ensure positive scaling
-    gamma = jnp.maximum(gamma, 1e-3)
-    gamma = jnp.minimum(gamma, 1e3)
-
-    return gamma * jnp.eye(n)
+    return jax.lax.cond(s_norm > skip_threshold, do_append, skip)
 
 
 @jaxtyped(typechecker=beartype)
@@ -180,21 +238,20 @@ def compute_lagrangian_gradient(
     """Compute the gradient of the Lagrangian function.
 
     The Lagrangian is:
-        L(x, λ, μ) = f(x) - λ^T c_eq(x) - μ^T c_ineq(x)
+        L(x, lambda, mu) = f(x) - lambda^T c_eq(x) - mu^T c_ineq(x)
 
     Its gradient with respect to x is:
-        ∇_x L = ∇f(x) - Σ λ_i ∇c_eq_i(x) - Σ μ_j ∇c_ineq_j(x)
-              = ∇f(x) - J_eq^T λ - J_ineq^T μ
+        nabla_x L = nabla f(x) - J_eq^T lambda - J_ineq^T mu
 
     Args:
-        grad_f: Gradient of objective function ∇f(x).
+        grad_f: Gradient of objective function nabla f(x).
         eq_jac: Jacobian of equality constraints (m_eq x n).
         ineq_jac: Jacobian of inequality constraints (m_ineq x n).
         multipliers_eq: Lagrange multipliers for equality constraints.
         multipliers_ineq: Lagrange multipliers for inequality constraints.
 
     Returns:
-        Gradient of Lagrangian ∇_x L.
+        Gradient of Lagrangian nabla_x L.
     """
     grad_L = grad_f
 

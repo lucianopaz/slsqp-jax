@@ -8,13 +8,19 @@ The QP subproblem has the form:
     subject to  A_eq d = b_eq
                 A_ineq d >= b_ineq
 
-For inequality constraints A d >= b, the Lagrangian is:
-    L(d, λ) = (1/2) d^T H d + g^T d - λ^T (A d - b)
+The solver uses a **projected conjugate gradient** method for the inner
+equality-constrained QP solve, wrapped in an **active-set** method for
+inequality constraints. The Hessian is accessed only through a
+Hessian-vector product (HVP) function, enabling matrix-free operation
+for large-scale problems (n > 5000).
 
-with λ >= 0 for active constraints.
+For inequality constraints A d >= b, the Lagrangian is:
+    L(d, lambda) = (1/2) d^T H d + g^T d - lambda^T (A d - b)
+
+with lambda >= 0 for active constraints.
 """
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import equinox as eqx
 import jax
@@ -44,145 +50,217 @@ class QPResult(NamedTuple):
     iterations: Int[Array, ""]
 
 
-@jaxtyped(typechecker=beartype)
-def solve_equality_qp(
-    H: Float[Array, "n n"],
+class _CGState(NamedTuple):
+    """Internal state for the projected conjugate gradient solver."""
+
+    d: Float[Array, " n"]
+    r: Float[Array, " n"]
+    p: Float[Array, " n"]
+    r_norm_sq: Float[Array, ""]
+    iteration: Int[Array, ""]
+    converged: Bool[Array, ""]
+
+
+def _solve_unconstrained_cg(
+    hvp_fn: Callable[[Float[Array, " n"]], Float[Array, " n"]],
+    g: Float[Array, " n"],
+    max_cg_iter: int,
+    cg_tol: float,
+) -> Float[Array, " n"]:
+    """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
+
+    Uses conjugate gradient to solve B d = -g without forming B.
+
+    Args:
+        hvp_fn: Hessian-vector product function v -> B @ v.
+        g: Linear term (gradient).
+        max_cg_iter: Maximum CG iterations.
+        cg_tol: Convergence tolerance on residual norm.
+
+    Returns:
+        Solution vector d.
+    """
+    n = g.shape[0]
+    r0 = -g
+    r0_norm_sq = jnp.dot(r0, r0)
+
+    init_cg = _CGState(
+        d=jnp.zeros(n),
+        r=r0,
+        p=r0,
+        r_norm_sq=r0_norm_sq,
+        iteration=jnp.array(0),
+        converged=r0_norm_sq < cg_tol**2,
+    )
+
+    def cg_step(i, state):
+        def do_step(state):
+            Bp = hvp_fn(state.p)
+            pBp = jnp.dot(state.p, Bp)
+            safe_pBp = jnp.maximum(pBp, 1e-12)
+            alpha = state.r_norm_sq / safe_pBp
+
+            d_new = state.d + alpha * state.p
+            r_new = state.r - alpha * Bp
+            r_new_norm_sq = jnp.dot(r_new, r_new)
+
+            beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
+            p_new = r_new + beta * state.p
+
+            converged = (r_new_norm_sq < cg_tol**2) | (pBp <= 1e-12)
+
+            return _CGState(
+                d=d_new,
+                r=r_new,
+                p=p_new,
+                r_norm_sq=r_new_norm_sq,
+                iteration=state.iteration + 1,
+                converged=converged,
+            )
+
+        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
+
+    final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
+    return final_cg.d
+
+
+def _solve_projected_cg(
+    hvp_fn: Callable[[Float[Array, " n"]], Float[Array, " n"]],
     g: Float[Array, " n"],
     A: Float[Array, "m n"],
     b: Float[Array, " m"],
+    active_mask: Bool[Array, " m"],
+    max_cg_iter: int,
+    cg_tol: float,
 ) -> tuple[Float[Array, " n"], Float[Array, " m"]]:
-    """Solve equality-constrained QP using the KKT system.
+    """Solve equality-constrained QP using projected conjugate gradient.
 
     Solves:
-        minimize    (1/2) d^T H d + g^T d
-        subject to  A d = b
+        minimize    (1/2) d^T B d + g^T d
+        subject to  A[active] d = b[active]
 
-    KKT conditions:
-        H d - A^T λ = -g   (stationarity, with sign for equality constraints)
-        A d = b            (primal feasibility)
+    where B is given implicitly via hvp_fn(v) = B @ v.
 
-    Note: For equality constraints A d = b, the multiplier λ can be any sign.
+    The method:
+    1. Computes a particular solution d_p satisfying A d_p = b for
+       active constraints.
+    2. Defines the projection P(v) = v - A^T (A A^T)^{-1} A v onto
+       the null space of A (for active constraints only).
+    3. Runs CG on the reduced problem in the null space of A.
+    4. Recovers Lagrange multipliers from the KKT conditions.
+
+    The projection involves a small m x m system (A A^T) which is
+    solved directly. Inactive constraint rows are zeroed and regularized
+    so that the system remains non-singular.
+
+    Complexity per CG iteration: O(kn) for HVP + O(mn) for projection,
+    where k is L-BFGS memory and m is the number of constraints.
+
+    Args:
+        hvp_fn: Hessian-vector product function v -> B @ v.
+        g: Linear term (gradient of objective).
+        A: Combined constraint matrix (m x n), rows are constraint normals.
+        b: Combined RHS vector (m,).
+        active_mask: Boolean mask (m,) indicating which constraints are active.
+        max_cg_iter: Maximum CG iterations.
+        cg_tol: CG convergence tolerance.
+
+    Returns:
+        Tuple of (d, multipliers) where d is the solution and multipliers
+        is a vector of Lagrange multipliers for all m constraints (0 for
+        inactive constraints).
     """
-    n = H.shape[0]
     m = A.shape[0]
-    eps = 1e-12
-    H_reg = H + eps * jnp.eye(n)
 
-    if m == 0:
-        d = jnp.linalg.solve(H_reg, -g)
-        return d, jnp.zeros((0,))
+    # Mask inactive constraints: zero out their rows
+    A_masked = jnp.where(active_mask[:, None], A, 0.0)
+    b_masked = jnp.where(active_mask, b, 0.0)
 
-    # KKT system:
-    # [H   -A^T] [d]   [-g]
-    # [A    0  ] [λ] = [b ]
-    #
-    # Solving: H d - A^T λ = -g, A d = b
+    # Build regularized A A^T (m x m, small)
+    # Active rows contribute normally; inactive rows get diagonal 1.0
+    # to keep the system non-singular (their multiplier will be 0).
+    reg_diag = jnp.where(active_mask, 0.0, 1.0)
+    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-12 * jnp.eye(m)
 
-    KKT = jnp.zeros((n + m, n + m))
-    KKT = KKT.at[:n, :n].set(H_reg)
-    KKT = KKT.at[:n, n:].set(-A.T)  # Note: -A^T
-    KKT = KKT.at[n:, :n].set(A)
-    KKT = KKT.at[n:, n:].set(eps * jnp.eye(m))  # Small regularization
+    def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
+        """Solve AAt @ x = rhs."""
+        return jnp.linalg.solve(AAt, rhs)
 
-    rhs = jnp.concatenate([-g, b])
-    solution = jnp.linalg.solve(KKT, rhs)
+    # Particular solution satisfying A d_p = b (for active constraints)
+    d_p = A_masked.T @ solve_AAt(b_masked)
 
-    return solution[:n], solution[n:]
+    # Projection onto null space of active constraints:
+    # P(v) = v - A^T (A A^T)^{-1} A v
+    def project(v: Float[Array, " n"]) -> Float[Array, " n"]:
+        return v - A_masked.T @ solve_AAt(A_masked @ v)
 
+    # Initial residual for CG in the null space
+    Bd_p = hvp_fn(d_p)
+    r0 = project(-(g + Bd_p))
+    r0_norm_sq = jnp.dot(r0, r0)
 
-def _solve_kkt_with_active_set(
-    H: Float[Array, "n n"],
-    g: Float[Array, " n"],
-    A_eq: Float[Array, "m_eq n"],
-    b_eq: Float[Array, " m_eq"],
-    A_ineq: Float[Array, "m_ineq n"],
-    b_ineq: Float[Array, " m_ineq"],
-    active_mask: Bool[Array, " m_ineq"],
-) -> tuple[Float[Array, " n"], Float[Array, " m_eq"], Float[Array, " m_ineq"]]:
-    """Solve the KKT system treating active inequalities as equalities.
+    init_cg = _CGState(
+        d=d_p,
+        r=r0,
+        p=r0,
+        r_norm_sq=r0_norm_sq,
+        iteration=jnp.array(0),
+        converged=r0_norm_sq < cg_tol**2,
+    )
 
-    For inequality constraints A d >= b:
-        L(d, λ) = (1/2) d^T H d + g^T d - λ^T (A d - b)
+    def cg_step(i, state):
+        def do_step(state):
+            Bp = hvp_fn(state.p)
+            PBp = project(Bp)
+            pPBp = jnp.dot(state.p, PBp)
 
-    KKT conditions for active constraints:
-        H d - A_eq^T λ_eq - A_ineq^T λ_ineq = -g
-        A_eq d = b_eq
-        A_ineq[active] d = b_ineq[active]
-        λ_ineq[inactive] = 0
-        λ_ineq[active] >= 0  (checked separately)
-    """
-    n = H.shape[0]
-    m_eq = A_eq.shape[0]
-    m_ineq = A_ineq.shape[0]
-    eps = 1e-12
+            # Guard against negative curvature (stop CG if detected)
+            safe_pPBp = jnp.maximum(pPBp, 1e-12)
+            alpha = state.r_norm_sq / safe_pPBp
 
-    m_total = m_eq + m_ineq
-    H_reg = H + eps * jnp.eye(n)
+            d_new = state.d + alpha * state.p
+            r_new = state.r - alpha * PBp
+            r_new_norm_sq = jnp.dot(r_new, r_new)
 
-    if m_total == 0:
-        d = jnp.linalg.solve(H_reg, -g)
-        return d, jnp.zeros((0,)), jnp.zeros((0,))
+            beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
+            p_new = r_new + beta * state.p
 
-    # Build KKT matrix
-    kkt_size = n + m_total
-    KKT = jnp.zeros((kkt_size, kkt_size))
+            converged = (r_new_norm_sq < cg_tol**2) | (pPBp <= 1e-12)
 
-    # Top-left: H
-    KKT = KKT.at[:n, :n].set(H_reg)
+            return _CGState(
+                d=d_new,
+                r=r_new,
+                p=p_new,
+                r_norm_sq=r_new_norm_sq,
+                iteration=state.iteration + 1,
+                converged=converged,
+            )
 
-    # Top-right: -[A_eq^T, A_ineq^T]  (note negative sign!)
-    if m_eq > 0:
-        KKT = KKT.at[:n, n : n + m_eq].set(-A_eq.T)
-    if m_ineq > 0:
-        KKT = KKT.at[:n, n + m_eq :].set(-A_ineq.T)
+        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
-    # Equality constraint rows
-    if m_eq > 0:
-        KKT = KKT.at[n : n + m_eq, :n].set(A_eq)
-        KKT = KKT.at[n : n + m_eq, n : n + m_eq].set(eps * jnp.eye(m_eq))
+    final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
-    # Inequality constraint rows:
-    # Active: enforce A_ineq[i] d = b_ineq[i]
-    # Inactive: set λ_ineq[i] = 0
-    if m_ineq > 0:
-        A_ineq_active = jnp.where(active_mask[:, None], A_ineq, 0.0)
-        KKT = KKT.at[n + m_eq :, :n].set(A_ineq_active)
+    # Recover multipliers from KKT stationarity:
+    # B d + g - A^T lambda = 0  =>  lambda = (A A^T)^{-1} A (B d + g)
+    Bd = hvp_fn(final_cg.d)
+    kkt_residual = A_masked @ (Bd + g)
+    multipliers = solve_AAt(kkt_residual)
+    # Zero out multipliers for inactive constraints
+    multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-        # Diagonal: small eps for active, 1.0 for inactive (to enforce λ=0)
-        diag_ineq = jnp.where(active_mask, eps, 1.0)
-        KKT = KKT.at[n + m_eq :, n + m_eq :].set(jnp.diag(diag_ineq))
-
-    # Build RHS
-    if m_eq > 0 and m_ineq > 0:
-        b_ineq_rhs = jnp.where(active_mask, b_ineq, 0.0)
-        rhs = jnp.concatenate([-g, b_eq, b_ineq_rhs])
-    elif m_eq > 0:
-        rhs = jnp.concatenate([-g, b_eq])
-    elif m_ineq > 0:
-        b_ineq_rhs = jnp.where(active_mask, b_ineq, 0.0)
-        rhs = jnp.concatenate([-g, b_ineq_rhs])
-    else:
-        rhs = -g
-
-    # Solve KKT system
-    solution = jnp.linalg.solve(KKT, rhs)
-
-    d = solution[:n]
-    mult_eq = solution[n : n + m_eq] if m_eq > 0 else jnp.zeros((0,))
-    mult_ineq = solution[n + m_eq :] if m_ineq > 0 else jnp.zeros((0,))
-
-    return d, mult_eq, mult_ineq
+    return final_cg.d, multipliers
 
 
 @jaxtyped(typechecker=beartype)
 def solve_qp(
-    H: Float[Array, "n n"],
+    hvp_fn: Callable,
     g: Float[Array, " n"],
     A_eq: Float[Array, "m_eq n"],
     b_eq: Float[Array, " m_eq"],
     A_ineq: Float[Array, "m_ineq n"],
     b_ineq: Float[Array, " m_ineq"],
     max_iter: int = 100,
+    max_cg_iter: int = 50,
     tol: float = 1e-8,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
@@ -192,16 +270,49 @@ def solve_qp(
         subject to  A_eq d = b_eq
                     A_ineq d >= b_ineq
 
-    Uses a primal active-set method.
+    where H is provided implicitly via hvp_fn(v) = H @ v.
 
-    For a constraint A d >= b to be optimal when active, its multiplier
-    should be non-negative (λ >= 0).
+    Uses a primal active-set method: at each iteration, active inequality
+    constraints are treated as equalities, and the resulting
+    equality-constrained QP is solved using projected conjugate gradient.
+    Constraints are added/removed from the active set based on
+    feasibility violations and multiplier signs until optimality is reached.
+
+    Args:
+        hvp_fn: Hessian-vector product function v -> H @ v.
+        g: Linear term of the objective (gradient).
+        A_eq: Equality constraint matrix (m_eq x n).
+        b_eq: Equality constraint RHS (m_eq,).
+        A_ineq: Inequality constraint matrix (m_ineq x n).
+        b_ineq: Inequality constraint RHS (m_ineq,).
+        max_iter: Maximum active-set iterations.
+        max_cg_iter: Maximum CG iterations per active-set step.
+        tol: Feasibility and optimality tolerance.
+
+    Returns:
+        QPResult containing the solution, multipliers, and convergence info.
     """
+    m_eq = A_eq.shape[0]
     m_ineq = A_ineq.shape[0]
+    m_total = m_eq + m_ineq
 
-    # Handle case with no inequality constraints
+    # Case 1: No constraints at all
+    if m_total == 0:
+        d = _solve_unconstrained_cg(hvp_fn, g, max_cg_iter, tol)
+        return QPResult(
+            d=d,
+            multipliers_eq=jnp.zeros((0,)),
+            multipliers_ineq=jnp.zeros((0,)),
+            converged=jnp.array(True),
+            iterations=jnp.array(1),
+        )
+
+    # Case 2: Only equality constraints (no active-set loop needed)
     if m_ineq == 0:
-        d, mult_eq = solve_equality_qp(H, g, A_eq, b_eq)
+        active_mask = jnp.ones(m_eq, dtype=bool)
+        d, mult_eq = _solve_projected_cg(
+            hvp_fn, g, A_eq, b_eq, active_mask, max_cg_iter, tol
+        )
         return QPResult(
             d=d,
             multipliers_eq=mult_eq,
@@ -210,13 +321,25 @@ def solve_qp(
             iterations=jnp.array(1),
         )
 
-    # Solve equality-only problem first
-    d_init, mult_eq_init = solve_equality_qp(H, g, A_eq, b_eq)
+    # Case 3: Has inequality constraints -> active-set method
+    # Build combined constraint matrix: [A_eq; A_ineq]
+    A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
+    b_combined = jnp.concatenate([b_eq, b_ineq])
 
-    # Check which inequality constraints are violated
+    # Step 1: Initial solve with equality constraints only
+    eq_only_mask = jnp.concatenate(
+        [jnp.ones(m_eq, dtype=bool), jnp.zeros(m_ineq, dtype=bool)]
+    )
+    d_init, mult_init = _solve_projected_cg(
+        hvp_fn, g, A_combined, b_combined, eq_only_mask, max_cg_iter, tol
+    )
+
+    # Check which inequality constraints are violated by the initial solution
     residuals_init = A_ineq @ d_init - b_ineq
     init_active = residuals_init < -tol
     init_converged = ~jnp.any(init_active)
+
+    mult_eq_init = mult_init[:m_eq] if m_eq > 0 else jnp.zeros((0,))
 
     init_state = QPState(
         d=d_init,
@@ -231,22 +354,28 @@ def solve_qp(
         return ~state.converged & (state.iteration < max_iter)
 
     def body_fn(state: QPState) -> QPState:
-        # Solve with current active set
-        d_new, mult_eq_new, mult_ineq_new = _solve_kkt_with_active_set(
-            H, g, A_eq, b_eq, A_ineq, b_ineq, state.active_set
+        # Build active mask for the combined constraint matrix
+        combined_mask = jnp.concatenate([jnp.ones(m_eq, dtype=bool), state.active_set])
+
+        # Solve with current active set using projected CG
+        d_new, mult_all = _solve_projected_cg(
+            hvp_fn, g, A_combined, b_combined, combined_mask, max_cg_iter, tol
         )
 
-        # Check feasibility of solution for inactive constraints
+        mult_eq_new = mult_all[:m_eq] if m_eq > 0 else jnp.zeros((0,))
+        mult_ineq_new = mult_all[m_eq:]
+
+        # Check feasibility of solution for inactive inequality constraints
         residuals = A_ineq @ d_new - b_ineq
         violated = (residuals < -tol) & ~state.active_set
         any_violated = jnp.any(violated)
 
-        # Find most violated inactive constraint
+        # Find the most violated inactive constraint
         violation_scores = jnp.where(violated, -residuals, -jnp.inf)
         most_violated_idx = jnp.argmax(violation_scores)
 
-        # Check multipliers of active constraints
-        # For A d >= b constraints, optimal multipliers should be >= 0
+        # Check multiplier signs of active inequality constraints
+        # For A d >= b, optimal multipliers should be non-negative
         negative_mult = (mult_ineq_new < -tol) & state.active_set
         any_negative = jnp.any(negative_mult)
 
