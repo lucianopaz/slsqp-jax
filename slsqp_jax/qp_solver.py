@@ -97,36 +97,44 @@ def _solve_unconstrained_cg(
         def do_step(state):
             Bp = hvp_fn(state.p)
             pBp = jnp.dot(state.p, Bp)
-            safe_pBp = jnp.maximum(pBp, 1e-12)
-            alpha = state.r_norm_sq / safe_pBp
-            # Clip alpha to prevent numerical instability
-            alpha = jnp.clip(alpha, 0.0, 1e10)
+
+            # Detect negative or near-zero curvature
+            has_bad_curvature = pBp <= 1e-8
+
+            alpha = jnp.where(
+                has_bad_curvature,
+                jnp.array(0.0),
+                state.r_norm_sq / pBp,
+            )
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * Bp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
             beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
-            beta = jnp.clip(beta, 0.0, 1e10)
             p_new = r_new + beta * state.p
 
-            # Check for NaN and stop if detected
-            has_nan = jnp.any(jnp.isnan(d_new)) | jnp.any(jnp.isnan(r_new))
-            converged = (r_new_norm_sq < cg_tol**2) | (pBp <= 1e-12) | has_nan
+            converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
 
-            # If NaN detected, keep the previous valid state
-            d_new = jnp.where(has_nan, state.d, d_new)
-            r_new = jnp.where(has_nan, state.r, r_new)
-            p_new = jnp.where(has_nan, state.p, p_new)
-            r_new_norm_sq = jnp.where(has_nan, state.r_norm_sq, r_new_norm_sq)
-
-            return _CGState(
-                d=d_new,
-                r=r_new,
-                p=p_new,
-                r_norm_sq=r_new_norm_sq,
-                iteration=state.iteration + 1,
-                converged=converged,
+            # If bad curvature, keep current state
+            return jax.lax.cond(
+                has_bad_curvature,
+                lambda: _CGState(
+                    d=state.d,
+                    r=state.r,
+                    p=state.p,
+                    r_norm_sq=state.r_norm_sq,
+                    iteration=state.iteration + 1,
+                    converged=jnp.array(True),
+                ),
+                lambda: _CGState(
+                    d=d_new,
+                    r=r_new,
+                    p=p_new,
+                    r_norm_sq=r_new_norm_sq,
+                    iteration=state.iteration + 1,
+                    converged=converged,
+                ),
             )
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
@@ -191,14 +199,11 @@ def _solve_projected_cg(
     # Active rows contribute normally; inactive rows get diagonal 1.0
     # to keep the system non-singular (their multiplier will be 0).
     reg_diag = jnp.where(active_mask, 0.0, 1.0)
-    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-10 * jnp.eye(m)
+    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
 
     def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        """Solve AAt @ x = rhs using lstsq for numerical stability."""
-        result, _, _, _ = jnp.linalg.lstsq(AAt, rhs, rcond=1e-10)
-        # Guard against NaN
-        result = jnp.where(jnp.any(jnp.isnan(result)), jnp.zeros_like(result), result)
-        return result
+        """Solve AAt @ x = rhs using direct solve."""
+        return jnp.linalg.solve(AAt, rhs)
 
     # Particular solution satisfying A d_p = b (for active constraints)
     d_p = A_masked.T @ solve_AAt(b_masked)
@@ -228,59 +233,60 @@ def _solve_projected_cg(
             PBp = project(Bp)
             pPBp = jnp.dot(state.p, PBp)
 
-            # Guard against negative curvature (stop CG if detected)
-            safe_pPBp = jnp.maximum(pPBp, 1e-12)
-            alpha = state.r_norm_sq / safe_pPBp
-            # Clip alpha to prevent numerical instability
-            alpha = jnp.clip(alpha, 0.0, 1e10)
+            # Detect negative or near-zero curvature - stop CG and keep current d
+            has_bad_curvature = pPBp <= 1e-8
+
+            # Only proceed if curvature is positive
+            alpha = jnp.where(
+                has_bad_curvature,
+                jnp.array(0.0),
+                state.r_norm_sq / pPBp,
+            )
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * PBp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
             beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
-            beta = jnp.clip(beta, 0.0, 1e10)
             p_new = r_new + beta * state.p
 
-            # Check for NaN and stop if detected
-            has_nan = jnp.any(jnp.isnan(d_new)) | jnp.any(jnp.isnan(r_new))
-            converged = (r_new_norm_sq < cg_tol**2) | (pPBp <= 1e-12) | has_nan
+            # Mark as converged if we have bad curvature (to stop iteration)
+            converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
 
-            # If NaN detected, keep the previous valid state
-            d_new = jnp.where(has_nan, state.d, d_new)
-            r_new = jnp.where(has_nan, state.r, r_new)
-            p_new = jnp.where(has_nan, state.p, p_new)
-            r_new_norm_sq = jnp.where(has_nan, state.r_norm_sq, r_new_norm_sq)
-
-            return _CGState(
-                d=d_new,
-                r=r_new,
-                p=p_new,
-                r_norm_sq=r_new_norm_sq,
-                iteration=state.iteration + 1,
-                converged=converged,
+            # If bad curvature, keep the previous state
+            return jax.lax.cond(
+                has_bad_curvature,
+                lambda: _CGState(
+                    d=state.d,
+                    r=state.r,
+                    p=state.p,
+                    r_norm_sq=state.r_norm_sq,
+                    iteration=state.iteration + 1,
+                    converged=jnp.array(True),
+                ),
+                lambda: _CGState(
+                    d=d_new,
+                    r=r_new,
+                    p=p_new,
+                    r_norm_sq=r_new_norm_sq,
+                    iteration=state.iteration + 1,
+                    converged=converged,
+                ),
             )
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
-    # Guard against NaN in the solution
-    d_final = jnp.where(
-        jnp.any(jnp.isnan(final_cg.d)),
-        d_p,  # Fall back to particular solution if CG produced NaN
-        final_cg.d,
-    )
-
     # Recover multipliers from KKT stationarity:
     # B d + g - A^T lambda = 0  =>  lambda = (A A^T)^{-1} A (B d + g)
-    Bd = hvp_fn(d_final)
+    Bd = hvp_fn(final_cg.d)
     kkt_residual = A_masked @ (Bd + g)
     multipliers = solve_AAt(kkt_residual)
     # Zero out multipliers for inactive constraints
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-    return d_final, multipliers
+    return final_cg.d, multipliers
 
 
 @jaxtyped(typechecker=beartype)

@@ -435,10 +435,6 @@ class SLSQP(optx.AbstractMinimiser):
         qp_result = self._solve_qp_subproblem(state, hvp_fn)
         direction = qp_result.direction
 
-        # Guard against NaN in the search direction
-        has_nan = jnp.any(jnp.isnan(direction))
-        direction = jnp.where(has_nan, -state.grad, direction)
-
         # Step 3: Update penalty parameter based on new multipliers
         merit_penalty = update_penalty_parameter(
             state.merit_penalty,
@@ -469,13 +465,6 @@ class SLSQP(optx.AbstractMinimiser):
         eq_val_new = ls_result.eq_val
         ineq_val_new = ls_result.ineq_val
 
-        # Guard against NaN in the new point - fall back to current point with small step
-        y_new_has_nan = jnp.any(jnp.isnan(y_new))
-        y_new = jnp.where(y_new_has_nan, y, y_new)
-        f_val_new = jnp.where(y_new_has_nan, state.f_val, f_val_new)
-        eq_val_new = jnp.where(y_new_has_nan, state.eq_val, eq_val_new)
-        ineq_val_new = jnp.where(y_new_has_nan, state.ineq_val, ineq_val_new)
-
         # Get auxiliary output from function evaluation
         _, aux = fn(y_new, args)
 
@@ -497,18 +486,6 @@ class SLSQP(optx.AbstractMinimiser):
         )
 
         y_diff = grad_lagrangian_new - state.prev_grad_lagrangian
-
-        # Guard against NaN in Lagrangian gradient
-        grad_lagrangian_new = jnp.where(
-            jnp.any(jnp.isnan(grad_lagrangian_new)),
-            state.prev_grad_lagrangian,
-            grad_lagrangian_new,
-        )
-        y_diff = jnp.where(
-            jnp.any(jnp.isnan(y_diff)),
-            jnp.zeros_like(y_diff),
-            y_diff,
-        )
 
         # Update L-BFGS history if not using exact HVPs
         if self.obj_hvp_fn is None:

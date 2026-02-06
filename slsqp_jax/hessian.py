@@ -116,12 +116,16 @@ def lbfgs_hvp(
     # Regularize invalid entries to keep N non-singular
     invalid_diag = jnp.where(jnp.arange(k) < count, 0.0, 1.0)
 
-    # Build N = [[gamma * S^T S, L], [L^T, -D]]  with regularization
-    N = jnp.zeros((2 * k, 2 * k))
-    N = N.at[:k, :k].set(gamma * SS + jnp.diag(invalid_diag))
-    N = N.at[:k, k:].set(L)
-    N = N.at[k:, :k].set(L.T)
-    N = N.at[k:, k:].set(-jnp.diag(D_diag) + jnp.diag(invalid_diag))
+    # Build N = [[gamma * S^T S, L], [L^T, -D]] with regularization
+    # Use concatenate instead of multiple .at[].set() for efficiency
+    top_left = gamma * SS + jnp.diag(invalid_diag)
+    top_right = L
+    bottom_left = L.T
+    bottom_right = -jnp.diag(D_diag) + jnp.diag(invalid_diag)
+
+    top = jnp.concatenate([top_left, top_right], axis=1)
+    bottom = jnp.concatenate([bottom_left, bottom_right], axis=1)
+    N = jnp.concatenate([top, bottom], axis=0)
 
     # Small regularization for numerical stability
     N = N + 1e-10 * jnp.eye(2 * k)
@@ -131,29 +135,27 @@ def lbfgs_hvp(
     Yv = Y @ v  # (k,)
     p = jnp.concatenate([gamma * Sv, Yv])
 
-    # Solve N @ q = p using lstsq for better numerical stability
-    # This handles rank-deficient cases more gracefully than solve
-    q, _, _, _ = jnp.linalg.lstsq(N, p, rcond=1e-10)
+    # Solve N @ q = p using regularized solve (faster than lstsq on GPU)
+    q = jnp.linalg.solve(N, p)
 
     # B @ v = gamma * v - [gamma*S^T, Y^T] @ q
     #       = gamma * v - gamma * S^T @ q[:k] - Y^T @ q[k:]
     result = gamma * v - gamma * (S.T @ q[:k]) - Y.T @ q[k:]
 
-    # Guard against NaN or huge values: fall back to gamma * v (identity scaling)
-    # The HVP should produce values on the same scale as gamma * ||v||
-    # If it's much larger, the L-BFGS approximation is corrupted
+    # Guard against NaN/inf or unreasonable values: fall back to identity scaling
+    # For well-conditioned problems, the Hessian eigenvalues should be O(1) to O(100)
     v_norm = jnp.linalg.norm(v)
     result_norm = jnp.linalg.norm(result)
-    expected_scale = jnp.maximum(gamma * v_norm, v_norm)  # Reasonable upper bound
 
-    is_bad = (
-        jnp.any(jnp.isnan(result))
-        | jnp.any(jnp.isinf(result))
-        | (result_norm > 1e6 * expected_scale)  # HVP is way too large
+    # The ratio result_norm / v_norm should be bounded by max eigenvalue of B
+    # For most problems this is < 100; use a threshold of 1000
+    is_bad = jnp.any(~jnp.isfinite(result)) | (
+        result_norm > 1000.0 * jnp.maximum(v_norm, 1e-10)
     )
 
-    # Fall back to identity scaling if the L-BFGS approximation is bad
-    result = jnp.where(is_bad, gamma * v, result)
+    # When fallback triggers, use identity scaling (1.0 * v) not gamma * v
+    # because gamma can be very small and would create ill-conditioned QP
+    result = jnp.where(is_bad, v, result)
 
     return result
 
@@ -182,7 +184,7 @@ def lbfgs_append(
     the update is skipped entirely to avoid numerical issues.
 
     After appending, the initial Hessian scaling gamma is updated to
-    y_damped^T s / (y_damped^T y_damped), clipped to [1e-3, 1e3].
+    y_damped^T s / (y_damped^T y_damped), clipped to [1e-3, 100].
 
     Args:
         history: Current L-BFGS history.
@@ -197,20 +199,32 @@ def lbfgs_append(
     s_norm = jnp.linalg.norm(s)
     y_norm = jnp.linalg.norm(y)
 
-    # Skip if step is too small (absolute threshold)
+    # Skip if step or gradient difference is too small (absolute threshold)
     step_too_small = s_norm < skip_threshold
+    grad_diff_too_small = y_norm < skip_threshold
 
-    # Skip if curvature ratio is too extreme (y_norm / s_norm too large)
-    # This prevents ill-conditioning when a tiny step produces large gradient change
+    # Skip if curvature ratio is too extreme (y_norm / s_norm too large or too small)
+    # This prevents ill-conditioning when curvature doesn't match step size
     curvature_ratio = y_norm / jnp.maximum(s_norm, 1e-30)
-    curvature_too_extreme = curvature_ratio > 1e8
+    curvature_too_extreme = (curvature_ratio > 1e6) | (curvature_ratio < 1e-6)
 
     # Also check that s^T y is not too small relative to ||s|| ||y||
     sTy_raw = jnp.dot(s, y)
     relative_curvature = jnp.abs(sTy_raw) / jnp.maximum(s_norm * y_norm, 1e-30)
-    curvature_too_small = relative_curvature < 1e-8
+    curvature_too_small = relative_curvature < 1e-6
 
-    should_skip = step_too_small | curvature_too_extreme | curvature_too_small
+    # Skip if any values are non-finite
+    has_bad_values = ~(
+        jnp.isfinite(s_norm) & jnp.isfinite(y_norm) & jnp.isfinite(sTy_raw)
+    )
+
+    should_skip = (
+        step_too_small
+        | grad_diff_too_small
+        | curvature_too_extreme
+        | curvature_too_small
+        | has_bad_values
+    )
 
     def do_append():
         # Compute B @ s using current L-BFGS approximation for damping
@@ -230,12 +244,15 @@ def lbfgs_append(
         y_damped = theta * y + (1.0 - theta) * Bs
 
         # Update gamma (initial Hessian scaling) based on new curvature
+        # gamma = s^T y / (y^T y) is the Barzilai-Borwein step length approximation
         yTy = jnp.dot(y_damped, y_damped)
         yTs = jnp.dot(y_damped, s)
         gamma_candidate = yTs / jnp.maximum(yTy, 1e-12)
+
+        # Clip to a reasonable range - for most problems eigenvalues are O(1) to O(100)
         gamma_new = jax.lax.cond(
             (yTy > 1e-12) & jnp.isfinite(gamma_candidate),
-            lambda: jnp.clip(gamma_candidate, 1e-3, 1e3),
+            lambda: jnp.clip(gamma_candidate, 1e-3, 100.0),
             lambda: history.gamma,
         )
 
