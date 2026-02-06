@@ -99,15 +99,26 @@ def _solve_unconstrained_cg(
             pBp = jnp.dot(state.p, Bp)
             safe_pBp = jnp.maximum(pBp, 1e-12)
             alpha = state.r_norm_sq / safe_pBp
+            # Clip alpha to prevent numerical instability
+            alpha = jnp.clip(alpha, 0.0, 1e10)
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * Bp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
             beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
+            beta = jnp.clip(beta, 0.0, 1e10)
             p_new = r_new + beta * state.p
 
-            converged = (r_new_norm_sq < cg_tol**2) | (pBp <= 1e-12)
+            # Check for NaN and stop if detected
+            has_nan = jnp.any(jnp.isnan(d_new)) | jnp.any(jnp.isnan(r_new))
+            converged = (r_new_norm_sq < cg_tol**2) | (pBp <= 1e-12) | has_nan
+
+            # If NaN detected, keep the previous valid state
+            d_new = jnp.where(has_nan, state.d, d_new)
+            r_new = jnp.where(has_nan, state.r, r_new)
+            p_new = jnp.where(has_nan, state.p, p_new)
+            r_new_norm_sq = jnp.where(has_nan, state.r_norm_sq, r_new_norm_sq)
 
             return _CGState(
                 d=d_new,
@@ -180,11 +191,14 @@ def _solve_projected_cg(
     # Active rows contribute normally; inactive rows get diagonal 1.0
     # to keep the system non-singular (their multiplier will be 0).
     reg_diag = jnp.where(active_mask, 0.0, 1.0)
-    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-12 * jnp.eye(m)
+    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-10 * jnp.eye(m)
 
     def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        """Solve AAt @ x = rhs."""
-        return jnp.linalg.solve(AAt, rhs)
+        """Solve AAt @ x = rhs using lstsq for numerical stability."""
+        result, _, _, _ = jnp.linalg.lstsq(AAt, rhs, rcond=1e-10)
+        # Guard against NaN
+        result = jnp.where(jnp.any(jnp.isnan(result)), jnp.zeros_like(result), result)
+        return result
 
     # Particular solution satisfying A d_p = b (for active constraints)
     d_p = A_masked.T @ solve_AAt(b_masked)
@@ -217,15 +231,26 @@ def _solve_projected_cg(
             # Guard against negative curvature (stop CG if detected)
             safe_pPBp = jnp.maximum(pPBp, 1e-12)
             alpha = state.r_norm_sq / safe_pPBp
+            # Clip alpha to prevent numerical instability
+            alpha = jnp.clip(alpha, 0.0, 1e10)
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * PBp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
             beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
+            beta = jnp.clip(beta, 0.0, 1e10)
             p_new = r_new + beta * state.p
 
-            converged = (r_new_norm_sq < cg_tol**2) | (pPBp <= 1e-12)
+            # Check for NaN and stop if detected
+            has_nan = jnp.any(jnp.isnan(d_new)) | jnp.any(jnp.isnan(r_new))
+            converged = (r_new_norm_sq < cg_tol**2) | (pPBp <= 1e-12) | has_nan
+
+            # If NaN detected, keep the previous valid state
+            d_new = jnp.where(has_nan, state.d, d_new)
+            r_new = jnp.where(has_nan, state.r, r_new)
+            p_new = jnp.where(has_nan, state.p, p_new)
+            r_new_norm_sq = jnp.where(has_nan, state.r_norm_sq, r_new_norm_sq)
 
             return _CGState(
                 d=d_new,
@@ -240,15 +265,22 @@ def _solve_projected_cg(
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
+    # Guard against NaN in the solution
+    d_final = jnp.where(
+        jnp.any(jnp.isnan(final_cg.d)),
+        d_p,  # Fall back to particular solution if CG produced NaN
+        final_cg.d,
+    )
+
     # Recover multipliers from KKT stationarity:
     # B d + g - A^T lambda = 0  =>  lambda = (A A^T)^{-1} A (B d + g)
-    Bd = hvp_fn(final_cg.d)
+    Bd = hvp_fn(d_final)
     kkt_residual = A_masked @ (Bd + g)
     multipliers = solve_AAt(kkt_residual)
     # Zero out multipliers for inactive constraints
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-    return final_cg.d, multipliers
+    return d_final, multipliers
 
 
 @jaxtyped(typechecker=beartype)

@@ -124,19 +124,23 @@ def lbfgs_hvp(
     N = N.at[k:, k:].set(-jnp.diag(D_diag) + jnp.diag(invalid_diag))
 
     # Small regularization for numerical stability
-    N = N + 1e-12 * jnp.eye(2 * k)
+    N = N + 1e-10 * jnp.eye(2 * k)
 
     # Compute p = [gamma * S @ v; Y @ v]
     Sv = S @ v  # (k,)
     Yv = Y @ v  # (k,)
     p = jnp.concatenate([gamma * Sv, Yv])
 
-    # Solve N @ q = p
-    q = jnp.linalg.solve(N, p)
+    # Solve N @ q = p using lstsq for better numerical stability
+    # This handles rank-deficient cases more gracefully than solve
+    q, _, _, _ = jnp.linalg.lstsq(N, p, rcond=1e-10)
 
     # B @ v = gamma * v - [gamma*S^T, Y^T] @ q
     #       = gamma * v - gamma * S^T @ q[:k] - Y^T @ q[k:]
     result = gamma * v - gamma * (S.T @ q[:k]) - Y.T @ q[k:]
+
+    # Guard against NaN: if result contains NaN, fall back to gamma * v (identity scaling)
+    result = jnp.where(jnp.any(jnp.isnan(result)), gamma * v, result)
 
     return result
 
@@ -199,9 +203,10 @@ def lbfgs_append(
         # Update gamma (initial Hessian scaling) based on new curvature
         yTy = jnp.dot(y_damped, y_damped)
         yTs = jnp.dot(y_damped, s)
+        gamma_candidate = yTs / jnp.maximum(yTy, 1e-12)
         gamma_new = jax.lax.cond(
-            yTy > 1e-12,
-            lambda: jnp.clip(yTs / yTy, 1e-3, 1e3),
+            (yTy > 1e-12) & jnp.isfinite(gamma_candidate),
+            lambda: jnp.clip(gamma_candidate, 1e-3, 1e3),
             lambda: history.gamma,
         )
 
