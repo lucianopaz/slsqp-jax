@@ -773,3 +773,399 @@ class TestSLSQPComparisonWithSciPy:
         y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
+
+
+class TestSLSQPBoxConstraints:
+    """Tests for box constraints (bounds) on decision variables."""
+
+    def test_simple_lower_bound(self):
+        """Minimize x^2 subject to x >= 2  =>  x = 2"""
+
+        def objective(x, args):
+            return x[0] ** 2, None
+
+        bounds = jnp.array([[2.0, jnp.inf]])  # x >= 2
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([5.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0], rtol=1e-4)
+
+    def test_simple_upper_bound(self):
+        """Minimize -x subject to x <= 3  =>  x = 3"""
+
+        def objective(x, args):
+            return -x[0], None
+
+        bounds = jnp.array([[-jnp.inf, 3.0]])  # x <= 3
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([0.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [3.0], rtol=1e-4)
+
+    def test_box_bounds(self):
+        """Minimize (x-5)^2 + (y-5)^2 subject to 0 <= x,y <= 3  =>  (3, 3)"""
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        bounds = jnp.array(
+            [
+                [0.0, 3.0],
+                [0.0, 3.0],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [3.0, 3.0], rtol=1e-3)
+        # Check bounds are satisfied
+        assert jnp.all(y >= 0.0 - 1e-5)
+        assert jnp.all(y <= 3.0 + 1e-5)
+
+    def test_bounds_with_equality_constraint(self):
+        """Minimize x^2 + y^2 subject to x + y = 4, 0 <= x,y <= 3  =>  (2, 2)"""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 4.0])
+
+        bounds = jnp.array(
+            [
+                [0.0, 3.0],
+                [0.0, 3.0],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            bounds=bounds,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)
+        np.testing.assert_allclose(y[0] + y[1], 4.0, atol=1e-5)
+
+    def test_bounds_with_inequality_constraint(self):
+        """Minimize (x-5)^2 + (y-5)^2 subject to x + y >= 3, 0 <= x,y <= 2
+
+        The optimal unconstrained solution is (5, 5), but bounds limit to (2, 2).
+        The sum constraint x + y >= 3 is satisfied at (2, 2) since 4 >= 3.
+        """
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 3.0])
+
+        bounds = jnp.array(
+            [
+                [0.0, 2.0],
+                [0.0, 2.0],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            bounds=bounds,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)
+        # Check constraints
+        assert y[0] + y[1] >= 3.0 - 1e-5
+        assert jnp.all(y >= 0.0 - 1e-5)
+        assert jnp.all(y <= 2.0 + 1e-5)
+
+    def test_bounds_inactive(self):
+        """Test when bounds exist but are not active at the solution.
+
+        Minimize (x-1)^2 + (y-1)^2 with bounds 0 <= x,y <= 10
+        Solution: (1, 1) which is interior to the box.
+        """
+
+        def objective(x, args):
+            return (x[0] - 1) ** 2 + (x[1] - 1) ** 2, None
+
+        bounds = jnp.array(
+            [
+                [0.0, 10.0],
+                [0.0, 10.0],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([5.0, 5.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-4)
+
+    def test_partial_bounds(self):
+        """Test with some variables bounded and some unbounded.
+
+        Minimize x^2 + y^2 subject to x >= 2 (y unbounded)
+        Solution: (2, 0)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        bounds = jnp.array(
+            [
+                [2.0, jnp.inf],  # x >= 2
+                [-jnp.inf, jnp.inf],  # y unbounded
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([5.0, 5.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0, 0.0], rtol=1e-3, atol=1e-6)
+
+    def test_mixed_bounds(self):
+        """Test with different bound types on each variable.
+
+        Minimize (x-5)^2 + (y+5)^2 + z^2
+        subject to x >= 0, y <= 0, -1 <= z <= 1
+
+        Solution:
+        - x: minimize (x-5)^2 with x >= 0 -> x = 5
+        - y: minimize (y+5)^2 with y <= 0 -> y = -5 (since -5 <= 0)
+        - z: minimize z^2 with -1 <= z <= 1 -> z = 0
+        """
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] + 5) ** 2 + x[2] ** 2, None
+
+        bounds = jnp.array(
+            [
+                [0.0, jnp.inf],  # x >= 0 only
+                [-jnp.inf, 0.0],  # y <= 0 only
+                [-1.0, 1.0],  # z in [-1, 1]
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([0.0, 0.0, 0.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        # y = -5 is optimal because (y+5)^2 is minimized at y=-5, and -5 <= 0 satisfies the bound
+        np.testing.assert_allclose(y, [5.0, -5.0, 0.0], rtol=1e-3)
+
+    def test_no_bounds(self):
+        """Test that bounds=None behaves the same as before."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=None,
+        )
+        x0 = jnp.array([3.0, -2.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
+
+    def test_all_infinite_bounds(self):
+        """Test with explicit bounds that are all infinite (no constraints)."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        bounds = jnp.array(
+            [
+                [-jnp.inf, jnp.inf],
+                [-jnp.inf, jnp.inf],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([3.0, -2.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
+
+    def test_bounds_with_optimistix(self):
+        """Test bounds work with optimistix.minimise API."""
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        bounds = jnp.array(
+            [
+                [0.0, 2.0],
+                [0.0, 2.0],
+            ]
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            bounds=bounds,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
+
+        np.testing.assert_allclose(sol.value, [2.0, 2.0], rtol=1e-3)
+
+
+class TestSLSQPBoundsComparisonWithSciPy:
+    """Compare SLSQP-JAX bounds with SciPy's bounds parameter."""
+
+    def test_bounds_match_scipy_simple(self):
+        """Compare simple bounded optimization with SciPy."""
+
+        def objective_scipy(x):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2
+
+        def objective_jax(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        scipy_bounds = [(0, 3), (0, 3)]
+        jax_bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
+
+        x0 = np.array([1.0, 1.0])
+
+        result_scipy = scipy_minimize(
+            objective_scipy,
+            x0,
+            method="SLSQP",
+            bounds=scipy_bounds,
+        )
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50, bounds=jax_bounds)
+        y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
+
+        np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
+        np.testing.assert_allclose(y, [3.0, 3.0], rtol=1e-3)
+
+    def test_bounds_match_scipy_with_constraint(self):
+        """Compare bounded + constrained optimization with SciPy."""
+
+        def objective_scipy(x):
+            return x[0] ** 2 + x[1] ** 2
+
+        def constraint_scipy(x):
+            return x[0] + x[1] - 4.0
+
+        def objective_jax(x, args):
+            return x[0] ** 2 + x[1] ** 2, None
+
+        def constraint_jax(x, args):
+            return jnp.array([x[0] + x[1] - 4.0])
+
+        scipy_bounds = [(0, 3), (0, 3)]
+        jax_bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
+
+        x0 = np.array([2.0, 2.0])
+
+        result_scipy = scipy_minimize(
+            objective_scipy,
+            x0,
+            method="SLSQP",
+            bounds=scipy_bounds,
+            constraints={"type": "eq", "fun": constraint_scipy},
+        )
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=constraint_jax,
+            n_eq_constraints=1,
+            bounds=jax_bounds,
+        )
+        y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
+
+        np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
+
+    def test_bounds_match_scipy_partial(self):
+        """Compare partially bounded optimization with SciPy."""
+
+        def objective_scipy(x):
+            return x[0] ** 2 + x[1] ** 2 + x[2] ** 2
+
+        def objective_jax(x, args):
+            return jnp.sum(x**2), None
+
+        # x >= 1, y unrestricted, z <= -1
+        scipy_bounds = [(1, None), (None, None), (None, -1)]
+        jax_bounds = jnp.array(
+            [
+                [1.0, jnp.inf],
+                [-jnp.inf, jnp.inf],
+                [-jnp.inf, -1.0],
+            ]
+        )
+
+        x0 = np.array([5.0, 5.0, -5.0])
+
+        result_scipy = scipy_minimize(
+            objective_scipy,
+            x0,
+            method="SLSQP",
+            bounds=scipy_bounds,
+        )
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50, bounds=jax_bounds)
+        y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
+
+        np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3, atol=1e-6)
+        np.testing.assert_allclose(y, [1.0, 0.0, -1.0], rtol=1e-3, atol=1e-6)

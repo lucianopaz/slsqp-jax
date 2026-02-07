@@ -17,11 +17,12 @@ automatically via jax.grad (reverse-mode) and jax.jacrev.
 """
 
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optimistix as optx
 import optimistix._misc as optx_misc
 from jaxtyping import Array, Bool, Float, Int
@@ -187,6 +188,18 @@ class SLSQP(optx.AbstractMinimiser):
     n_eq_constraints: int = eqx.field(static=True, default=0)
     n_ineq_constraints: int = eqx.field(static=True, default=0)
 
+    # Box constraints (bounds) on decision variables
+    # Shape (n, 2) where bounds[i, 0] = lower, bounds[i, 1] = upper
+    # Use -jnp.inf / jnp.inf for unbounded dimensions
+    bounds: Optional[Float[Array, "n 2"]] = None
+
+    # Masks indicating which bounds are finite (static for compilation)
+    # These are computed from bounds at construction time and stored as tuples
+    _lower_bound_mask: Optional[tuple[bool, ...]] = eqx.field(static=True, default=None)
+    _upper_bound_mask: Optional[tuple[bool, ...]] = eqx.field(static=True, default=None)
+    _n_lower_bounds: int = eqx.field(static=True, default=0)
+    _n_upper_bounds: int = eqx.field(static=True, default=0)
+
     # Optional user-supplied derivative functions
     obj_grad_fn: Optional[GradFn] = eqx.field(static=True, default=None)
     eq_jac_fn: Optional[JacobianFn] = eqx.field(static=True, default=None)
@@ -205,6 +218,130 @@ class SLSQP(optx.AbstractMinimiser):
     # QP solver parameters
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
+
+    def __check_init__(self):
+        """Post-initialization to compute bound masks.
+
+        This is called by equinox after __init__ to validate/process fields.
+        We compute the static bound masks here.
+        """
+        if self.bounds is not None:
+            # Compute masks for finite bounds (must be done with numpy for static values)
+            bounds_np = np.asarray(self.bounds)
+            lower_mask = np.isfinite(bounds_np[:, 0])
+            upper_mask = np.isfinite(bounds_np[:, 1])
+
+            # Store as tuples for static fields (JAX-compatible)
+            object.__setattr__(self, "_lower_bound_mask", tuple(lower_mask.tolist()))
+            object.__setattr__(self, "_upper_bound_mask", tuple(upper_mask.tolist()))
+            object.__setattr__(self, "_n_lower_bounds", int(np.sum(lower_mask)))
+            object.__setattr__(self, "_n_upper_bounds", int(np.sum(upper_mask)))
+
+    def _compute_bound_constraint_values(
+        self,
+        y: Float[Array, " n"],
+    ) -> Float[Array, " m_bounds"]:
+        """Compute bound constraint values.
+
+        Returns constraint values c(x) where c(x) >= 0 means feasible.
+        - Lower bounds: c_i = y_i - lower_i >= 0
+        - Upper bounds: c_i = upper_i - y_i >= 0
+
+        The values are concatenated as [lower_bound_values, upper_bound_values].
+
+        Args:
+            y: Current point.
+
+        Returns:
+            Array of bound constraint values, shape (n_lower + n_upper,).
+        """
+        if self.bounds is None or (
+            self._n_lower_bounds == 0 and self._n_upper_bounds == 0
+        ):
+            return jnp.zeros((0,))
+
+        # Use static numpy indices (not JAX boolean indexing) for JIT compatibility
+        lower_indices = np.array(
+            [
+                i
+                for i, m in enumerate(cast(tuple[bool, ...], self._lower_bound_mask))
+                if m
+            ]
+        )
+        upper_indices = np.array(
+            [
+                i
+                for i, m in enumerate(cast(tuple[bool, ...], self._upper_bound_mask))
+                if m
+            ]
+        )
+
+        # Lower bounds: y - lower >= 0
+        if len(lower_indices) > 0:
+            lower_vals = y[lower_indices] - self.bounds[lower_indices, 0]
+        else:
+            lower_vals = jnp.zeros((0,))
+
+        # Upper bounds: upper - y >= 0
+        if len(upper_indices) > 0:
+            upper_vals = self.bounds[upper_indices, 1] - y[upper_indices]
+        else:
+            upper_vals = jnp.zeros((0,))
+
+        return jnp.concatenate([lower_vals, upper_vals])
+
+    def _build_bound_jacobian(
+        self,
+        n: int,
+    ) -> Float[Array, "m_bounds n"]:
+        """Build the Jacobian matrix for bound constraints.
+
+        The Jacobian is:
+        - For lower bound y_i >= lower_i: row is e_i (unit vector, +1 at position i)
+        - For upper bound y_i <= upper_i: row is -e_i (-1 at position i)
+
+        Args:
+            n: Number of decision variables.
+
+        Returns:
+            Jacobian matrix of shape (n_lower + n_upper, n).
+        """
+        if self.bounds is None or (
+            self._n_lower_bounds == 0 and self._n_upper_bounds == 0
+        ):
+            return jnp.zeros((0, n))
+
+        # Use static numpy indices for JIT compatibility
+        lower_indices = np.array(
+            [
+                i
+                for i, m in enumerate(cast(tuple[bool, ...], self._lower_bound_mask))
+                if m
+            ]
+        )
+        upper_indices = np.array(
+            [
+                i
+                for i, m in enumerate(cast(tuple[bool, ...], self._upper_bound_mask))
+                if m
+            ]
+        )
+
+        # Lower bounds: +1 on diagonal for active indices
+        # Select rows from identity matrix
+        identity = jnp.eye(n)
+        if len(lower_indices) > 0:
+            J_lower = identity[lower_indices]  # (n_lower, n)
+        else:
+            J_lower = jnp.zeros((0, n))
+
+        # Upper bounds: -1 on diagonal for active indices
+        if len(upper_indices) > 0:
+            J_upper = -identity[upper_indices]  # (n_upper, n)
+        else:
+            J_upper = jnp.zeros((0, n))
+
+        return jnp.concatenate([J_lower, J_upper], axis=0)
 
     def _compute_grad(
         self,
@@ -292,16 +429,21 @@ class SLSQP(optx.AbstractMinimiser):
                         _, eq_contribution = jax.jvp(jax.grad(weighted_eq), (y,), (v,))
 
                 # Inequality constraint HVP contribution
+                # Note: Only use general inequality multipliers (not bound multipliers)
+                # since bounds have zero Hessian and don't contribute to the HVP.
                 ineq_contribution = jnp.zeros_like(v)
                 if self.ineq_constraint_fn is not None and m_ineq > 0:
+                    # Extract only the general inequality multipliers
+                    multipliers_ineq_general = state.multipliers_ineq[:m_ineq]
+
                     if self.ineq_hvp_fn is not None:
                         ineq_hvps = self.ineq_hvp_fn(y, v, args)
-                        ineq_contribution = state.multipliers_ineq @ ineq_hvps
+                        ineq_contribution = multipliers_ineq_general @ ineq_hvps
                     else:
 
                         def weighted_ineq(x):
                             return jnp.dot(
-                                state.multipliers_ineq,
+                                multipliers_ineq_general,
                                 self.ineq_constraint_fn(x, args),  # type: ignore[misc]
                             )
 
@@ -351,7 +493,9 @@ class SLSQP(optx.AbstractMinimiser):
         """
         n = y.shape[0]
         m_eq = self.n_eq_constraints
-        m_ineq = self.n_ineq_constraints
+        m_ineq_general = self.n_ineq_constraints
+        m_bounds = self._n_lower_bounds + self._n_upper_bounds
+        m_ineq_total = m_ineq_general + m_bounds
 
         # Evaluate objective
         f_val, _aux = fn(y, args)
@@ -359,27 +503,38 @@ class SLSQP(optx.AbstractMinimiser):
         # Compute gradient (user-supplied or AD)
         grad = self._compute_grad(fn, y, args)
 
-        # Evaluate constraint values
+        # Evaluate equality constraint values
         if self.eq_constraint_fn is not None and m_eq > 0:
             eq_val = self.eq_constraint_fn(y, args)
         else:
             eq_val = jnp.zeros((m_eq,))
 
-        if self.ineq_constraint_fn is not None and m_ineq > 0:
-            ineq_val = self.ineq_constraint_fn(y, args)
+        # Evaluate general inequality constraint values
+        if self.ineq_constraint_fn is not None and m_ineq_general > 0:
+            ineq_val_general = self.ineq_constraint_fn(y, args)
         else:
-            ineq_val = jnp.zeros((m_ineq,))
+            ineq_val_general = jnp.zeros((m_ineq_general,))
+
+        # Evaluate bound constraint values
+        bound_vals = self._compute_bound_constraint_values(y)
+
+        # Concatenate general inequality and bound constraints
+        ineq_val = jnp.concatenate([ineq_val_general, bound_vals])
 
         # Compute constraint Jacobians (user-supplied or AD via jacrev)
         eq_jac = self._compute_eq_jac(y, args)
-        ineq_jac = self._compute_ineq_jac(y, args)
+        ineq_jac_general = self._compute_ineq_jac(y, args)
+
+        # Build bound Jacobian and concatenate
+        bound_jac = self._build_bound_jacobian(n)
+        ineq_jac = jnp.concatenate([ineq_jac_general, bound_jac], axis=0)
 
         # Initialize L-BFGS history (empty, gamma=1 -> B_0 = I)
         lbfgs_history = lbfgs_init(n, self.lbfgs_memory)
 
         # Initialize multipliers to zero
         multipliers_eq = jnp.zeros((m_eq,))
-        multipliers_ineq = jnp.zeros((m_ineq,))
+        multipliers_ineq = jnp.zeros((m_ineq_total,))
 
         # Initial merit penalty
         merit_penalty = jnp.array(1.0)
@@ -458,21 +613,33 @@ class SLSQP(optx.AbstractMinimiser):
             grad=state.grad,
             c1=self.armijo_c1,
             max_iter=self.line_search_max_steps,
+            bounds=self.bounds,
+            lower_bound_mask=self._lower_bound_mask,
+            upper_bound_mask=self._upper_bound_mask,
         )
 
         alpha = ls_result.alpha
         y_new = y + alpha * direction
         f_val_new = ls_result.f_val
         eq_val_new = ls_result.eq_val
-        ineq_val_new = ls_result.ineq_val
+        ineq_val_new = ls_result.ineq_val  # Includes bounds from line search
 
         # Get auxiliary output from function evaluation
         _, aux = fn(y_new, args)
 
         # Step 5: Compute gradient and Jacobians at new point
+        n = y.shape[0]
         grad_new = self._compute_grad(fn, y_new, args)
         eq_jac_new = self._compute_eq_jac(y_new, args)
-        ineq_jac_new = self._compute_ineq_jac(y_new, args)
+
+        # General inequality Jacobian
+        ineq_jac_general_new = self._compute_ineq_jac(y_new, args)
+
+        # Bound Jacobian (constant, doesn't depend on y)
+        bound_jac = self._build_bound_jacobian(n)
+
+        # Concatenate general + bound Jacobians
+        ineq_jac_new = jnp.concatenate([ineq_jac_general_new, bound_jac], axis=0)
 
         # Step 6: Update L-BFGS history (only in L-BFGS mode)
         s = y_new - y  # Step taken
@@ -540,7 +707,9 @@ class SLSQP(optx.AbstractMinimiser):
             termination and result is the termination status code.
         """
         m_eq = self.n_eq_constraints
-        m_ineq = self.n_ineq_constraints
+        m_ineq_total = (
+            self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
+        )
 
         # Compute gradient of Lagrangian
         grad_lagrangian = compute_lagrangian_gradient(
@@ -563,7 +732,7 @@ class SLSQP(optx.AbstractMinimiser):
             eq_feasible = eq_violation <= self.atol
 
         ineq_feasible = jnp.array(True)
-        if m_ineq > 0:
+        if m_ineq_total > 0:
             ineq_violation = jnp.max(jnp.maximum(0.0, -state.ineq_val))
             ineq_feasible = ineq_violation <= self.atol
 

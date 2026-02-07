@@ -10,7 +10,7 @@ where ρ is the penalty parameter, chosen large enough to ensure descent.
 """
 
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -174,6 +174,9 @@ def backtracking_line_search(
     rho: float = 0.5,
     max_iter: int = 20,
     alpha_init: float = 1.0,
+    bounds: Float[Array, "n 2"] | None = None,
+    lower_bound_mask: tuple[bool, ...] | None = None,
+    upper_bound_mask: tuple[bool, ...] | None = None,
 ) -> LineSearchResult:
     """Perform backtracking line search with the L1 merit function.
 
@@ -191,19 +194,28 @@ def backtracking_line_search(
         args: Arguments to pass to functions.
         f_val: Current objective value.
         eq_val: Current equality constraint values.
-        ineq_val: Current inequality constraint values.
+        ineq_val: Current inequality constraint values (including bounds).
         penalty: Penalty parameter.
         grad: Gradient of objective at x.
         c1: Armijo condition parameter (default 1e-4).
         rho: Step reduction factor (default 0.5).
         max_iter: Maximum number of iterations.
         alpha_init: Initial step size (default 1.0).
+        bounds: Optional box constraints, shape (n, 2) with [lower, upper] per variable.
+        lower_bound_mask: Tuple of bools indicating which lower bounds are finite.
+        upper_bound_mask: Tuple of bools indicating which upper bounds are finite.
 
     Returns:
         LineSearchResult with the found step size and function values.
     """
     m_eq = eq_val.shape[0]
     m_ineq = ineq_val.shape[0]
+
+    # Determine how many general inequality constraints vs bounds
+    n_lower = sum(lower_bound_mask) if lower_bound_mask is not None else 0
+    n_upper = sum(upper_bound_mask) if upper_bound_mask is not None else 0
+    n_bounds = n_lower + n_upper
+    m_ineq_general = m_ineq - n_bounds
 
     # Current merit value
     merit_0 = compute_merit(f_val, eq_val, ineq_val, penalty)
@@ -235,10 +247,43 @@ def backtracking_line_search(
         else:
             eq_new = jnp.zeros((m_eq,))
 
-        if ineq_constraint_fn is not None and m_ineq > 0:
-            ineq_new = ineq_constraint_fn(x_new, args)
+        # Evaluate general inequality constraints
+        if ineq_constraint_fn is not None and m_ineq_general > 0:
+            ineq_new_general = ineq_constraint_fn(x_new, args)
         else:
-            ineq_new = jnp.zeros((m_ineq,))
+            ineq_new_general = jnp.zeros((m_ineq_general,))
+
+        # Evaluate bound constraints
+        if bounds is not None and n_bounds > 0:
+            # Use static indexing based on precomputed indices
+            # The masks are tuples of bools - convert to numpy indices
+            import numpy as np_cpu
+
+            lower_indices = np_cpu.array(
+                [i for i, m in enumerate(cast(tuple[bool, ...], lower_bound_mask)) if m]
+            )
+            upper_indices = np_cpu.array(
+                [i for i, m in enumerate(cast(tuple[bool, ...], upper_bound_mask)) if m]
+            )
+
+            # Lower bounds: x - lower >= 0
+            if len(lower_indices) > 0:
+                lower_vals = x_new[lower_indices] - bounds[lower_indices, 0]
+            else:
+                lower_vals = jnp.zeros((0,))
+
+            # Upper bounds: upper - x >= 0
+            if len(upper_indices) > 0:
+                upper_vals = bounds[upper_indices, 1] - x_new[upper_indices]
+            else:
+                upper_vals = jnp.zeros((0,))
+
+            bound_vals = jnp.concatenate([lower_vals, upper_vals])
+        else:
+            bound_vals = jnp.zeros((0,))
+
+        # Concatenate general + bounds
+        ineq_new = jnp.concatenate([ineq_new_general, bound_vals])
 
         merit_new = compute_merit(f_new, eq_new, ineq_new, penalty)
 
