@@ -304,12 +304,13 @@ def solve_qp(
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
-    Solves:
+    Solves::
+
         minimize    (1/2) d^T H d + g^T d
         subject to  A_eq d = b_eq
                     A_ineq d >= b_ineq
 
-    where H is provided implicitly via hvp_fn(v) = H @ v.
+    where H is provided implicitly via ``hvp_fn(v) = H @ v``.
 
     Uses a primal active-set method: at each iteration, active inequality
     constraints are treated as equalities, and the resulting

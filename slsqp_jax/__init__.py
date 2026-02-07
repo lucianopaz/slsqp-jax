@@ -13,7 +13,12 @@ from slsqp_jax.hessian import (
     lbfgs_hvp,
     lbfgs_init,
 )
-from slsqp_jax.merit import backtracking_line_search, compute_merit
+from slsqp_jax.merit import (
+    LineSearchResult,
+    backtracking_line_search,
+    compute_merit,
+    update_penalty_parameter,
+)
 from slsqp_jax.qp_solver import solve_qp
 from slsqp_jax.solver import SLSQP, QPResult, SLSQPState
 from slsqp_jax.types import (
@@ -43,8 +48,10 @@ __all__ = [
     "lbfgs_hvp",
     "lbfgs_append",
     # Merit function
+    "LineSearchResult",
     "compute_merit",
     "backtracking_line_search",
+    "update_penalty_parameter",
     # Hessian utilities
     "compute_lagrangian_gradient",
 ]

@@ -126,7 +126,7 @@ def update_penalty_parameter(
     The penalty should be larger than the maximum absolute multiplier
     to ensure the merit function provides a descent direction.
 
-    ρ >= max(|λ_i|, |μ_j|) + margin
+    ``ρ >= max(abs(λ_i), abs(μ_j)) + margin``
 
     Args:
         current_penalty: Current penalty parameter.

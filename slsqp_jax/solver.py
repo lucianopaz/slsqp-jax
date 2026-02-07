@@ -120,6 +120,7 @@ class SLSQP(optx.AbstractMinimiser):
     optimization, designed to scale to large dimensions (n > 5000).
 
     At each iteration, it:
+
     1. Constructs a QP subproblem using the Lagrangian Hessian (via L-BFGS
        or exact HVPs) and linearized constraints.
     2. Solves the QP using projected conjugate gradient with an active-set

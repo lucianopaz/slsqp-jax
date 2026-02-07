@@ -25,6 +25,13 @@ dev = [
     "pytest-cov",
     "matplotlib",
 ]
+docs = [
+    "sphinx>=7.0",
+    "myst-parser>=2.0",
+    "sphinx-autodoc-typehints>=2.0",
+    "sphinx-copybutton>=0.5",
+    "furo>=2024.0",
+]
 
 [build-system]
 build-backend = "hatchling.build"
