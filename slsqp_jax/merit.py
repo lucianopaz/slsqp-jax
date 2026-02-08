@@ -70,51 +70,6 @@ def compute_merit(
 
 
 @jaxtyped(typechecker=beartype)
-def compute_directional_derivative(
-    grad: Float[Array, " n"],
-    direction: Float[Array, " n"],
-    eq_val: Float[Array, " m_eq"],
-    eq_jac: Float[Array, "m_eq n"],
-    ineq_val: Float[Array, " m_ineq"],
-    ineq_jac: Float[Array, "m_ineq n"],
-    penalty: Float[Array, ""],
-) -> Float[Array, ""]:
-    """Compute the directional derivative of the merit function.
-
-    The directional derivative at x in direction d is:
-        φ'(x; d, ρ) = g^T d - ρ * (‖c_eq‖_1 + sum of violated ineq)
-
-    For a descent direction from the QP, this should be negative when
-    the penalty is large enough.
-
-    Args:
-        grad: Gradient of objective ∇f(x).
-        direction: Search direction d.
-        eq_val: Equality constraint values c_eq(x).
-        eq_jac: Jacobian of equality constraints.
-        ineq_val: Inequality constraint values c_ineq(x).
-        ineq_jac: Jacobian of inequality constraints.
-        penalty: Penalty parameter ρ.
-
-    Returns:
-        Directional derivative φ'(x; d, ρ).
-    """
-    # Derivative of objective along direction
-    obj_deriv = jnp.dot(grad, direction)
-
-    # For equality constraints: derivative of |c_eq| is sign(c_eq) * c_eq' * d
-    # But we use a simpler approximation: -‖c_eq‖_1 when moving toward feasibility
-    eq_reduction = jnp.sum(jnp.abs(eq_val))
-
-    # For violated inequality constraints: similar
-    ineq_reduction = jnp.sum(jnp.maximum(0.0, -ineq_val))
-
-    # The directional derivative approximation
-    # If we're solving the QP correctly, the direction should reduce constraint violation
-    return obj_deriv - penalty * (eq_reduction + ineq_reduction)
-
-
-@jaxtyped(typechecker=beartype)
 def update_penalty_parameter(
     current_penalty: Float[Array, ""],
     multipliers_eq: Float[Array, " m_eq"],

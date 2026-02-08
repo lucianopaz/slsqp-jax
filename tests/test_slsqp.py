@@ -346,6 +346,41 @@ class TestSLSQPUserSuppliedDerivatives:
         # Solution: x = y = z = 1 on the sphere
         np.testing.assert_allclose(jnp.sum(y**2), 3.0, rtol=1e-4)
 
+    def test_user_hvp_ad_fallback_for_ineq_constraints(self):
+        """Test with user-supplied objective HVP but AD fallback for ineq constraints.
+
+        The solver should compute inequality constraint HVP via forward-over-reverse AD.
+
+        minimize x^2 + y^2  s.t. x + y >= 2
+        Unconstrained minimum at (0, 0), but constraint pushes to (1, 1).
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            # Nonlinear inequality: x^2 + y >= 1 (so x^2 + y - 1 >= 0)
+            return jnp.array([x[0] ** 2 + x[1] - 1.0])
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        # No ineq_hvp_fn provided -> AD fallback
+        solver = SLSQP(
+            rtol=1e-6,
+            atol=1e-6,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        # Constraint should be satisfied: x^2 + y >= 1
+        constraint_val = ineq_constraint(y, None)[0]
+        assert constraint_val >= -1e-4, f"Constraint violated: {constraint_val}"
+
 
 class TestSLSQPModerateScale:
     """Tests at moderate scale to verify scalability."""
