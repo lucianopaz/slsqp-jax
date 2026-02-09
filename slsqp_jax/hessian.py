@@ -23,6 +23,8 @@ import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, Float, Int, jaxtyped
 
+from slsqp_jax.types import Scalar, Vector
+
 
 class LBFGSHistory(eqx.Module):
     """L-BFGS history buffer for matrix-free Hessian approximation.
@@ -40,7 +42,7 @@ class LBFGSHistory(eqx.Module):
 
     s_history: Float[Array, "memory n"]
     y_history: Float[Array, "memory n"]
-    gamma: Float[Array, ""]
+    gamma: Scalar
     count: Int[Array, ""]
     next_idx: Int[Array, ""]
 
@@ -67,8 +69,8 @@ def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
 @jaxtyped(typechecker=beartype)
 def lbfgs_hvp(
     history: LBFGSHistory,
-    v: Float[Array, " n"],
-) -> Float[Array, " n"]:
+    v: Vector,
+) -> Vector:
     """Compute B @ v using the L-BFGS compact representation.
 
     Uses the compact form (Nocedal & Wright, Theorem 7.4):
@@ -163,8 +165,8 @@ def lbfgs_hvp(
 @jaxtyped(typechecker=beartype)
 def lbfgs_append(
     history: LBFGSHistory,
-    s: Float[Array, " n"],
-    y: Float[Array, " n"],
+    s: Vector,
+    y: Vector,
     damping_threshold: float = 0.2,
     skip_threshold: float = 1e-8,
 ) -> LBFGSHistory:
@@ -280,12 +282,12 @@ def lbfgs_append(
 
 @jaxtyped(typechecker=beartype)
 def compute_lagrangian_gradient(
-    grad_f: Float[Array, " n"],
+    grad_f: Vector,
     eq_jac: Float[Array, "m_eq n"],
     ineq_jac: Float[Array, "m_ineq n"],
     multipliers_eq: Float[Array, " m_eq"],
     multipliers_ineq: Float[Array, " m_ineq"],
-) -> Float[Array, " n"]:
+) -> Vector:
     """Compute the gradient of the Lagrangian function.
 
     The Lagrangian is:

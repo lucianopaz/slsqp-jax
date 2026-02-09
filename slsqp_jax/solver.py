@@ -45,6 +45,8 @@ from slsqp_jax.types import (
     GradFn,
     HVPFn,
     JacobianFn,
+    Scalar,
+    Vector,
 )
 from slsqp_jax.utils import args_closure
 
@@ -74,8 +76,8 @@ class SLSQPState(eqx.Module):
     step_count: Int[Array, ""]
 
     # Current function values and gradients
-    f_val: Float[Array, ""]
-    grad: Float[Array, " n"]
+    f_val: Scalar
+    grad: Vector
 
     # Constraint information
     eq_val: Float[Array, " m_eq"]
@@ -91,10 +93,10 @@ class SLSQPState(eqx.Module):
     multipliers_ineq: Float[Array, " m_ineq"]
 
     # Previous Lagrangian gradient for L-BFGS y = grad_L_new - grad_L_old
-    prev_grad_lagrangian: Float[Array, " n"]
+    prev_grad_lagrangian: Vector
 
     # Merit function penalty parameter
-    merit_penalty: Float[Array, ""]
+    merit_penalty: Scalar
 
 
 class QPResult(eqx.Module):
@@ -107,7 +109,7 @@ class QPResult(eqx.Module):
         converged: Whether the QP solver converged successfully.
     """
 
-    direction: Float[Array, " n"]
+    direction: Vector
     multipliers_eq: Float[Array, " m_eq"]
     multipliers_ineq: Float[Array, " m_ineq"]
     converged: Bool[Array, ""]
@@ -240,7 +242,7 @@ class SLSQP(optx.AbstractMinimiser):
 
     def _compute_bound_constraint_values(
         self,
-        y: Float[Array, " n"],
+        y: Vector,
     ) -> Float[Array, " m_bounds"]:
         """Compute bound constraint values.
 
@@ -347,9 +349,9 @@ class SLSQP(optx.AbstractMinimiser):
     def _compute_grad(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
-    ) -> Float[Array, " n"]:
+    ) -> Vector:
         """Compute gradient of objective using user-supplied fn or AD."""
         if self.obj_grad_fn is not None:
             return self.obj_grad_fn(y, args)
@@ -357,7 +359,7 @@ class SLSQP(optx.AbstractMinimiser):
 
     def _compute_eq_jac(
         self,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
     ) -> Float[Array, "m_eq n"]:
         """Compute equality constraint Jacobian."""
@@ -371,7 +373,7 @@ class SLSQP(optx.AbstractMinimiser):
 
     def _compute_ineq_jac(
         self,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
     ) -> Float[Array, "m_ineq n"]:
         """Compute inequality constraint Jacobian."""
@@ -386,10 +388,10 @@ class SLSQP(optx.AbstractMinimiser):
     def _build_lagrangian_hvp(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
         state: "SLSQPState",
-    ) -> Callable[[Float[Array, " n"]], Float[Array, " n"]]:
+    ) -> Callable[[Vector], Vector]:
         """Build the Lagrangian HVP function for the QP subproblem.
 
         Returns a closure v -> H_L(y) @ v where H_L is the Hessian of the
@@ -408,7 +410,7 @@ class SLSQP(optx.AbstractMinimiser):
             m_eq = self.n_eq_constraints
             m_ineq = self.n_ineq_constraints
 
-            def lagrangian_hvp(v: Float[Array, " n"]) -> Float[Array, " n"]:
+            def lagrangian_hvp(v: Vector) -> Vector:
                 # Objective HVP
                 obj_hvp_val = self.obj_hvp_fn(y, v, args)  # type: ignore[misc]
 
@@ -460,7 +462,7 @@ class SLSQP(optx.AbstractMinimiser):
             # L-BFGS mode: use stored history
             lbfgs_history = state.lbfgs_history
 
-            def lbfgs_lagrangian_hvp(v: Float[Array, " n"]) -> Float[Array, " n"]:
+            def lbfgs_lagrangian_hvp(v: Vector) -> Vector:
                 return lbfgs_hvp(lbfgs_history, v)
 
             return lbfgs_lagrangian_hvp
@@ -468,7 +470,7 @@ class SLSQP(optx.AbstractMinimiser):
     def init(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
         options: dict[str, Any],
         f_struct: Any,
@@ -558,12 +560,12 @@ class SLSQP(optx.AbstractMinimiser):
     def step(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
         options: dict[str, Any],
         state: SLSQPState,
         tags: frozenset[object],
-    ) -> tuple[Float[Array, " n"], SLSQPState, Any]:
+    ) -> tuple[Vector, SLSQPState, Any]:
         """Perform one SLSQP iteration.
 
         This method:
@@ -683,7 +685,7 @@ class SLSQP(optx.AbstractMinimiser):
     def terminate(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         args: Any,
         options: dict[str, Any],
         state: SLSQPState,
@@ -763,14 +765,14 @@ class SLSQP(optx.AbstractMinimiser):
     def postprocess(
         self,
         fn: Callable,
-        y: Float[Array, " n"],
+        y: Vector,
         aux: Any,
         args: Any,
         options: dict[str, Any],
         state: SLSQPState,
         tags: frozenset[object],
         result: Any,
-    ) -> tuple[Float[Array, " n"], Any, dict[str, Any]]:
+    ) -> tuple[Vector, Any, dict[str, Any]]:
         """Post-process the optimization result.
 
         Args:
@@ -799,7 +801,7 @@ class SLSQP(optx.AbstractMinimiser):
     def _solve_qp_subproblem(
         self,
         state: SLSQPState,
-        hvp_fn: Callable[[Float[Array, " n"]], Float[Array, " n"]],
+        hvp_fn: Callable[[Vector], Vector],
     ) -> QPResult:
         """Solve the QP subproblem for the search direction.
 

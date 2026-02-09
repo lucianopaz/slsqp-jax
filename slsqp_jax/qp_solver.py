@@ -29,11 +29,13 @@ import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int, jaxtyped
 
+from slsqp_jax.types import Scalar, Vector
+
 
 class QPState(eqx.Module):
     """State for the Active Set QP solver."""
 
-    d: Float[Array, " n"]
+    d: Vector
     active_set: Bool[Array, " m_ineq"]
     multipliers_eq: Float[Array, " m_eq"]
     multipliers_ineq: Float[Array, " m_ineq"]
@@ -44,7 +46,7 @@ class QPState(eqx.Module):
 class QPResult(NamedTuple):
     """Result from the QP solver."""
 
-    d: Float[Array, " n"]
+    d: Vector
     multipliers_eq: Float[Array, " m_eq"]
     multipliers_ineq: Float[Array, " m_ineq"]
     converged: Bool[Array, ""]
@@ -54,20 +56,20 @@ class QPResult(NamedTuple):
 class _CGState(NamedTuple):
     """Internal state for the projected conjugate gradient solver."""
 
-    d: Float[Array, " n"]
-    r: Float[Array, " n"]
-    p: Float[Array, " n"]
-    r_norm_sq: Float[Array, ""]
+    d: Vector
+    r: Vector
+    p: Vector
+    r_norm_sq: Scalar
     iteration: Int[Array, ""]
     converged: Bool[Array, ""]
 
 
 def _solve_unconstrained_cg(
-    hvp_fn: Callable[[Float[Array, " n"]], Float[Array, " n"]],
-    g: Float[Array, " n"],
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
     max_cg_iter: int,
     cg_tol: float,
-) -> Float[Array, " n"]:
+) -> Vector:
     """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
 
     Uses conjugate gradient to solve B d = -g without forming B.
@@ -145,14 +147,14 @@ def _solve_unconstrained_cg(
 
 
 def _solve_projected_cg(
-    hvp_fn: Callable[[Float[Array, " n"]], Float[Array, " n"]],
-    g: Float[Array, " n"],
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
     A: Float[Array, "m n"],
     b: Float[Array, " m"],
     active_mask: Bool[Array, " m"],
     max_cg_iter: int,
     cg_tol: float,
-) -> tuple[Float[Array, " n"], Float[Array, " m"]]:
+) -> tuple[Vector, Float[Array, " m"]]:
     """Solve equality-constrained QP using projected conjugate gradient.
 
     Solves:
@@ -211,7 +213,7 @@ def _solve_projected_cg(
 
     # Projection onto null space of active constraints:
     # P(v) = v - A^T (A A^T)^{-1} A v
-    def project(v: Float[Array, " n"]) -> Float[Array, " n"]:
+    def project(v: Vector) -> Vector:
         return v - A_masked.T @ solve_AAt(A_masked @ v)
 
     # Initial residual for CG in the null space
@@ -293,7 +295,7 @@ def _solve_projected_cg(
 @jaxtyped(typechecker=beartype)
 def solve_qp(
     hvp_fn: Callable,
-    g: Float[Array, " n"],
+    g: Vector,
     A_eq: Float[Array, "m_eq n"],
     b_eq: Float[Array, " m_eq"],
     A_ineq: Float[Array, "m_ineq n"],

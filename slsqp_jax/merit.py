@@ -14,8 +14,11 @@ from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np_cpu
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int, jaxtyped
+
+from slsqp_jax.types import Scalar, Vector
 
 
 class LineSearchResult(NamedTuple):
@@ -30,8 +33,8 @@ class LineSearchResult(NamedTuple):
         n_evals: Number of function evaluations.
     """
 
-    alpha: Float[Array, ""]
-    f_val: Float[Array, ""]
+    alpha: Scalar
+    f_val: Scalar
     eq_val: Float[Array, " m_eq"]
     ineq_val: Float[Array, " m_ineq"]
     success: Bool[Array, ""]
@@ -40,11 +43,11 @@ class LineSearchResult(NamedTuple):
 
 @jaxtyped(typechecker=beartype)
 def compute_merit(
-    f_val: Float[Array, ""],
+    f_val: Scalar,
     eq_val: Float[Array, " m_eq"],
     ineq_val: Float[Array, " m_ineq"],
-    penalty: Float[Array, ""],
-) -> Float[Array, ""]:
+    penalty: Scalar,
+) -> Scalar:
     """Compute the L1-exact penalty merit function value.
 
     The merit function is:
@@ -71,11 +74,11 @@ def compute_merit(
 
 @jaxtyped(typechecker=beartype)
 def update_penalty_parameter(
-    current_penalty: Float[Array, ""],
+    current_penalty: Scalar,
     multipliers_eq: Float[Array, " m_eq"],
     multipliers_ineq: Float[Array, " m_ineq"],
     margin: float = 1.1,
-) -> Float[Array, ""]:
+) -> Scalar:
     """Update the penalty parameter based on Lagrange multipliers.
 
     The penalty should be larger than the maximum absolute multiplier
@@ -117,14 +120,14 @@ def backtracking_line_search(
     fn: Callable,
     eq_constraint_fn: Callable | None,
     ineq_constraint_fn: Callable | None,
-    x: Float[Array, " n"],
-    direction: Float[Array, " n"],
+    x: Vector,
+    direction: Vector,
     args: Any,
-    f_val: Float[Array, ""],
+    f_val: Scalar,
     eq_val: Float[Array, " m_eq"],
     ineq_val: Float[Array, " m_ineq"],
-    penalty: Float[Array, ""],
-    grad: Float[Array, " n"],
+    penalty: Scalar,
+    grad: Vector,
     c1: float = 1e-4,
     rho: float = 0.5,
     max_iter: int = 20,
@@ -184,11 +187,11 @@ def backtracking_line_search(
 
     # Initial state for the line search loop
     class LSState(NamedTuple):
-        alpha: Float[Array, ""]
-        f_val: Float[Array, ""]
+        alpha: Scalar
+        f_val: Scalar
         eq_val: Float[Array, " m_eq"]
         ineq_val: Float[Array, " m_ineq"]
-        merit: Float[Array, ""]
+        merit: Scalar
         iteration: Int[Array, ""]
         done: Bool[Array, ""]
 
@@ -212,7 +215,6 @@ def backtracking_line_search(
         if bounds is not None and n_bounds > 0:
             # Use static indexing based on precomputed indices
             # The masks are tuples of bools - convert to numpy indices
-            import numpy as np_cpu
 
             lower_indices = np_cpu.array(
                 [i for i, m in enumerate(cast(tuple[bool, ...], lower_bound_mask)) if m]
