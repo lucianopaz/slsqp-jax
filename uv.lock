@@ -1324,7 +1324,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.9.0" },
     { name = "jaxlib", specifier = ">=0.9.0" },
     { name = "jaxtyping", specifier = ">=0.3.7" },
-    { name = "numpy", specifier = ">=2.4.2" },
+    { name = "numpy", specifier = ">=2" },
     { name = "optimistix", specifier = ">=0.0.11" },
     { name = "scipy", specifier = ">=1.16.0" },
 ]
