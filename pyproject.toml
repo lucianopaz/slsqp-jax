@@ -1,6 +1,6 @@
 [project]
 name = "slsqp-jax"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Sequential Least Squares Programming (SLSQP) optimizer implemented in pure JAX"
 readme = "README.md"
 license = "MIT"
