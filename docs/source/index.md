@@ -24,7 +24,7 @@ pip install slsqp-jax
 **uv**
 
 ```bash
-uv add "slsqp-jax
+uv add slsqp-jax
 ```
 
 **pixi**
