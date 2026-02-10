@@ -1,29 +1,36 @@
 # slsqp-jax
 
+[![Build](https://github.com/lucianopaz/slsqp-jax/actions/workflows/test.yml/badge.svg)](https://github.com/lucianopaz/slsqp-jax/actions/workflows/test.yml)
+[![Documentation](https://readthedocs.org/projects/slsqp-jax/badge/?version=latest)](https://slsqp-jax.readthedocs.io/en/latest/)
+[![codecov](https://codecov.io/gh/lucianopaz/slsqp-jax/graph/badge.svg?token=K6Y9JBL6F2)](https://codecov.io/gh/lucianopaz/slsqp-jax)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI - Version](https://img.shields.io/pypi/v/slsqp-jax)](https://pypi.org/project/slsqp-jax/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lucianopaz/slsqp-jax/blob/main/benchmark_cpu_gpu.ipynb)
+
 A pure-JAX implementation of the **SLSQP** (Sequential Least Squares Quadratic Programming) algorithm for constrained nonlinear optimization, designed for **moderate to large decision spaces** (5,000–50,000 variables). All linear algebra is performed through JAX, so the solver runs natively on CPU, GPU, and TPU, and is fully compatible with `jax.jit`, `jax.vmap`, and `jax.grad`.
 
 The `SLSQP` solver is built on top of [Optimistix](https://github.com/patrick-kidger/optimistix), a JAX library for nonlinear solvers. It implements the {class}`optimistix.AbstractMinimiser` interface, so you run it through the standard {func}`optimistix.minimise` entry point — no manual iteration loop required.
 
 ## Installation
 
-The package is not yet published to PyPI. Install directly from GitHub:
+You can install the package from PyPI using any standard method:
 
 **pip**
 
 ```bash
-pip install "slsqp-jax @ git+https://github.com/lucianopaz/slsqp-jax.git"
+pip install slsqp-jax
 ```
 
 **uv**
 
 ```bash
-uv add "slsqp-jax @ git+https://github.com/lucianopaz/slsqp-jax.git"
+uv add "slsqp-jax
 ```
 
 **pixi**
 
 ```bash
-pixi add --pypi "slsqp-jax @ git+https://github.com/lucianopaz/slsqp-jax.git"
+pixi add --pypi slsqp-jax
 ```
 
 ## Usage
