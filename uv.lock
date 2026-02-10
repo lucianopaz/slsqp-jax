@@ -1326,7 +1326,7 @@ requires-dist = [
     { name = "jaxtyping", specifier = ">=0.3.7" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "optimistix", specifier = ">=0.0.11" },
-    { name = "scipy", specifier = ">=1.17.0" },
+    { name = "scipy", specifier = ">=1.16.0" },
 ]
 
 [package.metadata.requires-dev]
