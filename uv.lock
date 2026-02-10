@@ -1319,13 +1319,13 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "beartype", specifier = ">=0.18.0" },
-    { name = "equinox", specifier = ">=0.11.0" },
-    { name = "jax", specifier = ">=0.9.0" },
-    { name = "jaxlib", specifier = ">=0.9.0" },
-    { name = "jaxtyping", specifier = ">=0.3.7" },
+    { name = "beartype" },
+    { name = "equinox" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "jaxtyping" },
     { name = "numpy", specifier = ">=2" },
-    { name = "optimistix", specifier = ">=0.0.11" },
+    { name = "optimistix" },
     { name = "scipy", specifier = ">=1.16.0" },
 ]
 
