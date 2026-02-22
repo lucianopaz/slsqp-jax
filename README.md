@@ -102,7 +102,7 @@ sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100)
 
 ### Supplying Hessian-vector products
 
-For problems where you have access to exact second-order information, you can supply Hessian-vector product (HVP) functions. This switches the solver from the default L-BFGS approximation to **exact Hessian mode**, which typically converges in fewer iterations:
+For problems where you have access to exact second-order information, you can supply Hessian-vector product (HVP) functions. The solver uses these to produce high-quality secant pairs for the L-BFGS Hessian approximation, which typically improves convergence compared to using gradient differences alone:
 
 ```python
 # Objective HVP: (x, v, args) -> H_f(x) @ v
@@ -131,16 +131,18 @@ $$
 
 If you provide `obj_hvp_fn` but omit the constraint HVP functions, the solver automatically computes the missing constraint HVPs via forward-over-reverse AD on the scalar function $\lambda^T c(x)$, which costs one reverse pass plus one forward pass regardless of the number of constraints.
 
+**Frozen Hessian in the QP subproblem**: The QP inner loop always uses a frozen L-BFGS approximation to the Lagrangian Hessian, even when exact HVPs are available. The exact HVP is called only **once per main iteration** (to probe along the step direction and produce an exact secant pair for the L-BFGS update). This design ensures (1) the QP subproblem sees a truly constant quadratic model, and (2) expensive HVP evaluations are not repeated thousands of times inside the projected CG solver.
+
 ## Algorithm
 
 ### Overview
 
 Each SLSQP iteration performs four steps:
 
-1. **QP subproblem**: Construct a quadratic approximation of the objective and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
+1. **QP subproblem**: Construct a quadratic approximation of the objective using the frozen L-BFGS Hessian and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
 2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho (\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
 3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha d_k$.
-4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history (or skip if using exact HVPs).
+4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla L(x_{k+1}) - \nabla L(x_k)$.
 
 ### Scaling considerations: why L-BFGS over BFGS
 
@@ -197,6 +199,22 @@ solver = SLSQP(
 ```
 
 When all derivative functions are supplied, the solver never calls `jax.grad`, `jax.jacrev`, or `jax.jvp` on your functions, so `while_loop` and other control flow work without issue. Alternatively, if only the HVP functions are problematic, you can supply `obj_grad_fn` and the Jacobian functions (which only require first-order derivatives) and let the solver fall back to L-BFGS mode (no HVPs needed) by omitting `obj_hvp_fn`.
+
+### Convergence safeguards
+
+The solver includes safeguards against premature termination, a known issue in SciPy's SLSQP where the optimizer can terminate after a single iteration when the initial point exactly satisfies equality constraints:
+
+- **Minimum iterations** (`min_steps`, default 1): The solver will not declare convergence before completing at least `min_steps` iterations. This ensures that KKT multipliers have been computed by at least one QP solve before checking KKT optimality conditions.
+
+- **Initial multiplier estimation**: When equality constraints are present, the initial Lagrange multipliers are estimated via least-squares rather than being set to zero. This prevents the Lagrangian gradient from collapsing to the objective gradient at the first convergence check.
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    min_steps=1,  # Default; set to 0 to allow convergence at step 0
+)
+```
 
 ## License
 

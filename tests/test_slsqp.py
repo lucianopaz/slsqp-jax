@@ -1204,3 +1204,361 @@ class TestSLSQPBoundsComparisonWithSciPy:
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3, atol=1e-6)
         np.testing.assert_allclose(y, [1.0, 0.0, -1.0], rtol=1e-3, atol=1e-6)
+
+
+class TestFrozenHVP:
+    """Tests verifying that user-supplied HVPs use frozen L-BFGS in the QP solver.
+
+    When a user provides exact HVP functions, the solver should:
+    1. Use the frozen L-BFGS approximation inside the QP inner loop.
+    2. Call the exact HVP only once per main iteration (to probe the step
+       direction for the L-BFGS secant update).
+    """
+
+    def test_hvp_call_count_unconstrained(self):
+        """Verify exact HVP is called once per step, not per CG iteration."""
+        call_count = {"n": 0}
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def obj_hvp(x, v, args):
+            call_count["n"] += 1
+            return 2.0 * v
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=10,
+            obj_hvp_fn=obj_hvp,
+        )
+        x0 = jnp.array([3.0, -2.0])
+
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+
+        call_count["n"] = 0
+        y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+
+        # Exact HVP should be called exactly once per step (for the secant probe)
+        assert call_count["n"] == 1, (
+            f"Expected 1 exact HVP call per step, got {call_count['n']}"
+        )
+
+    def test_hvp_call_count_equality_constrained(self):
+        """Verify exact HVP call count with equality constraints."""
+        call_count = {"obj": 0, "eq": 0}
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] + x[2] - 3.0])
+
+        def obj_hvp(x, v, args):
+            call_count["obj"] += 1
+            return 2.0 * v
+
+        def eq_hvp(x, v, args):
+            call_count["eq"] += 1
+            return jnp.zeros((1, x.shape[0]))
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=10,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+            eq_hvp_fn=eq_hvp,
+        )
+        x0 = jnp.array([2.0, 0.5, 0.5])
+
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+
+        call_count["obj"] = 0
+        call_count["eq"] = 0
+        y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+
+        assert call_count["obj"] == 1, (
+            f"Expected 1 obj HVP call per step, got {call_count['obj']}"
+        )
+        assert call_count["eq"] == 1, (
+            f"Expected 1 eq HVP call per step, got {call_count['eq']}"
+        )
+
+    def test_frozen_hvp_gives_correct_solution(self):
+        """Verify that using frozen L-BFGS with exact HVP probes converges.
+
+        minimize x^2 + 2*y^2  s.t. x + y = 1
+        Solution: x = 2/3, y = 1/3
+        """
+
+        def objective(x, args):
+            return x[0] ** 2 + 2 * x[1] ** 2, None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        def obj_hvp(x, v, args):
+            return jnp.array([2.0 * v[0], 4.0 * v[1]])
+
+        def eq_hvp(x, v, args):
+            return jnp.zeros((1, x.shape[0]))
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+            eq_hvp_fn=eq_hvp,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0 / 3.0, 1.0 / 3.0], rtol=1e-4)
+
+    def test_frozen_hvp_inequality_constrained(self):
+        """Verify frozen HVP works with inequality constraints.
+
+        minimize x^2 + y^2  s.t. x + y >= 2
+        Solution: (1, 1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        def obj_hvp(x, v, args):
+            return 2.0 * v
+
+        def ineq_hvp(x, v, args):
+            return jnp.zeros((1, x.shape[0]))
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            obj_hvp_fn=obj_hvp,
+            ineq_hvp_fn=ineq_hvp,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-4)
+
+    def test_frozen_hvp_multi_step_convergence(self):
+        """Verify L-BFGS builds up curvature over multiple steps.
+
+        The L-BFGS starts as the identity (B_0 = I). With exact HVP probes,
+        it should gradually improve, and the solver should converge even
+        for problems where the true Hessian differs from the identity.
+        """
+
+        def objective(x, args):
+            return x[0] ** 2 + 10 * x[1] ** 2 + 100 * x[2] ** 2, None
+
+        def obj_hvp(x, v, args):
+            return jnp.array([2.0 * v[0], 20.0 * v[1], 200.0 * v[2]])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            obj_hvp_fn=obj_hvp,
+        )
+        x0 = jnp.array([5.0, 5.0, 5.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [0.0, 0.0, 0.0], atol=1e-5)
+        assert state.lbfgs_history.count > 0, "L-BFGS should have accumulated pairs"
+
+
+class TestEarlyTerminationFix:
+    """Tests for the premature termination fix.
+
+    Verifies that the solver does not terminate prematurely when:
+    1. The initial point exactly satisfies equality constraints.
+    2. The objective gradient is small at the initial point.
+    3. Multipliers haven't been computed yet (zero-initialized before fix).
+    """
+
+    def test_equality_on_constraint_surface(self):
+        """The pathological case: initial point satisfies constraint, optimizer
+        should still explore.
+
+        minimize (x-3)^2 + (y+3)^2  s.t. x + y = 2
+        x0 = (1, 1) satisfies x+y=2 but is not optimal.
+        Solution: (4, -2) with f = 2 vs f(1,1) = 20.
+
+        To verify this, substitute y = 2-x:
+        minimize (x-3)^2 + (2-x+3)^2 = (x-3)^2 + (5-x)^2
+        = x^2-6x+9 + 25-10x+x^2 = 2x^2 - 16x + 34
+        d/dx = 4x - 16 = 0 -> x = 4, y = -2.
+        f(4,-2) = 1+1 = 2.
+        f(1,1) = 4+16 = 20. So the optimizer should move from 20 to 2.
+        """
+
+        def objective(x, args):
+            return (x[0] - 3) ** 2 + (x[1] + 3) ** 2, None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0])  # Satisfies x+y=2 but not optimal
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [4.0, -2.0], rtol=1e-4)
+        np.testing.assert_allclose(eq_constraint(y, None), 0.0, atol=1e-5)
+        assert state.step_count > 0, "Solver should have taken at least one step"
+
+    def test_small_gradient_on_constraint(self):
+        """Pathological case with small objective gradient on constraint surface.
+
+        minimize 1e-3 * ((x-10)^2 + y^2)  s.t. x + y = 2
+        x0 = (1, 1) exactly on constraint.
+
+        grad_f at (1,1) = 1e-3 * (-18, 2) which has norm ~= 1.81e-2.
+        With zero multipliers, this would be the Lagrangian gradient,
+        potentially triggering false convergence in a poorly calibrated solver.
+
+        Optimal: substitute y=2-x -> minimize (x-10)^2 + (2-x)^2
+        = x^2-20x+100 + x^2-4x+4 = 2x^2 - 24x + 104
+        d/dx = 4x-24=0 -> x=6, y=-4.
+        """
+
+        def objective(x, args):
+            return 1e-3 * ((x[0] - 10) ** 2 + x[1] ** 2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=200,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [6.0, -4.0], rtol=1e-3)
+        assert state.step_count > 0, "Should not terminate at initial point"
+
+    def test_min_steps_prevents_zero_step_convergence(self):
+        """Verify min_steps parameter prevents convergence before any step."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            min_steps=1,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0])
+
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+
+        # Before any step, terminate should return False (min_steps=1)
+        done, _ = solver.terminate(objective, x0, None, {}, state, frozenset())
+        assert not done, "Should not terminate before min_steps"
+
+    def test_min_steps_zero_allows_immediate_convergence(self):
+        """Verify min_steps=0 allows convergence at step 0 if KKT conditions hold.
+
+        This tests that the min_steps parameter actually controls the behavior.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            rtol=1.0,  # Very loose tolerance
+            atol=1.0,
+            max_steps=50,
+            min_steps=0,
+        )
+        x0 = jnp.array([0.1, 0.1])
+
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        done, _ = solver.terminate(objective, x0, None, {}, state, frozenset())
+
+        # With very loose tolerance and min_steps=0, should converge immediately
+        assert done, "With min_steps=0 and loose tol, should converge at step 0"
+
+    def test_initial_multipliers_not_zero(self):
+        """Verify initial equality multipliers are computed via least-squares."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0])
+
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+
+        # Initial multipliers should not be zero (least-squares estimate)
+        assert not jnp.allclose(state.multipliers_eq, 0.0), (
+            "Initial eq multipliers should be estimated via least-squares, not zero"
+        )
+
+    def test_feasible_start_nonlinear_constraint(self):
+        """Test with nonlinear equality constraint satisfied at start.
+
+        minimize x^2 + y^2  s.t. x^2 + y^2 = 2
+        x0 = (1, 1) satisfies constraint.
+        Solution: any point on the circle with radius sqrt(2), but with min norm.
+        Since the objective IS the constraint, f* = 2.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] ** 2 + x[1] ** 2 - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        # The constraint should be satisfied
+        np.testing.assert_allclose(eq_constraint(y, None), 0.0, atol=1e-5)
+        # Solution should be on the sphere
+        np.testing.assert_allclose(jnp.sum(y**2), 2.0, rtol=1e-4)
