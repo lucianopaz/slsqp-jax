@@ -133,6 +133,27 @@ If you provide `obj_hvp_fn` but omit the constraint HVP functions, the solver au
 
 **Frozen Hessian in the QP subproblem**: The QP inner loop always uses a frozen L-BFGS approximation to the Lagrangian Hessian, even when exact HVPs are available. The exact HVP is called only **once per main iteration** (to probe along the step direction and produce an exact secant pair for the L-BFGS update). This design ensures (1) the QP subproblem sees a truly constant quadratic model, and (2) expensive HVP evaluations are not repeated thousands of times inside the projected CG solver.
 
+### Box constraints (bounds)
+
+You can specify simple lower and upper bounds on decision variables using the `bounds` parameter:
+
+```python
+import jax.numpy as jnp
+
+bounds = jnp.array([
+    [0.0, 1.0],      # 0 <= x_0 <= 1
+    [-jnp.inf, 5.0], # x_1 <= 5 (no lower bound)
+    [0.0, jnp.inf],  # x_2 >= 0 (no upper bound)
+])
+
+solver = SLSQP(bounds=bounds)
+```
+
+Bounds play a **dual role** in the solver, following the projected-SQP methodology (Heinkenschloss & Ridzal, *Projected Sequential Quadratic Programming Methods*, SIAM J. Optim., 1996):
+
+1. **QP inequality constraints** — inside the QP subproblem, bounds are linearised as ordinary inequality constraints so the search direction is aware of the feasible box.
+2. **Hard projection** — after every line search step (and at initialisation), the iterate is *projected* (clipped) onto the feasible box. This guarantees that the objective and constraint functions are **never evaluated outside the bounds**, which is critical when those functions are undefined or ill-conditioned outside the box (e.g. a log-likelihood with positivity constraints on its parameters).
+
 ## Algorithm
 
 ### Overview

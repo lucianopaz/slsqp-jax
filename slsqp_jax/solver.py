@@ -154,6 +154,17 @@ class SLSQP(optx.AbstractMinimiser):
     - obj_hvp_fn: HVP of objective (probed once per iteration for L-BFGS).
     - eq_hvp_fn / ineq_hvp_fn: HVPs of constraints (else forward-over-reverse AD).
 
+    Box constraints (bounds) play a dual role.  Inside the QP
+    subproblem they act as ordinary inequality constraints so that
+    the search direction is aware of the feasible box.  After the
+    line search, the accepted iterate is *projected* (clipped) onto
+    the box, following the projected-SQP methodology
+    (Heinkenschloss & Ridzal, *SIAM J. Optim.*, 1996).  This
+    guarantees that the objective and constraint functions are never
+    evaluated outside the bounds -- essential when those functions
+    are undefined or ill-conditioned outside the box (e.g. a log
+    likelihood with positivity constraints on its parameters).
+
     Attributes:
         rtol: Relative tolerance for convergence.
         atol: Absolute tolerance for convergence.
@@ -162,6 +173,9 @@ class SLSQP(optx.AbstractMinimiser):
         ineq_constraint_fn: Function computing inequality constraints c_ineq(x) >= 0.
         n_eq_constraints: Number of equality constraints (static).
         n_ineq_constraints: Number of inequality constraints (static).
+        bounds: Optional box constraints with shape (n, 2).  Iterates are
+            always projected onto this box so functions are never evaluated
+            outside the bounds.
         obj_grad_fn: Optional gradient of objective.
         eq_jac_fn: Optional Jacobian of equality constraints.
         ineq_jac_fn: Optional Jacobian of inequality constraints.
@@ -207,9 +221,18 @@ class SLSQP(optx.AbstractMinimiser):
     n_eq_constraints: int = eqx.field(static=True, default=0)
     n_ineq_constraints: int = eqx.field(static=True, default=0)
 
-    # Box constraints (bounds) on decision variables
-    # Shape (n, 2) where bounds[i, 0] = lower, bounds[i, 1] = upper
-    # Use -jnp.inf / jnp.inf for unbounded dimensions
+    # Box constraints (bounds) on decision variables.
+    # Shape (n, 2) where bounds[i, 0] = lower, bounds[i, 1] = upper.
+    # Use -jnp.inf / jnp.inf for unbounded dimensions.
+    #
+    # Bounds serve a dual role: (1) they enter the QP subproblem as
+    # inequality constraints so the search direction respects them,
+    # and (2) iterates are projected (clipped) onto the feasible box
+    # after every line search step, following the projected-SQP
+    # approach (Heinkenschloss & Ridzal, SIAM J. Optim., 1996).
+    # This guarantees that the objective and constraint functions are
+    # never evaluated outside the bounds, which is critical when those
+    # functions are undefined or ill-conditioned outside the box.
     bounds: Optional[Float[Array, "n 2"]] = None
 
     # Masks indicating which bounds are finite (static for compilation)
@@ -381,6 +404,15 @@ class SLSQP(optx.AbstractMinimiser):
 
         object.__setattr__(self, "_ineq_hvp_contrib_impl", ineq_hvp_contrib)
 
+    def _clip_to_bounds(self, y: Vector) -> Vector:
+        """Project ``y`` onto the box defined by ``self.bounds``.
+
+        Returns ``y`` unchanged when no finite bounds exist.
+        """
+        if self.bounds is None:
+            return y
+        return jnp.clip(y, self.bounds[:, 0], self.bounds[:, 1])
+
     def _compute_bound_constraint_values(
         self,
         y: Vector,
@@ -512,6 +544,7 @@ class SLSQP(optx.AbstractMinimiser):
             Initial SLSQPState with all fields populated.
         """
         n = y.shape[0]
+        y = self._clip_to_bounds(y)
         m_eq = self.n_eq_constraints
         m_ineq_general = self.n_ineq_constraints
         m_bounds = self._n_lower_bounds + self._n_upper_bounds
@@ -625,6 +658,10 @@ class SLSQP(optx.AbstractMinimiser):
         Returns:
             Tuple of (new_y, new_state, aux).
         """
+        # Ensure y is within bounds (matters for the first iteration when
+        # the user-supplied y0 may violate bounds).
+        y = self._clip_to_bounds(y)
+
         # Step 1: Build the frozen L-BFGS HVP for the QP subproblem
         hvp_fn = self._build_lagrangian_hvp(state)
 
@@ -660,7 +697,7 @@ class SLSQP(optx.AbstractMinimiser):
         )
 
         alpha = ls_result.alpha
-        y_new = y + alpha * direction
+        y_new = self._clip_to_bounds(y + alpha * direction)
         f_val_new = ls_result.f_val
         eq_val_new = ls_result.eq_val
         ineq_val_new = ls_result.ineq_val  # Includes bounds from line search
@@ -855,6 +892,7 @@ class SLSQP(optx.AbstractMinimiser):
             Tuple of (y, aux, stats) where stats is a dictionary
             containing solver statistics.
         """
+        y = self._clip_to_bounds(y)
         stats = {
             "num_steps": state.step_count,
             "final_objective": state.f_val,

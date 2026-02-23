@@ -155,7 +155,10 @@ solver = SLSQP(
 )
 ```
 
-Box constraints are handled specially: their Jacobian is known to be ±1 and their Hessian is zero, so they add minimal computational overhead compared to general inequality constraints.
+Bounds play a **dual role** in the solver, following the projected-SQP methodology (Heinkenschloss & Ridzal, *Projected Sequential Quadratic Programming Methods*, SIAM J. Optim., 1996):
+
+1. **QP inequality constraints** — inside the QP subproblem, bounds are linearised as ordinary inequality constraints so the search direction is aware of the feasible box. Their Jacobian is known to be $\pm 1$ and their Hessian is zero, so they add minimal computational overhead compared to general inequality constraints.
+2. **Hard projection** — after every line search step (and at initialisation), the iterate is *projected* (clipped) onto the feasible box. This guarantees that the objective and constraint functions are **never evaluated outside the bounds**, which is critical when those functions are undefined or ill-conditioned outside the box (e.g. a log-likelihood with positivity constraints on its parameters).
 
 ## Algorithm
 

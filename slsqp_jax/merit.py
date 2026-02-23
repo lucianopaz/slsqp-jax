@@ -196,8 +196,10 @@ def backtracking_line_search(
         done: Bool[Array, ""]
 
     def evaluate_at_alpha(alpha):
-        """Evaluate function and constraints at x + alpha * d."""
+        """Evaluate function and constraints at x + alpha * d, clipped to bounds."""
         x_new = x + alpha * direction
+        if bounds is not None:
+            x_new = jnp.clip(x_new, bounds[:, 0], bounds[:, 1])
         f_new, _ = fn(x_new, args)
 
         if eq_constraint_fn is not None and m_eq > 0:
