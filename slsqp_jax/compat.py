@@ -665,7 +665,7 @@ def minimize_like_scipy(
     constraints: dict | list | LinearConstraint | NonlinearConstraint | tuple = (),
     options: dict[str, Any] | None = None,
     has_aux: bool = False,
-    throw: bool = True,
+    throw: bool = False,
     verbose: bool | Callable[..., None] = False,
 ) -> optx.Solution:
     """Minimise a function using SLSQP with a SciPy-like interface.
