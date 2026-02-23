@@ -72,6 +72,21 @@ Line search with the Han-Powell L1 merit function.
 .. autofunction:: slsqp_jax.update_penalty_parameter
 ```
 
+## SciPy Compatibility
+
+Utilities to convert SciPy-style constraint specifications (dicts, `LinearConstraint`, `NonlinearConstraint`) and a convenience entry point that mirrors `scipy.optimize.minimize`.
+
+```{eval-rst}
+.. autofunction:: slsqp_jax.minimize_like_scipy
+
+.. autofunction:: slsqp_jax.parse_constraints
+
+.. autoclass:: slsqp_jax.ParsedConstraints
+   :members:
+   :undoc-members:
+   :show-inheritance:
+```
+
 ## Type Definitions
 
 Type aliases used throughout the library.

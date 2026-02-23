@@ -6,6 +6,11 @@ problems (n > 5000) using matrix-free L-BFGS Hessian approximation and
 projected conjugate gradient for the QP subproblem.
 """
 
+from slsqp_jax.compat import (
+    ParsedConstraints,
+    minimize_like_scipy,
+    parse_constraints,
+)
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
@@ -40,6 +45,10 @@ __all__ = [
     "JacobianFn",
     "HVPFn",
     "ConstraintHVPFn",
+    # SciPy compatibility
+    "ParsedConstraints",
+    "parse_constraints",
+    "minimize_like_scipy",
     # QP solver
     "solve_qp",
     # L-BFGS
