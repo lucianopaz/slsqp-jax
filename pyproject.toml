@@ -15,7 +15,7 @@ dependencies = [
     "jaxlib",
     "jaxtyping",
     "numpy>=2",
-    "optimistix",
+    "optimistix>=0.1.0",
     "scipy>=1.16.0",
 ]
 
