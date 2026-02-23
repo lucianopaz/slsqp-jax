@@ -16,7 +16,7 @@ automatically via jax.grad (reverse-mode) and jax.jacrev.
 """
 
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import equinox as eqx
 import jax
@@ -230,11 +230,11 @@ class SLSQP(optx.AbstractMinimiser):
     ineq_hvp_fn: Optional[ConstraintHVPFn] = eqx.field(static=True, default=None)
 
     # Precomputed derivative callables (always set in __check_init__)
-    _grad_impl: Callable = eqx.field(static=True, default=None)  # type: ignore[assignment]
-    _eq_jac_impl: Callable = eqx.field(static=True, default=None)  # type: ignore[assignment]
-    _ineq_jac_impl: Callable = eqx.field(static=True, default=None)  # type: ignore[assignment]
-    _eq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)  # type: ignore[assignment]
-    _ineq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)  # type: ignore[assignment]
+    _grad_impl: Callable = eqx.field(static=True, default=None)
+    _eq_jac_impl: Callable = eqx.field(static=True, default=None)
+    _ineq_jac_impl: Callable = eqx.field(static=True, default=None)
+    _eq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)
+    _ineq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)
 
     # L-BFGS parameters
     lbfgs_memory: int = eqx.field(static=True, default=10)
@@ -247,6 +247,9 @@ class SLSQP(optx.AbstractMinimiser):
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
 
+    # Verbose output (resolved to Callable[..., None] in __check_init__)
+    verbose: Callable = eqx.field(static=True, default=False)
+
     def __check_init__(self):
         """Post-initialization to precompute bound info and derivative callables.
 
@@ -255,6 +258,9 @@ class SLSQP(optx.AbstractMinimiser):
         - Gradient, Jacobian, and HVP contribution callables that dispatch
           once here rather than branching on every call.
         """
+        # --- Verbose callable ---
+        object.__setattr__(self, "verbose", optx_misc.default_verbose(self.verbose))
+
         # --- Bound constraint info ---
         if self.bounds is not None:
             bounds_np = np.asarray(self.bounds)
@@ -466,16 +472,14 @@ class SLSQP(optx.AbstractMinimiser):
         construction time in ``__check_init__``.
         """
         m_ineq = self.n_ineq_constraints
-        obj_hvp_fn = self.obj_hvp_fn
+        obj_hvp_fn = cast(HVPFn, self.obj_hvp_fn)
         eq_hvp_contrib = self._eq_hvp_contrib_impl
         ineq_hvp_contrib = self._ineq_hvp_contrib_impl
 
         def lagrangian_hvp(v: Vector) -> Vector:
-            obj_val = obj_hvp_fn(y, v, args)  # type: ignore[misc]
-            eq_val = eq_hvp_contrib(y, v, args, multipliers_eq)  # type: ignore[misc]
-            ineq_val = ineq_hvp_contrib(  # type: ignore[misc]
-                y, v, args, multipliers_ineq[:m_ineq]
-            )
+            obj_val = obj_hvp_fn(y, v, args)
+            eq_val = eq_hvp_contrib(y, v, args, multipliers_eq)
+            ineq_val = ineq_hvp_contrib(y, v, args, multipliers_ineq[:m_ineq])
             return obj_val - eq_val - ineq_val
 
         return lagrangian_hvp
@@ -715,6 +719,28 @@ class SLSQP(optx.AbstractMinimiser):
             bound_jac=state.bound_jac,
             qp_iterations=state.qp_iterations + qp_result.iterations,
             qp_converged=qp_result.converged,
+        )
+
+        # Verbose output
+        m_eq = self.n_eq_constraints
+        m_ineq_total = (
+            self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
+        )
+        eq_viol = jnp.max(jnp.abs(eq_val_new)) if m_eq > 0 else jnp.array(0.0)
+        ineq_viol = (
+            jnp.max(jnp.maximum(0.0, -ineq_val_new))
+            if m_ineq_total > 0
+            else jnp.array(0.0)
+        )
+        c_viol = jnp.maximum(eq_viol, ineq_viol)
+        kkt = jnp.linalg.norm(grad_lagrangian_new)
+        self.verbose(
+            num_steps=("Step", new_state.step_count),
+            objective=("Objective", f_val_new),
+            constraint_violation=("Constraint violation", c_viol),
+            kkt_residual=("KKT residual", kkt),
+            step_size=("Step size", alpha),
+            qp_iterations=("QP iterations", qp_result.iterations),
         )
 
         return y_new, new_state, aux
