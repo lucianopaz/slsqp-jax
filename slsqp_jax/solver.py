@@ -165,9 +165,36 @@ class SLSQP(optx.AbstractMinimiser):
     are undefined or ill-conditioned outside the box (e.g. a log
     likelihood with positivity constraints on its parameters).
 
+    **Convergence criteria.**  The solver checks two conditions each
+    iteration (both must be satisfied, and at least ``min_steps``
+    iterations must have elapsed):
+
+    1. *Stationarity* -- the Lagrangian gradient is small relative to
+       the objective gradient:
+
+       ``‖∇_x L‖ ≤ atol + rtol · max(‖∇f‖, 1)``
+
+       The ``max(‖∇f‖, 1)`` floor prevents the relative term from
+       vanishing when the objective gradient is already small, so the
+       effective tolerance is never tighter than ``atol + rtol``.
+
+    2. *Primal feasibility* -- constraint violations are within
+       absolute tolerance:
+
+       ``max|c_eq(x)| ≤ atol``  and  ``max(0, −c_ineq(x)) ≤ atol``
+
+    ``rtol`` therefore only participates in the stationarity check
+    (scaled by the objective gradient norm), while ``atol`` appears in
+    both stationarity and feasibility checks.
+
     Attributes:
-        rtol: Relative tolerance for convergence.
-        atol: Absolute tolerance for convergence.
+        rtol: Relative tolerance for the stationarity convergence check.
+            Multiplied by ``max(‖∇f‖, 1)`` and added to ``atol`` to form
+            the threshold on the Lagrangian gradient norm.
+        atol: Absolute tolerance for convergence.  Used as the base
+            threshold for both the stationarity check (on the Lagrangian
+            gradient norm) and the feasibility check (on constraint
+            violations).
         max_steps: Maximum number of iterations.
         eq_constraint_fn: Function computing equality constraints c_eq(x) = 0.
         ineq_constraint_fn: Function computing inequality constraints c_ineq(x) >= 0.
@@ -287,6 +314,15 @@ class SLSQP(optx.AbstractMinimiser):
         # --- Bound constraint info ---
         if self.bounds is not None:
             bounds_np = np.asarray(self.bounds)
+
+            if np.any(np.isnan(bounds_np)):
+                raise ValueError("bounds must not contain NaN values")
+
+            if np.any(bounds_np[:, 0] >= bounds_np[:, 1]):
+                raise ValueError(
+                    "Lower bounds must be strictly less than upper bounds."
+                )
+
             lower_mask = np.isfinite(bounds_np[:, 0])
             upper_mask = np.isfinite(bounds_np[:, 1])
 
@@ -823,8 +859,10 @@ class SLSQP(optx.AbstractMinimiser):
             state.multipliers_ineq,
         )
 
-        # Check stationarity: ||nabla L|| <= atol + rtol * ||nabla f||
+        # Check stationarity: ||nabla L|| <= atol + rtol * max(||nabla f||, 1)
         grad_norm = jnp.linalg.norm(grad_lagrangian)
+        # Floor of 1.0 prevents the relative term from vanishing when
+        # ||∇f|| is already small, keeping the tolerance ≥ atol + rtol.
         grad_ref = jnp.maximum(jnp.linalg.norm(state.grad), 1.0)
         stationarity = grad_norm <= self.atol + self.rtol * grad_ref
 
