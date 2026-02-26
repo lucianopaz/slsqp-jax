@@ -344,9 +344,16 @@ class SLSQP(optx.AbstractMinimiser):
                     "bounds must not contain NaN values"
                 )  # pragma: no cover
 
-            if np.any(bounds_np[:, 0] >= bounds_np[:, 1]):
+            if np.any(bounds_np[:, 0] > bounds_np[:, 1]):
                 raise ValueError(  # pragma: no cover
-                    "Lower bounds must be strictly less than upper bounds."
+                    "Lower bounds must be strictly less or equal to upper bounds."
+                )
+            if np.any(np.isinf(bounds_np[:, 0]) & (bounds_np[:, 0] > 0)) or np.any(
+                np.isinf(bounds_np[:, 1]) & (bounds_np[:, 1] < 0)
+            ):
+                raise ValueError(  # pragma: no cover
+                    "Lower bounds cannot be set to +inf and upper bounds cannot be "
+                    "set to -inf."
                 )
 
             lower_mask = np.isfinite(bounds_np[:, 0])
