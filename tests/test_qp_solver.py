@@ -334,5 +334,141 @@ class TestQPJIT:
         assert result.converged
 
 
+class TestQPExpandAntiCycling:
+    """Tests for the EXPAND anti-cycling mechanism in the QP active-set solver."""
+
+    def test_degenerate_vertex_converges(self):
+        """Degenerate QP where all constraints are active at the solution.
+
+        minimize 0.5 * ||d||^2 + g^T d   with g = [1, 1, ..., 1]
+        subject to d_i >= 0 for all i
+                   sum(d) >= 0  (redundant)
+                   d_1 + d_2 >= 0 (redundant)
+
+        The unconstrained minimum violates all constraints.  The solution
+        d = 0 has all constraints active simultaneously -- a maximally
+        degenerate vertex.  Without anti-cycling guards, the redundant
+        constraints can cause the active-set loop to oscillate.
+        """
+        n = 4
+        H = jnp.eye(n)
+        g = jnp.ones(n)
+
+        A_ineq = jnp.concatenate(
+            [
+                jnp.eye(n),
+                jnp.ones((1, n)),
+                jnp.array([[1.0, 1.0, 0.0, 0.0]]),
+            ],
+            axis=0,
+        )
+        b_ineq = jnp.zeros(n + 2)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=200,
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.d, jnp.zeros(n), atol=1e-6)
+
+    def test_nearly_parallel_constraints(self):
+        """QP with nearly parallel inequality constraints.
+
+        Two constraints that differ only by a tiny epsilon create a
+        near-degenerate configuration.  The active-set solver must
+        resolve which constraint to keep active without cycling between
+        them.
+
+        minimize 0.5 * (x^2 + y^2)
+        subject to  x + y >= 1
+                    x + y >= 1 - 1e-10   (nearly identical)
+                    x >= 0
+                    y >= 0
+        Solution: (0.5, 0.5) with only x + y >= 1 active.
+        """
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+
+        eps = 1e-10
+        A_ineq = jnp.array(
+            [
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ]
+        )
+        b_ineq = jnp.array([1.0, 1.0 - eps, 0.0, 0.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=200,
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.d, jnp.array([0.5, 0.5]), atol=1e-4)
+
+    def test_expand_disabled_vs_enabled(self):
+        """Compare convergence with and without EXPAND on a degenerate QP.
+
+        With expand_factor=0 (disabled), the solver relies solely on the
+        iteration limit.  With expand_factor=1 (default), the expanding
+        tolerance should help convergence.  We verify the EXPAND version
+        converges and uses no more iterations.
+        """
+        n = 3
+        H = jnp.eye(n)
+        g = jnp.ones(n)
+
+        A_ineq = jnp.concatenate(
+            [
+                jnp.eye(n),
+                jnp.ones((1, n)),
+            ],
+            axis=0,
+        )
+        b_ineq = jnp.zeros(n + 1)
+
+        result_expand = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=100,
+            expand_factor=1.0,
+        )
+
+        result_no_expand = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=100,
+            expand_factor=0.0,
+        )
+
+        assert result_expand.converged
+        np.testing.assert_allclose(result_expand.d, jnp.zeros(n), atol=1e-6)
+
+        # Both should converge on this problem, but EXPAND should not
+        # use more iterations than the non-EXPAND version
+        assert result_expand.iterations <= result_no_expand.iterations + 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

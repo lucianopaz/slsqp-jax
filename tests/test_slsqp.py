@@ -1567,3 +1567,121 @@ class TestEarlyTerminationFix:
         np.testing.assert_allclose(eq_constraint(y, None), 0.0, atol=1e-5)
         # Solution should be on the sphere
         np.testing.assert_allclose(jnp.sum(y**2), 2.0, rtol=1e-4)
+
+
+class TestStagnationDetection:
+    """Tests for outer-loop stagnation detection.
+
+    Verifies that the solver terminates early with a stagnation result
+    when the merit function stops improving.
+    """
+
+    def _run_solver_with_result(self, solver, objective, x0, args=None, max_steps=None):
+        """Run solver and return (y, state, result_code)."""
+        if max_steps is None:
+            max_steps = solver.max_steps
+        state = solver.init(objective, x0, args, {}, None, None, frozenset())
+        y = x0
+        result = optx.RESULTS.successful
+        for _ in range(max_steps):
+            done, result = solver.terminate(objective, y, args, {}, state, frozenset())
+            if done:
+                break
+            y, state, _ = solver.step(objective, y, args, {}, state, frozenset())
+        return y, state, result
+
+    def test_stagnation_on_infeasible_problem(self):
+        """Infeasible constraints should cause merit stagnation.
+
+        minimize x^2  s.t. x >= 10  AND  x <= -10
+
+        The constraints are mutually exclusive, so the solver cannot
+        satisfy both.  The merit function will stagnate because no
+        direction can reduce constraint violation, and the solver
+        should terminate early with a stagnation result.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] - 10.0, -x[0] - 10.0])
+
+        solver = SLSQP(
+            rtol=1e-12,
+            atol=1e-12,
+            max_steps=200,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=2,
+            stagnation_tol=1e-12,
+            stagnation_patience=3,
+        )
+        x0 = jnp.array([0.0])
+        _, state, result = self._run_solver_with_result(
+            solver, objective, x0, max_steps=200
+        )
+
+        assert state.stagnation_count >= solver.stagnation_patience
+
+    def test_stagnation_count_resets_on_progress(self):
+        """Stagnation count should reset when the merit improves.
+
+        On a well-behaved problem, the stagnation count should stay
+        near zero because every step makes meaningful progress.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            stagnation_tol=1e-12,
+            stagnation_patience=5,
+        )
+        x0 = jnp.array([3.0, -2.0])
+        _, state, _ = self._run_solver_with_result(solver, objective, x0)
+
+        assert state.stagnation_count < solver.stagnation_patience
+
+    def test_stagnation_fields_in_postprocess(self):
+        """Verify stagnation stats appear in postprocess output."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=10)
+        x0 = jnp.array([1.0, 1.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        _, _, stats = solver.postprocess(
+            objective, y, None, None, {}, state, frozenset(), optx.RESULTS.successful
+        )
+
+        assert "stagnation_count" in stats
+        assert "last_step_size" in stats
+
+    def test_stagnation_patience_zero_terminates_immediately(self):
+        """With patience=0, any single stagnant step triggers termination."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] - 10.0, -x[0] - 10.0])
+
+        solver = SLSQP(
+            rtol=1e-15,
+            atol=1e-15,
+            max_steps=200,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=2,
+            stagnation_tol=1e-12,
+            stagnation_patience=0,
+        )
+        x0 = jnp.array([0.0])
+        _, state, _ = self._run_solver_with_result(solver, objective, x0, max_steps=200)
+
+        # Should terminate very quickly due to patience=0
+        assert state.step_count < 10

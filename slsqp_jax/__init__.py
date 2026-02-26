@@ -25,7 +25,7 @@ from slsqp_jax.merit import (
     update_penalty_parameter,
 )
 from slsqp_jax.qp_solver import solve_qp
-from slsqp_jax.solver import SLSQP, QPResult, SLSQPState
+from slsqp_jax.solver import SLSQP, STAGNATION_MESSAGE, QPResult, SLSQPState
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -37,6 +37,7 @@ from slsqp_jax.types import (
 __all__ = [
     # Main solver
     "SLSQP",
+    "STAGNATION_MESSAGE",
     "SLSQPState",
     "QPResult",
     # Types

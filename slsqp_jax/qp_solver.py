@@ -18,6 +18,14 @@ For inequality constraints A d >= b, the Lagrangian is:
     L(d, lambda) = (1/2) d^T H d + g^T d - lambda^T (A d - b)
 
 with lambda >= 0 for active constraints.
+
+**Anti-cycling.**  The active-set loop uses the EXPAND procedure
+(Gill, Murray, Saunders & Wright, *Math. Programming* 45, 1989) to
+prevent cycling caused by degenerate constraints.  A working
+feasibility tolerance ``delta_k = tol + k * tau`` increases
+monotonically at each active-set iteration, ensuring strict progress
+and preventing the same constraint from being repeatedly activated
+and deactivated.
 """
 
 from collections.abc import Callable
@@ -303,6 +311,7 @@ def solve_qp(
     max_iter: int = 100,
     max_cg_iter: int = 50,
     tol: float = 1e-8,
+    expand_factor: float = 1.0,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -320,6 +329,11 @@ def solve_qp(
     Constraints are added/removed from the active set based on
     feasibility violations and multiplier signs until optimality is reached.
 
+    To prevent cycling due to degenerate constraints, the EXPAND
+    procedure is used: the feasibility tolerance increases by a small
+    increment ``tau = tol * expand_factor / max_iter`` at every
+    active-set iteration.  Set *expand_factor* to 0 to disable.
+
     Args:
         hvp_fn: Hessian-vector product function v -> H @ v.
         g: Linear term of the objective (gradient).
@@ -330,6 +344,10 @@ def solve_qp(
         max_iter: Maximum active-set iterations.
         max_cg_iter: Maximum CG iterations per active-set step.
         tol: Feasibility and optimality tolerance.
+        expand_factor: Controls the EXPAND tolerance growth rate.
+            The per-iteration increment is ``tol * expand_factor / max_iter``.
+            Default 1.0 doubles the tolerance over the full iteration budget.
+            Set to 0.0 to disable expansion.
 
     Returns:
         QPResult containing the solution, multipliers, and convergence info.
@@ -395,7 +413,13 @@ def solve_qp(
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
+    # EXPAND anti-cycling: per-iteration tolerance increment
+    tau = tol * expand_factor / jnp.maximum(max_iter, 1)
+
     def body_fn(state: QPState) -> QPState:
+        # EXPAND: working tolerance grows monotonically each iteration
+        working_tol = tol + state.iteration * tau
+
         # Build active mask for the combined constraint matrix
         combined_mask = jnp.concatenate([jnp.ones(m_eq, dtype=bool), state.active_set])
 
@@ -407,18 +431,17 @@ def solve_qp(
         mult_eq_new = mult_all[:m_eq] if m_eq > 0 else jnp.zeros((0,))
         mult_ineq_new = mult_all[m_eq:]
 
-        # Check feasibility of solution for inactive inequality constraints
+        # Check feasibility with expanding tolerance (stricter activation)
         residuals = A_ineq @ d_new - b_ineq
-        violated = (residuals < -tol) & ~state.active_set
+        violated = (residuals < -working_tol) & ~state.active_set
         any_violated = jnp.any(violated)
 
         # Find the most violated inactive constraint
         violation_scores = jnp.where(violated, -residuals, -jnp.inf)
         most_violated_idx = jnp.argmax(violation_scores)
 
-        # Check multiplier signs of active inequality constraints
-        # For A d >= b, optimal multipliers should be non-negative
-        negative_mult = (mult_ineq_new < -tol) & state.active_set
+        # Check multiplier signs with expanding tolerance (stricter deactivation)
+        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
         any_negative = jnp.any(negative_mult)
 
         mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)

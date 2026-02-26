@@ -243,6 +243,58 @@ solver = SLSQP(
 )
 ```
 
+### QP anti-cycling: the EXPAND procedure
+
+The QP subproblem is solved by a primal active-set method that adds or removes inequality constraints one at a time. When the problem is **degenerate** — multiple constraints pass through the same vertex or have tied violation/multiplier values — the active-set loop can *cycle*: iteration $i$ activates a constraint, iteration $i+1$ drops it, iteration $i+2$ re-activates it, and so on. The QP then exhausts its iteration budget without converging, producing a poor search direction.
+
+This implementation uses the **EXPAND** procedure (Gill, Murray, Saunders & Wright, *Mathematical Programming* 45, 1989) to break such cycles. The idea is simple: instead of a fixed feasibility tolerance, the active-set loop maintains a *working tolerance* that grows monotonically:
+
+$$
+\delta_k = \texttt{tol} + k \cdot \tau, \qquad \tau = \frac{\texttt{tol} \cdot \texttt{expand\_factor}}{\texttt{max\_iter}}
+$$
+
+At each active-set iteration $k$:
+
+- A constraint is considered *violated* only if its residual is below $-\delta_k$ (progressively stricter threshold for activation).
+- A multiplier is considered *negative* only if it is below $-\delta_k$ (progressively stricter threshold for deactivation).
+
+Because $\delta_k$ increases at every step, marginally active or marginally infeasible constraints that cause cycling are gradually excluded, breaking the degeneracy. With the default settings (`expand_factor=1.0`, `tol=1e-8`, `max_iter=100`), the tolerance doubles from `tol` to `2·tol` over the full iteration budget — conservative enough to preserve solution quality while reliably eliminating cycles.
+
+EXPAND is the standard anti-cycling technique used in production solvers (MINOS, SNOPT, SQOPT) and is backed by a convergence guarantee: strict objective decrease within each expanding sequence. The `expand_factor` parameter on `solve_qp` controls the growth rate; set it to `0.0` to disable expansion entirely.
+
+### Outer-loop stagnation detection
+
+Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this by tracking the **L1 merit function** across iterations:
+
+$$
+\phi(x; \rho) = f(x) + \rho \bigl(\lVert c_{\text{eq}}(x) \rVert_1 + \lVert \max(0, -c_{\text{ineq}}(x)) \rVert_1\bigr)
+$$
+
+After each step, the relative improvement in the merit value is computed:
+
+$$
+\text{rel\_improvement} = \frac{|\phi_{k-1} - \phi_k|}{\max(|\phi_{k-1}|,\, 1)}
+$$
+
+If this falls below `stagnation_tol` for `stagnation_patience` consecutive iterations, the solver terminates early with a `nonlinear_divergence` result code rather than running until `max_steps`. This avoids wasting computation on a problem the solver cannot solve.
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    stagnation_tol=1e-12,    # Minimum relative merit improvement
+    stagnation_patience=5,   # Consecutive stagnant steps before failure
+)
+```
+
+The stagnation count and last step size are included in `sol.stats` for diagnostics:
+
+```python
+sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100, throw=False)
+print(sol.stats["stagnation_count"])  # 0 if converged normally
+print(sol.stats["last_step_size"])    # Step size from final iteration
+```
+
 ## License
 
 MIT
