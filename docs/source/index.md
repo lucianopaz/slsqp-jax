@@ -268,7 +268,54 @@ Wright (*Properties of the Log-Barrier Function on Degenerate Nonlinear Programs
 
 This implementation promotes multiplier stability through **active-set warm-starting**: the final active set from each QP solve is passed as the initial guess for the next outer iteration's QP subproblem. Because the active set carries implicit information about which multipliers are nonzero, reusing it across iterations biases the QP toward consistent multiplier selections. This is the same strategy used by production SQP codes such as SNOPT (Gill, Murray & Saunders, 2005).
 
-For pathological cases where warm-starting is insufficient, proximal multiplier stabilization (the sSQP approach of Wright, 2002, Section 6) adds an explicit penalty term $\tfrac{1}{2}\sigma \lVert \lambda - \lambda_k \rVert^2$ to the QP objective. This is not currently implemented but is tracked as a potential enhancement.
+For pathological cases where warm-starting is insufficient, the solver provides **proximal multiplier stabilization** (see next section).
+
+### Proximal multiplier stabilization (sSQP)
+
+When the QP subproblem is highly degenerate — for example, when SciPy's SLSQP reports "Inequality constraints incompatible" — the standard active-set method can cycle indefinitely, exhausting its iteration budget and producing a poor search direction. The solver then stagnates because the corrupted multipliers yield an inaccurate Lagrangian gradient.
+
+The **stabilized SQP (sSQP)** formulation (Hager, *Computational Optimization and Applications*, 12(1–3), 1999; Wright, *Mathematics of Operations Research*, 27(3), 2002, Section 6) addresses this by absorbing equality constraints into the QP objective via an augmented-Lagrangian penalty. The standard QP subproblem
+
+$$
+\min_d \tfrac{1}{2} d^T B d + g^T d \quad \text{s.t. } A_{\text{eq}}\, d = b_{\text{eq}},\; A_{\text{ineq}}\, d \geq b_{\text{ineq}}
+$$
+
+is replaced by
+
+$$
+\min_d \tfrac{1}{2} d^T \widetilde{B}\, d + \widetilde{g}^T d \quad \text{s.t. } A_{\text{ineq}}\, d \geq b_{\text{ineq}}
+$$
+
+where
+
+$$
+\widetilde{B}(v) = B v + \frac{1}{\sigma}\, A_{\text{eq}}^T (A_{\text{eq}}\, v), \qquad
+\widetilde{g} = g - \frac{1}{\sigma}\, A_{\text{eq}}^T b_{\text{eq}} - A_{\text{eq}}^T \lambda_k^{\text{eq}}
+$$
+
+Here $\sigma > 0$ is the stabilization parameter and $\lambda_k^{\text{eq}}$ are the equality multipliers from the previous outer iteration. The term $\tfrac{1}{\sigma} A_{\text{eq}}^T A_{\text{eq}}$ regularizes the reduced Hessian in the equality-constraint normal directions, making the dual solution unique even at degenerate vertices. Equality multipliers are recovered from the penalty optimality condition:
+
+$$
+\lambda_{\text{eq}} = \lambda_k^{\text{eq}} - \frac{1}{\sigma}\bigl(A_{\text{eq}}\, d - b_{\text{eq}}\bigr)
+$$
+
+Larger $\sigma$ means more relaxation (softer equality enforcement); smaller $\sigma$ tightens toward the standard hard-constraint QP. Near convergence, $b_{\text{eq}} = -c_{\text{eq}}(x_k) \to 0$ and $d \to 0$, so the penalty vanishes and constraint satisfaction is asymptotically exact.
+
+Inequality constraints remain as hard constraints in the active-set method — the EXPAND procedure and warm-starting already handle inequality cycling. The equality absorption is the primary mechanism because it addresses QP infeasibility at degenerate vertices.
+
+To enable proximal stabilization, set `proximal_sigma` to a positive value (recommended range: $[10^{-4}, 10^{-1}]$):
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    ineq_constraint_fn=ineq_constraint,
+    n_ineq_constraints=3,
+    proximal_sigma=0.01,   # Enable sSQP stabilization
+)
+```
+
+When `proximal_sigma=0` (the default), the solver uses the standard hard-constraint QP and no stabilization overhead is incurred.
 
 ### Outer-loop stagnation detection
 

@@ -231,6 +231,12 @@ class SLSQP(optx.AbstractMinimiser):
         ineq_hvp_fn: Optional per-constraint HVP of inequality constraints.
         min_steps: Minimum iterations before convergence is allowed (default 1).
         lbfgs_memory: Number of (s, y) pairs to store for L-BFGS (default 10).
+        proximal_sigma: Stabilization parameter for the sSQP formulation
+            (Hager, 1999; Wright, 2002).  When positive, equality constraints
+            are absorbed into the QP objective with penalty weight
+            ``1/proximal_sigma``, regularizing the dual solution and preventing
+            QP infeasibility at degenerate vertices.  Recommended range:
+            ``[1e-4, 1e-1]``.  Default 0.0 disables stabilization.
 
     Example:
         >>> import jax.numpy as jnp
@@ -316,6 +322,15 @@ class SLSQP(optx.AbstractMinimiser):
     # QP solver parameters
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
+
+    # Proximal multiplier stabilization (sSQP).
+    # When positive, equality constraints are absorbed into the QP
+    # objective via an augmented-Lagrangian penalty with weight
+    # 1/proximal_sigma.  This regularizes the dual solution and
+    # prevents QP infeasibility at degenerate vertices.  Larger
+    # values mean more relaxation.  Recommended range: [1e-4, 1e-1].
+    # Default 0.0 disables stabilization (standard QP).
+    proximal_sigma: float = 0.0
 
     # Stagnation detection parameters
     stagnation_tol: float = 1e-12
@@ -1024,7 +1039,8 @@ class SLSQP(optx.AbstractMinimiser):
 
         The previous iteration's QP active set is passed as a warm-start
         hint, and the outer KKT residual norm is used for adaptive EXPAND
-        tolerance scaling.
+        tolerance scaling.  When ``proximal_sigma > 0``, the equality
+        constraints are absorbed into the objective via sSQP.
 
         Args:
             state: Current solver state.
@@ -1061,6 +1077,8 @@ class SLSQP(optx.AbstractMinimiser):
             max_cg_iter=self.qp_max_cg_iter,
             initial_active_set=initial_active_set,
             kkt_residual=kkt_residual,
+            proximal_sigma=self.proximal_sigma,
+            prev_multipliers_eq=state.multipliers_eq,
         )
 
         return QPResult(

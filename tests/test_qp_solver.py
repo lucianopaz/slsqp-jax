@@ -711,5 +711,183 @@ class TestQPAdaptiveTolerance:
         assert result_one.iterations == result_large.iterations
 
 
+class TestProximalStabilization:
+    """Tests for proximal multiplier stabilization (sSQP) in solve_qp."""
+
+    def test_degenerate_qp_converges_with_proximal(self):
+        """Proximal should converge on a QP that cycles without it.
+
+        Constructs a degenerate QP where 4 inequality constraints meet
+        at the same vertex with near-linearly-dependent normals. The
+        standard active-set method cycles (hits max_iter), but sSQP
+        absorbs the equality constraint and converges.
+        """
+        n = 3
+        H = jnp.eye(n)
+        g = -jnp.array([1.0, 1.0, 1.0])
+        A_eq = jnp.array([[1.0, 1.0, 1.0]])
+        b_eq = jnp.array([1.0])
+
+        # Near-degenerate inequalities: all nearly parallel normals
+        # meeting close to the same vertex
+        A_ineq = jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+        b_ineq = jnp.array([0.0, 0.0, 0.0, 0.0])
+
+        result_proximal = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            max_iter=100,
+            proximal_sigma=0.01,
+            prev_multipliers_eq=jnp.zeros(1),
+        )
+        assert result_proximal.converged
+
+    def test_solution_quality_matches_standard(self):
+        """Proximal solution should approximate standard solution on
+        a non-degenerate problem."""
+        H = 2.0 * jnp.eye(2)
+        g = jnp.array([-2.0, -5.0])
+        A_eq = jnp.array([[1.0, 1.0]])
+        b_eq = jnp.array([1.0])
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+        b_ineq = jnp.array([0.0, 0.0])
+
+        result_standard = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+        )
+        result_proximal = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            proximal_sigma=0.001,
+            prev_multipliers_eq=jnp.zeros(1),
+        )
+
+        assert result_standard.converged
+        assert result_proximal.converged
+        np.testing.assert_allclose(
+            result_proximal.d,
+            result_standard.d,
+            atol=0.05,
+        )
+
+    def test_multiplier_recovery_formula(self):
+        """Equality multipliers should satisfy
+        lambda = lambda_k - (1/sigma)(A_eq d - b_eq)."""
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, -2.0])
+        A_eq = jnp.array([[1.0, 1.0]])
+        b_eq = jnp.array([1.0])
+        A_ineq = jnp.zeros((0, 2))
+        b_ineq = jnp.zeros(0)
+
+        sigma = 0.01
+        prev_mult = jnp.array([0.5])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            proximal_sigma=sigma,
+            prev_multipliers_eq=prev_mult,
+        )
+
+        expected_mult = prev_mult - (1.0 / sigma) * (A_eq @ result.d - b_eq)
+        np.testing.assert_allclose(
+            result.multipliers_eq,
+            expected_mult,
+            rtol=1e-6,
+        )
+
+    def test_sigma_zero_matches_standard(self):
+        """proximal_sigma=0 should produce identical results to default."""
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, -2.0])
+        A_eq = jnp.array([[1.0, 1.0]])
+        b_eq = jnp.array([1.0])
+        A_ineq = jnp.array([[1.0, 0.0]])
+        b_ineq = jnp.array([0.0])
+
+        result_default = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+        )
+        result_zero = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            proximal_sigma=0.0,
+        )
+
+        np.testing.assert_allclose(result_default.d, result_zero.d, rtol=1e-10)
+        np.testing.assert_allclose(
+            result_default.multipliers_eq,
+            result_zero.multipliers_eq,
+            rtol=1e-10,
+        )
+
+    def test_no_equalities_proximal_passthrough(self):
+        """proximal_sigma > 0 with no equalities should use standard path."""
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, -2.0])
+        A_eq = jnp.zeros((0, 2))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+        b_ineq = jnp.array([0.0, 0.0])
+
+        result_standard = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+        )
+        result_proximal = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            proximal_sigma=0.01,
+        )
+
+        np.testing.assert_allclose(
+            result_proximal.d,
+            result_standard.d,
+            rtol=1e-10,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
