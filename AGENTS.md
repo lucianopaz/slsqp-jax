@@ -96,6 +96,12 @@ Each SLSQP iteration performs four steps:
 3. **Accept step**: Update iterate x_{k+1} = x_k + α·d_k.
 4. **Hessian update**: Append new curvature pair (s, y) to L-BFGS history (or skip if using exact HVPs).
 
+### Robustness: Anti-cycling and Stagnation Detection
+
+**QP anti-cycling (EXPAND procedure):** The active-set QP solver uses the EXPAND procedure (Gill, Murray, Saunders & Wright, 1989) to prevent cycling at degenerate vertices. A working tolerance `delta_k = tol + k * tau` grows monotonically each active-set iteration, ensuring strict progress and preventing the same constraint from being repeatedly activated and deactivated. Controlled by the `expand_factor` parameter on `solve_qp`.
+
+**Outer-loop stagnation detection:** The solver tracks the L1 merit function across iterations and declares failure if the relative improvement falls below `stagnation_tol` for `stagnation_patience` consecutive iterations. This prevents the solver from exhausting `max_steps` on infeasible or degenerate problems. Controlled by `stagnation_tol` and `stagnation_patience` on `SLSQP`.
+
 ## The Task: SLSQP Implementation
 You need to port the logic of SLSQP (Sequential Least Squares Programming) to JAX.
 * **Core logic:** SLSQP solves a nonlinear optimization problem by solving a Quadratic Programming (QP) subproblem at each step to determine the search direction.

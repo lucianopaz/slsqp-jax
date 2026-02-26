@@ -35,6 +35,7 @@ from slsqp_jax.hessian import (
 )
 from slsqp_jax.merit import (
     backtracking_line_search,
+    compute_merit,
     update_penalty_parameter,
 )
 from slsqp_jax.qp_solver import solve_qp
@@ -48,6 +49,12 @@ from slsqp_jax.types import (
     Vector,
 )
 from slsqp_jax.utils import args_closure
+
+STAGNATION_MESSAGE = (
+    "The solver stagnated: no sufficient progress in the merit function "
+    "was made for several consecutive iterations. This may indicate "
+    "cycling in the QP subproblem or an infeasible/degenerate problem."
+)
 
 
 class SLSQPState(eqx.Module):
@@ -106,6 +113,11 @@ class SLSQPState(eqx.Module):
     # QP solver statistics
     qp_iterations: Int[Array, ""]
     qp_converged: Bool[Array, ""]
+
+    # Stagnation detection
+    prev_merit: Scalar
+    stagnation_count: Int[Array, ""]
+    last_alpha: Scalar
 
 
 class QPResult(eqx.Module):
@@ -297,6 +309,10 @@ class SLSQP(optx.AbstractMinimiser):
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
 
+    # Stagnation detection parameters
+    stagnation_tol: float = 1e-12
+    stagnation_patience: int = 5
+
     # Verbose output (resolved to Callable[..., None] in __check_init__)
     verbose: Callable = eqx.field(static=True, default=False)
 
@@ -316,10 +332,12 @@ class SLSQP(optx.AbstractMinimiser):
             bounds_np = np.asarray(self.bounds)
 
             if np.any(np.isnan(bounds_np)):
-                raise ValueError("bounds must not contain NaN values")
+                raise ValueError(
+                    "bounds must not contain NaN values"
+                )  # pragma: no cover
 
             if np.any(bounds_np[:, 0] >= bounds_np[:, 1]):
-                raise ValueError(
+                raise ValueError(  # pragma: no cover
                     "Lower bounds must be strictly less than upper bounds."
                 )
 
@@ -645,6 +663,9 @@ class SLSQP(optx.AbstractMinimiser):
         # Initial merit penalty
         merit_penalty = jnp.array(1.0)
 
+        # Compute initial merit for stagnation tracking
+        prev_merit = compute_merit(f_val, eq_val, ineq_val, merit_penalty)
+
         return SLSQPState(
             step_count=jnp.array(0),
             f_val=f_val,
@@ -661,6 +682,9 @@ class SLSQP(optx.AbstractMinimiser):
             bound_jac=bound_jac,
             qp_iterations=jnp.array(0),
             qp_converged=jnp.array(True),
+            prev_merit=prev_merit,
+            stagnation_count=jnp.array(0),
+            last_alpha=jnp.array(1.0),
         )
 
     def step(
@@ -776,6 +800,16 @@ class SLSQP(optx.AbstractMinimiser):
 
         new_lbfgs_history = lbfgs_append(state.lbfgs_history, s, y_for_lbfgs)
 
+        # Stagnation detection: compare merit at new point vs previous
+        merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
+        rel_improvement = jnp.abs(state.prev_merit - merit_new) / jnp.maximum(
+            jnp.abs(state.prev_merit), 1.0
+        )
+        is_stagnant = rel_improvement < self.stagnation_tol
+        new_stagnation_count = jnp.where(
+            is_stagnant, state.stagnation_count + 1, jnp.array(0)
+        )
+
         new_state = SLSQPState(
             step_count=state.step_count + 1,
             f_val=f_val_new,
@@ -792,6 +826,9 @@ class SLSQP(optx.AbstractMinimiser):
             bound_jac=state.bound_jac,
             qp_iterations=state.qp_iterations + qp_result.iterations,
             qp_converged=qp_result.converged,
+            prev_merit=merit_new,
+            stagnation_count=new_stagnation_count,
+            last_alpha=alpha,
         )
 
         # Verbose output
@@ -882,6 +919,9 @@ class SLSQP(optx.AbstractMinimiser):
         # Check max iterations
         max_iters_reached = state.step_count >= self.max_steps
 
+        # Check stagnation
+        stagnation_detected = state.stagnation_count >= self.stagnation_patience
+
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
@@ -889,15 +929,19 @@ class SLSQP(optx.AbstractMinimiser):
         converged = stationarity & primal_feasible & has_min_steps
 
         # Determine result code
-        done = converged | max_iters_reached
+        done = converged | max_iters_reached | stagnation_detected
 
         result = jax.lax.cond(
             converged,
             lambda: optx.RESULTS.successful,
             lambda: jax.lax.cond(
-                max_iters_reached,
-                lambda: optx.RESULTS.max_steps_reached,
-                lambda: optx.RESULTS.successful,  # Still running
+                stagnation_detected,
+                lambda: optx.RESULTS.nonlinear_divergence,
+                lambda: jax.lax.cond(
+                    max_iters_reached,
+                    lambda: optx.RESULTS.max_steps_reached,
+                    lambda: optx.RESULTS.successful,  # Still running
+                ),
             ),
         )
 
@@ -941,6 +985,8 @@ class SLSQP(optx.AbstractMinimiser):
             "qp_tolerance": 1e-8,
             "multipliers_eq": state.multipliers_eq,
             "multipliers_ineq": state.multipliers_ineq,
+            "stagnation_count": state.stagnation_count,
+            "last_step_size": state.last_alpha,
         }
 
         return y, aux, stats
