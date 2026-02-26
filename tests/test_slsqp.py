@@ -1834,3 +1834,103 @@ class TestStagnationDetection:
 
         # Should terminate very quickly due to patience=0
         assert state.step_count < 10
+
+
+class TestProximalStabilization:
+    """Tests for proximal multiplier stabilization (sSQP) in the full solver."""
+
+    def test_convergence_with_equality_and_inequality(self):
+        """Solver with proximal_sigma converges on a problem with
+        equality and inequality constraints where the inequality is active."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] - 0.6])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            rtol=1e-6,
+            atol=1e-6,
+            proximal_sigma=0.01,
+        )
+        x0 = jnp.array([0.9, 0.1])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [0.6, 0.4], atol=1e-2)
+        np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-3)
+        assert y[0] >= 0.6 - 1e-3
+
+    def test_non_degenerate_regression(self):
+        """Proximal sigma should not break well-conditioned problems."""
+
+        def objective(x, args):
+            return (x[0] - 1.0) ** 2 + (x[1] - 2.5) ** 2, None
+
+        def ineq_constraint(x, args):
+            return jnp.array(
+                [
+                    x[0] - 2 * x[1] + 2.0,
+                    -x[0] - 2 * x[1] + 6.0,
+                    -x[0] + 2 * x[1] + 2.0,
+                ]
+            )
+
+        solver_standard = SLSQP(
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=3,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        solver_proximal = SLSQP(
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=3,
+            rtol=1e-6,
+            atol=1e-6,
+            proximal_sigma=0.01,
+        )
+
+        x0 = jnp.array([0.0, 0.0])
+        y_std, _ = _run_solver(solver_standard, objective, x0)
+        y_prox, _ = _run_solver(solver_proximal, objective, x0)
+
+        np.testing.assert_allclose(y_prox, y_std, atol=0.05)
+
+    def test_jit_compatibility(self):
+        """proximal_sigma works under jax.jit(optx.minimise)."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            rtol=1e-6,
+            atol=1e-6,
+            proximal_sigma=0.01,
+        )
+        x0 = jnp.array([0.5, 0.5])
+
+        @jax.jit
+        def do_solve(x0):
+            return optx.minimise(
+                objective,
+                solver,
+                x0,
+                has_aux=True,
+                max_steps=50,
+                throw=False,
+            )
+
+        sol = do_solve(x0)
+        np.testing.assert_allclose(sol.value[0] + sol.value[1], 1.0, atol=1e-3)

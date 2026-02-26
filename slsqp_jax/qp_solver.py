@@ -26,6 +26,12 @@ feasibility tolerance ``delta_k = tol + k * tau`` increases
 monotonically at each active-set iteration, ensuring strict progress
 and preventing the same constraint from being repeatedly activated
 and deactivated.
+
+**Proximal stabilization (sSQP).**  When enabled via ``proximal_sigma``,
+equality constraints are absorbed into the QP objective through an
+augmented-Lagrangian penalty, following Hager (*Comp. Optim. Appl.*,
+1999) and Wright (*Math. Oper. Res.*, 2002).  This regularizes the
+dual solution and prevents QP infeasibility at degenerate vertices.
 """
 
 from collections.abc import Callable
@@ -301,6 +307,174 @@ def _solve_projected_cg(
     return final_cg.d, multipliers
 
 
+def _solve_qp_proximal(
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
+    A_eq: Float[Array, "m_eq n"],
+    b_eq: Float[Array, " m_eq"],
+    A_ineq: Float[Array, "m_ineq n"],
+    b_ineq: Float[Array, " m_ineq"],
+    m_eq: int,
+    m_ineq: int,
+    max_iter: int,
+    max_cg_iter: int,
+    tol: float,
+    expand_factor: float,
+    initial_active_set: Bool[Array, " m_ineq"] | None,
+    kkt_residual: Scalar | float,
+    proximal_sigma: float,
+    prev_multipliers_eq: Float[Array, " m_eq"] | None,
+) -> QPResult:
+    """Solve the QP using the stabilized SQP (sSQP) formulation.
+
+    Equality constraints are absorbed into the objective via an
+    augmented-Lagrangian penalty with weight ``1/proximal_sigma``.
+    The active-set loop operates on inequality constraints only.
+
+    The stabilized objective is::
+
+        (1/2) d^T B_tilde d + g_tilde^T d
+
+    where ``B_tilde(v) = H v + (1/sigma) A_eq^T (A_eq v)`` and
+    ``g_tilde = g - (1/sigma) A_eq^T b_eq - A_eq^T lambda_k``.
+
+    Equality multipliers are recovered from the penalty optimality
+    condition: ``lambda = lambda_k - (1/sigma)(A_eq d - b_eq)``.
+    """
+    inv_sigma = 1.0 / proximal_sigma
+    prev_mult_eq = (
+        prev_multipliers_eq if prev_multipliers_eq is not None else jnp.zeros((m_eq,))
+    )
+
+    def stabilized_hvp(v: Vector) -> Vector:
+        return hvp_fn(v) + inv_sigma * (A_eq.T @ (A_eq @ v))
+
+    g_mod = g - inv_sigma * (A_eq.T @ b_eq) - A_eq.T @ prev_mult_eq
+
+    def _recover_mult_eq(d: Vector) -> Float[Array, " m_eq"]:
+        return prev_mult_eq - inv_sigma * (A_eq @ d - b_eq)
+
+    # Sub-case: no inequality constraints — just unconstrained CG
+    if m_ineq == 0:
+        d = _solve_unconstrained_cg(stabilized_hvp, g_mod, max_cg_iter, tol)
+        return QPResult(
+            d=d,
+            multipliers_eq=_recover_mult_eq(d),
+            multipliers_ineq=jnp.zeros((0,)),
+            active_set=jnp.zeros((0,), dtype=bool),
+            converged=jnp.array(True),
+            iterations=jnp.array(1),
+        )
+
+    # Sub-case: inequalities present — active-set loop on A_ineq only
+    kkt_res = jnp.asarray(kkt_residual, dtype=jnp.float64)
+    base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
+
+    # Initial unconstrained solve (equalities absorbed into objective)
+    d_init = _solve_unconstrained_cg(stabilized_hvp, g_mod, max_cg_iter, tol)
+
+    # Determine starting active set
+    residuals_init = A_ineq @ d_init - b_ineq
+    if initial_active_set is not None:
+        init_active = initial_active_set | (residuals_init < -base_tol)
+    else:
+        init_active = residuals_init < -base_tol
+    init_converged = ~jnp.any(init_active)
+
+    init_state = QPState(
+        d=d_init,
+        active_set=init_active,
+        multipliers_eq=_recover_mult_eq(d_init),
+        multipliers_ineq=jnp.zeros((m_ineq,)),
+        iteration=jnp.array(0),
+        converged=init_converged,
+    )
+
+    def cond_fn(state: QPState) -> Bool[Array, ""]:
+        return ~state.converged & (state.iteration < max_iter)
+
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+
+    def body_fn(state: QPState) -> QPState:
+        working_tol = base_tol + state.iteration * tau
+
+        # Solve with current active set — inequalities only
+        d_new, mult_ineq_new = _solve_projected_cg(
+            stabilized_hvp,
+            g_mod,
+            A_ineq,
+            b_ineq,
+            state.active_set,
+            max_cg_iter,
+            tol,
+        )
+
+        mult_eq_new = _recover_mult_eq(d_new)
+
+        # Check feasibility with expanding tolerance
+        residuals = A_ineq @ d_new - b_ineq
+        violated = (residuals < -working_tol) & ~state.active_set
+        any_violated = jnp.any(violated)
+
+        violation_scores = jnp.where(violated, -residuals, -jnp.inf)
+        most_violated_idx = jnp.argmax(violation_scores)
+
+        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
+        any_negative = jnp.any(negative_mult)
+
+        mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)
+        most_negative_idx = jnp.argmin(mult_scores)
+
+        def add_constraint():
+            new_active = state.active_set.at[most_violated_idx].set(True)
+            return QPState(
+                d=d_new,
+                active_set=new_active,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(False),
+            )
+
+        def drop_constraint():
+            new_active = state.active_set.at[most_negative_idx].set(False)
+            return QPState(
+                d=d_new,
+                active_set=new_active,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(False),
+            )
+
+        def mark_converged():
+            return QPState(
+                d=d_new,
+                active_set=state.active_set,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(True),
+            )
+
+        return jax.lax.cond(
+            any_violated,
+            add_constraint,
+            lambda: jax.lax.cond(any_negative, drop_constraint, mark_converged),
+        )
+
+    final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
+
+    return QPResult(
+        d=final_state.d,
+        multipliers_eq=final_state.multipliers_eq,
+        multipliers_ineq=final_state.multipliers_ineq,
+        active_set=final_state.active_set,
+        converged=final_state.converged,
+        iterations=final_state.iteration,
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def solve_qp(
     hvp_fn: Callable,
@@ -315,6 +489,8 @@ def solve_qp(
     expand_factor: float = 1.0,
     initial_active_set: Bool[Array, " m_ineq"] | None = None,
     kkt_residual: Scalar | float = 0.0,
+    proximal_sigma: float = 0.0,
+    prev_multipliers_eq: Float[Array, " m_eq"] | None = None,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -336,6 +512,19 @@ def solve_qp(
     procedure is used: the feasibility tolerance increases by a small
     increment ``tau = tol * expand_factor / max_iter`` at every
     active-set iteration.  Set *expand_factor* to 0 to disable.
+
+    When ``proximal_sigma > 0`` and there are equality constraints, the
+    solver uses the **stabilized SQP (sSQP)** formulation (Hager, 1999;
+    Wright, 2002).  Equality constraints are absorbed into the objective
+    via an augmented-Lagrangian penalty::
+
+        minimize  (1/2) d^T B_tilde d + g_tilde^T d
+        subject to  A_ineq d >= b_ineq
+
+    where ``B_tilde(v) = H v + (1/sigma) A_eq^T (A_eq v)`` and
+    ``g_tilde = g - (1/sigma) A_eq^T b_eq - A_eq^T lambda_k``.
+    Equality multipliers are recovered as
+    ``lambda = lambda_k - (1/sigma)(A_eq d - b_eq)``.
 
     Args:
         hvp_fn: Hessian-vector product function v -> H @ v.
@@ -361,6 +550,14 @@ def solve_qp(
             proportionally so that the QP tolerates larger violations
             far from optimality and tightens automatically as convergence
             proceeds.
+        proximal_sigma: Stabilization parameter for the sSQP formulation.
+            When positive, equality constraints are absorbed into the
+            objective with penalty weight ``1/sigma``.  Larger values
+            mean more relaxation.  Recommended range: ``[1e-4, 1e-1]``.
+            Default 0.0 disables stabilization (standard QP).
+        prev_multipliers_eq: Equality multipliers from the previous outer
+            iteration, used as the proximal center when ``proximal_sigma > 0``.
+            When ``None``, defaults to zeros.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -381,6 +578,30 @@ def solve_qp(
             converged=jnp.array(True),
             iterations=jnp.array(1),
         )
+
+    # ---- Proximal stabilized path (sSQP) ----
+    # Absorb equality constraints into the objective when proximal_sigma > 0.
+    if proximal_sigma > 0 and m_eq > 0:
+        return _solve_qp_proximal(
+            hvp_fn=hvp_fn,
+            g=g,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            A_ineq=A_ineq,
+            b_ineq=b_ineq,
+            m_eq=m_eq,
+            m_ineq=m_ineq,
+            max_iter=max_iter,
+            max_cg_iter=max_cg_iter,
+            tol=tol,
+            expand_factor=expand_factor,
+            initial_active_set=initial_active_set,
+            kkt_residual=kkt_residual,
+            proximal_sigma=proximal_sigma,
+            prev_multipliers_eq=prev_multipliers_eq,
+        )
+
+    # ---- Standard path ----
 
     # Case 2: Only equality constraints (no active-set loop needed)
     if m_ineq == 0:
