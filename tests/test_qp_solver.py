@@ -470,5 +470,246 @@ class TestQPExpandAntiCycling:
         assert result_expand.iterations <= result_no_expand.iterations + 1
 
 
+class TestQPActiveSetWarmStart:
+    """Tests for active-set warm-starting via initial_active_set."""
+
+    def test_qp_result_has_active_set(self):
+        """QPResult should include the final active set."""
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([2.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+        )
+
+        assert hasattr(result, "active_set")
+        assert result.active_set.shape == (1,)
+        assert result.active_set.dtype == jnp.bool_
+
+    def test_active_set_reflects_solution(self):
+        """Active set should be True for constraints active at the solution.
+
+        minimize (1/2)(x^2 + y^2)
+        subject to x + y >= 2
+
+        Solution: (1, 1) with the constraint active.
+        """
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([2.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+        )
+
+        assert result.converged
+        assert result.active_set[0], "Constraint should be active at the solution"
+
+    def test_inactive_constraint_not_in_active_set(self):
+        """Inactive constraints should be False in the returned active set.
+
+        minimize (1/2)((x-1)^2 + (y-1)^2)
+        subject to x + y >= 0
+
+        Unconstrained min at (1, 1) satisfies the constraint => inactive.
+        """
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, -1.0])
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([0.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+        )
+
+        assert result.converged
+        assert not result.active_set[0], "Constraint should be inactive"
+
+    def test_warm_start_reduces_iterations(self):
+        """Warm-starting with the correct active set should not require
+        more iterations than cold start, and ideally fewer.
+
+        minimize (1/2)(x^2 + y^2)
+        subject to x >= 1, y >= 0
+
+        Solution: (1, 0) with x >= 1 active, y >= 0 active.
+        """
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+        b_ineq = jnp.array([1.0, 0.0])
+
+        result_cold = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+        )
+        assert result_cold.converged
+
+        result_warm = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            initial_active_set=result_cold.active_set,
+        )
+        assert result_warm.converged
+        np.testing.assert_allclose(result_warm.d, result_cold.d, rtol=1e-5)
+        assert result_warm.iterations <= result_cold.iterations
+
+    def test_warm_start_wrong_active_set_still_converges(self):
+        """Even with an incorrect warm-start, the solver should still converge.
+
+        minimize (1/2)((x-1)^2 + (y-1)^2)
+        subject to x + y >= 0, x >= -10
+
+        Solution: (1, 1) with both constraints inactive.
+        Warm-start with both constraints active (incorrect).
+        """
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, -1.0])
+        A_ineq = jnp.array([[1.0, 1.0], [1.0, 0.0]])
+        b_ineq = jnp.array([0.0, -10.0])
+
+        wrong_active = jnp.array([True, True])
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            initial_active_set=wrong_active,
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.d, jnp.array([1.0, 1.0]), rtol=1e-4)
+
+    def test_no_inequality_active_set_empty(self):
+        """When there are no inequality constraints, active_set should be empty."""
+        H = jnp.eye(2)
+        g = jnp.array([1.0, 1.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+        )
+
+        assert result.active_set.shape == (0,)
+
+
+class TestQPAdaptiveTolerance:
+    """Tests for KKT-residual-based adaptive EXPAND tolerance."""
+
+    def test_kkt_residual_zero_matches_default(self):
+        """With kkt_residual=0, behavior should match default."""
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([2.0])
+
+        result_default = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+        )
+
+        result_zero = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            kkt_residual=0.0,
+        )
+
+        np.testing.assert_allclose(result_default.d, result_zero.d, rtol=1e-10)
+        assert result_default.iterations == result_zero.iterations
+
+    def test_large_kkt_residual_converges(self):
+        """With a large KKT residual the solver should still converge.
+
+        minimize (1/2)(x^2 + y^2) subject to x + y >= 2
+        """
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([2.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            kkt_residual=100.0,
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.d, jnp.array([1.0, 1.0]), rtol=1e-4)
+
+    def test_kkt_residual_capped_at_one(self):
+        """kkt_residual > 1 should produce the same tolerance as kkt_residual=1."""
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        A_ineq = jnp.array([[1.0, 1.0]])
+        b_ineq = jnp.array([2.0])
+
+        result_one = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            kkt_residual=1.0,
+        )
+
+        result_large = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            kkt_residual=1000.0,
+        )
+
+        np.testing.assert_allclose(result_one.d, result_large.d, rtol=1e-10)
+        assert result_one.iterations == result_large.iterations
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

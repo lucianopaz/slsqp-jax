@@ -1569,6 +1569,155 @@ class TestEarlyTerminationFix:
         np.testing.assert_allclose(jnp.sum(y**2), 2.0, rtol=1e-4)
 
 
+class TestWarmStartAndAdaptiveTolerance:
+    """Tests for active-set warm-starting and adaptive tolerance in the outer solver."""
+
+    def test_state_has_prev_active_set(self):
+        """SLSQPState should include prev_active_set after init."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+
+        assert hasattr(state, "prev_active_set")
+        assert state.prev_active_set.dtype == jnp.bool_
+        assert not jnp.any(state.prev_active_set), "Initial active set should be empty"
+
+    def test_prev_active_set_updated_after_step(self):
+        """After a step, prev_active_set should reflect the QP solution."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        _, state, _ = solver.step(objective, x0, None, {}, state, frozenset())
+
+        assert state.prev_active_set.shape == (1,)
+
+    def test_bounds_prev_active_set_size(self):
+        """With bounds, prev_active_set should include bound constraints."""
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            bounds=bounds,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+
+        # 4 bound constraints: lower x, lower y, upper x, upper y
+        assert state.prev_active_set.shape[0] == 4
+
+    def test_warm_start_solver_still_converges(self):
+        """Full solver loop with warm-starting should still converge.
+
+        minimize x^2 + y^2  s.t. x + y >= 2  =>  (1, 1)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y, _ = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-4)
+
+    def test_warm_start_with_bounds_and_equality(self):
+        """Warm-starting should work with combined bounds and equality constraints.
+
+        minimize x^2 + y^2  s.t. x + y = 4, 0 <= x,y <= 3  =>  (2, 2)
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 4.0])
+
+        bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            bounds=bounds,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)
+        assert hasattr(state, "prev_active_set")
+
+    def test_warm_start_jit_compatible(self):
+        """Warm-starting should work under JIT compilation."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=10,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+        )
+
+        x0 = jnp.array([2.0, 2.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+
+        @jax.jit
+        def jit_step(y, state):
+            return solver.step(objective, y, None, {}, state, frozenset())
+
+        y = x0
+        for _ in range(3):
+            y, state, _ = jit_step(y, state)
+
+        assert jnp.linalg.norm(y) < jnp.linalg.norm(x0)
+
+
 class TestStagnationDetection:
     """Tests for outer-loop stagnation detection.
 

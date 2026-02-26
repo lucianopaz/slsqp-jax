@@ -57,6 +57,7 @@ class QPResult(NamedTuple):
     d: Vector
     multipliers_eq: Float[Array, " m_eq"]
     multipliers_ineq: Float[Array, " m_ineq"]
+    active_set: Bool[Array, " m_ineq"]
     converged: Bool[Array, ""]
     iterations: Int[Array, ""]
 
@@ -312,6 +313,8 @@ def solve_qp(
     max_cg_iter: int = 50,
     tol: float = 1e-8,
     expand_factor: float = 1.0,
+    initial_active_set: Bool[Array, " m_ineq"] | None = None,
+    kkt_residual: Scalar | float = 0.0,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -348,9 +351,20 @@ def solve_qp(
             The per-iteration increment is ``tol * expand_factor / max_iter``.
             Default 1.0 doubles the tolerance over the full iteration budget.
             Set to 0.0 to disable expansion.
+        initial_active_set: Optional warm-start active set from a previous
+            QP solve.  When provided, the active-set loop starts from this
+            set instead of a cold-start violation check, promoting multiplier
+            stability across outer SLSQP iterations (Wright, SIAM J. Optim.,
+            2002, Section 8).
+        kkt_residual: Norm of the KKT residual from the outer solver.
+            When nonzero, the EXPAND base tolerance is widened
+            proportionally so that the QP tolerates larger violations
+            far from optimality and tightens automatically as convergence
+            proceeds.
 
     Returns:
-        QPResult containing the solution, multipliers, and convergence info.
+        QPResult containing the solution, multipliers, active set, and
+        convergence info.
     """
     m_eq = A_eq.shape[0]
     m_ineq = A_ineq.shape[0]
@@ -363,6 +377,7 @@ def solve_qp(
             d=d,
             multipliers_eq=jnp.zeros((0,)),
             multipliers_ineq=jnp.zeros((0,)),
+            active_set=jnp.zeros((0,), dtype=bool),
             converged=jnp.array(True),
             iterations=jnp.array(1),
         )
@@ -377,6 +392,7 @@ def solve_qp(
             d=d,
             multipliers_eq=mult_eq,
             multipliers_ineq=jnp.zeros((0,)),
+            active_set=jnp.zeros((0,), dtype=bool),
             converged=jnp.array(True),
             iterations=jnp.array(1),
         )
@@ -386,6 +402,11 @@ def solve_qp(
     A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
     b_combined = jnp.concatenate([b_eq, b_ineq])
 
+    # Adaptive EXPAND: widen base tolerance proportionally to KKT residual.
+    # When kkt_residual is 0 (default), this reduces to the original tol.
+    kkt_residual = jnp.asarray(kkt_residual, dtype=jnp.float64)
+    base_tol = tol + jnp.minimum(kkt_residual, 1.0) * tol
+
     # Step 1: Initial solve with equality constraints only
     eq_only_mask = jnp.concatenate(
         [jnp.ones(m_eq, dtype=bool), jnp.zeros(m_ineq, dtype=bool)]
@@ -394,9 +415,12 @@ def solve_qp(
         hvp_fn, g, A_combined, b_combined, eq_only_mask, max_cg_iter, tol
     )
 
-    # Check which inequality constraints are violated by the initial solution
+    # Determine starting active set: warm-start or cold-start
     residuals_init = A_ineq @ d_init - b_ineq
-    init_active = residuals_init < -tol
+    if initial_active_set is not None:
+        init_active = initial_active_set | (residuals_init < -base_tol)
+    else:
+        init_active = residuals_init < -base_tol
     init_converged = ~jnp.any(init_active)
 
     mult_eq_init = mult_init[:m_eq] if m_eq > 0 else jnp.zeros((0,))
@@ -414,11 +438,11 @@ def solve_qp(
         return ~state.converged & (state.iteration < max_iter)
 
     # EXPAND anti-cycling: per-iteration tolerance increment
-    tau = tol * expand_factor / jnp.maximum(max_iter, 1)
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
 
     def body_fn(state: QPState) -> QPState:
         # EXPAND: working tolerance grows monotonically each iteration
-        working_tol = tol + state.iteration * tau
+        working_tol = base_tol + state.iteration * tau
 
         # Build active mask for the combined constraint matrix
         combined_mask = jnp.concatenate([jnp.ones(m_eq, dtype=bool), state.active_set])
@@ -491,6 +515,7 @@ def solve_qp(
         d=final_state.d,
         multipliers_eq=final_state.multipliers_eq,
         multipliers_ineq=final_state.multipliers_ineq,
+        active_set=final_state.active_set,
         converged=final_state.converged,
         iterations=final_state.iteration,
     )

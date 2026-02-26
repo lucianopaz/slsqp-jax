@@ -79,6 +79,8 @@ class SLSQPState(eqx.Module):
         bound_jac: Constant Jacobian for bound constraints (computed once in init).
         qp_iterations: Total accumulated QP active-set iterations across all steps.
         qp_converged: Whether the most recent QP solve converged.
+        prev_active_set: Active inequality constraint set from the previous QP solve,
+            used for warm-starting the next QP subproblem.
     """
 
     # Iteration tracking
@@ -114,6 +116,10 @@ class SLSQPState(eqx.Module):
     qp_iterations: Int[Array, ""]
     qp_converged: Bool[Array, ""]
 
+    # Active-set warm-starting: carry the QP active set across iterations
+    # to promote multiplier stability (Wright, SIAM J. Optim., 2002, Sec. 8)
+    prev_active_set: Bool[Array, " m_ineq"]
+
     # Stagnation detection
     prev_merit: Scalar
     stagnation_count: Int[Array, ""]
@@ -127,6 +133,7 @@ class QPResult(eqx.Module):
         direction: The search direction d from the QP solution.
         multipliers_eq: Lagrange multipliers for equality constraints.
         multipliers_ineq: Lagrange multipliers for inequality constraints.
+        active_set: Boolean mask of active inequality constraints at the solution.
         converged: Whether the QP solver converged successfully.
         iterations: Number of active-set iterations taken.
     """
@@ -134,6 +141,7 @@ class QPResult(eqx.Module):
     direction: Vector
     multipliers_eq: Float[Array, " m_eq"]
     multipliers_ineq: Float[Array, " m_ineq"]
+    active_set: Bool[Array, " m_ineq"]
     converged: Bool[Array, ""]
     iterations: Int[Array, ""]
 
@@ -682,6 +690,7 @@ class SLSQP(optx.AbstractMinimiser):
             bound_jac=bound_jac,
             qp_iterations=jnp.array(0),
             qp_converged=jnp.array(True),
+            prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
             prev_merit=prev_merit,
             stagnation_count=jnp.array(0),
             last_alpha=jnp.array(1.0),
@@ -826,6 +835,7 @@ class SLSQP(optx.AbstractMinimiser):
             bound_jac=state.bound_jac,
             qp_iterations=state.qp_iterations + qp_result.iterations,
             qp_converged=qp_result.converged,
+            prev_active_set=qp_result.active_set,
             prev_merit=merit_new,
             stagnation_count=new_stagnation_count,
             last_alpha=alpha,
@@ -1005,12 +1015,17 @@ class SLSQP(optx.AbstractMinimiser):
 
         using the HVP function v -> B @ v for the Hessian.
 
+        The previous iteration's QP active set is passed as a warm-start
+        hint, and the outer KKT residual norm is used for adaptive EXPAND
+        tolerance scaling.
+
         Args:
             state: Current solver state.
             hvp_fn: Hessian-vector product function for the Lagrangian.
 
         Returns:
-            QPResult containing the search direction and multipliers.
+            QPResult containing the search direction, multipliers, and
+            active set.
         """
         g = state.grad
 
@@ -1021,6 +1036,13 @@ class SLSQP(optx.AbstractMinimiser):
         A_ineq = state.ineq_jac
         b_ineq = -state.ineq_val
 
+        # KKT residual for adaptive EXPAND tolerance
+        kkt_residual = jnp.linalg.norm(state.prev_grad_lagrangian)
+
+        # Warm-start: use the active set from the previous outer iteration.
+        # On the first iteration prev_active_set is all-False (cold start).
+        initial_active_set = state.prev_active_set
+
         qp_result = solve_qp(
             hvp_fn=hvp_fn,
             g=g,
@@ -1030,12 +1052,15 @@ class SLSQP(optx.AbstractMinimiser):
             b_ineq=b_ineq,
             max_iter=self.qp_max_iter,
             max_cg_iter=self.qp_max_cg_iter,
+            initial_active_set=initial_active_set,
+            kkt_residual=kkt_residual,
         )
 
         return QPResult(
             direction=qp_result.d,
             multipliers_eq=qp_result.multipliers_eq,
             multipliers_ineq=qp_result.multipliers_ineq,
+            active_set=qp_result.active_set,
             converged=qp_result.converged,
             iterations=qp_result.iterations,
         )

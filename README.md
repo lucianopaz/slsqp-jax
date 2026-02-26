@@ -256,6 +256,14 @@ Because $\delta_k$ increases at every step, marginally active or marginally infe
 
 EXPAND is the standard anti-cycling technique used in production solvers (MINOS, SNOPT, SQOPT) and is backed by a convergence guarantee: strict objective decrease within each expanding sequence. The `expand_factor` parameter on `solve_qp` controls the growth rate; set it to `0.0` to disable expansion entirely.
 
+### Multiplier stability and convergence rate
+
+Wright (*Properties of the Log-Barrier Function on Degenerate Nonlinear Programs*, SIAM J. Optim., 2002, Theorem 5.3) proved that the convergence rate of SQP methods depends critically on **multiplier stability**: the rate at which Lagrange multipliers change between successive iterations. Specifically, superlinear convergence requires $\lVert \lambda_k - \lambda_{k+1} \rVert = O(\delta)$ where $\delta$ is the step norm. When the QP subproblem is degenerate, the multiplier solution may not be unique, and arbitrary choices across iterations can destroy this stability — even though the primal iterates converge.
+
+This implementation promotes multiplier stability through **active-set warm-starting**: the final active set from each QP solve is passed as the initial guess for the next outer iteration's QP subproblem. Because the active set carries implicit information about which multipliers are nonzero, reusing it across iterations biases the QP toward consistent multiplier selections. This is the same strategy used by production SQP codes such as SNOPT (Gill, Murray & Saunders, 2005).
+
+For pathological cases where warm-starting is insufficient, proximal multiplier stabilization (the sSQP approach of Wright, 2002, Section 6) adds an explicit penalty term $\tfrac{1}{2}\sigma \lVert \lambda - \lambda_k \rVert^2$ to the QP objective. This is not currently implemented but is tracked as a potential enhancement.
+
 ### Outer-loop stagnation detection
 
 Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this by tracking the **L1 merit function** across iterations:

@@ -100,6 +100,8 @@ Each SLSQP iteration performs four steps:
 
 **QP anti-cycling (EXPAND procedure):** The active-set QP solver uses the EXPAND procedure (Gill, Murray, Saunders & Wright, 1989) to prevent cycling at degenerate vertices. A working tolerance `delta_k = tol + k * tau` grows monotonically each active-set iteration, ensuring strict progress and preventing the same constraint from being repeatedly activated and deactivated. Controlled by the `expand_factor` parameter on `solve_qp`.
 
+**Multiplier stability:** Wright (SIAM J. Optim., 2002, Theorem 5.3) proved that SQP superlinear convergence requires multiplier stability across iterations. The solver promotes this by warm-starting the QP active set from the previous iteration and using an adaptive EXPAND tolerance tied to the outer KKT residual. Proximal multiplier stabilization (sSQP) is a stronger remedy tracked as a potential enhancement.
+
 **Outer-loop stagnation detection:** The solver tracks the L1 merit function across iterations and declares failure if the relative improvement falls below `stagnation_tol` for `stagnation_patience` consecutive iterations. This prevents the solver from exhausting `max_steps` on infeasible or degenerate problems. Controlled by `stagnation_tol` and `stagnation_patience` on `SLSQP`.
 
 ## The Task: SLSQP Implementation
