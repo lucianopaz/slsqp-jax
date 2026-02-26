@@ -17,6 +17,7 @@ from slsqp_jax.hessian import (
     lbfgs_append,
     lbfgs_hvp,
     lbfgs_init,
+    lbfgs_inverse_hvp,
 )
 from slsqp_jax.merit import (
     LineSearchResult,
@@ -56,6 +57,7 @@ __all__ = [
     "LBFGSHistory",
     "lbfgs_init",
     "lbfgs_hvp",
+    "lbfgs_inverse_hvp",
     "lbfgs_append",
     # Merit function
     "LineSearchResult",

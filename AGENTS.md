@@ -69,6 +69,8 @@ Classical SLSQP solves the QP subproblem by forming and factorising the (n+m)×(
 
 Total cost per QP solve: O(n·k·t), where t is the number of CG iterations (typically t << n).
 
+**Preconditioning**: The CG solver supports an optional preconditioner M ≈ B⁻¹. By default, the L-BFGS inverse Hessian (two-loop recursion, Algorithm 7.4 of Nocedal & Wright) is used as M. This dramatically reduces the number of CG iterations on ill-conditioned subproblems (e.g., when proximal stabilization inflates the condition number). For projected CG, the preconditioner is applied as z = P(M(P(r))) to keep the search direction in the constraint null space.
+
 ### Derivative Computation
 
 By default, the solver computes:
