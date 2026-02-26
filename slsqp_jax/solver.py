@@ -32,6 +32,7 @@ from slsqp_jax.hessian import (
     lbfgs_append,
     lbfgs_hvp,
     lbfgs_init,
+    lbfgs_inverse_hvp,
 )
 from slsqp_jax.merit import (
     backtracking_line_search,
@@ -237,6 +238,13 @@ class SLSQP(optx.AbstractMinimiser):
             ``1/proximal_sigma``, regularizing the dual solution and preventing
             QP infeasibility at degenerate vertices.  Recommended range:
             ``[1e-4, 1e-1]``.  Default 0.0 disables stabilization.
+        use_preconditioner: When True (default), the L-BFGS inverse Hessian
+            (two-loop recursion) is used as a preconditioner for the inner
+            CG solver, dramatically improving convergence on ill-conditioned
+            QP subproblems.
+        adaptive_cg_tol: When True, the CG convergence tolerance is adapted
+            based on the outer KKT residual (Eisenstat-Walker style).
+            Default False preserves baseline behavior.
 
     Example:
         >>> import jax.numpy as jnp
@@ -331,6 +339,20 @@ class SLSQP(optx.AbstractMinimiser):
     # values mean more relaxation.  Recommended range: [1e-4, 1e-1].
     # Default 0.0 disables stabilization (standard QP).
     proximal_sigma: float = 0.0
+
+    # Preconditioned CG: use L-BFGS inverse Hessian (two-loop recursion)
+    # as preconditioner for the inner CG solver.  Dramatically improves
+    # convergence on ill-conditioned QP subproblems, especially when
+    # proximal_sigma is active.  Default True; set False to disable.
+    use_preconditioner: bool = eqx.field(static=True, default=True)
+
+    # Adaptive CG tolerance (Eisenstat-Walker-inspired).  Instead of
+    # a fixed CG tolerance of atol, the tolerance is set to
+    # min(0.1, max(atol, ||grad_L||)) so early QPs are solved loosely
+    # and accuracy increases as the outer solver converges.  Default
+    # False preserves baseline behavior; enable for large-scale problems
+    # where early QP over-solving is wasteful.
+    adaptive_cg_tol: bool = eqx.field(static=True, default=False)
 
     # Stagnation detection parameters
     stagnation_tol: float = 1e-12
@@ -569,6 +591,25 @@ class SLSQP(optx.AbstractMinimiser):
             return lbfgs_hvp(lbfgs_history, v)
 
         return lbfgs_lagrangian_hvp
+
+    def _build_preconditioner(
+        self,
+        state: "SLSQPState",
+    ) -> Callable[[Vector], Vector] | None:
+        """Build the L-BFGS inverse Hessian preconditioner for PCG.
+
+        Returns a closure v -> H_k @ v = B_k^{-1} @ v using the two-loop
+        recursion (Nocedal & Wright, Algorithm 7.4).  When preconditioning
+        is disabled, returns ``None``.
+        """
+        if not self.use_preconditioner:
+            return None
+        lbfgs_history = state.lbfgs_history
+
+        def preconditioner(v: Vector) -> Vector:
+            return lbfgs_inverse_hvp(lbfgs_history, v)
+
+        return preconditioner
 
     def _build_exact_lagrangian_hvp(
         self,
@@ -1042,6 +1083,12 @@ class SLSQP(optx.AbstractMinimiser):
         tolerance scaling.  When ``proximal_sigma > 0``, the equality
         constraints are absorbed into the objective via sSQP.
 
+        When ``use_preconditioner`` is True, the L-BFGS inverse Hessian
+        is passed to the QP solver as a CG preconditioner.
+
+        When ``adaptive_cg_tol`` is True, the CG tolerance is adapted
+        based on the outer KKT residual (Eisenstat-Walker style).
+
         Args:
             state: Current solver state.
             hvp_fn: Hessian-vector product function for the Lagrangian.
@@ -1052,19 +1099,25 @@ class SLSQP(optx.AbstractMinimiser):
         """
         g = state.grad
 
-        # Linearized constraints (rearranged to standard form)
         A_eq = state.eq_jac
         b_eq = -state.eq_val
 
         A_ineq = state.ineq_jac
         b_ineq = -state.ineq_val
 
-        # KKT residual for adaptive EXPAND tolerance
         kkt_residual = jnp.linalg.norm(state.prev_grad_lagrangian)
 
-        # Warm-start: use the active set from the previous outer iteration.
-        # On the first iteration prev_active_set is all-False (cold start).
         initial_active_set = state.prev_active_set
+
+        precond_fn = self._build_preconditioner(state)
+
+        # Eisenstat-Walker adaptive CG tolerance: solve loosely far from
+        # optimum (fast), tightly near the solution (accurate).
+        # Kept separate from `tol` so feasibility checking stays tight.
+        if self.adaptive_cg_tol:
+            adaptive_tol = jnp.minimum(0.1, jnp.maximum(self.atol, kkt_residual))
+        else:
+            adaptive_tol = None
 
         qp_result = solve_qp(
             hvp_fn=hvp_fn,
@@ -1079,6 +1132,8 @@ class SLSQP(optx.AbstractMinimiser):
             kkt_residual=kkt_residual,
             proximal_sigma=self.proximal_sigma,
             prev_multipliers_eq=state.multipliers_eq,
+            precond_fn=precond_fn,
+            cg_tol=adaptive_tol,
         )
 
         return QPResult(

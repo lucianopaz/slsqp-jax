@@ -1934,3 +1934,112 @@ class TestProximalStabilization:
 
         sol = do_solve(x0)
         np.testing.assert_allclose(sol.value[0] + sol.value[1], 1.0, atol=1e-3)
+
+
+class TestPreconditionedSolver:
+    """Integration tests for the L-BFGS preconditioned CG solver."""
+
+    def test_preconditioned_convergence(self):
+        """Preconditioned solver converges on a problem with equality constraints."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            use_preconditioner=True,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        x0 = jnp.array([0.1, 0.9])
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-4)
+        np.testing.assert_allclose(y[0], 0.5, atol=0.05)
+
+    def test_preconditioner_disabled_regression(self):
+        """use_preconditioner=False matches behavior of unpreconditioned solver."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] - 0.5])
+
+        solver_on = SLSQP(
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            use_preconditioner=True,
+            adaptive_cg_tol=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        solver_off = SLSQP(
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            use_preconditioner=False,
+            adaptive_cg_tol=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y_on, _ = _run_solver(solver_on, objective, x0)
+        y_off, _ = _run_solver(solver_off, objective, x0)
+
+        np.testing.assert_allclose(y_on, y_off, atol=0.05)
+
+    def test_adaptive_cg_tol(self):
+        """Adaptive CG tolerance does not break convergence."""
+
+        def objective(x, args):
+            return (x[0] - 1.0) ** 2 + (x[1] - 2.0) ** 2, None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 2.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            adaptive_cg_tol=True,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        y, _ = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y[0] + y[1], 2.0, atol=1e-4)
+
+    def test_jit_compatible(self):
+        """JIT compilation works with preconditioning enabled."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            use_preconditioner=True,
+            adaptive_cg_tol=True,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        x0 = jnp.array([0.5, 0.5])
+
+        @jax.jit
+        def do_solve(x0):
+            return optx.minimise(
+                objective,
+                solver,
+                x0,
+                has_aux=True,
+                max_steps=50,
+                throw=False,
+            )
+
+        sol = do_solve(x0)
+        np.testing.assert_allclose(sol.value[0] + sol.value[1], 1.0, atol=1e-3)

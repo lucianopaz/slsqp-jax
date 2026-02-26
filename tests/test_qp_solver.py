@@ -889,5 +889,167 @@ class TestProximalStabilization:
         )
 
 
+class TestPreconditionedCG:
+    """Tests for preconditioned conjugate gradient in the QP solver."""
+
+    def test_pcg_matches_unpreconditioned_well_conditioned(self):
+        """On a well-conditioned Hessian, PCG and CG produce the same result."""
+        H = jnp.array([[3.0, 1.0], [1.0, 4.0]])
+        g = jnp.array([1.0, -2.0])
+        A_eq = jnp.zeros((0, 2))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, 2))
+        b_ineq = jnp.zeros(0)
+
+        H_inv = jnp.linalg.inv(H)
+
+        result_no_precond = solve_qp(_make_hvp(H), g, A_eq, b_eq, A_ineq, b_ineq)
+        result_precond = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            precond_fn=lambda v: H_inv @ v,
+        )
+
+        np.testing.assert_allclose(result_precond.d, result_no_precond.d, atol=1e-10)
+
+    def test_pcg_converges_ill_conditioned(self):
+        """PCG converges on an ill-conditioned H where unpreconditioned CG struggles."""
+        n = 20
+        rng = np.random.RandomState(42)
+        Q, _ = np.linalg.qr(rng.randn(n, n))
+        eigenvalues = np.logspace(-3, 2, n)
+        H = jnp.array(Q @ np.diag(eigenvalues) @ Q.T)
+        g = jnp.array(rng.randn(n))
+        A_eq = jnp.zeros((0, n))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, n))
+        b_ineq = jnp.zeros(0)
+
+        expected = -jnp.linalg.solve(H, g)
+
+        H_inv = jnp.linalg.inv(H)
+        result_precond = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            max_cg_iter=5,
+            precond_fn=lambda v: H_inv @ v,
+        )
+        np.testing.assert_allclose(result_precond.d, expected, atol=1e-6)
+
+        result_no_precond = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            max_cg_iter=5,
+        )
+        error_no_precond = float(jnp.linalg.norm(result_no_precond.d - expected))
+        error_precond = float(jnp.linalg.norm(result_precond.d - expected))
+        assert error_precond < error_no_precond * 0.01
+
+    def test_pcg_with_proximal_stabilization(self):
+        """PCG works with proximal stabilization (sSQP)."""
+        H = jnp.eye(3) * 0.001
+        g = jnp.array([1.0, -1.0, 0.5])
+        A_eq = jnp.array([[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]])
+        b_eq = jnp.array([1.0, 0.5])
+        A_ineq = jnp.zeros((0, 3))
+        b_ineq = jnp.zeros(0)
+
+        H_inv = jnp.linalg.inv(H)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            proximal_sigma=0.01,
+            precond_fn=lambda v: H_inv @ v,
+        )
+        residual = A_eq @ result.d - b_eq
+        np.testing.assert_allclose(residual, 0.0, atol=0.1)
+
+    def test_pcg_projected_equality_constrained(self):
+        """PCG with equality constraints in projected null space."""
+        H = jnp.array([[10.0, 0.0], [0.0, 0.1]])
+        g = jnp.array([1.0, 1.0])
+        A_eq = jnp.array([[1.0, 1.0]])
+        b_eq = jnp.array([0.5])
+        A_ineq = jnp.zeros((0, 2))
+        b_ineq = jnp.zeros(0)
+
+        H_inv = jnp.linalg.inv(H)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            precond_fn=lambda v: H_inv @ v,
+        )
+        np.testing.assert_allclose(A_eq @ result.d, b_eq, atol=1e-6)
+
+    def test_pcg_identity_preconditioner(self):
+        """Identity preconditioner behaves like no preconditioning."""
+        H = jnp.array([[2.0, 0.5], [0.5, 3.0]])
+        g = jnp.array([1.0, -1.0])
+        A_eq = jnp.zeros((0, 2))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, 2))
+        b_ineq = jnp.zeros(0)
+
+        result_none = solve_qp(_make_hvp(H), g, A_eq, b_eq, A_ineq, b_ineq)
+        result_identity = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            precond_fn=lambda v: v,
+        )
+        np.testing.assert_allclose(result_identity.d, result_none.d, atol=1e-10)
+
+    def test_pcg_with_active_set(self):
+        """Full QP with inequality constraints and preconditioner."""
+        n = 10
+        rng = np.random.RandomState(123)
+        Q, _ = np.linalg.qr(rng.randn(n, n))
+        eigenvalues = np.logspace(-2, 2, n)
+        H = jnp.array(Q @ np.diag(eigenvalues) @ Q.T)
+        g = jnp.array(rng.randn(n))
+        A_eq = jnp.zeros((0, n))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.eye(n)
+        b_ineq = jnp.zeros(n)
+
+        H_inv = jnp.linalg.inv(H)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            precond_fn=lambda v: H_inv @ v,
+        )
+        np.testing.assert_array_less(-1e-6, A_ineq @ result.d - b_ineq)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

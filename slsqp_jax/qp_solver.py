@@ -69,12 +69,16 @@ class QPResult(NamedTuple):
 
 
 class _CGState(NamedTuple):
-    """Internal state for the projected conjugate gradient solver."""
+    """Internal state for the (preconditioned) conjugate gradient solver.
+
+    When a preconditioner M is used, ``rz`` stores r^T z (where z = M r)
+    instead of r^T r, and ``p`` is built from z rather than r.
+    """
 
     d: Vector
     r: Vector
     p: Vector
-    r_norm_sq: Scalar
+    rz: Scalar  # r^T z (preconditioned) or r^T r (unpreconditioned)
     iteration: Int[Array, ""]
     converged: Bool[Array, ""]
 
@@ -83,17 +87,22 @@ def _solve_unconstrained_cg(
     hvp_fn: Callable[[Vector], Vector],
     g: Vector,
     max_cg_iter: int,
-    cg_tol: float,
+    cg_tol: Scalar | float,
+    precond_fn: Callable[[Vector], Vector] | None = None,
 ) -> Vector:
     """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
 
-    Uses conjugate gradient to solve B d = -g without forming B.
+    Uses (preconditioned) conjugate gradient to solve B d = -g without
+    forming B.  When *precond_fn* is provided, the standard PCG algorithm
+    is used: z = M r, beta = r_new^T z_new / r_old^T z_old, and p is
+    built from z (Nocedal & Wright, Algorithm 5.3).
 
     Args:
         hvp_fn: Hessian-vector product function v -> B @ v.
         g: Linear term (gradient).
         max_cg_iter: Maximum CG iterations.
         cg_tol: Convergence tolerance on residual norm.
+        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
 
     Returns:
         Solution vector d.
@@ -102,11 +111,22 @@ def _solve_unconstrained_cg(
     r0 = -g
     r0_norm_sq = jnp.dot(r0, r0)
 
+    if precond_fn is not None:
+        z0 = precond_fn(r0)
+        rz0_raw = jnp.dot(r0, z0)
+        # Fall back to identity if preconditioner is not SPD for this residual
+        z0 = jnp.where(rz0_raw > 0, z0, r0)
+        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
+        p0 = z0
+    else:
+        rz0 = r0_norm_sq
+        p0 = r0
+
     init_cg = _CGState(
         d=jnp.zeros(n),
         r=r0,
-        p=r0,
-        r_norm_sq=r0_norm_sq,
+        p=p0,
+        rz=rz0,
         iteration=jnp.array(0),
         converged=r0_norm_sq < cg_tol**2,
     )
@@ -116,32 +136,39 @@ def _solve_unconstrained_cg(
             Bp = hvp_fn(state.p)
             pBp = jnp.dot(state.p, Bp)
 
-            # Detect negative or near-zero curvature
             has_bad_curvature = pBp <= 1e-8
 
             alpha = jnp.where(
                 has_bad_curvature,
                 jnp.array(0.0),
-                state.r_norm_sq / pBp,
+                state.rz / jnp.maximum(pBp, 1e-30),
             )
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * Bp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
-            beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
-            p_new = r_new + beta * state.p
+            if precond_fn is not None:
+                z_new_raw = precond_fn(r_new)
+                rz_raw = jnp.dot(r_new, z_new_raw)
+                z_new = jnp.where(rz_raw > 0, z_new_raw, r_new)
+                rz_new = jnp.where(rz_raw > 0, rz_raw, r_new_norm_sq)
+            else:
+                z_new = r_new
+                rz_new = r_new_norm_sq
+
+            beta = rz_new / jnp.maximum(state.rz, 1e-30)
+            p_new = z_new + beta * state.p
 
             converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
 
-            # If bad curvature, keep current state
             return jax.lax.cond(
                 has_bad_curvature,
                 lambda: _CGState(
                     d=state.d,
                     r=state.r,
                     p=state.p,
-                    r_norm_sq=state.r_norm_sq,
+                    rz=state.rz,
                     iteration=state.iteration + 1,
                     converged=jnp.array(True),
                 ),
@@ -149,7 +176,7 @@ def _solve_unconstrained_cg(
                     d=d_new,
                     r=r_new,
                     p=p_new,
-                    r_norm_sq=r_new_norm_sq,
+                    rz=rz_new,
                     iteration=state.iteration + 1,
                     converged=converged,
                 ),
@@ -168,9 +195,10 @@ def _solve_projected_cg(
     b: Float[Array, " m"],
     active_mask: Bool[Array, " m"],
     max_cg_iter: int,
-    cg_tol: float,
+    cg_tol: Scalar | float,
+    precond_fn: Callable[[Vector], Vector] | None = None,
 ) -> tuple[Vector, Float[Array, " m"]]:
-    """Solve equality-constrained QP using projected conjugate gradient.
+    """Solve equality-constrained QP using projected (preconditioned) CG.
 
     Solves:
         minimize    (1/2) d^T B d + g^T d
@@ -186,9 +214,9 @@ def _solve_projected_cg(
     3. Runs CG on the reduced problem in the null space of A.
     4. Recovers Lagrange multipliers from the KKT conditions.
 
-    The projection involves a small m x m system (A A^T) which is
-    solved directly. Inactive constraint rows are zeroed and regularized
-    so that the system remains non-singular.
+    When *precond_fn* is provided, the projected PCG algorithm is used:
+    z = P(M(P(r))) where M is the preconditioner (Nocedal & Wright,
+    Chapter 16).  The extra projection ensures z stays in the null space.
 
     Complexity per CG iteration: O(kn) for HVP + O(mn) for projection,
     where k is L-BFGS memory and m is the number of constraints.
@@ -201,6 +229,7 @@ def _solve_projected_cg(
         active_mask: Boolean mask (m,) indicating which constraints are active.
         max_cg_iter: Maximum CG iterations.
         cg_tol: CG convergence tolerance.
+        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
 
     Returns:
         Tuple of (d, multipliers) where d is the solution and multipliers
@@ -209,38 +238,39 @@ def _solve_projected_cg(
     """
     m = A.shape[0]
 
-    # Mask inactive constraints: zero out their rows
     A_masked = jnp.where(active_mask[:, None], A, 0.0)
     b_masked = jnp.where(active_mask, b, 0.0)
 
-    # Build regularized A A^T (m x m, small)
-    # Active rows contribute normally; inactive rows get diagonal 1.0
-    # to keep the system non-singular (their multiplier will be 0).
     reg_diag = jnp.where(active_mask, 0.0, 1.0)
     AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
 
     def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        """Solve AAt @ x = rhs using direct solve."""
         return jnp.linalg.solve(AAt, rhs)
 
-    # Particular solution satisfying A d_p = b (for active constraints)
     d_p = A_masked.T @ solve_AAt(b_masked)
 
-    # Projection onto null space of active constraints:
-    # P(v) = v - A^T (A A^T)^{-1} A v
     def project(v: Vector) -> Vector:
         return v - A_masked.T @ solve_AAt(A_masked @ v)
 
-    # Initial residual for CG in the null space
     Bd_p = hvp_fn(d_p)
     r0 = project(-(g + Bd_p))
     r0_norm_sq = jnp.dot(r0, r0)
 
+    if precond_fn is not None:
+        z0 = project(precond_fn(r0))
+        rz0_raw = jnp.dot(r0, z0)
+        z0 = jnp.where(rz0_raw > 0, z0, r0)
+        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
+        p0 = z0
+    else:
+        rz0 = r0_norm_sq
+        p0 = r0
+
     init_cg = _CGState(
         d=d_p,
         r=r0,
-        p=r0,
-        r_norm_sq=r0_norm_sq,
+        p=p0,
+        rz=rz0,
         iteration=jnp.array(0),
         converged=r0_norm_sq < cg_tol**2,
     )
@@ -251,34 +281,39 @@ def _solve_projected_cg(
             PBp = project(Bp)
             pPBp = jnp.dot(state.p, PBp)
 
-            # Detect negative or near-zero curvature - stop CG and keep current d
             has_bad_curvature = pPBp <= 1e-8
 
-            # Only proceed if curvature is positive
             alpha = jnp.where(
                 has_bad_curvature,
                 jnp.array(0.0),
-                state.r_norm_sq / pPBp,
+                state.rz / jnp.maximum(pPBp, 1e-30),
             )
 
             d_new = state.d + alpha * state.p
             r_new = state.r - alpha * PBp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
-            beta = r_new_norm_sq / jnp.maximum(state.r_norm_sq, 1e-30)
-            p_new = r_new + beta * state.p
+            if precond_fn is not None:
+                z_new_raw = project(precond_fn(r_new))
+                rz_raw = jnp.dot(r_new, z_new_raw)
+                z_new = jnp.where(rz_raw > 0, z_new_raw, r_new)
+                rz_new = jnp.where(rz_raw > 0, rz_raw, r_new_norm_sq)
+            else:
+                z_new = r_new
+                rz_new = r_new_norm_sq
 
-            # Mark as converged if we have bad curvature (to stop iteration)
+            beta = rz_new / jnp.maximum(state.rz, 1e-30)
+            p_new = z_new + beta * state.p
+
             converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
 
-            # If bad curvature, keep the previous state
             return jax.lax.cond(
                 has_bad_curvature,
                 lambda: _CGState(
                     d=state.d,
                     r=state.r,
                     p=state.p,
-                    r_norm_sq=state.r_norm_sq,
+                    rz=state.rz,
                     iteration=state.iteration + 1,
                     converged=jnp.array(True),
                 ),
@@ -286,7 +321,7 @@ def _solve_projected_cg(
                     d=d_new,
                     r=r_new,
                     p=p_new,
-                    r_norm_sq=r_new_norm_sq,
+                    rz=rz_new,
                     iteration=state.iteration + 1,
                     converged=converged,
                 ),
@@ -296,12 +331,9 @@ def _solve_projected_cg(
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
-    # Recover multipliers from KKT stationarity:
-    # B d + g - A^T lambda = 0  =>  lambda = (A A^T)^{-1} A (B d + g)
     Bd = hvp_fn(final_cg.d)
     kkt_residual = A_masked @ (Bd + g)
     multipliers = solve_AAt(kkt_residual)
-    # Zero out multipliers for inactive constraints
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
     return final_cg.d, multipliers
@@ -318,12 +350,14 @@ def _solve_qp_proximal(
     m_ineq: int,
     max_iter: int,
     max_cg_iter: int,
-    tol: float,
+    tol: Scalar | float,
     expand_factor: float,
     initial_active_set: Bool[Array, " m_ineq"] | None,
     kkt_residual: Scalar | float,
     proximal_sigma: float,
     prev_multipliers_eq: Float[Array, " m_eq"] | None,
+    precond_fn: Callable[[Vector], Vector] | None = None,
+    cg_tol: Scalar | float | None = None,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -345,6 +379,7 @@ def _solve_qp_proximal(
     prev_mult_eq = (
         prev_multipliers_eq if prev_multipliers_eq is not None else jnp.zeros((m_eq,))
     )
+    inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
 
     def stabilized_hvp(v: Vector) -> Vector:
         return hvp_fn(v) + inv_sigma * (A_eq.T @ (A_eq @ v))
@@ -356,7 +391,13 @@ def _solve_qp_proximal(
 
     # Sub-case: no inequality constraints — just unconstrained CG
     if m_ineq == 0:
-        d = _solve_unconstrained_cg(stabilized_hvp, g_mod, max_cg_iter, tol)
+        d = _solve_unconstrained_cg(
+            stabilized_hvp,
+            g_mod,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
+        )
         return QPResult(
             d=d,
             multipliers_eq=_recover_mult_eq(d),
@@ -371,7 +412,13 @@ def _solve_qp_proximal(
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
 
     # Initial unconstrained solve (equalities absorbed into objective)
-    d_init = _solve_unconstrained_cg(stabilized_hvp, g_mod, max_cg_iter, tol)
+    d_init = _solve_unconstrained_cg(
+        stabilized_hvp,
+        g_mod,
+        max_cg_iter,
+        inner_cg_tol,
+        precond_fn=precond_fn,
+    )
 
     # Determine starting active set
     residuals_init = A_ineq @ d_init - b_ineq
@@ -406,7 +453,8 @@ def _solve_qp_proximal(
             b_ineq,
             state.active_set,
             max_cg_iter,
-            tol,
+            inner_cg_tol,
+            precond_fn=precond_fn,
         )
 
         mult_eq_new = _recover_mult_eq(d_new)
@@ -491,6 +539,8 @@ def solve_qp(
     kkt_residual: Scalar | float = 0.0,
     proximal_sigma: float = 0.0,
     prev_multipliers_eq: Float[Array, " m_eq"] | None = None,
+    precond_fn: Callable | None = None,
+    cg_tol: Scalar | float | None = None,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -558,6 +608,16 @@ def solve_qp(
         prev_multipliers_eq: Equality multipliers from the previous outer
             iteration, used as the proximal center when ``proximal_sigma > 0``.
             When ``None``, defaults to zeros.
+        precond_fn: Optional preconditioner function v -> M @ v where
+            M approximates H^{-1}.  When provided, the inner CG solver
+            uses preconditioned CG (PCG), which dramatically improves
+            convergence on ill-conditioned subproblems.  Typically
+            the L-BFGS inverse Hessian (two-loop recursion) is used.
+        cg_tol: Optional CG convergence tolerance that overrides ``tol``
+            for the inner CG solver only.  When ``None`` (default), the
+            CG solver uses ``tol``.  This allows the CG tolerance to be
+            adapted (e.g. Eisenstat-Walker) independently of the
+            feasibility tolerance used by the active-set method.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -567,9 +627,14 @@ def solve_qp(
     m_ineq = A_ineq.shape[0]
     m_total = m_eq + m_ineq
 
+    # Resolve CG tolerance: use cg_tol if provided, else fall back to tol.
+    inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
+
     # Case 1: No constraints at all
     if m_total == 0:
-        d = _solve_unconstrained_cg(hvp_fn, g, max_cg_iter, tol)
+        d = _solve_unconstrained_cg(
+            hvp_fn, g, max_cg_iter, inner_cg_tol, precond_fn=precond_fn
+        )
         return QPResult(
             d=d,
             multipliers_eq=jnp.zeros((0,)),
@@ -580,7 +645,6 @@ def solve_qp(
         )
 
     # ---- Proximal stabilized path (sSQP) ----
-    # Absorb equality constraints into the objective when proximal_sigma > 0.
     if proximal_sigma > 0 and m_eq > 0:
         return _solve_qp_proximal(
             hvp_fn=hvp_fn,
@@ -599,6 +663,8 @@ def solve_qp(
             kkt_residual=kkt_residual,
             proximal_sigma=proximal_sigma,
             prev_multipliers_eq=prev_multipliers_eq,
+            precond_fn=precond_fn,
+            cg_tol=inner_cg_tol,
         )
 
     # ---- Standard path ----
@@ -607,7 +673,14 @@ def solve_qp(
     if m_ineq == 0:
         active_mask = jnp.ones(m_eq, dtype=bool)
         d, mult_eq = _solve_projected_cg(
-            hvp_fn, g, A_eq, b_eq, active_mask, max_cg_iter, tol
+            hvp_fn,
+            g,
+            A_eq,
+            b_eq,
+            active_mask,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
         )
         return QPResult(
             d=d,
@@ -619,21 +692,24 @@ def solve_qp(
         )
 
     # Case 3: Has inequality constraints -> active-set method
-    # Build combined constraint matrix: [A_eq; A_ineq]
     A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
     b_combined = jnp.concatenate([b_eq, b_ineq])
 
-    # Adaptive EXPAND: widen base tolerance proportionally to KKT residual.
-    # When kkt_residual is 0 (default), this reduces to the original tol.
     kkt_residual = jnp.asarray(kkt_residual, dtype=jnp.float64)
     base_tol = tol + jnp.minimum(kkt_residual, 1.0) * tol
 
-    # Step 1: Initial solve with equality constraints only
     eq_only_mask = jnp.concatenate(
         [jnp.ones(m_eq, dtype=bool), jnp.zeros(m_ineq, dtype=bool)]
     )
     d_init, mult_init = _solve_projected_cg(
-        hvp_fn, g, A_combined, b_combined, eq_only_mask, max_cg_iter, tol
+        hvp_fn,
+        g,
+        A_combined,
+        b_combined,
+        eq_only_mask,
+        max_cg_iter,
+        inner_cg_tol,
+        precond_fn=precond_fn,
     )
 
     # Determine starting active set: warm-start or cold-start
@@ -670,7 +746,14 @@ def solve_qp(
 
         # Solve with current active set using projected CG
         d_new, mult_all = _solve_projected_cg(
-            hvp_fn, g, A_combined, b_combined, combined_mask, max_cg_iter, tol
+            hvp_fn,
+            g,
+            A_combined,
+            b_combined,
+            combined_mask,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
         )
 
         mult_eq_new = mult_all[:m_eq] if m_eq > 0 else jnp.zeros((0,))

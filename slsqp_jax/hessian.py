@@ -163,6 +163,89 @@ def lbfgs_hvp(
 
 
 @jaxtyped(typechecker=beartype)
+def lbfgs_inverse_hvp(
+    history: LBFGSHistory,
+    v: Vector,
+) -> Vector:
+    """Compute H @ v = B^{-1} @ v via the L-BFGS two-loop recursion.
+
+    Implements Nocedal & Wright Algorithm 7.4.  Since the L-BFGS Hessian
+    approximation is B_k with initial scaling B_0 = gamma * I, the
+    inverse initial scaling is H_0 = (1/gamma) * I.
+
+    Complexity: O(kn) where k is the number of stored pairs.
+
+    Args:
+        history: L-BFGS history buffer.
+        v: Vector to multiply by the inverse Hessian approximation.
+
+    Returns:
+        H @ v = B^{-1} @ v, the inverse Hessian-vector product.
+    """
+    k = history.s_history.shape[0]
+    gamma = history.gamma
+    count = history.count
+
+    start = (history.next_idx - count + k) % k
+    indices = (start + jnp.arange(k)) % k
+    S = history.s_history[indices]  # (k, n) chronological
+    Y = history.y_history[indices]  # (k, n) chronological
+
+    valid_mask = (jnp.arange(k) < count)[:, None]
+    S = S * valid_mask
+    Y = Y * valid_mask
+
+    # rho_i = 1 / (y_i^T s_i); skip pairs with non-positive curvature
+    sTy = jnp.sum(S * Y, axis=1)  # (k,)
+    pair_ok = (jnp.arange(k) < count) & (sTy > 1e-12)
+    rho = jnp.where(pair_ok, 1.0 / sTy, 0.0)
+
+    # Backward loop: q = v; for i = k-1,...,0: alpha_i = rho_i s_i^T q; q -= alpha_i y_i
+    alphas_init = jnp.zeros(k)
+
+    def backward_step(carry, idx):
+        q, alphas = carry
+        rev_idx = k - 1 - idx
+        s_i = S[rev_idx]
+        y_i = Y[rev_idx]
+        rho_i = rho[rev_idx]
+        is_valid = rev_idx < count
+        alpha_i = jnp.where(is_valid, rho_i * jnp.dot(s_i, q), 0.0)
+        q = q - alpha_i * y_i
+        alphas = alphas.at[rev_idx].set(alpha_i)
+        return (q, alphas), None
+
+    (q, alphas), _ = jax.lax.scan(backward_step, (v, alphas_init), jnp.arange(k))
+
+    # Apply initial inverse Hessian: r = H_0 q = (1/gamma) q
+    gamma_safe = jnp.maximum(gamma, 1e-30)
+    r = q / gamma_safe
+
+    # Forward loop: for i = 0,...,k-1: beta = rho_i y_i^T r; r += s_i (alpha_i - beta)
+    def forward_step(r, idx):
+        s_i = S[idx]
+        y_i = Y[idx]
+        rho_i = rho[idx]
+        alpha_i = alphas[idx]
+        is_valid = idx < count
+        beta = jnp.where(is_valid, rho_i * jnp.dot(y_i, r), 0.0)
+        r = r + s_i * (alpha_i - beta)
+        return r, None
+
+    r, _ = jax.lax.scan(forward_step, r, jnp.arange(k))
+
+    v_norm = jnp.linalg.norm(v)
+    r_norm = jnp.linalg.norm(r)
+
+    # Fall back to identity if the result is non-finite or unreasonably large.
+    # Use plain v (not v/gamma) so the fallback always has unit spectral radius.
+    is_bad = jnp.any(~jnp.isfinite(r)) | (r_norm > 1000.0 * jnp.maximum(v_norm, 1e-10))
+    r = jnp.where(is_bad, v, r)
+
+    return r
+
+
+@jaxtyped(typechecker=beartype)
 def lbfgs_append(
     history: LBFGSHistory,
     s: Vector,
