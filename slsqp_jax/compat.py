@@ -696,10 +696,27 @@ def minimize_like_scipy(
         SciPy-style constraints (dict / list-of-dicts /
         ``LinearConstraint`` / ``NonlinearConstraint``).
     options
-        Solver options dict.  Recognised keys: ``rtol``, ``atol``,
-        ``max_steps``, ``min_steps``, ``lbfgs_memory``,
-        ``line_search_max_steps``, ``armijo_c1``, ``qp_max_iter``,
-        ``qp_max_cg_iter``.
+        Solver options dict.  The following keys are popped with
+        the listed defaults (which match the ``SLSQP`` constructor
+        defaults):
+
+        * ``rtol`` (``1e-6``) -- relative tolerance for stationarity.
+        * ``atol`` (``1e-6``) -- absolute tolerance for stationarity
+          and feasibility.
+        * ``max_steps`` or ``maxiter`` (``100``) -- maximum outer
+          iterations.
+        * ``min_steps`` (``1``) -- minimum iterations before
+          convergence is allowed.
+        * ``lbfgs_memory`` (``10``) -- number of L-BFGS pairs.
+        * ``line_search_max_steps`` (``20``) -- backtracking steps.
+        * ``armijo_c1`` (``1e-4``) -- Armijo sufficient decrease.
+        * ``qp_max_iter`` (``100``) -- active-set iteration budget.
+        * ``qp_max_cg_iter`` (``50``) -- CG iterations per QP step.
+
+        Any remaining keys are forwarded as ``**kwargs`` to the
+        ``SLSQP`` constructor, so any ``SLSQP`` attribute can be
+        set here (e.g. ``proximal_sigma``, ``stagnation_tol``,
+        ``stagnation_patience``).
     has_aux
         If ``True``, *fun* returns ``(value, aux)``.
     throw
@@ -799,6 +816,7 @@ def minimize_like_scipy(
         qp_max_iter=opts.pop("qp_max_iter", 100),
         qp_max_cg_iter=opts.pop("qp_max_cg_iter", 50),
         verbose=verbose,  # type: ignore[arg-type]  # verbose is resolved in __check_init__
+        **opts,
     )
 
     sol = optx.minimise(
