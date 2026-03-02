@@ -58,6 +58,31 @@ STAGNATION_MESSAGE = (
 )
 
 
+def _slsqp_verbose(**kwargs: tuple) -> None:
+    """Default verbose callback with per-field format specifiers.
+
+    Each kwarg value is either ``(label, value)`` or
+    ``(label, value, fmt_spec)``.  The *fmt_spec* string (e.g. ``".3e"``)
+    is inserted into the ``jax.debug.print`` format placeholder.
+    """
+    string_pieces: list[str] = []
+    arg_pieces: list[Any] = []
+    for entry in kwargs.values():
+        if len(entry) == 3:
+            name, value, fmt = entry
+            string_pieces.append(f"{name}: {{:{fmt}}}")
+        else:
+            name, value = entry
+            string_pieces.append(f"{name}: {{}}")
+        arg_pieces.append(value)
+    if string_pieces:
+        jax.debug.print(", ".join(string_pieces), *arg_pieces)
+
+
+def _no_verbose(**kwargs: tuple) -> None:
+    pass
+
+
 class SLSQPState(eqx.Module):
     """State for the SLSQP solver.
 
@@ -370,7 +395,22 @@ class SLSQP(optx.AbstractMinimiser):
           once here rather than branching on every call.
         """
         # --- Verbose callable ---
-        object.__setattr__(self, "verbose", optx_misc.default_verbose(self.verbose))
+        if self.verbose is True:
+            object.__setattr__(self, "verbose", _slsqp_verbose)
+        elif self.verbose is False:
+            object.__setattr__(self, "verbose", _no_verbose)
+        elif callable(self.verbose):
+            user_fn = self.verbose
+
+            def _strip_fmt(**kwargs: tuple) -> None:
+                user_fn(**{k: v[:2] for k, v in kwargs.items()})
+
+            object.__setattr__(self, "verbose", _strip_fmt)
+        else:
+            raise ValueError(
+                f"Unrecognized `verbose` of type {type(self.verbose)}. "
+                "Expected True, False, or a callable."
+            )
 
         # --- Bound constraint info ---
         if self.bounds is not None:
@@ -917,13 +957,25 @@ class SLSQP(optx.AbstractMinimiser):
         )
         c_viol = jnp.maximum(eq_viol, ineq_viol)
         kkt = jnp.linalg.norm(grad_lagrangian_new)
+        dir_norm = jnp.linalg.norm(direction)
+        grad_norm = jnp.linalg.norm(grad_new)
+        n_active = jnp.sum(qp_result.active_set.astype(jnp.int32))
         self.verbose(
             num_steps=("Step", new_state.step_count),
-            objective=("Objective", f_val_new),
-            constraint_violation=("Constraint violation", c_viol),
-            kkt_residual=("KKT residual", kkt),
-            step_size=("Step size", alpha),
-            qp_iterations=("QP iterations", qp_result.iterations),
+            objective=("f", f_val_new, ".6e"),
+            constraint_violation=("|c|", c_viol, ".3e"),
+            kkt_residual=("|∇L|", kkt, ".3e"),
+            grad_norm=("|∇f|", grad_norm, ".3e"),
+            step_size=("α", alpha, ".3e"),
+            direction_norm=("|d|", dir_norm, ".3e"),
+            merit=("merit", merit_new, ".6e"),
+            merit_improvement=("Δmerit", rel_improvement, ".3e"),
+            stagnation_count=("stag", new_stagnation_count),
+            penalty=("ρ", merit_penalty, ".3e"),
+            lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
+            qp_iters=("QP it", qp_result.iterations),
+            qp_converged=("QP ok", qp_result.converged),
+            n_active=("#act", n_active),
         )
 
         return y_new, new_state, aux
