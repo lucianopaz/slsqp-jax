@@ -15,9 +15,11 @@ from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
     lbfgs_append,
+    lbfgs_compute_diagonal,
     lbfgs_hvp,
     lbfgs_init,
     lbfgs_inverse_hvp,
+    lbfgs_reset,
 )
 from slsqp_jax.merit import (
     LineSearchResult,
@@ -59,6 +61,8 @@ __all__ = [
     "lbfgs_hvp",
     "lbfgs_inverse_hvp",
     "lbfgs_append",
+    "lbfgs_compute_diagonal",
+    "lbfgs_reset",
     # Merit function
     "LineSearchResult",
     "compute_merit",

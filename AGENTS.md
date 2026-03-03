@@ -71,7 +71,7 @@ Classical SLSQP solves the QP subproblem by forming and factorising the (n+m)×(
 
 Total cost per QP solve: O(n·k·t), where t is the number of CG iterations (typically t << n).
 
-**Preconditioning**: The CG solver supports an optional preconditioner M ≈ B⁻¹. By default, the L-BFGS inverse Hessian (two-loop recursion, Algorithm 7.4 of Nocedal & Wright) is used as M. This dramatically reduces the number of CG iterations on ill-conditioned subproblems (e.g., when proximal stabilization inflates the condition number). For projected CG, the preconditioner is applied as z = P(M(P(r))) to keep the search direction in the constraint null space.
+**Preconditioning**: The CG solver supports an optional preconditioner M ≈ B̃⁻¹. By default, the L-BFGS inverse Hessian (two-loop recursion, Algorithm 7.4 of Nocedal & Wright) is used. When proximal stabilization is active (proximal_sigma > 0), the preconditioner is upgraded to B̃⁻¹ via the Woodbury identity so it matches the actual QP system matrix B̃ = B + (1/σ) A_eq^T A_eq. For projected CG, the preconditioner is applied as z = P(M(P(r))) to keep the search direction in the constraint null space.
 
 ### Derivative Computation
 
@@ -105,6 +105,10 @@ Each SLSQP iteration performs four steps:
 **QP anti-cycling (EXPAND procedure):** The active-set QP solver uses the EXPAND procedure (Gill, Murray, Saunders & Wright, 1989) to prevent cycling at degenerate vertices. A working tolerance `delta_k = tol + k * tau` grows monotonically each active-set iteration, ensuring strict progress and preventing the same constraint from being repeatedly activated and deactivated. Controlled by the `expand_factor` parameter on `solve_qp`.
 
 **Multiplier stability:** Wright (SIAM J. Optim., 2002, Theorem 5.3) proved that SQP superlinear convergence requires multiplier stability across iterations. The solver promotes this through: (1) warm-starting the QP active set from the previous iteration, (2) an adaptive EXPAND tolerance tied to the outer KKT residual, and (3) optional proximal multiplier stabilization (sSQP, controlled by `proximal_sigma` on `SLSQP`). When `proximal_sigma > 0`, equality constraints are absorbed into the QP objective via an augmented-Lagrangian penalty, regularizing the dual solution and preventing QP infeasibility at degenerate vertices.
+
+**L-BFGS diagonal reset (SNOPT-style):** The L-BFGS initial Hessian is stored as a per-variable diagonal `B_0 = diag(d)` instead of a scalar `gamma * I`. When the QP solver fails, `diag(B_k)` is extracted from the compact representation, all stored pairs are discarded, and the approximation restarts with the per-variable curvature preserved. This prevents the gamma-freeze loop where tiny steps prevent L-BFGS updates. Based on Gill, Murray & Saunders, SIAM Review, 47(1), 2005, Section 3.3.
+
+**QP failure recovery:** When the QP fails to converge, the solver (1) gates penalty parameter updates so unreliable multipliers cannot permanently inflate `rho`, and (2) falls back to a steepest descent direction (`-grad`) instead of using the unconverged QP direction. Combined with the L-BFGS diagonal reset, this prevents the cascade where one QP failure leads to permanent stagnation.
 
 **Outer-loop stagnation detection:** The solver tracks the L1 merit function across iterations and declares failure if the relative improvement falls below `stagnation_tol` for `stagnation_patience` consecutive iterations. This prevents the solver from exhausting `max_steps` on infeasible or degenerate problems. Controlled by `stagnation_tol` and `stagnation_patience` on `SLSQP`.
 
