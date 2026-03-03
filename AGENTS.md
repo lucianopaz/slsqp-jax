@@ -73,6 +73,8 @@ Total cost per QP solve: O(n·k·t), where t is the number of CG iterations (typ
 
 **Preconditioning**: The CG solver supports an optional preconditioner M ≈ B̃⁻¹. By default, the L-BFGS inverse Hessian (two-loop recursion, Algorithm 7.4 of Nocedal & Wright) is used. When proximal stabilization is active (proximal_sigma > 0), the preconditioner is upgraded to B̃⁻¹ via the Woodbury identity so it matches the actual QP system matrix B̃ = B + (1/σ) A_eq^T A_eq. For projected CG, the preconditioner is applied as z = P(M(P(r))) to keep the search direction in the constraint null space.
 
+**CG regularization**: The CG curvature guard uses a scale-invariant relative threshold `pBp <= delta^2 * ||p||^2` instead of a hard absolute one. This prevents false negative-curvature detection when `||p||` is small (e.g. after an L-BFGS diagonal reset with high condition number). The step length and residual use the true curvature, so the CG solution is unbiased. Controlled by `cg_regularization` on `SLSQP` (default 1e-6). Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+
 ### Derivative Computation
 
 By default, the solver computes:

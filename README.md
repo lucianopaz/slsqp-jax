@@ -338,8 +338,13 @@ solver = SLSQP(
     n_eq_constraints=1,
     use_preconditioner=True,   # Default; set False to disable
     adaptive_cg_tol=False,     # Default; set True for Eisenstat-Walker tolerance
+    cg_regularization=1e-6,    # Default; minimum eigenvalue threshold for CG
 )
 ```
+
+**CG regularization.** The inner CG solver uses a scale-invariant curvature guard inspired by SNOPT's reduced-Hessian CG solver (Gill, Murray & Saunders, *SIAM Review*, 2005, Section 4.5). At each CG iteration, the effective eigenvalue $p^T B p / \lVert p \rVert^2$ is checked against `cg_regularization` ($\delta^2$). If the effective eigenvalue falls below $\delta^2$, CG declares "bad curvature" and stops. This replaces the previous absolute threshold `pBp <= 1e-8`, which was not scale-invariant: when $\lVert p \rVert$ is small (e.g. because the projected gradient is small near convergence), even a legitimate direction with positive curvature could trigger the threshold.
+
+The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG to continue through directions with eigenvalues as small as $10^{-6}$ while still stopping on numerical noise. The CG step length and residual update use the true (unregularized) curvature, so the solution is unbiased. Set to `0.0` to disable (CG only stops on truly non-positive curvature).
 
 **Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior.
 

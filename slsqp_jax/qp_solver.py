@@ -89,6 +89,7 @@ def _solve_unconstrained_cg(
     max_cg_iter: int,
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
+    cg_regularization: float = 1e-6,
 ) -> Vector:
     """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
 
@@ -103,6 +104,10 @@ def _solve_unconstrained_cg(
         max_cg_iter: Maximum CG iterations.
         cg_tol: Convergence tolerance on residual norm.
         precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
+        cg_regularization: Minimum eigenvalue threshold for the curvature
+            guard.  CG declares "bad curvature" when the effective
+            eigenvalue ``p^T B p / ||p||^2`` falls below this value.
+            Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
 
     Returns:
         Solution vector d.
@@ -136,7 +141,15 @@ def _solve_unconstrained_cg(
             Bp = hvp_fn(state.p)
             pBp = jnp.dot(state.p, Bp)
 
-            has_bad_curvature = pBp <= 1e-8
+            # SNOPT-style curvature guard: declare "bad curvature" when the
+            # effective eigenvalue p^T B p / ||p||^2 falls below delta^2.
+            # This is scale-invariant (no false stops when ||p|| is small)
+            # while still catching numerical noise from the null-space
+            # projector.  Alpha and the residual use the true curvature so
+            # the CG recurrence is exact and the solution is unbiased.
+            # Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+            pp = jnp.dot(state.p, state.p)
+            has_bad_curvature = pBp <= cg_regularization * pp
 
             alpha = jnp.where(
                 has_bad_curvature,
@@ -197,6 +210,7 @@ def _solve_projected_cg(
     max_cg_iter: int,
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
+    cg_regularization: float = 1e-6,
 ) -> tuple[Vector, Float[Array, " m"]]:
     """Solve equality-constrained QP using projected (preconditioned) CG.
 
@@ -230,6 +244,9 @@ def _solve_projected_cg(
         max_cg_iter: Maximum CG iterations.
         cg_tol: CG convergence tolerance.
         precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
+        cg_regularization: Minimum eigenvalue threshold for the curvature
+            guard.  CG declares "bad curvature" when the projected
+            eigenvalue falls below this value.  Based on SNOPT Section 4.5.
 
     Returns:
         Tuple of (d, multipliers) where d is the solution and multipliers
@@ -281,7 +298,11 @@ def _solve_projected_cg(
             PBp = project(Bp)
             pPBp = jnp.dot(state.p, PBp)
 
-            has_bad_curvature = pPBp <= 1e-8
+            # SNOPT-style curvature guard (see unconstrained CG for detail).
+            # For projected CG, p is in the null space, so this checks the
+            # effective eigenvalue of the reduced Hessian Z^T B Z along p.
+            pp = jnp.dot(state.p, state.p)
+            has_bad_curvature = pPBp <= cg_regularization * pp
 
             alpha = jnp.where(
                 has_bad_curvature,
@@ -358,6 +379,7 @@ def _solve_qp_proximal(
     prev_multipliers_eq: Float[Array, " m_eq"] | None,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_tol: Scalar | float | None = None,
+    cg_regularization: float = 1e-6,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -397,6 +419,7 @@ def _solve_qp_proximal(
             max_cg_iter,
             inner_cg_tol,
             precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
         )
         return QPResult(
             d=d,
@@ -418,6 +441,7 @@ def _solve_qp_proximal(
         max_cg_iter,
         inner_cg_tol,
         precond_fn=precond_fn,
+        cg_regularization=cg_regularization,
     )
 
     # Determine starting active set
@@ -455,6 +479,7 @@ def _solve_qp_proximal(
             max_cg_iter,
             inner_cg_tol,
             precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
         )
 
         mult_eq_new = _recover_mult_eq(d_new)
@@ -541,6 +566,7 @@ def solve_qp(
     prev_multipliers_eq: Float[Array, " m_eq"] | None = None,
     precond_fn: Callable | None = None,
     cg_tol: Scalar | float | None = None,
+    cg_regularization: float = 1e-6,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -618,6 +644,12 @@ def solve_qp(
             CG solver uses ``tol``.  This allows the CG tolerance to be
             adapted (e.g. Eisenstat-Walker) independently of the
             feasibility tolerance used by the active-set method.
+        cg_regularization: Minimum eigenvalue threshold ``delta^2`` for the
+            CG curvature guard.  CG declares "bad curvature" when
+            ``p^T B p / ||p||^2 < delta^2``, preventing premature termination
+            when the Hessian has small but positive eigenvalues.  Based on
+            SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).  Default
+            ``1e-6`` (delta ~ 1e-3).  Set to ``0.0`` to disable.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -633,7 +665,12 @@ def solve_qp(
     # Case 1: No constraints at all
     if m_total == 0:
         d = _solve_unconstrained_cg(
-            hvp_fn, g, max_cg_iter, inner_cg_tol, precond_fn=precond_fn
+            hvp_fn,
+            g,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
         )
         return QPResult(
             d=d,
@@ -665,6 +702,7 @@ def solve_qp(
             prev_multipliers_eq=prev_multipliers_eq,
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
+            cg_regularization=cg_regularization,
         )
 
     # ---- Standard path ----
@@ -681,6 +719,7 @@ def solve_qp(
             max_cg_iter,
             inner_cg_tol,
             precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
         )
         return QPResult(
             d=d,
@@ -710,6 +749,7 @@ def solve_qp(
         max_cg_iter,
         inner_cg_tol,
         precond_fn=precond_fn,
+        cg_regularization=cg_regularization,
     )
 
     # Determine starting active set: warm-start or cold-start
@@ -754,6 +794,7 @@ def solve_qp(
             max_cg_iter,
             inner_cg_tol,
             precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
         )
 
         mult_eq_new = mult_all[:m_eq] if m_eq > 0 else jnp.zeros((0,))

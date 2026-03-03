@@ -716,8 +716,8 @@ def minimize_like_scipy(
         Any remaining keys are forwarded as ``**kwargs`` to the
         ``SLSQP`` constructor, so any ``SLSQP`` attribute can be
         set here (e.g. ``proximal_sigma``, ``use_preconditioner``,
-        ``adaptive_cg_tol``, ``stagnation_tol``,
-        ``stagnation_patience``).
+        ``adaptive_cg_tol``, ``cg_regularization``,
+        ``stagnation_tol``, ``stagnation_patience``).
     has_aux
         If ``True``, *fun* returns ``(value, aux)``.
     throw
