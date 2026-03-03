@@ -326,7 +326,13 @@ This implementation uses **preconditioned conjugate gradient (PCG)** with the L-
 When the preconditioner $M = B^{-1}$ is used:
 
 - **Without proximal term**: $M B = I$, so PCG converges in 1 iteration (perfect preconditioning).
-- **With proximal term**: $M \widetilde{B} = I + (1/\sigma)\, H_k\, A_{\text{eq}}^T A_{\text{eq}}$, and the condition number depends only on the proximal contribution, not the raw Hessian — typically orders of magnitude better.
+- **With proximal term**: the preconditioner is automatically upgraded to $M = \widetilde{B}^{-1}$ via the **Woodbury identity**:
+
+$$
+\widetilde{B}^{-1} = B^{-1} - B^{-1} A_{\text{eq}}^T \bigl(\sigma I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T\bigr)^{-1} A_{\text{eq}} B^{-1}
+$$
+
+The inner matrix $(\sigma I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T)$ is only $m_{\text{eq}} \times m_{\text{eq}}$ (tiny) and is factored once per QP solve. Each preconditioner application costs $O(kn + mn)$. This ensures the preconditioner matches the actual QP system matrix and avoids the pathological case where a plain $B^{-1}$ preconditioner amplifies the proximal eigenvalues when $\gamma$ is small.
 
 For projected (constrained) CG, the preconditioner is applied as $z = P(M(P(r)))$, where $P$ is the null-space projector. The extra projection ensures the preconditioned direction stays in the feasible subspace (Nocedal & Wright, Chapter 16).
 
@@ -344,6 +350,25 @@ solver = SLSQP(
 **Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior.
 
 **Why not rational CG?** We evaluated the rational conjugate gradient method (Kindermann & Zellinger, arXiv:2306.03670, 2023), which alternates CG steps with Tikhonov regularization steps in a mixed rational Krylov space. It is designed for ill-posed inverse problems with compact operators, not finite-dimensional positive definite QPs. Each rational step requires an inner solve of $(B + \alpha I)^{-1} v$, the regularization parameters need spectrum knowledge, and adapting the method to null-space projection is non-trivial. Standard PCG is simpler, cheaper, and directly addresses the ill-conditioning source.
+
+### L-BFGS diagonal reset
+
+The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal is uniform ($d = \gamma \mathbf{1}$), but when the QP solver fails to converge, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
+
+1. Extract $\text{diag}(B_k)$ from the current L-BFGS compact representation in $O(k^2 n)$.
+2. Discard all stored $(s, y)$ pairs.
+3. Restart with $B_0 = \text{diag}(\text{clip}(\text{diag}(B_k),\, 10^{-3},\, 100))$.
+
+This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the scalar $\gamma$ becomes very small and gets frozen by tiny steps. After the reset, the first successful L-BFGS append returns the diagonal to uniform scaling.
+
+### QP failure recovery
+
+When the QP subproblem fails to converge (exhausts its iteration budget), the solver applies two safeguards to prevent a cascade of failures:
+
+1. **Penalty gating**: the penalty parameter $\rho$ is only updated from QP multipliers when the QP converged. Failed QPs can produce unreliable multipliers that would permanently inflate $\rho$ (since it is monotone non-decreasing), making future line searches harder.
+2. **Steepest descent fallback**: the search direction falls back to the negative gradient $-\nabla f(x)$ instead of the unconverged QP direction.
+
+Combined with the L-BFGS diagonal reset (above), these mechanisms allow the solver to recover from QP failures rather than entering a permanent stagnation loop.
 
 ### Outer-loop stagnation detection
 

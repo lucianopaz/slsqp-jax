@@ -33,6 +33,7 @@ from slsqp_jax.hessian import (
     lbfgs_hvp,
     lbfgs_init,
     lbfgs_inverse_hvp,
+    lbfgs_reset,
 )
 from slsqp_jax.merit import (
     backtracking_line_search,
@@ -399,14 +400,14 @@ class SLSQP(optx.AbstractMinimiser):
             object.__setattr__(self, "verbose", _slsqp_verbose)
         elif self.verbose is False:
             object.__setattr__(self, "verbose", _no_verbose)
-        elif callable(self.verbose):
+        elif callable(self.verbose):  # pragma: no cover
             user_fn = self.verbose
 
             def _strip_fmt(**kwargs: tuple) -> None:
                 user_fn(**{k: v[:2] for k, v in kwargs.items()})
 
             object.__setattr__(self, "verbose", _strip_fmt)
-        else:
+        else:  # pragma: no cover
             raise ValueError(
                 f"Unrecognized `verbose` of type {type(self.verbose)}. "
                 "Expected True, False, or a callable."
@@ -636,20 +637,56 @@ class SLSQP(optx.AbstractMinimiser):
         self,
         state: "SLSQPState",
     ) -> Callable[[Vector], Vector] | None:
-        """Build the L-BFGS inverse Hessian preconditioner for PCG.
+        """Build the preconditioner for the PCG inner solver.
 
-        Returns a closure v -> H_k @ v = B_k^{-1} @ v using the two-loop
-        recursion (Nocedal & Wright, Algorithm 7.4).  When preconditioning
-        is disabled, returns ``None``.
+        When ``proximal_sigma > 0`` and equality constraints are present,
+        the QP system matrix is ``B_tilde = B + (1/sigma) A_eq^T A_eq``,
+        so a plain ``B^{-1}`` preconditioner can amplify the proximal
+        eigenvalues and make CG *worse*.  In that case the Woodbury
+        identity is used to build ``B_tilde^{-1}`` cheaply::
+
+            (B + (1/s) A^T A)^{-1}
+              = B^{-1} - B^{-1} A^T (s I + A B^{-1} A^T)^{-1} A B^{-1}
+
+        The inner matrix ``(s I + A B^{-1} A^T)`` is only m_eq x m_eq
+        and is factored once per QP solve.
+
+        When ``proximal_sigma == 0`` or there are no equality constraints,
+        falls back to the standard ``B^{-1}`` preconditioner.
+
+        Returns ``None`` when preconditioning is disabled.
         """
         if not self.use_preconditioner:
             return None
         lbfgs_history = state.lbfgs_history
 
-        def preconditioner(v: Vector) -> Vector:
-            return lbfgs_inverse_hvp(lbfgs_history, v)
+        if self.proximal_sigma > 0 and self.n_eq_constraints > 0:
+            A_eq = state.eq_jac
+            sigma = self.proximal_sigma
+            m_eq = A_eq.shape[0]
 
-        return preconditioner
+            Hinv_AT = jax.vmap(
+                lambda a: lbfgs_inverse_hvp(lbfgs_history, a),
+            )(A_eq)  # (m_eq, n): rows are B^{-1} @ a_i
+
+            gram = Hinv_AT @ A_eq.T  # (m_eq, m_eq): A B^{-1} A^T
+            inner = sigma * jnp.eye(m_eq) + gram
+            inner_factor = jnp.linalg.cholesky(inner + 1e-10 * jnp.eye(m_eq))
+
+            def preconditioner(v: Vector) -> Vector:
+                Hinv_v = lbfgs_inverse_hvp(lbfgs_history, v)
+                A_Hinv_v = A_eq @ Hinv_v  # (m_eq,)
+                w = jax.scipy.linalg.cho_solve((inner_factor, True), A_Hinv_v)
+                correction = Hinv_AT.T @ w  # (n,): B^{-1} A^T w
+                return Hinv_v - correction
+
+            return preconditioner
+        else:
+
+            def preconditioner(v: Vector) -> Vector:
+                return lbfgs_inverse_hvp(lbfgs_history, v)
+
+            return preconditioner
 
     def _build_exact_lagrangian_hvp(
         self,
@@ -839,14 +876,21 @@ class SLSQP(optx.AbstractMinimiser):
 
         # Step 2: Solve QP subproblem for search direction
         qp_result = self._solve_qp_subproblem(state, hvp_fn)
-        direction = qp_result.direction
 
-        # Step 3: Update penalty parameter based on new multipliers
-        merit_penalty = update_penalty_parameter(
+        # Steepest descent fallback when QP fails
+        fallback_direction = -state.grad
+        direction = jnp.where(
+            qp_result.converged, qp_result.direction, fallback_direction
+        )
+
+        # Step 3: Update penalty parameter — only trust multipliers
+        # from a converged QP to avoid permanently inflating rho.
+        new_penalty = update_penalty_parameter(
             state.merit_penalty,
             qp_result.multipliers_eq,
             qp_result.multipliers_ineq,
         )
+        merit_penalty = jnp.where(qp_result.converged, new_penalty, state.merit_penalty)
 
         # Step 4: Line search with merit function
         ls_result = backtracking_line_search(
@@ -912,6 +956,15 @@ class SLSQP(optx.AbstractMinimiser):
 
         new_lbfgs_history = lbfgs_append(state.lbfgs_history, s, y_for_lbfgs)
 
+        # SNOPT-style diagonal reset on QP failure: preserve per-variable
+        # curvature from the current approximation and clear stale pairs.
+        new_lbfgs_history = jax.lax.cond(
+            qp_result.converged,
+            lambda h: h,
+            lbfgs_reset,
+            new_lbfgs_history,
+        )
+
         # Stagnation detection: compare merit at new point vs previous
         merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
         rel_improvement = jnp.abs(state.prev_merit - merit_new) / jnp.maximum(
@@ -960,6 +1013,9 @@ class SLSQP(optx.AbstractMinimiser):
         dir_norm = jnp.linalg.norm(direction)
         grad_norm = jnp.linalg.norm(grad_new)
         n_active = jnp.sum(qp_result.active_set.astype(jnp.int32))
+        diag_cond = jnp.max(new_lbfgs_history.diagonal) / jnp.maximum(
+            jnp.min(new_lbfgs_history.diagonal), 1e-30
+        )
         self.verbose(
             num_steps=("Step", new_state.step_count),
             objective=("f", f_val_new, ".6e"),
@@ -973,6 +1029,7 @@ class SLSQP(optx.AbstractMinimiser):
             stagnation_count=("stag", new_stagnation_count),
             penalty=("ρ", merit_penalty, ".3e"),
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
+            lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
             qp_iters=("QP it", qp_result.iterations),
             qp_converged=("QP ok", qp_result.converged),
             n_active=("#act", n_active),

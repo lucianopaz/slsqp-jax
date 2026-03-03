@@ -7,10 +7,13 @@ Instead of storing a dense n x n matrix (O(n^2) memory), L-BFGS stores
 the last k (s, y) pairs and computes Hessian-vector products in O(kn) time
 using the compact representation (Byrd, Nocedal, Schnabel 1994):
 
-    B = gamma * I - [gamma*S, Y] @ N^{-1} @ [gamma*S^T; Y^T]
+    B = B_0 - [B_0 S, Y] @ M^{-1} @ [S^T B_0; Y^T]
 
-where N is a small 2k x 2k matrix built from inner products of the
-stored vectors.
+where B_0 = diag(diagonal) is the initial Hessian (per-variable scaling)
+and M is a small 2k x 2k matrix built from inner products of the stored
+vectors.  During normal operation ``diagonal = gamma * ones(n)`` and this
+reduces to the scalar-scaled form.  After an SNOPT-style diagonal reset,
+``diagonal`` captures per-variable curvature from the discarded history.
 
 Powell's damping is applied to each (s, y) pair before storage to ensure
 positive definiteness is preserved even when the standard curvature
@@ -35,7 +38,10 @@ class LBFGSHistory(eqx.Module):
     Attributes:
         s_history: Stored step vectors s_i = x_{i+1} - x_i.
         y_history: Stored (damped) gradient differences y_i.
-        gamma: Initial Hessian scaling (B_0 = gamma * I).
+        gamma: Scalar summary of the initial Hessian scaling.
+        diagonal: Per-variable initial Hessian scaling (B_0 = diag(d)).
+            During normal operation this equals ``gamma * ones(n)``.
+            After an SNOPT-style reset it stores per-variable curvature.
         count: Number of valid pairs stored (0 to memory size).
         next_idx: Next write position in the circular buffer.
     """
@@ -43,6 +49,7 @@ class LBFGSHistory(eqx.Module):
     s_history: Float[Array, "memory n"]
     y_history: Float[Array, "memory n"]
     gamma: Scalar
+    diagonal: Float[Array, " n"]
     count: Int[Array, ""]
     next_idx: Int[Array, ""]
 
@@ -61,6 +68,7 @@ def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
         s_history=jnp.zeros((memory, n)),
         y_history=jnp.zeros((memory, n)),
         gamma=jnp.array(1.0),
+        diagonal=jnp.ones(n),
         count=jnp.array(0),
         next_idx=jnp.array(0),
     )
@@ -73,18 +81,19 @@ def lbfgs_hvp(
 ) -> Vector:
     """Compute B @ v using the L-BFGS compact representation.
 
-    Uses the compact form (Nocedal & Wright, Theorem 7.4):
+    Uses the compact form with diagonal initial Hessian B_0 = diag(d)
+    (Byrd, Nocedal & Schnabel, 1994, Theorem 2.2):
 
-        B = gamma * I - [gamma*S, Y] @ N^{-1} @ [gamma*S^T; Y^T]
+        B = B_0 - [B_0 S, Y] @ M^{-1} @ [S^T B_0; Y^T]
 
     where:
-        N = [[gamma * S^T S, L], [L^T, -D]]   (2k x 2k)
+        M = [[S^T B_0 S, L], [L^T, -D_sy]]   (2k x 2k)
         L_{ij} = s_i^T y_j for i > j           (strictly lower triangular)
-        D = diag(s_i^T y_i)                    (diagonal)
+        D_sy = diag(s_i^T y_i)                 (diagonal)
 
-    When no pairs are stored (count=0), this reduces to B = gamma * I.
+    When no pairs are stored (count=0), this reduces to B = diag(d).
 
-    Complexity: O(kn) where k is the number of stored pairs.
+    Complexity: O(k^2 n) where k is the number of stored pairs.
 
     Args:
         history: L-BFGS history buffer.
@@ -94,7 +103,7 @@ def lbfgs_hvp(
         B @ v, the Hessian-vector product.
     """
     k = history.s_history.shape[0]
-    gamma = history.gamma
+    d = history.diagonal
     count = history.count
 
     # Reorder to chronological order from the circular buffer
@@ -108,41 +117,39 @@ def lbfgs_hvp(
     S = S * valid_mask
     Y = Y * valid_mask
 
+    # Compute the diagonal part of the Hessian approximation
+    # DS[i, :] = d * s_i  (B_0 applied row-wise)
+    DS = S * d[None, :]  # (k, n)
+
     # Build compact form inner matrices
-    SY = S @ Y.T  # (k, k): SY[i,j] = s_i^T y_j
-    SS = S @ S.T  # (k, k): SS[i,j] = s_i^T s_j
+    SY = S @ Y.T  # (k, k)
+    SDSS = DS @ S.T  # (k, k): S^T B_0 S
 
-    L = jnp.tril(SY, k=-1)  # strictly lower triangular
-    D_diag = jnp.diag(SY)  # diagonal s_i^T y_i
+    L = jnp.tril(SY, k=-1)
+    D_diag = jnp.diag(SY)
 
-    # Regularize invalid entries to keep N non-singular
     invalid_diag = jnp.where(jnp.arange(k) < count, 0.0, 1.0)
 
-    # Build N = [[gamma * S^T S, L], [L^T, -D]] with regularization
-    # Use concatenate instead of multiple .at[].set() for efficiency
-    top_left = gamma * SS + jnp.diag(invalid_diag)
+    top_left = SDSS + jnp.diag(invalid_diag)
     top_right = L
     bottom_left = L.T
     bottom_right = -jnp.diag(D_diag) + jnp.diag(invalid_diag)
 
     top = jnp.concatenate([top_left, top_right], axis=1)
     bottom = jnp.concatenate([bottom_left, bottom_right], axis=1)
-    N = jnp.concatenate([top, bottom], axis=0)
-
+    M = jnp.concatenate([top, bottom], axis=0)
     # Small regularization for numerical stability
-    N = N + 1e-10 * jnp.eye(2 * k)
+    M = M + 1e-10 * jnp.eye(2 * k)
 
-    # Compute p = [gamma * S @ v; Y @ v]
-    Sv = S @ v  # (k,)
-    Yv = Y @ v  # (k,)
-    p = jnp.concatenate([gamma * Sv, Yv])
+    # p = [S^T B_0 v; Y^T v] = [DS @ v; Y @ v]  but DS rows are d*s_i
+    # so DS @ v would be wrong shape.  We need S @ (d * v).
+    dv = d * v
+    p = jnp.concatenate([S @ dv, Y @ v])
 
-    # Solve N @ q = p using regularized solve (faster than lstsq on GPU)
-    q = jnp.linalg.solve(N, p)
+    q = jnp.linalg.solve(M, p)
 
-    # B @ v = gamma * v - [gamma*S^T, Y^T] @ q
-    #       = gamma * v - gamma * S^T @ q[:k] - Y^T @ q[k:]
-    result = gamma * v - gamma * (S.T @ q[:k]) - Y.T @ q[k:]
+    # B v = B_0 v - [B_0 S, Y]^T @ q = d*v - DS^T @ q[:k] - Y^T @ q[k:]
+    result = dv - DS.T @ q[:k] - Y.T @ q[k:]
 
     # Guard against NaN/inf or unreasonable values: fall back to identity scaling
     # For well-conditioned problems, the Hessian eigenvalues should be O(1) to O(100)
@@ -169,9 +176,8 @@ def lbfgs_inverse_hvp(
 ) -> Vector:
     """Compute H @ v = B^{-1} @ v via the L-BFGS two-loop recursion.
 
-    Implements Nocedal & Wright Algorithm 7.4.  Since the L-BFGS Hessian
-    approximation is B_k with initial scaling B_0 = gamma * I, the
-    inverse initial scaling is H_0 = (1/gamma) * I.
+    Implements Nocedal & Wright Algorithm 7.4 with diagonal initial
+    scaling H_0 = diag(1/diagonal) instead of scalar (1/gamma) I.
 
     Complexity: O(kn) where k is the number of stored pairs.
 
@@ -183,7 +189,7 @@ def lbfgs_inverse_hvp(
         H @ v = B^{-1} @ v, the inverse Hessian-vector product.
     """
     k = history.s_history.shape[0]
-    gamma = history.gamma
+    d = history.diagonal
     count = history.count
 
     start = (history.next_idx - count + k) % k
@@ -195,7 +201,6 @@ def lbfgs_inverse_hvp(
     S = S * valid_mask
     Y = Y * valid_mask
 
-    # rho_i = 1 / (y_i^T s_i); skip pairs with non-positive curvature
     sTy = jnp.sum(S * Y, axis=1)  # (k,)
     pair_ok = (jnp.arange(k) < count) & (sTy > 1e-12)
     rho = jnp.where(pair_ok, 1.0 / sTy, 0.0)
@@ -217,9 +222,9 @@ def lbfgs_inverse_hvp(
 
     (q, alphas), _ = jax.lax.scan(backward_step, (v, alphas_init), jnp.arange(k))
 
-    # Apply initial inverse Hessian: r = H_0 q = (1/gamma) q
-    gamma_safe = jnp.maximum(gamma, 1e-30)
-    r = q / gamma_safe
+    # Apply initial inverse Hessian: H_0 = diag(1/d)
+    d_safe = jnp.maximum(d, 1e-30)
+    r = q / d_safe
 
     # Forward loop: for i = 0,...,k-1: beta = rho_i y_i^T r; r += s_i (alpha_i - beta)
     def forward_step(r, idx):
@@ -238,7 +243,7 @@ def lbfgs_inverse_hvp(
     r_norm = jnp.linalg.norm(r)
 
     # Fall back to identity if the result is non-finite or unreasonably large.
-    # Use plain v (not v/gamma) so the fallback always has unit spectral radius.
+    # Use plain v so the fallback always has unit spectral radius.
     is_bad = jnp.any(~jnp.isfinite(r)) | (r_norm > 1000.0 * jnp.maximum(v_norm, 1e-10))
     r = jnp.where(is_bad, v, r)
 
@@ -311,6 +316,8 @@ def lbfgs_append(
         | has_bad_values
     )
 
+    n = history.diagonal.shape[0]
+
     def do_append():
         # Compute B @ s using current L-BFGS approximation for damping
         Bs = lbfgs_hvp(history, s)
@@ -353,6 +360,7 @@ def lbfgs_append(
             s_history=new_s_history,
             y_history=new_y_history,
             gamma=gamma_new,
+            diagonal=jnp.full(n, gamma_new),
             count=new_count,
             next_idx=new_idx,
         )
@@ -361,6 +369,103 @@ def lbfgs_append(
         return history
 
     return jax.lax.cond(~should_skip, do_append, skip)
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_compute_diagonal(
+    history: LBFGSHistory,
+) -> Float[Array, " n"]:
+    """Extract diag(B_k) from the L-BFGS compact representation.
+
+    From the compact form ``B = B_0 - W M^{-1} W^T``, the diagonal is
+
+        diag(B_k) = diagonal - diag(W M^{-1} W^T)
+
+    where ``W = [B_0 S, Y]`` is ``(n, 2k)`` and ``M`` is the ``2k x 2k``
+    inner matrix.  The correction term is computed in O(k^2 n) by forming
+    ``Q = W M^{-1}`` and summing ``(Q * W)`` row-wise.
+
+    This is used by :func:`lbfgs_reset` to implement the SNOPT diagonal
+    reset strategy (Gill, Murray & Saunders, 2005, Section 3.3).
+    """
+    k = history.s_history.shape[0]
+    d = history.diagonal
+    count = history.count
+
+    start = (history.next_idx - count + k) % k
+    indices = (start + jnp.arange(k)) % k
+    S = history.s_history[indices]
+    Y = history.y_history[indices]
+
+    valid_mask = (jnp.arange(k) < count)[:, None]
+    S = S * valid_mask
+    Y = Y * valid_mask
+
+    DS = S * d[None, :]  # (k, n): B_0 applied row-wise
+
+    SY = S @ Y.T
+    SDSS = DS @ S.T
+
+    L_mat = jnp.tril(SY, k=-1)
+    D_diag = jnp.diag(SY)
+    invalid_diag = jnp.where(jnp.arange(k) < count, 0.0, 1.0)
+
+    top_left = SDSS + jnp.diag(invalid_diag)
+    top_right = L_mat
+    bottom_left = L_mat.T
+    bottom_right = -jnp.diag(D_diag) + jnp.diag(invalid_diag)
+
+    top = jnp.concatenate([top_left, top_right], axis=1)
+    bottom = jnp.concatenate([bottom_left, bottom_right], axis=1)
+    M = jnp.concatenate([top, bottom], axis=0)
+    M = M + 1e-10 * jnp.eye(2 * k)
+
+    M_inv = jnp.linalg.inv(M)  # (2k, 2k) — tiny
+
+    # W is (n, 2k): columns are [d*s_0, ..., d*s_{k-1}, y_0, ..., y_{k-1}]
+    W = jnp.concatenate([DS.T, Y.T], axis=1)  # (n, 2k)
+
+    # Q = W M^{-1}, shape (n, 2k)
+    Q = W @ M_inv
+
+    # diag(W M^{-1} W^T) = row-wise sum of Q * W
+    diag_correction = jnp.sum(Q * W, axis=1)  # (n,)
+
+    return d - diag_correction
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_reset(
+    history: LBFGSHistory,
+) -> LBFGSHistory:
+    """SNOPT-style diagonal reset of the L-BFGS history.
+
+    Extracts ``diag(B_k)`` from the current approximation, discards all
+    stored ``(s, y)`` pairs, and restarts with ``B_0 = diag(diag(B_k))``.
+    This preserves per-variable curvature information across the reset,
+    preventing the "everything is flat" effect that occurs when the scalar
+    ``gamma`` becomes very small.
+
+    Based on the SNOPT limited-memory reset strategy (Gill, Murray &
+    Saunders, *SIAM Review*, 47(1), 2005, Section 3.3).
+    """
+    diag_B = lbfgs_compute_diagonal(history)
+    diag_clipped = jnp.clip(diag_B, 1e-3, 100.0)
+
+    # Ensure all values are finite; fall back to 1.0 otherwise
+    diag_safe = jnp.where(jnp.isfinite(diag_clipped), diag_clipped, 1.0)
+
+    gamma_new = jnp.median(diag_safe)
+
+    k, n = history.s_history.shape
+    return LBFGSHistory(
+        s_history=jnp.zeros((k, n)),
+        y_history=jnp.zeros((k, n)),
+        gamma=gamma_new,
+        diagonal=diag_safe,
+        count=jnp.array(0),
+        next_idx=jnp.array(0),
+    )
 
 
 @jaxtyped(typechecker=beartype)
