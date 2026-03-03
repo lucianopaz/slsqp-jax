@@ -410,3 +410,38 @@ class TestStagnationRecovery:
         x0 = jnp.array([1.0, 1.0, 1.0])
         y, state = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(jnp.sum(y), 3.0, atol=1e-4)
+
+    def test_cg_regularization_prevents_stagnation_with_bounds_and_eq(self):
+        """Bounds + equality constraints with ill-conditioned Hessian.
+
+        After a diagonal reset, kappa_B can reach 1e5.  Without CG
+        regularization the old hard threshold ``pBp <= 1e-8`` falsely
+        declares negative curvature and returns d=0, causing permanent
+        stagnation.  The SNOPT-style regularization (default 1e-6)
+        prevents this by adding delta^2 * ||p||^2 to the curvature
+        check.
+        """
+
+        def objective(x, args):
+            return -jnp.sum(jnp.log(x + 1.0)), None
+
+        def eq_constraint(x, args):
+            return jnp.array([jnp.sum(x) - 5.0])
+
+        n = 4
+        bounds = jnp.array([[0.0, 10.0]] * n)
+        x0 = jnp.array([2.0, 1.0, 1.5, 0.5])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            bounds=bounds,
+            cg_regularization=1e-6,
+            rtol=1e-5,
+            atol=1e-5,
+            max_steps=200,
+        )
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(jnp.sum(y), 5.0, atol=1e-3)
+        assert state.stagnation_count < solver.stagnation_patience

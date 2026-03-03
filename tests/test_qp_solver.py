@@ -1051,5 +1051,144 @@ class TestPreconditionedCG:
         np.testing.assert_array_less(-1e-6, A_ineq @ result.d - b_ineq)
 
 
+class TestCGRegularization:
+    """Tests for the SNOPT-style CG regularization parameter.
+
+    The regularization replaces the hard absolute curvature threshold
+    ``pBp <= 1e-8`` with a relative one ``pBp <= delta^2 * ||p||^2``,
+    where ``delta^2 = cg_regularization``.  This is scale-invariant:
+    CG stops when the effective eigenvalue along p falls below delta^2,
+    regardless of how small ||p|| is.
+    """
+
+    def test_regularization_allows_progress_on_small_eigenvalue(self):
+        """With eigenvalue 1e-5 (above delta^2 = 1e-6), CG should continue
+        and find the correct solution.  Under the old absolute threshold
+        (1e-8), this would have been stopped when ||p|| < ~0.003."""
+        n = 3
+        H = jnp.diag(jnp.array([1e-5, 1.0, 1.0]))
+        g = jnp.array([1.0, 1.0, 1.0])
+
+        A_eq = jnp.zeros((0, n))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, n))
+        b_ineq = jnp.zeros(0)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=1e-6,
+        )
+        expected = -jnp.linalg.solve(H, g)
+        np.testing.assert_allclose(result.d, expected, rtol=1e-4)
+
+    def test_regularization_negligible_on_well_conditioned(self):
+        """On a well-conditioned Hessian, the regularization has no effect
+        on the solution (CG converges normally without hitting the guard)."""
+        n = 5
+        H = jnp.diag(jnp.array([1.0, 2.0, 3.0, 4.0, 5.0]))
+        g = jnp.array([1.0, -2.0, 3.0, -4.0, 5.0])
+
+        A_eq = jnp.zeros((0, n))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, n))
+        b_ineq = jnp.zeros(0)
+
+        result_reg = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=1e-6,
+        )
+        result_no_reg = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=0.0,
+        )
+
+        expected = -jnp.linalg.solve(H, g)
+        np.testing.assert_allclose(result_reg.d, expected, atol=1e-6)
+        np.testing.assert_allclose(result_no_reg.d, expected, atol=1e-6)
+        np.testing.assert_allclose(result_reg.d, result_no_reg.d, atol=1e-8)
+
+    def test_negative_curvature_stops_cg(self):
+        """Truly negative curvature still triggers early stopping."""
+        n = 3
+        H = jnp.diag(jnp.array([-1.0, 1.0, 1.0]))
+        g = jnp.array([1.0, 0.0, 0.0])
+
+        A_eq = jnp.zeros((0, n))
+        b_eq = jnp.zeros(0)
+        A_ineq = jnp.zeros((0, n))
+        b_ineq = jnp.zeros(0)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=1e-6,
+        )
+        assert jnp.linalg.norm(result.d) < 1e-10
+
+    def test_regularization_with_projected_cg(self):
+        """CG regularization works correctly with projected CG."""
+        n = 5
+        H = jnp.diag(jnp.array([0.1, 1.0, 2.0, 5.0, 10.0]))
+        g = jnp.array([1.0, -2.0, 0.5, 3.0, -1.0])
+
+        A_eq = jnp.array([[1.0, 0.0, 0.0, 0.0, 0.0]])
+        b_eq = jnp.array([0.0])
+        A_ineq = jnp.zeros((0, n))
+        b_ineq = jnp.zeros(0)
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=1e-6,
+        )
+        np.testing.assert_allclose(A_eq @ result.d, b_eq, atol=1e-6)
+        assert jnp.linalg.norm(result.d) > 1e-8
+
+    def test_regularization_with_inequality_constraints(self):
+        """CG regularization does not degrade QP solutions with box
+        constraints (regression guard for the null-space projection
+        leakage issue)."""
+        H = 2.0 * jnp.eye(2)
+        g = jnp.array([-6.0, -6.0])
+        A_eq = jnp.zeros((0, 2))
+        b_eq = jnp.zeros((0,))
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]])
+        b_ineq = jnp.array([0.0, 0.0, -2.0, -2.0])
+
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            A_eq,
+            b_eq,
+            A_ineq,
+            b_ineq,
+            cg_regularization=1e-6,
+        )
+        np.testing.assert_allclose(result.d, jnp.array([2.0, 2.0]), rtol=1e-4)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -271,6 +271,14 @@ class SLSQP(optx.AbstractMinimiser):
         adaptive_cg_tol: When True, the CG convergence tolerance is adapted
             based on the outer KKT residual (Eisenstat-Walker style).
             Default False preserves baseline behavior.
+        cg_regularization: Minimum eigenvalue threshold ``delta^2`` for the
+            CG curvature guard.  CG declares "bad curvature" when the
+            effective eigenvalue ``p^T B p / ||p||^2`` falls below this
+            value.  Prevents CG from terminating prematurely when the
+            Hessian has small but positive eigenvalues (e.g. after an
+            L-BFGS diagonal reset).  Based on SNOPT Section 4.5
+            (Gill, Murray & Saunders, 2005).  Default ``1e-6``
+            (delta ~ 1e-3).  Set to ``0.0`` to disable.
 
     Example:
         >>> import jax.numpy as jnp
@@ -379,6 +387,14 @@ class SLSQP(optx.AbstractMinimiser):
     # False preserves baseline behavior; enable for large-scale problems
     # where early QP over-solving is wasteful.
     adaptive_cg_tol: bool = eqx.field(static=True, default=False)
+
+    # CG regularization: minimum eigenvalue threshold for the CG curvature
+    # guard.  CG stops when the effective eigenvalue p^T B p / ||p||^2
+    # falls below this value.  Prevents premature termination when Hessian
+    # eigenvalues are small but positive (e.g. after a diagonal reset).
+    # Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+    # Default 1e-6 (delta ~ 1e-3). Set to 0.0 to disable.
+    cg_regularization: float = 1e-6
 
     # Stagnation detection parameters
     stagnation_tol: float = 1e-12
@@ -877,10 +893,16 @@ class SLSQP(optx.AbstractMinimiser):
         # Step 2: Solve QP subproblem for search direction
         qp_result = self._solve_qp_subproblem(state, hvp_fn)
 
-        # Steepest descent fallback when QP fails
+        # Steepest descent fallback when QP fails or returns a zero direction
+        # despite a non-zero gradient (defense-in-depth against stagnation).
         fallback_direction = -state.grad
         direction = jnp.where(
             qp_result.converged, qp_result.direction, fallback_direction
+        )
+        zero_direction = jnp.linalg.norm(direction) < 1e-30
+        grad_nonzero = jnp.linalg.norm(state.grad) > self.atol
+        direction = jnp.where(
+            zero_direction & grad_nonzero, fallback_direction, direction
         )
 
         # Step 3: Update penalty parameter — only trust multipliers
@@ -1243,6 +1265,7 @@ class SLSQP(optx.AbstractMinimiser):
             prev_multipliers_eq=state.multipliers_eq,
             precond_fn=precond_fn,
             cg_tol=adaptive_tol,
+            cg_regularization=self.cg_regularization,
         )
 
         return QPResult(
