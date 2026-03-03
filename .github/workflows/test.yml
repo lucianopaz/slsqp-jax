@@ -19,6 +19,11 @@ jobs:
         - '3.12'
         - '3.13'
         - '3.14'
+        marker:
+        - -m "not slow"
+        include:
+        - python-version: '3.14'
+          marker: -m "slow"
 
     steps:
     - uses: actions/checkout@v5
@@ -33,11 +38,11 @@ jobs:
       run: uv sync --locked --all-extras --dev
 
     - name: Run tests
-      run: uv run pytest --cov-report=xml
+      run: uv run pytest --cov-report=xml ${{ matrix.marker }}
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        name: py${{ matrix.python-version }}
+        name: py${{ matrix.python-version }}-${{ matrix.marker }}
         fail_ci_if_error: false
