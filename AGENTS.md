@@ -14,6 +14,8 @@ uv sync --all-extras
 ```
 
 ### Running Tests
+While iterating fixes, it's highly recommended to run tests excluding slow ones
+
 ```bash
 # Run all tests
 uv run pytest
@@ -119,6 +121,16 @@ You have access to two key references. You must study the logic of the C/Fortran
     * Use this for the class structure (`AbstractMinimiser`, `AbstractDescent`).
 2.  **Algorithm Logic (SciPy SLSQP Source):** `https://github.com/scipy/scipy/tree/main/scipy/optimize/`
     * Specifically, look at `src/slsqp.c` (C source) which SciPy wraps. This contains the LDLT factorization and active-set logic.
+
+## Documentation Requirements
+
+**Any change to the core optimization algorithm MUST be accompanied by corresponding updates to the user-facing documentation.** This includes:
+
+1. **`README.md`**: Update the relevant Algorithm subsection (or add a new one) describing the change, its motivation, and any new parameters.
+2. **`docs/source/index.md`**: Mirror the same changes (this file is the Sphinx/ReadTheDocs source and should stay in sync with the README).
+3. **`AGENTS.md`**: Update the Architectural Guidelines if the change affects the high-level algorithm structure, scaling analysis, or robustness mechanisms.
+
+This applies to all algorithmic changes — new robustness features, modified Hessian handling, preconditioning changes, QP solver modifications, line search adjustments, etc. Do not merge code-only changes without documentation.
 
 ## Verification
 * Create a test suite using `pytest`.
