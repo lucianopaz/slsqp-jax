@@ -231,10 +231,10 @@ class TestProximalPreconditioner:
             return jnp.array([jnp.sum(x) - 1.0])
 
         n = 4
+        mu = 0.1
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            proximal_sigma=0.1,
             use_preconditioner=True,
             rtol=1e-8,
             atol=1e-8,
@@ -243,34 +243,27 @@ class TestProximalPreconditioner:
         x0 = jnp.array([0.5, 0.3, 0.1, 0.1])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
 
-        precond_fn = solver._build_preconditioner(state)
+        precond_fn = solver._build_preconditioner(state, proximal_mu=mu)
         assert precond_fn is not None
 
         A_eq = state.eq_jac
-        sigma = solver.proximal_sigma
         lbfgs_history = state.lbfgs_history
 
         key = jax.random.PRNGKey(0)
         for _ in range(5):
             key, subkey = jax.random.split(key)
             v = jax.random.normal(subkey, (n,))
-            Bv = lbfgs_hvp(lbfgs_history, v) + (1.0 / sigma) * (A_eq.T @ (A_eq @ v))
+            Bv = lbfgs_hvp(lbfgs_history, v) + (1.0 / mu) * (A_eq.T @ (A_eq @ v))
             recovered = precond_fn(Bv)
             np.testing.assert_allclose(recovered, v, atol=1e-4)
 
-    def test_no_proximal_uses_plain_inverse(self):
-        """Without proximal term, preconditioner is plain B^{-1}."""
+    def test_no_eq_constraints_uses_plain_inverse(self):
+        """Without equality constraints, preconditioner is plain B^{-1}."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        def eq_constraint(x, args):
-            return jnp.array([jnp.sum(x) - 1.0])
-
         solver = SLSQP(
-            eq_constraint_fn=eq_constraint,
-            n_eq_constraints=1,
-            proximal_sigma=0.0,
             use_preconditioner=True,
             rtol=1e-8,
             atol=1e-8,
@@ -306,7 +299,6 @@ class TestPenaltyGating:
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            proximal_sigma=0.1,
             qp_max_iter=1,  # force QP failure
             qp_max_cg_iter=1,
             rtol=1e-8,
@@ -366,8 +358,8 @@ class TestSteepestDescentFallback:
 class TestStagnationRecovery:
     """Verify solver recovers from scenarios that previously stagnated."""
 
-    def test_eq_constrained_with_proximal(self):
-        """Equality-constrained problem with proximal_sigma that used to stagnate."""
+    def test_eq_constrained_with_adaptive_proximal(self):
+        """Equality-constrained problem with adaptive proximal that used to stagnate."""
 
         def objective(x, args):
             return (x[0] - 1.0) ** 2 + (x[1] - 2.5) ** 2, None
@@ -378,7 +370,6 @@ class TestStagnationRecovery:
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            proximal_sigma=0.1,
             use_preconditioner=True,
             rtol=1e-6,
             atol=1e-6,
@@ -389,8 +380,8 @@ class TestStagnationRecovery:
         np.testing.assert_allclose(y[0] + y[1], 3.0, atol=1e-4)
         assert float(state.f_val) < 1.0
 
-    def test_bounded_eq_constrained_with_proximal(self):
-        """Bounded + equality-constrained problem with proximal sigma."""
+    def test_bounded_eq_constrained_with_adaptive_proximal(self):
+        """Bounded + equality-constrained problem with adaptive proximal."""
 
         def objective(x, args):
             return jnp.sum((x - jnp.array([1.0, 2.0, 0.5])) ** 2), None
@@ -403,7 +394,6 @@ class TestStagnationRecovery:
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             bounds=bounds,
-            proximal_sigma=0.1,
             use_preconditioner=True,
             rtol=1e-6,
             atol=1e-6,
@@ -446,7 +436,7 @@ class TestStagnationRecovery:
         y, state = _run_solver(solver, objective, x0)
 
         np.testing.assert_allclose(jnp.sum(y), 5.0, atol=1e-3)
-        assert state.stagnation_count < solver.stagnation_patience
+        assert not state.x_stagnation
 
 
 # ===================================================================
@@ -679,3 +669,146 @@ class TestAlphaScaledMultipliers:
         y, state = _run_solver(solver, objective, x0)
 
         np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)
+
+
+# ===================================================================
+# 9. Sliding-window stagnation detection
+# ===================================================================
+
+
+class TestSlidingWindowStagnation:
+    """Tests for the x-value sliding-window stagnation detection."""
+
+    def test_stagnation_window_calculation(self):
+        """_stagnation_window = max(1, max_steps // 10)."""
+        solver = SLSQP(max_steps=100)
+        assert solver._stagnation_window == 10
+
+        solver2 = SLSQP(max_steps=7)
+        assert solver2._stagnation_window == 1
+
+        solver3 = SLSQP(max_steps=200)
+        assert solver3._stagnation_window == 20
+
+    def test_x_history_shape(self):
+        """x_history should have shape (W, n) after init."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(max_steps=100)
+        x0 = jnp.array([1.0, 2.0, 3.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        assert state.x_history.shape == (10, 3)
+        np.testing.assert_allclose(state.x_history[0], x0)
+        np.testing.assert_allclose(state.x_history[9], x0)
+
+    def test_x_stagnation_false_on_progress(self):
+        """x_stagnation should be False on a well-behaved problem."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=50,
+            stagnation_tol=1e-12,
+        )
+        x0 = jnp.array([3.0, -2.0])
+        y, state = _run_solver(solver, objective, x0)
+        assert not state.x_stagnation
+
+    def test_x_stagnation_guard_before_window(self):
+        """Stagnation should not fire before W steps have elapsed."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            rtol=1e-15,
+            atol=1e-15,
+            max_steps=100,
+            stagnation_tol=1e-3,
+        )
+        x0 = jnp.array([0.001])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+        for i in range(5):
+            done, _ = solver.terminate(objective, y, None, {}, state, frozenset())
+            if done:
+                break
+            y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+        assert not state.x_stagnation
+
+
+# ===================================================================
+# 10. Adaptive proximal mu
+# ===================================================================
+
+
+class TestAdaptiveProximalMu:
+    """Tests for the adaptive proximal mu feature."""
+
+    def test_proximal_tau_validation(self):
+        """proximal_tau must be in (0, 1)."""
+        with pytest.raises(ValueError, match="proximal_tau"):
+            SLSQP(proximal_tau=0.0)
+        with pytest.raises(ValueError, match="proximal_tau"):
+            SLSQP(proximal_tau=1.0)
+        with pytest.raises(ValueError, match="proximal_tau"):
+            SLSQP(proximal_tau=-0.5)
+
+    def test_proximal_mu_min_default_from_atol(self):
+        """proximal_mu_min=None should resolve to atol."""
+        solver = SLSQP(atol=1e-7)
+        assert solver._proximal_mu_min == 1e-7
+
+    def test_proximal_mu_min_explicit(self):
+        """Explicit proximal_mu_min should be used."""
+        solver = SLSQP(proximal_mu_min=1e-5)
+        assert solver._proximal_mu_min == 1e-5
+
+    def test_adaptive_mu_converges_equality_constrained(self):
+        """Adaptive proximal mu converges on equality-constrained problem."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            rtol=1e-6,
+            atol=1e-6,
+            max_steps=50,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-4)
+        np.testing.assert_allclose(y[0], 0.5, atol=0.05)
+
+    def test_adaptive_mu_with_custom_tau(self):
+        """Different proximal_tau values should not break convergence."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        for tau in [0.1, 0.5, 0.9]:
+            solver = SLSQP(
+                eq_constraint_fn=eq_constraint,
+                n_eq_constraints=1,
+                proximal_tau=tau,
+                rtol=1e-5,
+                atol=1e-5,
+                max_steps=100,
+            )
+            x0 = jnp.array([0.0, 0.0])
+            y, state = _run_solver(solver, objective, x0)
+            np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-3)

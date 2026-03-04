@@ -1763,21 +1763,16 @@ class TestStagnationDetection:
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=2,
             stagnation_tol=1e-12,
-            stagnation_patience=3,
         )
         x0 = jnp.array([0.0])
         _, state, result = self._run_solver_with_result(
             solver, objective, x0, max_steps=200
         )
 
-        assert state.stagnation_count >= solver.stagnation_patience
+        assert state.x_stagnation
 
-    def test_stagnation_count_resets_on_progress(self):
-        """Stagnation count should reset when the merit improves.
-
-        On a well-behaved problem, the stagnation count should stay
-        near zero because every step makes meaningful progress.
-        """
+    def test_no_false_stagnation_on_progress(self):
+        """On a well-behaved problem, x_stagnation should remain False."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -1787,12 +1782,11 @@ class TestStagnationDetection:
             atol=1e-8,
             max_steps=50,
             stagnation_tol=1e-12,
-            stagnation_patience=5,
         )
         x0 = jnp.array([3.0, -2.0])
         _, state, _ = self._run_solver_with_result(solver, objective, x0)
 
-        assert state.stagnation_count < solver.stagnation_patience
+        assert not state.x_stagnation
 
     def test_stagnation_fields_in_postprocess(self):
         """Verify stagnation stats appear in postprocess output."""
@@ -1808,40 +1802,16 @@ class TestStagnationDetection:
             objective, y, None, None, {}, state, frozenset(), optx.RESULTS.successful
         )
 
-        assert "stagnation_count" in stats
+        assert "x_stagnation" in stats
         assert "last_step_size" in stats
-
-    def test_stagnation_patience_zero_terminates_immediately(self):
-        """With patience=0, any single stagnant step triggers termination."""
-
-        def objective(x, args):
-            return jnp.sum(x**2), None
-
-        def ineq_constraint(x, args):
-            return jnp.array([x[0] - 10.0, -x[0] - 10.0])
-
-        solver = SLSQP(
-            rtol=1e-15,
-            atol=1e-15,
-            max_steps=200,
-            ineq_constraint_fn=ineq_constraint,
-            n_ineq_constraints=2,
-            stagnation_tol=1e-12,
-            stagnation_patience=0,
-        )
-        x0 = jnp.array([0.0])
-        _, state, _ = self._run_solver_with_result(solver, objective, x0, max_steps=200)
-
-        # Should terminate very quickly due to patience=0
-        assert state.step_count < 10
 
 
 class TestProximalStabilization:
     """Tests for proximal multiplier stabilization (sSQP) in the full solver."""
 
     def test_convergence_with_equality_and_inequality(self):
-        """Solver with proximal_sigma converges on a problem with
-        equality and inequality constraints where the inequality is active."""
+        """Adaptive proximal converges on a problem with equality and
+        inequality constraints where the inequality is active."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -1859,7 +1829,6 @@ class TestProximalStabilization:
             n_ineq_constraints=1,
             rtol=1e-6,
             atol=1e-6,
-            proximal_sigma=0.01,
         )
         x0 = jnp.array([0.9, 0.1])
         y, state = _run_solver(solver, objective, x0)
@@ -1869,7 +1838,7 @@ class TestProximalStabilization:
         assert y[0] >= 0.6 - 1e-3
 
     def test_non_degenerate_regression(self):
-        """Proximal sigma should not break well-conditioned problems."""
+        """Adaptive proximal should not break well-conditioned problems."""
 
         def objective(x, args):
             return (x[0] - 1.0) ** 2 + (x[1] - 2.5) ** 2, None
@@ -1883,28 +1852,21 @@ class TestProximalStabilization:
                 ]
             )
 
-        solver_standard = SLSQP(
+        solver = SLSQP(
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=3,
             rtol=1e-6,
             atol=1e-6,
-        )
-        solver_proximal = SLSQP(
-            ineq_constraint_fn=ineq_constraint,
-            n_ineq_constraints=3,
-            rtol=1e-6,
-            atol=1e-6,
-            proximal_sigma=0.01,
         )
 
         x0 = jnp.array([0.0, 0.0])
-        y_std, _ = _run_solver(solver_standard, objective, x0)
-        y_prox, _ = _run_solver(solver_proximal, objective, x0)
+        y, _ = _run_solver(solver, objective, x0)
 
-        np.testing.assert_allclose(y_prox, y_std, atol=0.05)
+        np.testing.assert_allclose(y[0], 1.4, atol=0.05)
+        np.testing.assert_allclose(y[1], 1.7, atol=0.05)
 
     def test_jit_compatibility(self):
-        """proximal_sigma works under jax.jit(optx.minimise)."""
+        """Adaptive proximal works under jax.jit(optx.minimise)."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -1917,7 +1879,6 @@ class TestProximalStabilization:
             n_eq_constraints=1,
             rtol=1e-6,
             atol=1e-6,
-            proximal_sigma=0.01,
         )
         x0 = jnp.array([0.5, 0.5])
 
