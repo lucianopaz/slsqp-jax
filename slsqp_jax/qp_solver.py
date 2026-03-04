@@ -538,12 +538,17 @@ def _solve_qp_proximal(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
+    # The EXPAND procedure's growing tolerance can cause mark_converged()
+    # to fire on the last iteration under relaxed tolerances.  Override
+    # convergence when the iteration limit was actually reached.
+    final_converged = final_state.converged & (final_state.iteration < max_iter)
+
     return QPResult(
         d=final_state.d,
         multipliers_eq=final_state.multipliers_eq,
         multipliers_ineq=final_state.multipliers_ineq,
         active_set=final_state.active_set,
-        converged=final_state.converged,
+        converged=final_converged,
         iterations=final_state.iteration,
     )
 
@@ -856,11 +861,13 @@ def solve_qp(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
+    final_converged = final_state.converged & (final_state.iteration < max_iter)
+
     return QPResult(
         d=final_state.d,
         multipliers_eq=final_state.multipliers_eq,
         multipliers_ineq=final_state.multipliers_ineq,
         active_set=final_state.active_set,
-        converged=final_state.converged,
+        converged=final_converged,
         iterations=final_state.iteration,
     )

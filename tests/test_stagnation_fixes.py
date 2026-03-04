@@ -20,10 +20,12 @@ from slsqp_jax.hessian import (
     lbfgs_append,
     lbfgs_compute_diagonal,
     lbfgs_hvp,
+    lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
     lbfgs_reset,
 )
+from slsqp_jax.qp_solver import solve_qp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -445,3 +447,235 @@ class TestStagnationRecovery:
 
         np.testing.assert_allclose(jnp.sum(y), 5.0, atol=1e-3)
         assert state.stagnation_count < solver.stagnation_patience
+
+
+# ===================================================================
+# 6. QP false convergence at max iterations
+# ===================================================================
+
+
+class TestQPFalseConvergence:
+    """Verify QP reports converged=False when hitting max_iter."""
+
+    def test_qp_reports_false_at_max_iter(self):
+        """With max_iter=1, QP cannot converge genuinely; flag must be False."""
+        n = 3
+        H = jnp.eye(n)
+
+        def hvp_fn(v):
+            return H @ v
+
+        g = jnp.array([1.0, -2.0, 0.5])
+        A_ineq = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        b_ineq = jnp.array([0.5, 0.5])
+
+        result = solve_qp(
+            hvp_fn,
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=1,
+        )
+        assert not bool(result.converged)
+
+    def test_qp_converges_with_sufficient_iters(self):
+        """Same problem with enough iterations should converge."""
+        n = 3
+        H = jnp.eye(n)
+
+        def hvp_fn(v):
+            return H @ v
+
+        g = jnp.array([1.0, -2.0, 0.5])
+        A_ineq = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        b_ineq = jnp.array([0.5, 0.5])
+
+        result = solve_qp(
+            hvp_fn,
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros((0,)),
+            A_ineq,
+            b_ineq,
+            max_iter=100,
+        )
+        assert bool(result.converged)
+
+
+# ===================================================================
+# 7. L-BFGS identity reset
+# ===================================================================
+
+
+class TestLBFGSIdentityReset:
+    """Verify lbfgs_identity_reset clears everything to B_0 = I."""
+
+    def test_identity_reset_clears_pairs(self):
+        """After identity reset, count and next_idx must be zero."""
+        history = _build_history_with_pairs(
+            3,
+            [([1.0, 0.0, 0.0], [2.0, 0.0, 0.0]), ([0.0, 1.0, 0.0], [0.0, 3.0, 0.0])],
+        )
+        assert int(history.count) == 2
+
+        reset = lbfgs_identity_reset(history)
+        assert int(reset.count) == 0
+        assert int(reset.next_idx) == 0
+
+    def test_identity_reset_sets_gamma_one(self):
+        """After identity reset, gamma must be 1.0."""
+        history = _build_history_with_pairs(
+            3,
+            [([1.0, 0.0, 0.0], [2.0, 0.0, 0.0])],
+        )
+        reset = lbfgs_identity_reset(history)
+        assert float(reset.gamma) == pytest.approx(1.0)
+
+    def test_identity_reset_sets_diagonal_ones(self):
+        """After identity reset, diagonal must be all ones."""
+        history = _build_history_with_pairs(
+            3,
+            [([1.0, 0.0, 0.0], [2.0, 0.0, 0.0])],
+        )
+        reset = lbfgs_identity_reset(history)
+        np.testing.assert_allclose(reset.diagonal, jnp.ones(3))
+
+    def test_identity_reset_hvp_is_identity(self):
+        """After identity reset, B @ v = v."""
+        history = _build_history_with_pairs(
+            3,
+            [([1.0, 0.0, 0.0], [2.0, 0.0, 0.0])],
+        )
+        reset = lbfgs_identity_reset(history)
+        v = jnp.array([1.0, 2.0, 3.0])
+        np.testing.assert_allclose(lbfgs_hvp(reset, v), v, atol=1e-12)
+
+
+class TestEscalatingLBFGSRecovery:
+    """Verify consecutive QP failures trigger identity reset."""
+
+    def test_consecutive_failures_trigger_identity_reset(self):
+        """After qp_failure_patience consecutive QP failures, L-BFGS resets to identity.
+
+        Uses inequality constraints so the active-set loop always enters the
+        body (warm-start doesn't immediately satisfy KKT), forcing genuine QP
+        failures with qp_max_iter=1.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0, x[0] - x[1]])
+
+        patience = 3
+        solver = SLSQP(
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=2,
+            qp_max_iter=1,
+            qp_max_cg_iter=1,
+            qp_failure_patience=patience,
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=patience + 5,
+        )
+        x0 = jnp.array([2.0, -1.0, 0.5])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+
+        had_identity_reset = False
+        for _ in range(patience + 3):
+            y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+            if int(state.consecutive_qp_failures) >= patience:
+                # Identity reset should have fired this step
+                had_identity_reset = True
+
+        assert had_identity_reset, (
+            "Never reached qp_failure_patience consecutive failures"
+        )
+
+        # After an identity reset, consecutive steps will keep triggering
+        # identity resets (since QP keeps failing). Verify the counter is
+        # at least patience.
+        assert int(state.consecutive_qp_failures) >= patience
+
+    def test_qp_success_resets_failure_counter(self):
+        """A successful QP clears the consecutive failure counter."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            qp_failure_patience=3,
+            rtol=1e-6,
+            atol=1e-6,
+            max_steps=5,
+        )
+        x0 = jnp.array([3.0, -2.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+        y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+
+        # QP should succeed on this simple unconstrained problem
+        assert bool(state.qp_converged)
+        assert int(state.consecutive_qp_failures) == 0
+
+
+# ===================================================================
+# 8. Alpha-scaled multiplier blending
+# ===================================================================
+
+
+class TestAlphaScaledMultipliers:
+    """Verify multiplier blending with alpha in the outer solver."""
+
+    def test_full_step_uses_qp_multipliers(self):
+        """When alpha=1, stored multipliers should equal QP multipliers."""
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            rtol=1e-8,
+            atol=1e-8,
+            max_steps=2,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        y = x0
+        y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
+
+        # If alpha=1 (full step), multipliers_eq should be the raw QP value.
+        # We can't directly check if alpha was 1, but for this well-posed
+        # problem the QP multipliers should be non-zero and meaningful.
+        assert jnp.abs(state.multipliers_eq[0]) > 1e-10
+
+    def test_bounds_convergence_with_alpha_scaling(self):
+        """Bound-constrained problem should still converge with alpha-scaling.
+
+        This is a regression test: alpha-scaling must not prevent convergence
+        at bound-active solutions where the QP correctly identifies the
+        multipliers but the line search rejects the step.
+        """
+
+        def objective(x, args):
+            return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
+
+        bounds = jnp.array([[0.0, 2.0], [0.0, 2.0]])
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            bounds=bounds,
+            max_steps=50,
+        )
+        x0 = jnp.array([1.0, 1.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)

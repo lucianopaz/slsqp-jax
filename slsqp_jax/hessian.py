@@ -469,6 +469,29 @@ def lbfgs_reset(
 
 
 @jaxtyped(typechecker=beartype)
+def lbfgs_identity_reset(
+    history: LBFGSHistory,
+) -> LBFGSHistory:
+    """Hard reset of L-BFGS history to the identity Hessian.
+
+    Unlike :func:`lbfgs_reset` which preserves per-variable curvature,
+    this discards everything and restarts with ``B_0 = I``.  Used as an
+    escalation when repeated SNOPT-style diagonal resets fail to break
+    an ill-conditioning cycle (e.g. consecutive QP failures where the
+    extracted diagonal perpetuates the same problematic scaling).
+    """
+    k, n = history.s_history.shape
+    return LBFGSHistory(
+        s_history=jnp.zeros((k, n)),
+        y_history=jnp.zeros((k, n)),
+        gamma=jnp.array(1.0),
+        diagonal=jnp.ones(n),
+        count=jnp.array(0),
+        next_idx=jnp.array(0),
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def compute_lagrangian_gradient(
     grad_f: Vector,
     eq_jac: Float[Array, "m_eq n"],
