@@ -260,7 +260,11 @@ EXPAND is the standard anti-cycling technique used in production solvers (MINOS,
 
 Wright (*Properties of the Log-Barrier Function on Degenerate Nonlinear Programs*, SIAM J. Optim., 2002, Theorem 5.3) proved that the convergence rate of SQP methods depends critically on **multiplier stability**: the rate at which Lagrange multipliers change between successive iterations. Specifically, superlinear convergence requires $\lVert \lambda_k - \lambda_{k+1} \rVert = O(\delta)$ where $\delta$ is the step norm. When the QP subproblem is degenerate, the multiplier solution may not be unique, and arbitrary choices across iterations can destroy this stability — even though the primal iterates converge.
 
-This implementation promotes multiplier stability through **active-set warm-starting**: the final active set from each QP solve is passed as the initial guess for the next outer iteration's QP subproblem. Because the active set carries implicit information about which multipliers are nonzero, reusing it across iterations biases the QP toward consistent multiplier selections. This is the same strategy used by production SQP codes such as SNOPT (Gill, Murray & Saunders, 2005).
+This implementation promotes multiplier stability through three mechanisms:
+
+1. **Active-set warm-starting**: the final active set from each QP solve is passed as the initial guess for the next outer iteration's QP subproblem. Because the active set carries implicit information about which multipliers are nonzero, reusing it across iterations biases the QP toward consistent multiplier selections. This is the same strategy used by production SQP codes such as SNOPT (Gill, Murray & Saunders, 2005).
+
+2. **Alpha-scaled multiplier blending**: when the line search accepts a partial step ($\alpha < 1$), the QP multipliers correspond to the full-step linearization, not the actual accepted step. The solver blends the QP multipliers with the previous iteration's multipliers proportional to the step size: $\lambda_{k+1} = \lambda_k + \alpha (\lambda_{\text{QP}} - \lambda_k)$. The blended multipliers are used for the L-BFGS secant pair computation (ensuring consistency between the primal step and the curvature update), while the raw QP multipliers are stored for convergence checking (since they represent the best dual estimate at the current linearization point).
 
 For pathological cases where warm-starting is insufficient, the solver provides **proximal multiplier stabilization** (see next section).
 
@@ -360,12 +364,24 @@ The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{dia
 
 This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the scalar $\gamma$ becomes very small and gets frozen by tiny steps. After the reset, the first successful L-BFGS append returns the diagonal to uniform scaling.
 
+**Escalating identity reset.** When the QP fails repeatedly, the SNOPT diagonal reset can re-extract the same problematic diagonal, perpetuating an ill-conditioning cycle. To break this deadlock, the solver tracks consecutive QP failures and, after `qp_failure_patience` consecutive failures (default 3), performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal. This allows the L-BFGS to rebuild curvature from scratch.
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    qp_failure_patience=3,  # Identity reset after 3 consecutive QP failures
+)
+```
+
 ### QP failure recovery
 
 When the QP subproblem fails to converge (exhausts its iteration budget), the solver applies two safeguards to prevent a cascade of failures:
 
 1. **Penalty gating**: the penalty parameter $\rho$ is only updated from QP multipliers when the QP converged. Failed QPs can produce unreliable multipliers that would permanently inflate $\rho$ (since it is monotone non-decreasing), making future line searches harder.
 2. **Steepest descent fallback**: the search direction falls back to the negative gradient $-\nabla f(x)$ instead of the unconverged QP direction.
+
+**QP false convergence guard.** The EXPAND procedure's growing tolerance can cause the active-set loop to report convergence on its final iteration under relaxed tolerances, even though the QP did not truly converge at the base tolerance. To prevent this, the QP solver explicitly overrides the convergence flag to `False` whenever the iteration count reaches `max_iter`. This ensures the outer solver triggers L-BFGS resets and steepest descent fallback appropriately.
 
 Combined with the L-BFGS diagonal reset (above), these mechanisms allow the solver to recover from QP failures rather than entering a permanent stagnation loop.
 

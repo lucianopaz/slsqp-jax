@@ -31,6 +31,7 @@ from slsqp_jax.hessian import (
     compute_lagrangian_gradient,
     lbfgs_append,
     lbfgs_hvp,
+    lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
     lbfgs_reset,
@@ -146,6 +147,9 @@ class SLSQPState(eqx.Module):
     # Active-set warm-starting: carry the QP active set across iterations
     # to promote multiplier stability (Wright, SIAM J. Optim., 2002, Sec. 8)
     prev_active_set: Bool[Array, " m_ineq"]
+
+    # Consecutive QP failure tracking for escalating L-BFGS recovery
+    consecutive_qp_failures: Int[Array, ""]
 
     # Stagnation detection
     prev_merit: Scalar
@@ -395,6 +399,11 @@ class SLSQP(optx.AbstractMinimiser):
     # Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
     # Default 1e-6 (delta ~ 1e-3). Set to 0.0 to disable.
     cg_regularization: float = 1e-6
+
+    # QP failure patience: after this many consecutive QP failures, the
+    # L-BFGS history is hard-reset to identity (B_0 = I) instead of the
+    # SNOPT-style diagonal reset, breaking ill-conditioning cycles.
+    qp_failure_patience: int = 3
 
     # Stagnation detection parameters
     stagnation_tol: float = 1e-12
@@ -847,6 +856,7 @@ class SLSQP(optx.AbstractMinimiser):
             qp_iterations=jnp.array(0),
             qp_converged=jnp.array(True),
             prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
+            consecutive_qp_failures=jnp.array(0),
             prev_merit=prev_merit,
             stagnation_count=jnp.array(0),
             last_alpha=jnp.array(1.0),
@@ -951,26 +961,33 @@ class SLSQP(optx.AbstractMinimiser):
         ineq_jac_general_new = self._ineq_jac_impl(y_new, args)
         ineq_jac_new = jnp.concatenate([ineq_jac_general_new, state.bound_jac], axis=0)
 
+        # Alpha-scale multipliers: QP multipliers are for the full step;
+        # blend with previous multipliers proportional to the accepted step.
+        blended_mult_eq = state.multipliers_eq + alpha * (
+            qp_result.multipliers_eq - state.multipliers_eq
+        )
+        blended_mult_ineq = state.multipliers_ineq + alpha * (
+            qp_result.multipliers_ineq - state.multipliers_ineq
+        )
+
         # Step 6: Update L-BFGS history
         s = y_new - y  # Step taken
 
-        # Compute gradient of Lagrangian at new point
+        # Compute gradient of Lagrangian at new point using blended multipliers
         grad_lagrangian_new = compute_lagrangian_gradient(
             grad_new,
             eq_jac_new,
             ineq_jac_new,
-            qp_result.multipliers_eq,
-            qp_result.multipliers_ineq,
+            blended_mult_eq,
+            blended_mult_ineq,
         )
 
         if self.obj_hvp_fn is not None:
-            # Probe the exact Lagrangian HVP once along the step direction
-            # to get a high-quality secant pair y = H_L(x_k) @ s.
             exact_hvp_fn = self._build_exact_lagrangian_hvp(
                 y,
                 args,
-                qp_result.multipliers_eq,
-                qp_result.multipliers_ineq,
+                blended_mult_eq,
+                blended_mult_ineq,
             )
             y_for_lbfgs = exact_hvp_fn(s)
         else:
@@ -984,6 +1001,21 @@ class SLSQP(optx.AbstractMinimiser):
             qp_result.converged,
             lambda h: h,
             lbfgs_reset,
+            new_lbfgs_history,
+        )
+
+        # Escalating L-BFGS recovery: after qp_failure_patience consecutive
+        # QP failures, the SNOPT diagonal reset is re-extracting the same
+        # problematic diagonal. Hard-reset to identity to break the cycle.
+        new_consecutive_qp_failures = jnp.where(
+            qp_result.converged,
+            jnp.array(0),
+            state.consecutive_qp_failures + 1,
+        )
+        new_lbfgs_history = jax.lax.cond(
+            new_consecutive_qp_failures >= self.qp_failure_patience,
+            lbfgs_identity_reset,
+            lambda h: h,
             new_lbfgs_history,
         )
 
@@ -1014,6 +1046,7 @@ class SLSQP(optx.AbstractMinimiser):
             qp_iterations=state.qp_iterations + qp_result.iterations,
             qp_converged=qp_result.converged,
             prev_active_set=qp_result.active_set,
+            consecutive_qp_failures=new_consecutive_qp_failures,
             prev_merit=merit_new,
             stagnation_count=new_stagnation_count,
             last_alpha=alpha,
