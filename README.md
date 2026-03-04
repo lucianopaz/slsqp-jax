@@ -304,10 +304,10 @@ Inequality constraints remain as hard constraints in the active-set method — t
 Proximal stabilization is **always active** for equality-constrained problems. The proximal parameter $\mu$ is computed adaptively at each iteration following Wright (2002, eq 6.6):
 
 $$
-\mu_k = \max\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min}\bigr)
+\mu_k = \operatorname{clip}\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min},\;\mu_{\max}\bigr)
 $$
 
-where $\tau \in (0, 1)$ is the exponent (default 0.5) and $\mu_{\min}$ is a floor (default `atol`, typically $10^{-6}$). Far from the solution the KKT residual is large, so $\mu$ is large and the penalty is mild. As the solver converges, $\mu$ shrinks, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
+where $\tau \in (0, 1)$ is the exponent (default 0.5), $\mu_{\min}$ is a floor (default `atol`, typically $10^{-6}$), and $\mu_{\max}$ is a ceiling (default 0.1). Wright's local convergence theory assumes the KKT residual is below 1; the ceiling handles the regime where the residual is large (far from the solution) by ensuring the proximal weight $1/\mu \geq 1/\mu_{\max}$ — preventing weak equality enforcement that would sabotage the L1 merit function descent. As the solver converges, $\mu$ shrinks below the ceiling, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
 
 ```python
 solver = SLSQP(
@@ -315,6 +315,7 @@ solver = SLSQP(
     n_eq_constraints=1,
     proximal_tau=0.5,       # Exponent for adaptive mu (must be in (0,1))
     proximal_mu_min=None,   # Floor on mu; None defaults to atol
+    proximal_mu_max=0.1,    # Ceiling on mu; keeps 1/mu >= 10
 )
 ```
 
