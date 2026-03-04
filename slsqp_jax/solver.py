@@ -265,16 +265,25 @@ class SLSQP(optx.AbstractMinimiser):
         lbfgs_memory: Number of (s, y) pairs to store for L-BFGS (default 10).
         proximal_tau: Exponent for the adaptive proximal parameter mu in the
             sSQP formulation (Wright, 2002, eq 6.6).  The proximal parameter
-            is computed as ``mu = max(kkt_residual^tau, mu_min)`` at each
-            iteration.  Must be in the open interval ``(0, 1)`` for the
-            superlinear convergence guarantee.  Default 0.5.  The proximal
-            is always active for equality-constrained problems.
+            is computed as ``mu = clip(kkt_residual^tau, mu_min, mu_max)``
+            at each iteration.  Capped at ``mu_max`` (default 0.1) so the
+            proximal weight ``1/mu >= 1/mu_max``, ensuring adequate equality
+            even far from the solution.  Must be in the open interval
+            ``(0, 1)`` for the superlinear convergence guarantee.
+            Default 0.5.  The proximal is always active for
+            equality-constrained problems.
         proximal_mu_min: Floor on the adaptive proximal parameter mu.
             Prevents ``1/mu`` from exploding and creating a convergence floor
             on the Lagrangian gradient norm.  Default ``None`` resolves to
             ``atol`` in ``__check_init__``, so the proximal perturbation near
             convergence is ``O(atol)`` — consistent with the convergence
             tolerance.
+        proximal_mu_max: Ceiling on the adaptive proximal parameter mu.
+            Prevents ``1/mu`` from becoming too small far from the solution,
+            which would weaken equality-constraint enforcement and sabotage
+            the L1 merit function descent.  Wright's local convergence
+            theory assumes ``kkt_residual < 1``; this cap handles the
+            regime where ``kkt_residual >> 1``.  Default 0.1.
         use_preconditioner: When True (default), the L-BFGS inverse Hessian
             (two-loop recursion) is used as a preconditioner for the inner
             CG solver, dramatically improving convergence on ill-conditioned
@@ -378,8 +387,8 @@ class SLSQP(optx.AbstractMinimiser):
 
     # Adaptive proximal multiplier stabilization (sSQP).
     # Always active for equality-constrained problems.  The proximal
-    # parameter mu = max(kkt_residual^tau, mu_min) is computed per
-    # iteration (Wright, 2002, eq 6.6).  Must be in (0, 1).
+    # parameter mu = clip(kkt_residual^tau, mu_min, mu_max) is computed
+    # per iteration (Wright, 2002, eq 6.6).  Must be in (0, 1).
     proximal_tau: float = 0.5
 
     # Floor on adaptive proximal mu.  None defaults to atol in
@@ -387,8 +396,16 @@ class SLSQP(optx.AbstractMinimiser):
     # is O(atol), consistent with the convergence tolerance.
     proximal_mu_min: Optional[float] = None
 
+    # Ceiling on adaptive proximal mu.  Prevents weak enforcement of
+    # equality constraints when the KKT residual is large (far from
+    # solution).  With mu_max = 0.1, the proximal weight 1/mu >= 10.
+    proximal_mu_max: float = eqx.field(static=True, default=0.1)
+
     # Resolved proximal_mu_min (always set in __check_init__)
     _proximal_mu_min: float = eqx.field(static=True, default=1e-6)
+
+    # Resolved proximal_mu_max (always set in __check_init__)
+    _proximal_mu_max: float = eqx.field(static=True, default=0.1)
 
     # Preconditioned CG: use L-BFGS inverse Hessian (two-loop recursion)
     # as preconditioner for the inner CG solver.  Dramatically improves
@@ -445,6 +462,9 @@ class SLSQP(optx.AbstractMinimiser):
             object.__setattr__(self, "_proximal_mu_min", self.proximal_mu_min)
         else:
             object.__setattr__(self, "_proximal_mu_min", self.atol)
+
+        # --- Proximal mu ceiling ---
+        object.__setattr__(self, "_proximal_mu_max", self.proximal_mu_max)
 
         if not (0 < self.proximal_tau < 1):
             raise ValueError(
@@ -1317,8 +1337,16 @@ class SLSQP(optx.AbstractMinimiser):
         initial_active_set = state.prev_active_set
 
         # Adaptive proximal mu (Wright, 2002, eq 6.6):
-        # mu = max(kkt_residual^tau, mu_min)
-        mu = jnp.maximum(kkt_residual**self.proximal_tau, self._proximal_mu_min)
+        # mu = clip(kkt_residual^tau, mu_min, mu_max)
+        # Capped at mu_max so the proximal weight 1/mu >= 1/mu_max,
+        # ensuring adequate equality enforcement even far from the solution.
+        # Wright's local convergence analysis assumes eta < 1; when the
+        # KKT residual is large the cap keeps the penalty tight.
+        mu = jnp.clip(
+            kkt_residual**self.proximal_tau,
+            self._proximal_mu_min,
+            self._proximal_mu_max,
+        )
 
         precond_fn = self._build_preconditioner(state, proximal_mu=mu)
 

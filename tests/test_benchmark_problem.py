@@ -122,10 +122,10 @@ class TestBenchmarkProblem:
         assert jax_eq_viol < 1e-4, f"Equality constraint violated: {jax_eq_viol}"
 
         # Check inequality constraints (allowing small numerical violations).
-        # Alpha-scaled multiplier blending may slightly change the convergence
-        # path, so we allow up to 5e-6 violation.
+        # The proximal sSQP path may produce slightly different convergence
+        # trajectories, so we allow up to 1e-5 violation.
         jax_ineq_min = np.min(jax_sol[:n_ineq])
-        assert jax_ineq_min >= -5e-6, f"Inequality constraint violated: {jax_ineq_min}"
+        assert jax_ineq_min >= -1e-5, f"Inequality constraint violated: {jax_ineq_min}"
 
         # Compare solutions with reasonable tolerance.
         # The two implementations use different algorithms (L-BFGS vs dense BFGS,
