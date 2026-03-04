@@ -54,9 +54,10 @@ from slsqp_jax.types import (
 from slsqp_jax.utils import args_closure
 
 STAGNATION_MESSAGE = (
-    "The solver stagnated: no sufficient progress in the merit function "
-    "was made for several consecutive iterations. This may indicate "
-    "cycling in the QP subproblem or an infeasible/degenerate problem."
+    "The solver stagnated: the iterates did not change significantly "
+    "over the sliding window (max_steps / 10 iterations). This may "
+    "indicate cycling in the QP subproblem or an infeasible/degenerate "
+    "problem."
 )
 
 
@@ -151,9 +152,9 @@ class SLSQPState(eqx.Module):
     # Consecutive QP failure tracking for escalating L-BFGS recovery
     consecutive_qp_failures: Int[Array, ""]
 
-    # Stagnation detection
-    prev_merit: Scalar
-    stagnation_count: Int[Array, ""]
+    # Sliding-window stagnation detection (x-value based)
+    x_history: Float[Array, "W n"]
+    x_stagnation: Bool[Array, ""]
     last_alpha: Scalar
 
 
@@ -262,12 +263,18 @@ class SLSQP(optx.AbstractMinimiser):
         ineq_hvp_fn: Optional per-constraint HVP of inequality constraints.
         min_steps: Minimum iterations before convergence is allowed (default 1).
         lbfgs_memory: Number of (s, y) pairs to store for L-BFGS (default 10).
-        proximal_sigma: Stabilization parameter for the sSQP formulation
-            (Hager, 1999; Wright, 2002).  When positive, equality constraints
-            are absorbed into the QP objective with penalty weight
-            ``1/proximal_sigma``, regularizing the dual solution and preventing
-            QP infeasibility at degenerate vertices.  Recommended range:
-            ``[1e-4, 1e-1]``.  Default 0.0 disables stabilization.
+        proximal_tau: Exponent for the adaptive proximal parameter mu in the
+            sSQP formulation (Wright, 2002, eq 6.6).  The proximal parameter
+            is computed as ``mu = max(kkt_residual^tau, mu_min)`` at each
+            iteration.  Must be in the open interval ``(0, 1)`` for the
+            superlinear convergence guarantee.  Default 0.5.  The proximal
+            is always active for equality-constrained problems.
+        proximal_mu_min: Floor on the adaptive proximal parameter mu.
+            Prevents ``1/mu`` from exploding and creating a convergence floor
+            on the Lagrangian gradient norm.  Default ``None`` resolves to
+            ``atol`` in ``__check_init__``, so the proximal perturbation near
+            convergence is ``O(atol)`` — consistent with the convergence
+            tolerance.
         use_preconditioner: When True (default), the L-BFGS inverse Hessian
             (two-loop recursion) is used as a preconditioner for the inner
             CG solver, dramatically improving convergence on ill-conditioned
@@ -369,19 +376,24 @@ class SLSQP(optx.AbstractMinimiser):
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
 
-    # Proximal multiplier stabilization (sSQP).
-    # When positive, equality constraints are absorbed into the QP
-    # objective via an augmented-Lagrangian penalty with weight
-    # 1/proximal_sigma.  This regularizes the dual solution and
-    # prevents QP infeasibility at degenerate vertices.  Larger
-    # values mean more relaxation.  Recommended range: [1e-4, 1e-1].
-    # Default 0.0 disables stabilization (standard QP).
-    proximal_sigma: float = 0.0
+    # Adaptive proximal multiplier stabilization (sSQP).
+    # Always active for equality-constrained problems.  The proximal
+    # parameter mu = max(kkt_residual^tau, mu_min) is computed per
+    # iteration (Wright, 2002, eq 6.6).  Must be in (0, 1).
+    proximal_tau: float = 0.5
+
+    # Floor on adaptive proximal mu.  None defaults to atol in
+    # __check_init__ so that the proximal perturbation near convergence
+    # is O(atol), consistent with the convergence tolerance.
+    proximal_mu_min: Optional[float] = None
+
+    # Resolved proximal_mu_min (always set in __check_init__)
+    _proximal_mu_min: float = eqx.field(static=True, default=1e-6)
 
     # Preconditioned CG: use L-BFGS inverse Hessian (two-loop recursion)
     # as preconditioner for the inner CG solver.  Dramatically improves
     # convergence on ill-conditioned QP subproblems, especially when
-    # proximal_sigma is active.  Default True; set False to disable.
+    # the proximal term is active.  Default True; set False to disable.
     use_preconditioner: bool = eqx.field(static=True, default=True)
 
     # Adaptive CG tolerance (Eisenstat-Walker-inspired).  Instead of
@@ -405,9 +417,13 @@ class SLSQP(optx.AbstractMinimiser):
     # SNOPT-style diagonal reset, breaking ill-conditioning cycles.
     qp_failure_patience: int = 3
 
-    # Stagnation detection parameters
+    # Stagnation detection: sliding-window x-value comparison.
+    # If ||x_k - x_{k-W}|| / max(||x_k||, 1) < stagnation_tol
+    # (where W = max_steps // 10), the solver declares stagnation.
     stagnation_tol: float = 1e-12
-    stagnation_patience: int = 5
+
+    # Stagnation window size (computed in __check_init__)
+    _stagnation_window: int = eqx.field(static=True, default=10)
 
     # Verbose output (resolved to Callable[..., None] in __check_init__)
     verbose: Callable = eqx.field(static=True, default=False)
@@ -416,10 +432,26 @@ class SLSQP(optx.AbstractMinimiser):
         """Post-initialization to precompute bound info and derivative callables.
 
         Called by equinox after __init__. Precomputes:
+        - Stagnation window size and proximal mu floor.
         - Bound masks and indices for box constraints.
         - Gradient, Jacobian, and HVP contribution callables that dispatch
           once here rather than branching on every call.
         """
+        # --- Stagnation window ---
+        object.__setattr__(self, "_stagnation_window", max(1, self.max_steps // 10))
+
+        # --- Proximal mu floor ---
+        if self.proximal_mu_min is not None:
+            object.__setattr__(self, "_proximal_mu_min", self.proximal_mu_min)
+        else:
+            object.__setattr__(self, "_proximal_mu_min", self.atol)
+
+        if not (0 < self.proximal_tau < 1):
+            raise ValueError(
+                f"proximal_tau must be in the open interval (0, 1), "
+                f"got {self.proximal_tau}"
+            )
+
         # --- Verbose callable ---
         if self.verbose is True:
             object.__setattr__(self, "verbose", _slsqp_verbose)
@@ -661,23 +693,28 @@ class SLSQP(optx.AbstractMinimiser):
     def _build_preconditioner(
         self,
         state: "SLSQPState",
+        proximal_mu: Scalar | float = 0.0,
     ) -> Callable[[Vector], Vector] | None:
         """Build the preconditioner for the PCG inner solver.
 
-        When ``proximal_sigma > 0`` and equality constraints are present,
-        the QP system matrix is ``B_tilde = B + (1/sigma) A_eq^T A_eq``,
-        so a plain ``B^{-1}`` preconditioner can amplify the proximal
-        eigenvalues and make CG *worse*.  In that case the Woodbury
-        identity is used to build ``B_tilde^{-1}`` cheaply::
+        When equality constraints are present, the QP system matrix is
+        ``B_tilde = B + (1/mu) A_eq^T A_eq``, so a plain ``B^{-1}``
+        preconditioner can amplify the proximal eigenvalues and make CG
+        *worse*.  In that case the Woodbury identity is used to build
+        ``B_tilde^{-1}`` cheaply::
 
-            (B + (1/s) A^T A)^{-1}
-              = B^{-1} - B^{-1} A^T (s I + A B^{-1} A^T)^{-1} A B^{-1}
+            (B + (1/mu) A^T A)^{-1}
+              = B^{-1} - B^{-1} A^T (mu I + A B^{-1} A^T)^{-1} A B^{-1}
 
-        The inner matrix ``(s I + A B^{-1} A^T)`` is only m_eq x m_eq
+        The inner matrix ``(mu I + A B^{-1} A^T)`` is only m_eq x m_eq
         and is factored once per QP solve.
 
-        When ``proximal_sigma == 0`` or there are no equality constraints,
-        falls back to the standard ``B^{-1}`` preconditioner.
+        When there are no equality constraints, falls back to the
+        standard ``B^{-1}`` preconditioner.
+
+        Args:
+            state: Current solver state.
+            proximal_mu: Adaptive proximal parameter (mu).
 
         Returns ``None`` when preconditioning is disabled.
         """
@@ -685,9 +722,9 @@ class SLSQP(optx.AbstractMinimiser):
             return None
         lbfgs_history = state.lbfgs_history
 
-        if self.proximal_sigma > 0 and self.n_eq_constraints > 0:
+        if self.n_eq_constraints > 0:
             A_eq = state.eq_jac
-            sigma = self.proximal_sigma
+            mu = proximal_mu
             m_eq = A_eq.shape[0]
 
             Hinv_AT = jax.vmap(
@@ -695,7 +732,7 @@ class SLSQP(optx.AbstractMinimiser):
             )(A_eq)  # (m_eq, n): rows are B^{-1} @ a_i
 
             gram = Hinv_AT @ A_eq.T  # (m_eq, m_eq): A B^{-1} A^T
-            inner = sigma * jnp.eye(m_eq) + gram
+            inner = mu * jnp.eye(m_eq) + gram
             inner_factor = jnp.linalg.cholesky(inner + 1e-10 * jnp.eye(m_eq))
 
             def preconditioner(v: Vector) -> Vector:
@@ -836,8 +873,9 @@ class SLSQP(optx.AbstractMinimiser):
         # Initial merit penalty
         merit_penalty = jnp.array(1.0)
 
-        # Compute initial merit for stagnation tracking
-        prev_merit = compute_merit(f_val, eq_val, ineq_val, merit_penalty)
+        # Sliding-window stagnation: fill history with initial point
+        W = self._stagnation_window
+        x_history = jnp.tile(y, (W, 1))
 
         return SLSQPState(
             step_count=jnp.array(0),
@@ -857,8 +895,8 @@ class SLSQP(optx.AbstractMinimiser):
             qp_converged=jnp.array(True),
             prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
             consecutive_qp_failures=jnp.array(0),
-            prev_merit=prev_merit,
-            stagnation_count=jnp.array(0),
+            x_history=x_history,
+            x_stagnation=jnp.array(False),
             last_alpha=jnp.array(1.0),
         )
 
@@ -1019,15 +1057,16 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
-        # Stagnation detection: compare merit at new point vs previous
-        merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
-        rel_improvement = jnp.abs(state.prev_merit - merit_new) / jnp.maximum(
-            jnp.abs(state.prev_merit), 1.0
+        # Sliding-window stagnation detection: compare current x with
+        # the x from W steps ago stored in the circular buffer.
+        W = self._stagnation_window
+        buf_idx = state.step_count % W
+        old_x = state.x_history[buf_idx]
+        new_x_history = state.x_history.at[buf_idx].set(y_new)
+        rel_x_change = jnp.linalg.norm(y_new - old_x) / jnp.maximum(
+            jnp.linalg.norm(y_new), 1.0
         )
-        is_stagnant = rel_improvement < self.stagnation_tol
-        new_stagnation_count = jnp.where(
-            is_stagnant, state.stagnation_count + 1, jnp.array(0)
-        )
+        x_stagnation = (state.step_count >= W) & (rel_x_change < self.stagnation_tol)
 
         new_state = SLSQPState(
             step_count=state.step_count + 1,
@@ -1047,8 +1086,8 @@ class SLSQP(optx.AbstractMinimiser):
             qp_converged=qp_result.converged,
             prev_active_set=qp_result.active_set,
             consecutive_qp_failures=new_consecutive_qp_failures,
-            prev_merit=merit_new,
-            stagnation_count=new_stagnation_count,
+            x_history=new_x_history,
+            x_stagnation=x_stagnation,
             last_alpha=alpha,
         )
 
@@ -1071,6 +1110,7 @@ class SLSQP(optx.AbstractMinimiser):
         diag_cond = jnp.max(new_lbfgs_history.diagonal) / jnp.maximum(
             jnp.min(new_lbfgs_history.diagonal), 1e-30
         )
+        merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
         self.verbose(
             num_steps=("Step", new_state.step_count),
             objective=("f", f_val_new, ".6e"),
@@ -1080,8 +1120,8 @@ class SLSQP(optx.AbstractMinimiser):
             step_size=("α", alpha, ".3e"),
             direction_norm=("|d|", dir_norm, ".3e"),
             merit=("merit", merit_new, ".6e"),
-            merit_improvement=("Δmerit", rel_improvement, ".3e"),
-            stagnation_count=("stag", new_stagnation_count),
+            rel_x_change=("Δx", rel_x_change, ".3e"),
+            x_stagnation=("x_stag", x_stagnation),
             penalty=("ρ", merit_penalty, ".3e"),
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
             lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
@@ -1156,8 +1196,8 @@ class SLSQP(optx.AbstractMinimiser):
         # Check max iterations
         max_iters_reached = state.step_count >= self.max_steps
 
-        # Check stagnation
-        stagnation_detected = state.stagnation_count >= self.stagnation_patience
+        # Check sliding-window x-value stagnation
+        stagnation_detected = state.x_stagnation
 
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
@@ -1222,7 +1262,7 @@ class SLSQP(optx.AbstractMinimiser):
             "qp_tolerance": 1e-8,
             "multipliers_eq": state.multipliers_eq,
             "multipliers_ineq": state.multipliers_ineq,
-            "stagnation_count": state.stagnation_count,
+            "x_stagnation": state.x_stagnation,
             "last_step_size": state.last_alpha,
         }
 
@@ -1244,11 +1284,14 @@ class SLSQP(optx.AbstractMinimiser):
 
         The previous iteration's QP active set is passed as a warm-start
         hint, and the outer KKT residual norm is used for adaptive EXPAND
-        tolerance scaling.  When ``proximal_sigma > 0``, the equality
-        constraints are absorbed into the objective via sSQP.
+        tolerance scaling.  For equality-constrained problems, the
+        adaptive proximal parameter ``mu = max(kkt^tau, mu_min)`` is
+        computed and the equality constraints are absorbed into the
+        objective via sSQP (Wright, 2002, eq 6.6).
 
         When ``use_preconditioner`` is True, the L-BFGS inverse Hessian
-        is passed to the QP solver as a CG preconditioner.
+        (with Woodbury correction for the proximal term) is passed to
+        the QP solver as a CG preconditioner.
 
         When ``adaptive_cg_tol`` is True, the CG tolerance is adapted
         based on the outer KKT residual (Eisenstat-Walker style).
@@ -1273,7 +1316,11 @@ class SLSQP(optx.AbstractMinimiser):
 
         initial_active_set = state.prev_active_set
 
-        precond_fn = self._build_preconditioner(state)
+        # Adaptive proximal mu (Wright, 2002, eq 6.6):
+        # mu = max(kkt_residual^tau, mu_min)
+        mu = jnp.maximum(kkt_residual**self.proximal_tau, self._proximal_mu_min)
+
+        precond_fn = self._build_preconditioner(state, proximal_mu=mu)
 
         # Eisenstat-Walker adaptive CG tolerance: solve loosely far from
         # optimum (fast), tightly near the solution (accurate).
@@ -1294,7 +1341,7 @@ class SLSQP(optx.AbstractMinimiser):
             max_cg_iter=self.qp_max_cg_iter,
             initial_active_set=initial_active_set,
             kkt_residual=kkt_residual,
-            proximal_sigma=self.proximal_sigma,
+            proximal_mu=mu,
             prev_multipliers_eq=state.multipliers_eq,
             precond_fn=precond_fn,
             cg_tol=adaptive_tol,

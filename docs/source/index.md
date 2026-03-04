@@ -293,50 +293,55 @@ $$
 where
 
 $$
-\widetilde{B}(v) = B v + \frac{1}{\sigma}\, A_{\text{eq}}^T (A_{\text{eq}}\, v), \qquad
-\widetilde{g} = g - \frac{1}{\sigma}\, A_{\text{eq}}^T b_{\text{eq}} - A_{\text{eq}}^T \lambda_k^{\text{eq}}
+\widetilde{B}(v) = B v + \frac{1}{\mu}\, A_{\text{eq}}^T (A_{\text{eq}}\, v), \qquad
+\widetilde{g} = g - \frac{1}{\mu}\, A_{\text{eq}}^T b_{\text{eq}} - A_{\text{eq}}^T \lambda_k^{\text{eq}}
 $$
 
-Here $\sigma > 0$ is the stabilization parameter and $\lambda_k^{\text{eq}}$ are the equality multipliers from the previous outer iteration. The term $\tfrac{1}{\sigma} A_{\text{eq}}^T A_{\text{eq}}$ regularizes the reduced Hessian in the equality-constraint normal directions, making the dual solution unique even at degenerate vertices. Equality multipliers are recovered from the penalty optimality condition:
+Here $\mu > 0$ is the adaptive proximal parameter and $\lambda_k^{\text{eq}}$ are the equality multipliers from the previous outer iteration. The term $\tfrac{1}{\mu} A_{\text{eq}}^T A_{\text{eq}}$ regularizes the reduced Hessian in the equality-constraint normal directions, making the dual solution unique even at degenerate vertices. Equality multipliers are recovered from the penalty optimality condition:
 
 $$
-\lambda_{\text{eq}} = \lambda_k^{\text{eq}} - \frac{1}{\sigma}\bigl(A_{\text{eq}}\, d - b_{\text{eq}}\bigr)
+\lambda_{\text{eq}} = \lambda_k^{\text{eq}} - \frac{1}{\mu}\bigl(A_{\text{eq}}\, d - b_{\text{eq}}\bigr)
 $$
 
-Larger $\sigma$ means more relaxation (softer equality enforcement); smaller $\sigma$ tightens toward the standard hard-constraint QP. Near convergence, $b_{\text{eq}} = -c_{\text{eq}}(x_k) \to 0$ and $d \to 0$, so the penalty vanishes and constraint satisfaction is asymptotically exact.
+Larger $\mu$ means more relaxation (softer equality enforcement); smaller $\mu$ tightens toward the standard hard-constraint QP. Near convergence, $b_{\text{eq}} = -c_{\text{eq}}(x_k) \to 0$ and $d \to 0$, so the penalty vanishes and constraint satisfaction is asymptotically exact.
 
 Inequality constraints remain as hard constraints in the active-set method — the EXPAND procedure and warm-starting already handle inequality cycling. The equality absorption is the primary mechanism because it addresses QP infeasibility at degenerate vertices.
 
-To enable proximal stabilization, set `proximal_sigma` to a positive value (recommended range: $[10^{-4}, 10^{-1}]$):
+Proximal stabilization is **always active** for equality-constrained problems. The proximal parameter $\mu$ is computed adaptively at each iteration following Wright (2002, eq 6.6):
+
+$$
+\mu_k = \max\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min}\bigr)
+$$
+
+where $\tau \in (0, 1)$ is the exponent (default 0.5) and $\mu_{\min}$ is a floor (default `atol`, typically $10^{-6}$). Far from the solution the KKT residual is large, so $\mu$ is large and the penalty is mild. As the solver converges, $\mu$ shrinks, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
 
 ```python
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
-    ineq_constraint_fn=ineq_constraint,
-    n_ineq_constraints=3,
-    proximal_sigma=0.01,   # Enable sSQP stabilization
+    proximal_tau=0.5,       # Exponent for adaptive mu (must be in (0,1))
+    proximal_mu_min=None,   # Floor on mu; None defaults to atol
 )
 ```
 
-When `proximal_sigma=0` (the default), the solver uses the standard hard-constraint QP and no stabilization overhead is incurred.
+For inequality-only problems (no equality constraints), the proximal path is not used and no overhead is incurred.
 
 ### Preconditioning the CG solver
 
-When the L-BFGS scaling $\gamma$ is small (common after a few iterations) and proximal stabilization adds a $(1/\sigma)\, A_{\text{eq}}^T A_{\text{eq}}$ term to the Hessian, the effective condition number of the QP subproblem can reach $O(10^5)$ or higher. Standard (unpreconditioned) CG requires $O(\sqrt{\kappa})$ iterations to converge — far exceeding the default CG budget of 50 iterations. The result is an inaccurate QP solution, which corrupts the search direction and causes the outer solver to stagnate.
+When the L-BFGS scaling $\gamma$ is small (common after a few iterations) and proximal stabilization adds a $(1/\mu)\, A_{\text{eq}}^T A_{\text{eq}}$ term to the Hessian, the effective condition number of the QP subproblem can reach $O(10^5)$ or higher. Standard (unpreconditioned) CG requires $O(\sqrt{\kappa})$ iterations to converge — far exceeding the default CG budget of 50 iterations. The result is an inaccurate QP solution, which corrupts the search direction and causes the outer solver to stagnate.
 
 This implementation uses **preconditioned conjugate gradient (PCG)** with the L-BFGS inverse Hessian as preconditioner. The key insight is that the L-BFGS pairs $(s_i, y_i)$ already stored in the history buffer can be used to compute $H_k v = B_k^{-1} v$ via the **two-loop recursion** (Nocedal & Wright, Algorithm 7.4) in $O(kn)$ time — the same cost as the forward HVP.
 
 When the preconditioner $M = B^{-1}$ is used:
 
-- **Without proximal term**: $M B = I$, so PCG converges in 1 iteration (perfect preconditioning).
-- **With proximal term**: the preconditioner is automatically upgraded to $M = \widetilde{B}^{-1}$ via the **Woodbury identity**:
+- **Without equality constraints**: $M B = I$, so PCG converges in 1 iteration (perfect preconditioning).
+- **With equality constraints**: the preconditioner is automatically upgraded to $M = \widetilde{B}^{-1}$ via the **Woodbury identity**:
 
 $$
-\widetilde{B}^{-1} = B^{-1} - B^{-1} A_{\text{eq}}^T \bigl(\sigma I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T\bigr)^{-1} A_{\text{eq}} B^{-1}
+\widetilde{B}^{-1} = B^{-1} - B^{-1} A_{\text{eq}}^T \bigl(\mu I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T\bigr)^{-1} A_{\text{eq}} B^{-1}
 $$
 
-The inner matrix $(\sigma I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T)$ is only $m_{\text{eq}} \times m_{\text{eq}}$ (tiny) and is factored once per QP solve. Each preconditioner application costs $O(kn + mn)$. This ensures the preconditioner matches the actual QP system matrix and avoids the pathological case where a plain $B^{-1}$ preconditioner amplifies the proximal eigenvalues when $\gamma$ is small.
+The inner matrix $(\mu I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T)$ is only $m_{\text{eq}} \times m_{\text{eq}}$ (tiny) and is factored once per QP solve. Each preconditioner application costs $O(kn + mn)$. This ensures the preconditioner matches the actual QP system matrix and avoids the pathological case where a plain $B^{-1}$ preconditioner amplifies the proximal eigenvalues when $\gamma$ is small.
 
 For projected (constrained) CG, the preconditioner is applied as $z = P(M(P(r)))$, where $P$ is the null-space projector. The extra projection ensures the preconditioned direction stays in the feasible subspace (Nocedal & Wright, Chapter 16).
 
@@ -393,35 +398,32 @@ Combined with the L-BFGS diagonal reset (above), these mechanisms allow the solv
 
 ### Outer-loop stagnation detection
 
-Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this by tracking the **L1 merit function** across iterations:
+Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this using a **sliding-window x-value comparison**.
+
+A circular buffer of size $W = \lfloor \texttt{max\_steps} / 10 \rfloor$ stores recent iterates. At each step $k \geq W$, the solver compares the current iterate with the one from $W$ steps ago:
 
 $$
-\phi(x; \rho) = f(x) + \rho \bigl(\lVert c_{\text{eq}}(x) \rVert_1 + \lVert \max(0, -c_{\text{ineq}}(x)) \rVert_1\bigr)
+\frac{\lVert x_k - x_{k-W} \rVert}{\max(\lVert x_k \rVert,\, 1)} < \texttt{stagnation\_tol}
 $$
 
-After each step, the relative improvement in the merit value is computed:
+If this relative change is below `stagnation_tol` (default $10^{-12}$), the solver terminates early with a `nonlinear_divergence` result code rather than running until `max_steps`. This avoids wasting computation on a problem the solver cannot solve.
 
-$$
-\text{rel\_improvement} = \frac{|\phi_{k-1} - \phi_k|}{\max(|\phi_{k-1}|,\, 1)}
-$$
-
-If this falls below `stagnation_tol` for `stagnation_patience` consecutive iterations, the solver terminates early with a `nonlinear_divergence` result code rather than running until `max_steps`. This avoids wasting computation on a problem the solver cannot solve.
+This approach is more robust than merit-based consecutive-counter detection, which can miss cases where merit improvements are minuscule but technically above the threshold — causing the solver to run to `max_steps` without being flagged as stagnant.
 
 ```python
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
-    stagnation_tol=1e-12,    # Minimum relative merit improvement
-    stagnation_patience=5,   # Consecutive stagnant steps before failure
+    stagnation_tol=1e-12,    # Minimum relative x-value change over window
 )
 ```
 
-The stagnation count and last step size are included in `sol.stats` for diagnostics:
+The stagnation flag and last step size are included in `sol.stats` for diagnostics:
 
 ```python
 sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100, throw=False)
-print(sol.stats["stagnation_count"])  # 0 if converged normally
-print(sol.stats["last_step_size"])    # Step size from final iteration
+print(sol.stats["x_stagnation"])   # False if converged normally
+print(sol.stats["last_step_size"]) # Step size from final iteration
 ```
 
 ## License
