@@ -41,7 +41,7 @@ class TestSLSQPUnconstrained:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50)
+        solver = SLSQP(atol=1e-8, max_steps=50)
         x0 = jnp.array([3.0, -2.0])
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
@@ -52,7 +52,7 @@ class TestSLSQPUnconstrained:
         def objective(x, args):
             return (x[0] - 1) ** 2 + (x[1] - 2) ** 2, None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50)
+        solver = SLSQP(atol=1e-8, max_steps=50)
         x0 = jnp.array([0.0, 0.0])
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, [1.0, 2.0], atol=1e-5)
@@ -63,7 +63,7 @@ class TestSLSQPUnconstrained:
         def objective(x, args):
             return (1 - x[0]) ** 2 + 100 * (x[1] - x[0] ** 2) ** 2, None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=200)
+        solver = SLSQP(atol=1e-8, max_steps=200)
         x0 = jnp.array([-1.0, 1.0])
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-3)
@@ -82,7 +82,6 @@ class TestSLSQPEqualityConstraints:
             return jnp.array([x[0] + x[1] + x[2] - 3.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -104,7 +103,6 @@ class TestSLSQPEqualityConstraints:
             return jnp.array([x[0] ** 2 + x[1] ** 2 - 1.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -130,7 +128,6 @@ class TestSLSQPInequalityConstraints:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -152,7 +149,6 @@ class TestSLSQPInequalityConstraints:
             return jnp.array([x[0], x[1], 2.0 - x[0], 2.0 - x[1]])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -179,7 +175,6 @@ class TestSLSQPMixedConstraints:
             return x
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -201,7 +196,7 @@ class TestSLSQPJIT:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=10)
+        solver = SLSQP(atol=1e-6, max_steps=10)
         x0 = jnp.array([1.0, 2.0])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
 
@@ -229,7 +224,6 @@ class TestSLSQPUserSuppliedDerivatives:
             return 2.0 * x
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             obj_grad_fn=obj_grad,
@@ -251,7 +245,6 @@ class TestSLSQPUserSuppliedDerivatives:
             return jnp.array([[1.0, 1.0, 1.0]])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -273,7 +266,6 @@ class TestSLSQPUserSuppliedDerivatives:
             return 2.0 * v
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             obj_hvp_fn=obj_hvp,
@@ -302,7 +294,6 @@ class TestSLSQPUserSuppliedDerivatives:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -332,7 +323,6 @@ class TestSLSQPUserSuppliedDerivatives:
 
         # No eq_hvp_fn provided -> AD fallback
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -367,7 +357,6 @@ class TestSLSQPUserSuppliedDerivatives:
 
         # No ineq_hvp_fn provided -> AD fallback
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -398,7 +387,7 @@ class TestSLSQPModerateScale:
         def objective(x, args):
             return jnp.sum(weights * x**2), None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=300, lbfgs_memory=15)
+        solver = SLSQP(atol=1e-8, max_steps=300, lbfgs_memory=15)
         key = jax.random.PRNGKey(42)
         x0 = jax.random.normal(key, (n,))
 
@@ -423,7 +412,6 @@ class TestSLSQPModerateScale:
             return jnp.array([jnp.sum(x) - float(n)])
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -456,7 +444,6 @@ class TestSLSQPModerateScale:
             return 2.0 * weights * v
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=300,
             obj_hvp_fn=obj_hvp,
@@ -478,7 +465,7 @@ class TestOptimistixMinimise:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8)
+        solver = SLSQP(atol=1e-8)
         x0 = jnp.array([3.0, -2.0])
         sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
 
@@ -497,7 +484,6 @@ class TestOptimistixMinimise:
             return jnp.array([x[0] + x[1] + x[2] - 3.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
@@ -521,8 +507,7 @@ class TestOptimistixMinimise:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
-            atol=1e-8,
+            atol=1e-7,
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=1,
         )
@@ -547,7 +532,6 @@ class TestOptimistixMinimise:
             return x
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             eq_constraint_fn=eq_constraint,
             ineq_constraint_fn=ineq_constraint,
@@ -568,7 +552,7 @@ class TestOptimistixMinimise:
         def obj_grad(x, args):
             return 2.0 * x
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, obj_grad_fn=obj_grad)
+        solver = SLSQP(atol=1e-8, obj_grad_fn=obj_grad)
         x0 = jnp.array([3.0, -2.0])
         sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
 
@@ -593,7 +577,6 @@ class TestOptimistixMinimise:
             return jnp.array([[1.0, 1.0]])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
@@ -614,7 +597,7 @@ class TestOptimistixMinimise:
         def obj_hvp(x, v, args):
             return 2.0 * v
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, obj_hvp_fn=obj_hvp)
+        solver = SLSQP(atol=1e-8, obj_hvp_fn=obj_hvp)
         x0 = jnp.array([3.0, -2.0])
         sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
 
@@ -639,7 +622,6 @@ class TestOptimistixMinimise:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
@@ -669,7 +651,6 @@ class TestOptimistixMinimise:
 
         # No eq_hvp_fn — solver uses forward-over-reverse AD for constraint HVP
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
@@ -706,7 +687,6 @@ class TestOptimistixMinimise:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=1,
@@ -726,7 +706,7 @@ class TestOptimistixMinimise:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8)
+        solver = SLSQP(atol=1e-8)
         x0 = jnp.array([1.0, 2.0])
         sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=50)
 
@@ -743,7 +723,7 @@ class TestOptimistixMinimise:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-15, atol=1e-15)  # impossibly tight tolerance
+        solver = SLSQP(rtol=1e-15)  # impossibly tight tolerance
         x0 = jnp.array([3.0, -2.0])
         # Should not raise, just return with a non-successful result
         sol = optx.minimise(
@@ -774,7 +754,7 @@ class TestSLSQPComparisonWithSciPy:
         x0 = np.array([3.0, -2.0])
         result_scipy = scipy_minimize(objective_scipy, x0, method="SLSQP")
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50)
+        solver = SLSQP(atol=1e-8, max_steps=50)
         y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
 
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
@@ -804,7 +784,6 @@ class TestSLSQPComparisonWithSciPy:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=constraint_jax,
@@ -827,7 +806,6 @@ class TestSLSQPBoxConstraints:
         bounds = jnp.array([[2.0, jnp.inf]])  # x >= 2
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -846,7 +824,6 @@ class TestSLSQPBoxConstraints:
         bounds = jnp.array([[-jnp.inf, 3.0]])  # x <= 3
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -870,7 +847,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -900,7 +876,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -934,7 +909,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -968,7 +942,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -996,7 +969,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -1030,7 +1002,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -1048,7 +1019,6 @@ class TestSLSQPBoxConstraints:
             return jnp.sum(x**2), None
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=None,
@@ -1072,7 +1042,6 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -1096,8 +1065,7 @@ class TestSLSQPBoxConstraints:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
-            atol=1e-8,
+            atol=1e-7,
             bounds=bounds,
         )
         x0 = jnp.array([1.0, 1.0])
@@ -1130,7 +1098,7 @@ class TestSLSQPBoundsComparisonWithSciPy:
             bounds=scipy_bounds,
         )
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50, bounds=jax_bounds)
+        solver = SLSQP(atol=1e-8, max_steps=50, bounds=jax_bounds)
         y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
@@ -1165,7 +1133,6 @@ class TestSLSQPBoundsComparisonWithSciPy:
         )
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=constraint_jax,
@@ -1204,7 +1171,7 @@ class TestSLSQPBoundsComparisonWithSciPy:
             bounds=scipy_bounds,
         )
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=50, bounds=jax_bounds)
+        solver = SLSQP(atol=1e-8, max_steps=50, bounds=jax_bounds)
         y, _ = _run_solver(solver, objective_jax, jnp.array(x0))
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3, atol=1e-6)
@@ -1232,7 +1199,6 @@ class TestFrozenHVP:
             return 2.0 * v
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=10,
             obj_hvp_fn=obj_hvp,
@@ -1269,7 +1235,6 @@ class TestFrozenHVP:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=10,
             eq_constraint_fn=eq_constraint,
@@ -1313,7 +1278,6 @@ class TestFrozenHVP:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -1346,7 +1310,6 @@ class TestFrozenHVP:
             return jnp.zeros((1, x.shape[0]))
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -1374,7 +1337,6 @@ class TestFrozenHVP:
             return jnp.array([2.0 * v[0], 20.0 * v[1], 200.0 * v[2]])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             obj_hvp_fn=obj_hvp,
@@ -1418,7 +1380,6 @@ class TestEarlyTerminationFix:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -1453,7 +1414,6 @@ class TestEarlyTerminationFix:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=200,
             eq_constraint_fn=eq_constraint,
@@ -1475,7 +1435,6 @@ class TestEarlyTerminationFix:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             min_steps=1,
@@ -1523,7 +1482,6 @@ class TestEarlyTerminationFix:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -1554,7 +1512,6 @@ class TestEarlyTerminationFix:
             return jnp.array([x[0] ** 2 + x[1] ** 2 - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -1582,7 +1539,6 @@ class TestWarmStartAndAdaptiveTolerance:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -1605,7 +1561,6 @@ class TestWarmStartAndAdaptiveTolerance:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -1625,7 +1580,6 @@ class TestWarmStartAndAdaptiveTolerance:
 
         bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -1649,7 +1603,6 @@ class TestWarmStartAndAdaptiveTolerance:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -1674,7 +1627,6 @@ class TestWarmStartAndAdaptiveTolerance:
 
         bounds = jnp.array([[0.0, 3.0], [0.0, 3.0]])
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -1697,7 +1649,6 @@ class TestWarmStartAndAdaptiveTolerance:
             return jnp.array([x[0] + x[1] - 2.0])
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=10,
             ineq_constraint_fn=ineq_constraint,
@@ -1757,7 +1708,6 @@ class TestStagnationDetection:
             return jnp.array([x[0] - 10.0, -x[0] - 10.0])
 
         solver = SLSQP(
-            rtol=1e-12,
             atol=1e-12,
             max_steps=200,
             ineq_constraint_fn=ineq_constraint,
@@ -1778,7 +1728,6 @@ class TestStagnationDetection:
             return jnp.sum(x**2), None
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             stagnation_tol=1e-12,
@@ -1794,7 +1743,7 @@ class TestStagnationDetection:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(rtol=1e-8, atol=1e-8, max_steps=10)
+        solver = SLSQP(atol=1e-8, max_steps=10)
         x0 = jnp.array([1.0, 1.0])
         y, state = _run_solver(solver, objective, x0)
 
@@ -1827,7 +1776,6 @@ class TestProximalStabilization:
             n_eq_constraints=1,
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=1,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([0.9, 0.1])
@@ -1855,7 +1803,6 @@ class TestProximalStabilization:
         solver = SLSQP(
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=3,
-            rtol=1e-6,
             atol=1e-6,
         )
 
@@ -1877,7 +1824,6 @@ class TestProximalStabilization:
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([0.5, 0.5])
@@ -1913,7 +1859,6 @@ class TestPreconditionedSolver:
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             use_preconditioner=True,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([0.1, 0.9])
@@ -1935,7 +1880,6 @@ class TestPreconditionedSolver:
             n_ineq_constraints=1,
             use_preconditioner=True,
             adaptive_cg_tol=False,
-            rtol=1e-6,
             atol=1e-6,
         )
         solver_off = SLSQP(
@@ -1943,7 +1887,6 @@ class TestPreconditionedSolver:
             n_ineq_constraints=1,
             use_preconditioner=False,
             adaptive_cg_tol=False,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([2.0, 2.0])
@@ -1965,7 +1908,6 @@ class TestPreconditionedSolver:
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             adaptive_cg_tol=True,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([0.0, 0.0])
@@ -1986,7 +1928,6 @@ class TestPreconditionedSolver:
             n_eq_constraints=1,
             use_preconditioner=True,
             adaptive_cg_tol=True,
-            rtol=1e-6,
             atol=1e-6,
         )
         x0 = jnp.array([0.5, 0.5])
@@ -2004,3 +1945,44 @@ class TestPreconditionedSolver:
 
         sol = do_solve(x0)
         np.testing.assert_allclose(sol.value[0] + sol.value[1], 1.0, atol=1e-3)
+
+
+class TestRelativeStationarity:
+    """Tests for the relative stationarity convergence criterion."""
+
+    def test_large_lagrangian_converges(self):
+        """When |L| is large at the optimum, the relative criterion should
+        still allow convergence even though ||grad_L|| may exceed a tight
+        absolute threshold.
+
+        min (x - 1000)^2 + 1e8  =>  optimum at x=1000, f*=1e8.
+        With rtol=1e-6, threshold = 1e-6 * max(1e8, 1) = 100.
+        """
+
+        def objective(x, args):
+            return jnp.sum((x - 1000.0) ** 2) + 1e8, None
+
+        solver = SLSQP(rtol=1e-6, max_steps=50)
+        y, state = _run_solver(solver, objective, jnp.array([0.0]))
+        np.testing.assert_allclose(y, jnp.array([1000.0]), rtol=1e-3)
+
+    def test_rtol_controls_stationarity_not_feasibility(self):
+        """rtol affects only the stationarity check; atol still controls
+        feasibility.  Tightening rtol alone should not change the
+        feasibility threshold."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            rtol=1e-10,
+            atol=1e-6,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            max_steps=100,
+        )
+        y, state = _run_solver(solver, objective, jnp.array([0.5, 0.5]))
+        np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-5)

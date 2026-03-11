@@ -114,6 +114,8 @@ Each SLSQP iteration performs four steps:
 
 **Outer-loop stagnation detection:** The solver uses a sliding-window x-value comparison with window size `W = max_steps // 10`. At each step k >= W, it compares `||x_k - x_{k-W}|| / max(||x_k||, 1)` against `stagnation_tol`. If the relative change is below tolerance, the solver terminates early with `nonlinear_divergence`. This is more robust than merit-based consecutive-counter detection, which can miss cases where merit improvements are minuscule but above threshold. Controlled by `stagnation_tol` on `SLSQP`.
 
+**Convergence criterion:** The solver declares convergence when both conditions hold (and at least `min_steps` iterations have elapsed): (1) **relative stationarity** `||∇_x L|| <= rtol * max(|L|, 1)` where `L = f − λ_eq^T c_eq − μ_ineq^T c_ineq` is the Lagrangian value, and (2) **primal feasibility** `max|c_eq| <= atol` and `max(0, −c_ineq) <= atol`. The relative stationarity criterion is motivated by floating-point arithmetic: when the gradient is negligible relative to `|L|`, a step of that magnitude cannot change `L` in finite precision. The `max(|L|, 1)` safeguard prevents the criterion from becoming vacuous when `L ≈ 0`. `rtol` controls stationarity (default 1e-6); `atol` controls feasibility (default 1e-6).
+
 ## The Task: SLSQP Implementation
 You need to port the logic of SLSQP (Sequential Least Squares Programming) to JAX.
 * **Core logic:** SLSQP solves a nonlinear optimization problem by solving a Quadratic Programming (QP) subproblem at each step to determine the search direction.

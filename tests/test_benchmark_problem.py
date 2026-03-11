@@ -51,7 +51,6 @@ def make_benchmark_problem(n):
         return x[:n_ineq]
 
     solver = SLSQP(
-        rtol=1e-6,
         atol=1e-6,
         max_steps=200,
         eq_constraint_fn=eq_constraint,
@@ -206,7 +205,6 @@ class TestRosenbrock:
 
         # Unconstrained SLSQP solver
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=500,
             eq_constraint_fn=None,

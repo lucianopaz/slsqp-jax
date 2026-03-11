@@ -60,7 +60,6 @@ class TestIllConditionedHessian:
             return jnp.sum(weights * x**2), None
 
         solver = SLSQP(
-            rtol=1e-4,
             atol=1e-4,
             max_steps=50,
             lbfgs_memory=10,
@@ -93,7 +92,6 @@ class TestIllConditionedHessian:
             return jnp.array([jnp.sum(x) - float(n)])
 
         solver = SLSQP(
-            rtol=1e-3,
             atol=1e-3,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -125,7 +123,6 @@ class TestIllConditionedHessian:
             return (100 * x[0]) ** 2 + x[1] ** 2, None
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=50,
         )
@@ -166,7 +163,6 @@ class TestNearInfeasibleConstraints:
             )
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -205,7 +201,6 @@ class TestNearInfeasibleConstraints:
             )
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
             ineq_constraint_fn=ineq_constraint,
@@ -245,7 +240,6 @@ class TestNearInfeasibleConstraints:
             )
 
         solver = SLSQP(
-            rtol=1e-5,
             atol=1e-5,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -294,7 +288,7 @@ class TestComparisonWithSciPy:
         )
 
         # slsqp-jax
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=50, lbfgs_memory=10)
+        solver = SLSQP(atol=1e-6, max_steps=50, lbfgs_memory=10)
         y_jax, _ = _run_solver(solver, objective_jax, x0_jax)
 
         # Both should significantly reduce the objective
@@ -338,7 +332,6 @@ class TestComparisonWithSciPy:
 
         # slsqp-jax
         solver = SLSQP(
-            rtol=1e-4,
             atol=1e-4,
             max_steps=50,
             eq_constraint_fn=constraint_jax,
@@ -400,7 +393,6 @@ class TestProcessOptimizationBenchmarks:
             )
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
             ineq_constraint_fn=ineq_constraint,
@@ -451,7 +443,6 @@ class TestProcessOptimizationBenchmarks:
             )
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -522,7 +513,6 @@ class TestProcessOptimizationBenchmarks:
             )
 
         solver = SLSQP(
-            rtol=1e-4,
             atol=1e-4,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -566,7 +556,6 @@ class TestNumericalStability:
             return jnp.sum(x**4), None
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=100,
         )
@@ -585,7 +574,6 @@ class TestNumericalStability:
             return jnp.sum(x**2), None
 
         solver = SLSQP(
-            rtol=1e-4,
             atol=1e-4,
             max_steps=100,
         )
@@ -609,7 +597,6 @@ class TestNumericalStability:
             return (x[0] * 10 - 1) ** 2 + (x[1] * 0.1 - 1) ** 2, None
 
         solver = SLSQP(
-            rtol=1e-6,
             atol=1e-6,
             max_steps=50,
         )
