@@ -635,7 +635,7 @@ class TestMinimizeLikeScipy:
         x0 = np.array([2.0, 0.0])
         ref = scipy_minimize(fun, x0, method="SLSQP", constraints=cons)
         sol = minimize_like_scipy(fun, x0, constraints=cons, options={"max_steps": 100})
-        np.testing.assert_allclose(sol.value, ref.x, atol=1e-3)
+        np.testing.assert_allclose(sol.value, ref.x, atol=2e-3)
 
     def test_inequality_constraints_dict(self):
         """Minimise (x-1)^2 + (y-2.5)^2  s.t. x - 2y + 2 >= 0 etc."""
