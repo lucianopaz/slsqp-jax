@@ -63,7 +63,6 @@ solver = SLSQP(
     n_eq_constraints=1,
     ineq_constraint_fn=ineq_constraint,
     n_ineq_constraints=1,
-    rtol=1e-8,
     atol=1e-8,
 )
 
@@ -151,7 +150,6 @@ bounds = jnp.array([
 solver = SLSQP(
     bounds=bounds,
     rtol=1e-8,
-    atol=1e-8,
 )
 ```
 
@@ -313,14 +311,14 @@ $$
 \mu_k = \operatorname{clip}\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min},\;\mu_{\max}\bigr)
 $$
 
-where $\tau \in (0, 1)$ is the exponent (default 0.5), $\mu_{\min}$ is a floor (default `atol`, typically $10^{-6}$), and $\mu_{\max}$ is a ceiling (default 0.1). Wright's local convergence theory assumes the KKT residual is below 1; the ceiling handles the regime where the residual is large (far from the solution) by ensuring the proximal weight $1/\mu \geq 1/\mu_{\max}$ — preventing weak equality enforcement that would sabotage the L1 merit function descent. As the solver converges, $\mu$ shrinks below the ceiling, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
+where $\tau \in (0, 1)$ is the exponent (default 0.5), $\mu_{\min}$ is a floor (default `atol` — the feasibility tolerance, typically $10^{-6}$), and $\mu_{\max}$ is a ceiling (default 0.1). Wright's local convergence theory assumes the KKT residual is below 1; the ceiling handles the regime where the residual is large (far from the solution) by ensuring the proximal weight $1/\mu \geq 1/\mu_{\max}$ — preventing weak equality enforcement that would sabotage the L1 merit function descent. As the solver converges, $\mu$ shrinks below the ceiling, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
 
 ```python
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
     proximal_tau=0.5,       # Exponent for adaptive mu (must be in (0,1))
-    proximal_mu_min=None,   # Floor on mu; None defaults to atol
+    proximal_mu_min=None,   # Floor on mu; None defaults to atol (feasibility tol)
     proximal_mu_max=0.1,    # Ceiling on mu; keeps 1/mu >= 10
 )
 ```
@@ -362,7 +360,7 @@ solver = SLSQP(
 
 The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG to continue through directions with eigenvalues as small as $10^{-6}$ while still stopping on numerical noise. The CG step length and residual update use the true (unregularized) curvature, so the solution is unbiased. Set to `0.0` to disable (CG only stops on truly non-positive curvature).
 
-**Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior.
+**Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$, where `atol` is the feasibility tolerance. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior.
 
 **Why not rational CG?** We evaluated the rational conjugate gradient method (Kindermann & Zellinger, arXiv:2306.03670, 2023), which alternates CG steps with Tikhonov regularization steps in a mixed rational Krylov space. It is designed for ill-posed inverse problems with compact operators, not finite-dimensional positive definite QPs. Each rational step requires an inner solve of $(B + \alpha I)^{-1} v$, the regularization parameters need spectrum knowledge, and adapting the method to null-space projection is non-trivial. Standard PCG is simpler, cheaper, and directly addresses the ill-conditioning source.
 

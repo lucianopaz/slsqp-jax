@@ -236,7 +236,6 @@ class TestProximalPreconditioner:
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             use_preconditioner=True,
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
         )
@@ -265,7 +264,6 @@ class TestProximalPreconditioner:
 
         solver = SLSQP(
             use_preconditioner=True,
-            rtol=1e-8,
             atol=1e-8,
         )
         x0 = jnp.array([0.5, 0.3, 0.1, 0.1])
@@ -301,7 +299,6 @@ class TestPenaltyGating:
             n_eq_constraints=1,
             qp_max_iter=1,  # force QP failure
             qp_max_cg_iter=1,
-            rtol=1e-8,
             atol=1e-8,
             max_steps=5,
         )
@@ -341,7 +338,6 @@ class TestSteepestDescentFallback:
         solver = SLSQP(
             qp_max_iter=1,
             qp_max_cg_iter=1,
-            rtol=1e-4,
             atol=1e-4,
             max_steps=200,
         )
@@ -371,7 +367,6 @@ class TestStagnationRecovery:
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             use_preconditioner=True,
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
         )
@@ -395,7 +390,6 @@ class TestStagnationRecovery:
             n_eq_constraints=1,
             bounds=bounds,
             use_preconditioner=True,
-            rtol=1e-6,
             atol=1e-6,
             max_steps=100,
         )
@@ -429,7 +423,6 @@ class TestStagnationRecovery:
             n_eq_constraints=1,
             bounds=bounds,
             cg_regularization=1e-6,
-            rtol=1e-5,
             atol=1e-5,
             max_steps=200,
         )
@@ -567,7 +560,6 @@ class TestEscalatingLBFGSRecovery:
             qp_max_iter=1,
             qp_max_cg_iter=1,
             qp_failure_patience=patience,
-            rtol=1e-8,
             atol=1e-8,
             max_steps=patience + 5,
         )
@@ -599,7 +591,6 @@ class TestEscalatingLBFGSRecovery:
 
         solver = SLSQP(
             qp_failure_patience=3,
-            rtol=1e-6,
             atol=1e-6,
             max_steps=5,
         )
@@ -633,7 +624,6 @@ class TestAlphaScaledMultipliers:
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            rtol=1e-8,
             atol=1e-8,
             max_steps=2,
         )
@@ -660,7 +650,6 @@ class TestAlphaScaledMultipliers:
 
         bounds = jnp.array([[0.0, 2.0], [0.0, 2.0]])
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             bounds=bounds,
             max_steps=50,
@@ -710,7 +699,6 @@ class TestSlidingWindowStagnation:
             return jnp.sum(x**2), None
 
         solver = SLSQP(
-            rtol=1e-8,
             atol=1e-8,
             max_steps=50,
             stagnation_tol=1e-12,
@@ -726,7 +714,6 @@ class TestSlidingWindowStagnation:
             return jnp.sum(x**2), None
 
         solver = SLSQP(
-            rtol=1e-15,
             atol=1e-15,
             max_steps=100,
             stagnation_tol=1e-3,
@@ -781,7 +768,6 @@ class TestAdaptiveProximalMu:
         solver = SLSQP(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
-            rtol=1e-6,
             atol=1e-6,
             max_steps=50,
         )
@@ -805,7 +791,6 @@ class TestAdaptiveProximalMu:
                 eq_constraint_fn=eq_constraint,
                 n_eq_constraints=1,
                 proximal_tau=tau,
-                rtol=1e-5,
                 atol=1e-5,
                 max_steps=100,
             )

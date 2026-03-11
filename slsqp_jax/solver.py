@@ -221,32 +221,32 @@ class SLSQP(optx.AbstractMinimiser):
     iteration (both must be satisfied, and at least ``min_steps``
     iterations must have elapsed):
 
-    1. *Stationarity* -- the Lagrangian gradient is small relative to
-       the objective gradient:
+    1. *Stationarity* -- the Lagrangian gradient norm is small
+       relative to the Lagrangian value:
 
-       ``‖∇_x L‖ ≤ atol + rtol · max(‖∇f‖, 1)``
+       ``‖∇_x L‖ ≤ rtol · max(|L|, 1)``
 
-       The ``max(‖∇f‖, 1)`` floor prevents the relative term from
-       vanishing when the objective gradient is already small, so the
-       effective tolerance is never tighter than ``atol + rtol``.
+       where ``L = f − λ_eqᵀ c_eq − μ_ineqᵀ c_ineq`` is the
+       Lagrangian.  The ``max(|L|, 1)`` safeguard prevents the
+       criterion from becoming vacuous when ``L ≈ 0`` and degrades
+       gracefully to an absolute tolerance when ``|L| < 1``.  The
+       relative form is motivated by floating-point arithmetic: when
+       the gradient is negligible relative to ``|L|``, a step of
+       that magnitude cannot change ``L`` in finite precision.
 
     2. *Primal feasibility* -- constraint violations are within
        absolute tolerance:
 
        ``max|c_eq(x)| ≤ atol``  and  ``max(0, −c_ineq(x)) ≤ atol``
 
-    ``rtol`` therefore only participates in the stationarity check
-    (scaled by the objective gradient norm), while ``atol`` appears in
-    both stationarity and feasibility checks.
-
     Attributes:
-        rtol: Relative tolerance for the stationarity convergence check.
-            Multiplied by ``max(‖∇f‖, 1)`` and added to ``atol`` to form
-            the threshold on the Lagrangian gradient norm.
-        atol: Absolute tolerance for convergence.  Used as the base
-            threshold for both the stationarity check (on the Lagrangian
-            gradient norm) and the feasibility check (on constraint
-            violations).
+        rtol: Relative tolerance for the stationarity convergence
+            check.  The Lagrangian gradient norm is compared against
+            ``rtol · max(|L|, 1)``.  Default ``1e-6``.
+        atol: Absolute tolerance for primal feasibility.  Used as
+            the threshold for constraint violation checks and for
+            internal heuristics (steepest-descent fallback, adaptive
+            CG tolerance floor, proximal mu floor).  Default ``1e-6``.
         max_steps: Maximum number of iterations.
         eq_constraint_fn: Function computing equality constraints c_eq(x) = 0.
         ineq_constraint_fn: Function computing inequality constraints c_ineq(x) >= 0.
@@ -313,8 +313,10 @@ class SLSQP(optx.AbstractMinimiser):
         >>> solver = SLSQP(eq_constraint_fn=eq_constraint, n_eq_constraints=1)
     """
 
-    # Convergence tolerances
+    # Relative tolerance for the stationarity convergence check.
     rtol: float = 1e-6
+
+    # Absolute tolerance for primal feasibility and internal heuristics.
     atol: float = 1e-6
 
     # Norm function for convergence checking (required by AbstractMinimiser)
@@ -1193,12 +1195,18 @@ class SLSQP(optx.AbstractMinimiser):
             state.multipliers_ineq,
         )
 
-        # Check stationarity: ||nabla L|| <= atol + rtol * max(||nabla f||, 1)
+        # Lagrangian value: L = f - lambda_eq^T c_eq - mu_ineq^T c_ineq
+        lagrangian_val = state.f_val
+        if m_eq > 0:
+            lagrangian_val = lagrangian_val - state.multipliers_eq @ state.eq_val
+        if m_ineq_total > 0:
+            lagrangian_val = lagrangian_val - state.multipliers_ineq @ state.ineq_val
+
+        # Relative stationarity: ||nabla L|| <= rtol * max(|L|, 1)
         grad_norm = jnp.linalg.norm(grad_lagrangian)
-        # Floor of 1.0 prevents the relative term from vanishing when
-        # ||∇f|| is already small, keeping the tolerance ≥ atol + rtol.
-        grad_ref = jnp.maximum(jnp.linalg.norm(state.grad), 1.0)
-        stationarity = grad_norm <= self.atol + self.rtol * grad_ref
+        stationarity = grad_norm <= self.rtol * jnp.maximum(
+            jnp.abs(lagrangian_val), 1.0
+        )
 
         # Check primal feasibility
         eq_feasible = jnp.array(True)

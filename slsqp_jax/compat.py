@@ -701,8 +701,7 @@ def minimize_like_scipy(
         defaults):
 
         * ``rtol`` (``1e-6``) -- relative tolerance for stationarity.
-        * ``atol`` (``1e-6``) -- absolute tolerance for stationarity
-          and feasibility.
+        * ``atol`` (``1e-6``) -- absolute tolerance for feasibility.
         * ``max_steps`` or ``maxiter`` (``100``) -- maximum outer
           iterations.
         * ``min_steps`` (``1``) -- minimum iterations before
