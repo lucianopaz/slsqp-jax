@@ -84,86 +84,54 @@ class _CGState(NamedTuple):
     converged: Bool[Array, ""]
 
 
-def _solve_unconstrained_cg(
-    hvp_fn: Callable[[Vector], Vector],
-    g: Vector,
-    max_cg_iter: int,
+def build_cg_step(
+    hvp_fn,
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
+    project: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
-) -> Vector:
-    """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
-
-    Uses (preconditioned) conjugate gradient to solve B d = -g without
-    forming B.  When *precond_fn* is provided, the standard PCG algorithm
-    is used: z = M r, beta = r_new^T z_new / r_old^T z_old, and p is
-    built from z (Nocedal & Wright, Algorithm 5.3).
+):
+    """Build a CG step function.
 
     Args:
         hvp_fn: Hessian-vector product function v -> B @ v.
-        g: Linear term (gradient).
-        max_cg_iter: Maximum CG iterations.
         cg_tol: Convergence tolerance on residual norm.
         precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
-        cg_regularization: Minimum eigenvalue threshold for the curvature
-            guard.  CG declares "bad curvature" when the effective
-            eigenvalue ``p^T B p / ||p||^2`` falls below this value.
-            Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+        project: Optional projection function v -> P(v) where P is the projection onto the null space of A.
+        cg_regularization: Minimum eigenvalue threshold for the curvature guard.
 
     Returns:
-        Solution vector d.
+        A CG step function.
     """
-    n = g.shape[0]
-    r0 = -g
-    r0_norm_sq = jnp.dot(r0, r0)
+    if project is None:
 
-    if precond_fn is not None:
-        z0 = precond_fn(r0)
-        rz0_raw = jnp.dot(r0, z0)
-        # Fall back to identity if preconditioner is not SPD for this residual
-        z0 = jnp.where(rz0_raw > 0, z0, r0)
-        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
-        p0 = z0
-    else:
-        rz0 = r0_norm_sq
-        p0 = r0
-
-    init_cg = _CGState(
-        d=jnp.zeros(n),
-        r=r0,
-        p=p0,
-        rz=rz0,
-        iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
-    )
+        def project(v: Vector) -> Vector:
+            return v
 
     def cg_step(i, state):
-        def do_step(state):
+        def do_step(state: _CGState) -> _CGState:
             Bp = hvp_fn(state.p)
-            pBp = jnp.dot(state.p, Bp)
+            PBp = project(Bp)
+            pPBp = jnp.dot(state.p, PBp)
 
-            # SNOPT-style curvature guard: declare "bad curvature" when the
-            # effective eigenvalue p^T B p / ||p||^2 falls below delta^2.
-            # This is scale-invariant (no false stops when ||p|| is small)
-            # while still catching numerical noise from the null-space
-            # projector.  Alpha and the residual use the true curvature so
-            # the CG recurrence is exact and the solution is unbiased.
-            # Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+            # SNOPT-style curvature guard (see unconstrained CG for detail).
+            # For projected CG, p is in the null space, so this checks the
+            # effective eigenvalue of the reduced Hessian Z^T B Z along p.
             pp = jnp.dot(state.p, state.p)
-            has_bad_curvature = pBp <= cg_regularization * pp
+            has_bad_curvature = pPBp <= cg_regularization * pp
 
             alpha = jnp.where(
                 has_bad_curvature,
                 jnp.array(0.0),
-                state.rz / jnp.maximum(pBp, 1e-30),
+                state.rz / jnp.maximum(pPBp, 1e-30),
             )
 
             d_new = state.d + alpha * state.p
-            r_new = state.r - alpha * Bp
+            r_new = state.r - alpha * PBp
             r_new_norm_sq = jnp.dot(r_new, r_new)
 
             if precond_fn is not None:
-                z_new_raw = precond_fn(r_new)
+                z_new_raw = project(precond_fn(r_new))
                 rz_raw = jnp.dot(r_new, z_new_raw)
                 z_new = jnp.where(rz_raw > 0, z_new_raw, r_new)
                 rz_new = jnp.where(rz_raw > 0, rz_raw, r_new_norm_sq)
@@ -198,6 +166,76 @@ def _solve_unconstrained_cg(
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
+    return cg_step
+
+
+def _solve_unconstrained_cg(
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
+    max_cg_iter: int,
+    cg_tol: Scalar | float,
+    precond_fn: Callable[[Vector], Vector] | None = None,
+    cg_regularization: float = 1e-6,
+) -> Vector:
+    """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
+
+    Uses (preconditioned) conjugate gradient to solve B d = -g without
+    forming B.  When *precond_fn* is provided, the standard PCG algorithm
+    is used: z = M r, beta = r_new^T z_new / r_old^T z_old, and p is
+    built from z (Nocedal & Wright, Algorithm 5.3).
+
+    Args:
+        hvp_fn: Hessian-vector product function v -> B @ v.
+        g: Linear term (gradient).
+        max_cg_iter: Maximum CG iterations.
+        cg_tol: Convergence tolerance on residual norm.
+        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
+        cg_regularization: Minimum eigenvalue threshold for the curvature
+            guard.  CG declares "bad curvature" when the effective
+            eigenvalue ``p^T B p / ||p||^2`` falls below this value.
+            Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+
+    Returns:
+        Solution vector d.
+    """
+    # Sign convention: we define the residual as r = b - Ax = -g - Bd
+    # (the "negative residual"), whereas Nocedal & Wright Algorithm 5.3 uses
+    # r = Ax - b = Bd + g. So r_here = -r_NW throughout. The sign flip
+    # propagates to z (via the preconditioner) but cancels in the scalar
+    # products that define alpha, beta, and the search direction p, so those
+    # quantities are identical to the textbook. See the summary table in
+    # cg_sign_convention_analysis for the full derivation.
+    n = g.shape[0]
+    r0 = -g
+    r0_norm_sq = jnp.dot(r0, r0)
+
+    if precond_fn is not None:
+        z0 = precond_fn(r0)
+        rz0_raw = jnp.dot(r0, z0)
+        # Fall back to identity if preconditioner is not SPD for this residual
+        z0 = jnp.where(rz0_raw > 0, z0, r0)
+        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
+        p0 = z0
+    else:
+        rz0 = r0_norm_sq
+        p0 = r0
+
+    init_cg = _CGState(
+        d=jnp.zeros(n),
+        r=r0,
+        p=p0,
+        rz=rz0,
+        iteration=jnp.array(0),
+        converged=r0_norm_sq < cg_tol**2,
+    )
+
+    cg_step = build_cg_step(
+        hvp_fn=hvp_fn,
+        cg_tol=cg_tol,
+        precond_fn=precond_fn,
+        cg_regularization=cg_regularization,
+    )
+
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
     return final_cg.d
 
@@ -231,7 +269,7 @@ def _solve_projected_cg(
 
     When *precond_fn* is provided, the projected PCG algorithm is used:
     z = P(M(P(r))) where M is the preconditioner (Nocedal & Wright,
-    Chapter 16).  The extra projection ensures z stays in the null space.
+    Chapter 16). The extra projection ensures z stays in the null space.
 
     Complexity per CG iteration: O(kn) for HVP + O(mn) for projection,
     where k is L-BFGS memory and m is the number of constraints.
@@ -293,63 +331,13 @@ def _solve_projected_cg(
         converged=r0_norm_sq < cg_tol**2,
     )
 
-    def cg_step(i, state):
-        def do_step(state):
-            Bp = hvp_fn(state.p)
-            PBp = project(Bp)
-            pPBp = jnp.dot(state.p, PBp)
-
-            # SNOPT-style curvature guard (see unconstrained CG for detail).
-            # For projected CG, p is in the null space, so this checks the
-            # effective eigenvalue of the reduced Hessian Z^T B Z along p.
-            pp = jnp.dot(state.p, state.p)
-            has_bad_curvature = pPBp <= cg_regularization * pp
-
-            alpha = jnp.where(
-                has_bad_curvature,
-                jnp.array(0.0),
-                state.rz / jnp.maximum(pPBp, 1e-30),
-            )
-
-            d_new = state.d + alpha * state.p
-            r_new = state.r - alpha * PBp
-            r_new_norm_sq = jnp.dot(r_new, r_new)
-
-            if precond_fn is not None:
-                z_new_raw = project(precond_fn(r_new))
-                rz_raw = jnp.dot(r_new, z_new_raw)
-                z_new = jnp.where(rz_raw > 0, z_new_raw, r_new)
-                rz_new = jnp.where(rz_raw > 0, rz_raw, r_new_norm_sq)
-            else:
-                z_new = r_new
-                rz_new = r_new_norm_sq
-
-            beta = rz_new / jnp.maximum(state.rz, 1e-30)
-            p_new = z_new + beta * state.p
-
-            converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
-
-            return jax.lax.cond(
-                has_bad_curvature,
-                lambda: _CGState(
-                    d=state.d,
-                    r=state.r,
-                    p=state.p,
-                    rz=state.rz,
-                    iteration=state.iteration + 1,
-                    converged=jnp.array(True),
-                ),
-                lambda: _CGState(
-                    d=d_new,
-                    r=r_new,
-                    p=p_new,
-                    rz=rz_new,
-                    iteration=state.iteration + 1,
-                    converged=converged,
-                ),
-            )
-
-        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
+    cg_step = build_cg_step(
+        hvp_fn=hvp_fn,
+        cg_tol=cg_tol,
+        precond_fn=precond_fn,
+        project=project,
+        cg_regularization=cg_regularization,
+    )
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
