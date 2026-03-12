@@ -376,7 +376,7 @@ The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG 
 
 ### L-BFGS diagonal reset
 
-The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal is uniform ($d = \gamma \mathbf{1}$), but when the QP solver fails to converge, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
+The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal is uniform ($d = \gamma \mathbf{1}$), but when the QP solver or the line search fails, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
 
 1. Extract $\text{diag}(B_k)$ from the current L-BFGS compact representation in $O(k^2 n)$.
 2. Discard all stored $(s, y)$ pairs.
@@ -384,13 +384,14 @@ The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{dia
 
 This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the scalar $\gamma$ becomes very small and gets frozen by tiny steps. After the reset, the first successful L-BFGS append returns the diagonal to uniform scaling.
 
-**Escalating identity reset.** When the QP fails repeatedly, the SNOPT diagonal reset can re-extract the same problematic diagonal, perpetuating an ill-conditioning cycle. To break this deadlock, the solver tracks consecutive QP failures and, after `qp_failure_patience` consecutive failures (default 3), performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal. This allows the L-BFGS to rebuild curvature from scratch.
+**Escalating identity reset.** When failures occur repeatedly, the SNOPT diagonal reset can re-extract the same problematic diagonal, perpetuating an ill-conditioning cycle. To break this deadlock, the solver tracks consecutive failures (QP and line search independently) and, after `qp_failure_patience` consecutive QP failures (default 3) or `ls_failure_patience` consecutive line search failures (default 3), performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal. This allows the L-BFGS to rebuild curvature from scratch.
 
 ```python
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
     qp_failure_patience=3,  # Identity reset after 3 consecutive QP failures
+    ls_failure_patience=3,  # Identity reset after 3 consecutive LS failures
 )
 ```
 
@@ -404,6 +405,10 @@ When the QP subproblem fails to converge (exhausts its iteration budget), the so
 **QP false convergence guard.** The EXPAND procedure's growing tolerance can cause the active-set loop to report convergence on its final iteration under relaxed tolerances, even though the QP did not truly converge at the base tolerance. To prevent this, the QP solver explicitly overrides the convergence flag to `False` whenever the iteration count reaches `max_iter`. This ensures the outer solver triggers L-BFGS resets and steepest descent fallback appropriately.
 
 Combined with the L-BFGS diagonal reset (above), these mechanisms allow the solver to recover from QP failures rather than entering a permanent stagnation loop.
+
+### Line search failure recovery
+
+When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). This typically occurs when the L-BFGS Hessian approximation is poorly conditioned — the QP solves the right problem with the wrong data. The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: SNOPT diagonal reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
 
 ### Outer-loop stagnation detection
 

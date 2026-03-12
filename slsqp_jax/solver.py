@@ -152,6 +152,9 @@ class SLSQPState(eqx.Module):
     # Consecutive QP failure tracking for escalating L-BFGS recovery
     consecutive_qp_failures: Int[Array, ""]
 
+    # Consecutive line search failure tracking for escalating L-BFGS recovery
+    consecutive_ls_failures: Int[Array, ""]
+
     # Sliding-window stagnation detection (x-value based)
     x_history: Float[Array, "W n"]
     x_stagnation: Bool[Array, ""]
@@ -439,6 +442,12 @@ class SLSQP(optx.AbstractMinimiser):
     # L-BFGS history is hard-reset to identity (B_0 = I) instead of the
     # SNOPT-style diagonal reset, breaking ill-conditioning cycles.
     qp_failure_patience: int = 3
+
+    # Line search failure patience: after this many consecutive line search
+    # failures, the L-BFGS history is hard-reset to identity.  On each
+    # individual failure a SNOPT diagonal reset is applied first; the
+    # identity escalation fires only after the patience threshold.
+    ls_failure_patience: int = 3
 
     # Stagnation detection: sliding-window x-value comparison.
     # If ||x_k - x_{k-W}|| / max(||x_k||, 1) < stagnation_tol
@@ -923,6 +932,7 @@ class SLSQP(optx.AbstractMinimiser):
             qp_converged=jnp.array(True),
             prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
             consecutive_qp_failures=jnp.array(0),
+            consecutive_ls_failures=jnp.array(0),
             x_history=x_history,
             x_stagnation=jnp.array(False),
             last_alpha=jnp.array(1.0),
@@ -1085,6 +1095,29 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
+        # Escalating L-BFGS recovery on line search failure: the QP
+        # converged but the direction is not a descent direction for the
+        # L1 merit function (ill-conditioned Hessian).  Diagonal reset
+        # on each failure; identity escalation after patience threshold.
+        ls_failed = ~ls_result.success
+        new_consecutive_ls_failures = jnp.where(
+            ls_failed,
+            state.consecutive_ls_failures + 1,
+            jnp.array(0),
+        )
+        new_lbfgs_history = jax.lax.cond(
+            ls_failed & (new_consecutive_ls_failures < self.ls_failure_patience),
+            lbfgs_reset,
+            lambda h: h,
+            new_lbfgs_history,
+        )
+        new_lbfgs_history = jax.lax.cond(
+            new_consecutive_ls_failures >= self.ls_failure_patience,
+            lbfgs_identity_reset,
+            lambda h: h,
+            new_lbfgs_history,
+        )
+
         # Sliding-window stagnation detection: compare current x with
         # the x from W steps ago stored in the circular buffer.
         W = self._stagnation_window
@@ -1114,6 +1147,7 @@ class SLSQP(optx.AbstractMinimiser):
             qp_converged=qp_result.converged,
             prev_active_set=qp_result.active_set,
             consecutive_qp_failures=new_consecutive_qp_failures,
+            consecutive_ls_failures=new_consecutive_ls_failures,
             x_history=new_x_history,
             x_stagnation=x_stagnation,
             last_alpha=alpha,
@@ -1156,6 +1190,8 @@ class SLSQP(optx.AbstractMinimiser):
             qp_iters=("QP it", qp_result.iterations),
             qp_converged=("QP ok", qp_result.converged),
             n_active=("#act", n_active),
+            ls_steps=("LS it", ls_result.n_evals),
+            ls_success=("LS ok", ls_result.success),
         )
 
         return y_new, new_state, aux
@@ -1298,6 +1334,7 @@ class SLSQP(optx.AbstractMinimiser):
             "multipliers_ineq": state.multipliers_ineq,
             "x_stagnation": state.x_stagnation,
             "last_step_size": state.last_alpha,
+            "consecutive_ls_failures": state.consecutive_ls_failures,
         }
 
         return y, aux, stats
