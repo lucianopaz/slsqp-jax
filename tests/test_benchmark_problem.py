@@ -28,7 +28,7 @@ jax.config.update("jax_enable_x64", True)
 N_INEQ = 4  # fixed number of box constraints
 
 
-def make_benchmark_problem(n):
+def make_benchmark_problem(n, proximal_tau=0.5):
     """Create a constrained quadratic with 1 equality + 4 inequality constraints.
 
     Returns (solver, objective, x0, scipy_problem).
@@ -58,6 +58,7 @@ def make_benchmark_problem(n):
         ineq_constraint_fn=ineq_constraint,
         n_ineq_constraints=n_ineq,
         lbfgs_memory=10,
+        proximal_tau=proximal_tau,
     )
 
     # SciPy problem
@@ -189,6 +190,52 @@ class TestBenchmarkProblem:
         # proximal ill-conditioning can cause different CG/active-set
         # trajectories across platforms, but the objective should still be
         # close to SciPy's on this strictly convex problem.
+        scipy_f = scipy_result.fun
+        jax_f = float(scipy_problem["fun"](jax_sol))
+        assert abs(jax_f - scipy_f) / max(abs(scipy_f), 1.0) < 1e-2, (
+            f"Objective mismatch: JAX={jax_f:.6f}, SciPy={scipy_f:.6f}"
+        )
+
+
+class TestBenchmarkNoProximal:
+    """Test the benchmark problem with proximal_tau=0 (direct projection)."""
+
+    @pytest.mark.parametrize("n", [5, 20, 100])
+    def test_no_proximal_matches_scipy(self, n):
+        """Direct projection path matches SciPy on benchmark problems."""
+        solver, objective, x0, scipy_problem = make_benchmark_problem(n, proximal_tau=0)
+        x0_np = np.asarray(x0)
+        n_ineq = min(N_INEQ, n)
+
+        scipy_result = scipy_minimize(
+            scipy_problem["fun"],
+            x0_np,
+            method="SLSQP",
+            constraints=scipy_problem["constraints"],
+            options={"ftol": 1e-9, "maxiter": 200},
+        )
+
+        assert scipy_result.success, f"SciPy failed: {scipy_result.message}"
+
+        jax_result = optx.minimise(
+            objective,
+            solver,
+            x0,
+            has_aux=True,
+            max_steps=200,
+            throw=False,
+        )
+        jax_sol = np.asarray(jax_result.value)
+
+        assert not np.any(np.isnan(jax_sol)), f"JAX solution contains NaN for n={n}"
+        assert np.max(np.abs(jax_sol)) < 1e6, f"JAX solution diverged for n={n}"
+
+        jax_eq_viol = np.abs(np.sum(jax_sol) - n)
+        assert jax_eq_viol < 1e-4, f"Equality constraint violated: {jax_eq_viol}"
+
+        jax_ineq_min = np.min(jax_sol[:n_ineq])
+        assert jax_ineq_min >= -5e-5, f"Inequality constraint violated: {jax_ineq_min}"
+
         scipy_f = scipy_result.fun
         jax_f = float(scipy_problem["fun"](jax_sol))
         assert abs(jax_f - scipy_f) / max(abs(scipy_f), 1.0) < 1e-2, (

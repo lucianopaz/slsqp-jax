@@ -305,7 +305,7 @@ Larger $\mu$ means more relaxation (softer equality enforcement); smaller $\mu$ 
 
 Inequality constraints remain as hard constraints in the active-set method — the EXPAND procedure and warm-starting already handle inequality cycling. The equality absorption is the primary mechanism because it addresses QP infeasibility at degenerate vertices.
 
-Proximal stabilization is **always active** for equality-constrained problems. The proximal parameter $\mu$ is computed adaptively at each iteration following Wright (2002, eq 6.6):
+Proximal stabilization is **active by default** for equality-constrained problems (when `proximal_tau > 0`). The proximal parameter $\mu$ is computed adaptively at each iteration following Wright (2002, eq 6.6):
 
 $$
 \mu_k = \operatorname{clip}\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min},\;\mu_{\max}\bigr)
@@ -317,9 +317,19 @@ where $\tau \in (0, 1)$ is the exponent (default 0.5), $\mu_{\min}$ is a floor (
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
-    proximal_tau=0.5,       # Exponent for adaptive mu (must be in (0,1))
+    proximal_tau=0.5,       # Exponent for adaptive mu (must be in [0,1))
     proximal_mu_min=None,   # Floor on mu; None defaults to atol (feasibility tol)
     proximal_mu_max=0.1,    # Ceiling on mu; keeps 1/mu >= 10
+)
+```
+
+Setting `proximal_tau=0` **disables sSQP entirely**. Equality constraints are then enforced via direct null-space projection in the QP subproblem (the same mechanism used for inequality constraints). This avoids the ill-conditioning from the $(1/\mu)\, A_{\text{eq}}^T A_{\text{eq}}$ term, which can be beneficial for well-conditioned problems or when cross-platform floating-point reproducibility is important.
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    proximal_tau=0,         # Disable sSQP; use direct null-space projection
 )
 ```
 

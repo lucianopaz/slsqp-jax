@@ -268,10 +268,13 @@ class SLSQP(optx.AbstractMinimiser):
             is computed as ``mu = clip(kkt_residual^tau, mu_min, mu_max)``
             at each iteration.  Capped at ``mu_max`` (default 0.1) so the
             proximal weight ``1/mu >= 1/mu_max``, ensuring adequate equality
-            even far from the solution.  Must be in the open interval
-            ``(0, 1)`` for the superlinear convergence guarantee.
-            Default 0.5.  The proximal is always active for
-            equality-constrained problems.
+            even far from the solution.  Must be in the half-open interval
+            ``[0, 1)`` for the superlinear convergence guarantee.
+            Default 0.5.  Set to 0 to disable sSQP proximal stabilization
+            entirely: equality constraints are then enforced via direct
+            null-space projection instead of the augmented Lagrangian
+            penalty, avoiding the ill-conditioning introduced by the
+            proximal term.
         proximal_mu_min: Floor on the adaptive proximal parameter mu.
             Prevents ``1/mu`` from exploding and creating a convergence floor
             on the Lagrangian gradient norm.  Default ``None`` resolves to
@@ -388,9 +391,10 @@ class SLSQP(optx.AbstractMinimiser):
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
 
     # Adaptive proximal multiplier stabilization (sSQP).
-    # Always active for equality-constrained problems.  The proximal
+    # Active for equality-constrained problems when tau > 0.  The proximal
     # parameter mu = clip(kkt_residual^tau, mu_min, mu_max) is computed
-    # per iteration (Wright, 2002, eq 6.6).  Must be in (0, 1).
+    # per iteration (Wright, 2002, eq 6.6).  Must be in [0, 1).
+    # Set to 0 to disable sSQP and use direct null-space projection.
     proximal_tau: float = 0.5
 
     # Floor on adaptive proximal mu.  None defaults to atol in
@@ -468,9 +472,9 @@ class SLSQP(optx.AbstractMinimiser):
         # --- Proximal mu ceiling ---
         object.__setattr__(self, "_proximal_mu_max", self.proximal_mu_max)
 
-        if not (0 < self.proximal_tau < 1):
+        if not (0 <= self.proximal_tau < 1):
             raise ValueError(
-                f"proximal_tau must be in the open interval (0, 1), "
+                f"proximal_tau must be in the half-open interval [0, 1), "
                 f"got {self.proximal_tau}"
             )
 
@@ -719,11 +723,12 @@ class SLSQP(optx.AbstractMinimiser):
     ) -> Callable[[Vector], Vector] | None:
         """Build the preconditioner for the PCG inner solver.
 
-        When equality constraints are present, the QP system matrix is
-        ``B_tilde = B + (1/mu) A_eq^T A_eq``, so a plain ``B^{-1}``
-        preconditioner can amplify the proximal eigenvalues and make CG
-        *worse*.  In that case the Woodbury identity is used to build
-        ``B_tilde^{-1}`` cheaply::
+        When equality constraints are present *and* sSQP proximal
+        stabilization is active (``proximal_tau > 0``), the QP system
+        matrix is ``B_tilde = B + (1/mu) A_eq^T A_eq``, so a plain
+        ``B^{-1}`` preconditioner can amplify the proximal eigenvalues
+        and make CG *worse*.  In that case the Woodbury identity is used
+        to build ``B_tilde^{-1}`` cheaply::
 
             (B + (1/mu) A^T A)^{-1}
               = B^{-1} - B^{-1} A^T (mu I + A B^{-1} A^T)^{-1} A B^{-1}
@@ -731,8 +736,9 @@ class SLSQP(optx.AbstractMinimiser):
         The inner matrix ``(mu I + A B^{-1} A^T)`` is only m_eq x m_eq
         and is factored once per QP solve.
 
-        When there are no equality constraints, falls back to the
-        standard ``B^{-1}`` preconditioner.
+        When there are no equality constraints, or when sSQP is disabled
+        (``proximal_tau == 0``), the standard ``B^{-1}`` preconditioner
+        is used.
 
         Args:
             state: Current solver state.
@@ -744,7 +750,7 @@ class SLSQP(optx.AbstractMinimiser):
             return None
         lbfgs_history = state.lbfgs_history
 
-        if self.n_eq_constraints > 0:
+        if self.n_eq_constraints > 0 and self.proximal_tau > 0:
             A_eq = state.eq_jac
             mu = proximal_mu
             m_eq = A_eq.shape[0]
@@ -1344,17 +1350,21 @@ class SLSQP(optx.AbstractMinimiser):
 
         initial_active_set = state.prev_active_set
 
-        # Adaptive proximal mu (Wright, 2002, eq 6.6):
-        # mu = clip(kkt_residual^tau, mu_min, mu_max)
-        # Capped at mu_max so the proximal weight 1/mu >= 1/mu_max,
-        # ensuring adequate equality enforcement even far from the solution.
-        # Wright's local convergence analysis assumes eta < 1; when the
-        # KKT residual is large the cap keeps the penalty tight.
-        mu = jnp.clip(
-            kkt_residual**self.proximal_tau,
-            self._proximal_mu_min,
-            self._proximal_mu_max,
-        )
+        use_proximal = self.proximal_tau > 0
+        if use_proximal:
+            # Adaptive proximal mu (Wright, 2002, eq 6.6):
+            # mu = clip(kkt_residual^tau, mu_min, mu_max)
+            # Capped at mu_max so the proximal weight 1/mu >= 1/mu_max,
+            # ensuring adequate equality enforcement even far from the solution.
+            # Wright's local convergence analysis assumes eta < 1; when the
+            # KKT residual is large the cap keeps the penalty tight.
+            mu = jnp.clip(
+                kkt_residual**self.proximal_tau,
+                self._proximal_mu_min,
+                self._proximal_mu_max,
+            )
+        else:
+            mu = 0.0
 
         precond_fn = self._build_preconditioner(state, proximal_mu=mu)
 
@@ -1382,6 +1392,7 @@ class SLSQP(optx.AbstractMinimiser):
             precond_fn=precond_fn,
             cg_tol=adaptive_tol,
             cg_regularization=self.cg_regularization,
+            use_proximal=use_proximal,
         )
 
         return QPResult(
