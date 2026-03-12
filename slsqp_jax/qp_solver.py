@@ -542,6 +542,188 @@ def _solve_qp_proximal(
     )
 
 
+def _solve_qp_direct(
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
+    A_eq: Float[Array, "m_eq n"],
+    b_eq: Float[Array, " m_eq"],
+    A_ineq: Float[Array, "m_ineq n"],
+    b_ineq: Float[Array, " m_ineq"],
+    m_eq: int,
+    m_ineq: int,
+    max_iter: int,
+    max_cg_iter: int,
+    tol: Scalar | float,
+    expand_factor: float,
+    initial_active_set: Bool[Array, " m_ineq"] | None,
+    kkt_residual: Scalar | float,
+    precond_fn: Callable[[Vector], Vector] | None = None,
+    cg_tol: Scalar | float | None = None,
+    cg_regularization: float = 1e-6,
+) -> QPResult:
+    """Solve the QP with equality constraints enforced via direct projection.
+
+    Unlike ``_solve_qp_proximal``, equality constraints are not absorbed
+    into the objective via an augmented-Lagrangian penalty.  Instead,
+    they are enforced exactly through the null-space projector in
+    ``_solve_projected_cg``.  This avoids the ill-conditioning from the
+    ``(1/mu) A_eq^T A_eq`` proximal term.
+
+    A combined constraint matrix ``[A_eq; A_ineq]`` is formed.  Equality
+    rows are permanently active; the active-set loop only adds/drops
+    inequality rows.
+    """
+    inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
+
+    A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
+    b_combined = jnp.concatenate([b_eq, b_ineq], axis=0)
+    eq_active = jnp.ones(m_eq, dtype=bool)
+
+    if m_ineq == 0:
+        # Equality-only: single projected CG solve, no active-set loop.
+        combined_active = eq_active
+        d, multipliers = _solve_projected_cg(
+            hvp_fn,
+            g,
+            A_combined,
+            b_combined,
+            combined_active,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
+        )
+        return QPResult(
+            d=d,
+            multipliers_eq=multipliers[:m_eq],
+            multipliers_ineq=jnp.zeros((0,)),
+            active_set=jnp.zeros((0,), dtype=bool),
+            converged=jnp.array(True),
+            iterations=jnp.array(1),
+        )
+
+    # Equality + inequality: active-set loop on the inequality portion.
+    kkt_res = jnp.asarray(kkt_residual, dtype=jnp.float64)
+    base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
+
+    # Initial solve with equalities only (inequalities inactive).
+    d_init, mult_init = _solve_projected_cg(
+        hvp_fn,
+        g,
+        A_combined,
+        b_combined,
+        jnp.concatenate([eq_active, jnp.zeros(m_ineq, dtype=bool)]),
+        max_cg_iter,
+        inner_cg_tol,
+        precond_fn=precond_fn,
+        cg_regularization=cg_regularization,
+    )
+
+    residuals_init = A_ineq @ d_init - b_ineq
+    if initial_active_set is not None:
+        init_ineq_active = initial_active_set | (residuals_init < -base_tol)
+    else:
+        init_ineq_active = residuals_init < -base_tol  # pragma: no cover
+    init_converged = ~jnp.any(init_ineq_active)
+
+    init_state = QPState(
+        d=d_init,
+        active_set=init_ineq_active,
+        multipliers_eq=mult_init[:m_eq],
+        multipliers_ineq=jnp.zeros((m_ineq,)),
+        iteration=jnp.array(0),
+        converged=init_converged,
+    )
+
+    def cond_fn(state: QPState) -> Bool[Array, ""]:
+        return ~state.converged & (state.iteration < max_iter)
+
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+
+    def body_fn(state: QPState) -> QPState:
+        working_tol = base_tol + state.iteration * tau
+
+        combined_active = jnp.concatenate([eq_active, state.active_set])
+        d_new, mult_all = _solve_projected_cg(
+            hvp_fn,
+            g,
+            A_combined,
+            b_combined,
+            combined_active,
+            max_cg_iter,
+            inner_cg_tol,
+            precond_fn=precond_fn,
+            cg_regularization=cg_regularization,
+        )
+
+        mult_eq_new = mult_all[:m_eq]
+        mult_ineq_new = mult_all[m_eq:]
+
+        residuals = A_ineq @ d_new - b_ineq
+        violated = (residuals < -working_tol) & ~state.active_set
+        any_violated = jnp.any(violated)
+
+        violation_scores = jnp.where(violated, -residuals, -jnp.inf)
+        most_violated_idx = jnp.argmax(violation_scores)
+
+        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
+        any_negative = jnp.any(negative_mult)
+
+        mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)
+        most_negative_idx = jnp.argmin(mult_scores)
+
+        def add_constraint():
+            new_active = state.active_set.at[most_violated_idx].set(True)
+            return QPState(
+                d=d_new,
+                active_set=new_active,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(False),
+            )
+
+        def drop_constraint():
+            new_active = state.active_set.at[most_negative_idx].set(False)
+            return QPState(
+                d=d_new,
+                active_set=new_active,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(False),
+            )
+
+        def mark_converged():
+            return QPState(
+                d=d_new,
+                active_set=state.active_set,
+                multipliers_eq=mult_eq_new,
+                multipliers_ineq=mult_ineq_new,
+                iteration=state.iteration + 1,
+                converged=jnp.array(True),
+            )
+
+        return jax.lax.cond(
+            any_violated,
+            add_constraint,
+            lambda: jax.lax.cond(any_negative, drop_constraint, mark_converged),
+        )
+
+    final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
+
+    final_converged = final_state.converged & (final_state.iteration < max_iter)
+
+    return QPResult(
+        d=final_state.d,
+        multipliers_eq=final_state.multipliers_eq,
+        multipliers_ineq=final_state.multipliers_ineq,
+        active_set=final_state.active_set,
+        converged=final_converged,
+        iterations=final_state.iteration,
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def solve_qp(
     hvp_fn: Callable,
@@ -561,6 +743,7 @@ def solve_qp(
     precond_fn: Callable | None = None,
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
+    use_proximal: bool = True,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -644,6 +827,11 @@ def solve_qp(
             when the Hessian has small but positive eigenvalues.  Based on
             SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).  Default
             ``1e-6`` (delta ~ 1e-3).  Set to ``0.0`` to disable.
+        use_proximal: When True (default), equality constraints are handled
+            via the sSQP proximal path (augmented Lagrangian penalty).
+            When False, equality constraints are enforced via direct
+            null-space projection, avoiding the ill-conditioning introduced
+            by the ``(1/mu) A_eq^T A_eq`` term.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -676,8 +864,8 @@ def solve_qp(
         )
 
     # ---- Proximal stabilized path (sSQP) ----
-    # Always used when equality constraints are present.
-    if m_eq > 0:
+    # Used when equality constraints are present and proximal is enabled.
+    if m_eq > 0 and use_proximal:
         return _solve_qp_proximal(
             hvp_fn=hvp_fn,
             g=g,
@@ -695,6 +883,29 @@ def solve_qp(
             kkt_residual=kkt_residual,
             proximal_mu=proximal_mu,
             prev_multipliers_eq=prev_multipliers_eq,
+            precond_fn=precond_fn,
+            cg_tol=inner_cg_tol,
+            cg_regularization=cg_regularization,
+        )
+
+    # ---- Direct projection path (no proximal) ----
+    # Equality constraints enforced via null-space projection.
+    if m_eq > 0 and not use_proximal:
+        return _solve_qp_direct(
+            hvp_fn=hvp_fn,
+            g=g,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            A_ineq=A_ineq,
+            b_ineq=b_ineq,
+            m_eq=m_eq,
+            m_ineq=m_ineq,
+            max_iter=max_iter,
+            max_cg_iter=max_cg_iter,
+            tol=tol,
+            expand_factor=expand_factor,
+            initial_active_set=initial_active_set,
+            kkt_residual=kkt_residual,
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
             cg_regularization=cg_regularization,

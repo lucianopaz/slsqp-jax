@@ -738,9 +738,8 @@ class TestAdaptiveProximalMu:
     """Tests for the adaptive proximal mu feature."""
 
     def test_proximal_tau_validation(self):
-        """proximal_tau must be in (0, 1)."""
-        with pytest.raises(ValueError, match="proximal_tau"):
-            SLSQP(proximal_tau=0.0)
+        """proximal_tau must be in [0, 1)."""
+        SLSQP(proximal_tau=0.0)  # 0 is valid (disables proximal)
         with pytest.raises(ValueError, match="proximal_tau"):
             SLSQP(proximal_tau=1.0)
         with pytest.raises(ValueError, match="proximal_tau"):
@@ -786,7 +785,7 @@ class TestAdaptiveProximalMu:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        for tau in [0.1, 0.5, 0.9]:
+        for tau in [0.0, 0.1, 0.5, 0.9]:
             solver = SLSQP(
                 eq_constraint_fn=eq_constraint,
                 n_eq_constraints=1,
@@ -797,3 +796,53 @@ class TestAdaptiveProximalMu:
             x0 = jnp.array([0.0, 0.0])
             y, state = _run_solver(solver, objective, x0)
             np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-3)
+
+    def test_no_proximal_equality_only(self):
+        """proximal_tau=0 converges on equality-only problem."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            proximal_tau=0,
+            atol=1e-6,
+            max_steps=50,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-4)
+        np.testing.assert_allclose(y[0], 0.5, atol=0.05)
+
+    def test_no_proximal_equality_and_inequality(self):
+        """proximal_tau=0 converges with both eq and ineq constraints."""
+
+        def objective(x, args):
+            return (x[0] - 1) ** 2 + (x[1] - 2.5) ** 2, None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 4.0])
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0], x[1]])
+
+        solver = SLSQP(
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=2,
+            proximal_tau=0,
+            atol=1e-6,
+            max_steps=100,
+        )
+        x0 = jnp.array([2.0, 2.0])
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y[0] + y[1], 4.0, atol=1e-4)
+        assert y[0] >= -1e-5, f"x[0] < 0: {y[0]}"
+        assert y[1] >= -1e-5, f"x[1] < 0: {y[1]}"
