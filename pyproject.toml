@@ -26,6 +26,7 @@ extras = [
 dev = [
     {include-group = "extras"},
     "pytest>=9.0.2",
+    "pandas",
     "pytest-cov",
     "matplotlib",
 ]
