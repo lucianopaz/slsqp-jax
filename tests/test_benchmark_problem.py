@@ -123,9 +123,9 @@ class TestBenchmarkProblem:
         # Check inequality constraints (allowing small numerical violations).
         # The proximal sSQP path may produce slightly different convergence
         # trajectories on different platforms (x86 vs ARM), so we allow up
-        # to 5e-5 violation.
+        # to 1e-4 violation.
         jax_ineq_min = np.min(jax_sol[:n_ineq])
-        assert jax_ineq_min >= -5e-5, f"Inequality constraint violated: {jax_ineq_min}"
+        assert jax_ineq_min >= -1e-4, f"Inequality constraint violated: {jax_ineq_min}"
 
         # Compare objective values rather than solution vectors.  The
         # proximal sSQP path makes B_tilde = B + (1/mu) A_eq^T A_eq, which
@@ -184,7 +184,7 @@ class TestBenchmarkProblem:
         # ill-conditioned QP (B_tilde = B + (1/mu) A_eq^T A_eq), which
         # amplifies platform-dependent FP differences. Allow small violation.
         jax_ineq_min = np.min(jax_sol[:n_ineq])
-        assert jax_ineq_min >= -5e-5, f"Inequality constraint violated: {jax_ineq_min}"
+        assert jax_ineq_min >= -1e-4, f"Inequality constraint violated: {jax_ineq_min}"
 
         # Compare objective values rather than solution vectors. The
         # proximal ill-conditioning can cause different CG/active-set
@@ -231,10 +231,10 @@ class TestBenchmarkNoProximal:
         assert np.max(np.abs(jax_sol)) < 1e6, f"JAX solution diverged for n={n}"
 
         jax_eq_viol = np.abs(np.sum(jax_sol) - n)
-        assert jax_eq_viol < 1e-4, f"Equality constraint violated: {jax_eq_viol}"
+        assert jax_eq_viol < 1e-6, f"Equality constraint violated: {jax_eq_viol}"
 
         jax_ineq_min = np.min(jax_sol[:n_ineq])
-        assert jax_ineq_min >= -5e-5, f"Inequality constraint violated: {jax_ineq_min}"
+        assert jax_ineq_min >= -1e-6, f"Inequality constraint violated: {jax_ineq_min}"
 
         scipy_f = scipy_result.fun
         jax_f = float(scipy_problem["fun"](jax_sol))
