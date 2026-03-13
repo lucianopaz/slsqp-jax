@@ -36,6 +36,7 @@ from slsqp_jax.hessian import (
     lbfgs_inverse_hvp,
     lbfgs_reset,
 )
+from slsqp_jax.lpeca import compute_lpeca_active_set
 from slsqp_jax.merit import (
     backtracking_line_search,
     compute_merit,
@@ -305,6 +306,19 @@ class SLSQP(optx.AbstractMinimiser):
             L-BFGS diagonal reset).  Based on SNOPT Section 4.5
             (Gill, Murray & Saunders, 2005).  Default ``1e-6``
             (delta ~ 1e-3).  Set to ``0.0`` to disable.
+        active_set_method: Controls how the QP active set is initialized
+            and whether the EXPAND anti-cycling tolerance grows.  One of
+            ``"expand"`` (default EXPAND procedure), ``"lpeca_init"``
+            (LPEC-A warm-start with EXPAND fallback), or ``"lpeca"``
+            (LPEC-A with fixed tolerance, no EXPAND).  See Oberlin &
+            Wright (2005).
+        lpeca_sigma: Threshold exponent for LPEC-A (``sigma_bar`` in
+            the paper).  Must be in (0, 1).  Default 0.9.
+        lpeca_beta: Threshold scaling factor for LPEC-A.  Default
+            ``None`` uses ``1 / (m_ineq + n + m_eq)``.
+        lpeca_use_lp: When True, solve the LPEC-A LP to obtain tighter
+            multiplier estimates before the threshold test.  Requires
+            the ``mpax`` package.  Default False.
 
     Example:
         >>> import jax.numpy as jnp
@@ -457,6 +471,26 @@ class SLSQP(optx.AbstractMinimiser):
     # Stagnation window size (computed in __check_init__)
     _stagnation_window: int = eqx.field(static=True, default=10)
 
+    # LPEC-A active set identification (Oberlin & Wright, 2005).
+    # Controls how the QP active set is initialized and whether the
+    # EXPAND anti-cycling tolerance grows during the active-set loop.
+    #   "expand"     — standard EXPAND procedure (default)
+    #   "lpeca_init" — LPEC-A predicted set for warm-start, EXPAND fallback
+    #   "lpeca"      — LPEC-A predicted set, fixed tolerance (no EXPAND)
+    active_set_method: str = eqx.field(static=True, default="expand")
+
+    # Threshold exponent for LPEC-A (sigma_bar in the paper).
+    # Must be in (0, 1).  Default 0.9 per paper recommendation.
+    lpeca_sigma: float = eqx.field(static=True, default=0.9)
+
+    # Threshold scaling factor for LPEC-A.  None uses the paper's
+    # recommendation 1 / (m_ineq + n + m_eq).
+    lpeca_beta: Optional[float] = eqx.field(static=True, default=None)
+
+    # When True, solve the LPEC-A LP (via mpax.r2HPDHG) for tighter
+    # multiplier estimates before the threshold test.  Requires mpax.
+    lpeca_use_lp: bool = eqx.field(static=True, default=False)
+
     # Verbose output (resolved to Callable[..., None] in __check_init__)
     verbose: Callable = eqx.field(static=True, default=False)
 
@@ -485,6 +519,18 @@ class SLSQP(optx.AbstractMinimiser):
             raise ValueError(
                 f"proximal_tau must be in the half-open interval [0, 1), "
                 f"got {self.proximal_tau}"
+            )
+
+        # --- LPEC-A validation ---
+        if self.active_set_method not in ("expand", "lpeca_init", "lpeca"):
+            raise ValueError(
+                f"active_set_method must be 'expand', 'lpeca_init', or 'lpeca', "
+                f"got {self.active_set_method!r}"
+            )
+        if not (0 < self.lpeca_sigma < 1):
+            raise ValueError(
+                f"lpeca_sigma must be in the open interval (0, 1), "
+                f"got {self.lpeca_sigma}"
             )
 
         # --- Verbose callable ---
@@ -1360,6 +1406,11 @@ class SLSQP(optx.AbstractMinimiser):
         computed and the equality constraints are absorbed into the
         objective via sSQP (Wright, 2002, eq 6.6).
 
+        When ``active_set_method`` is ``"lpeca_init"`` or ``"lpeca"``,
+        the LPEC-A predicted active set (Oberlin & Wright, 2005) is
+        computed from the current NLP iterate and multiplier estimates,
+        and passed to the QP solver for initialization.
+
         When ``use_preconditioner`` is True, the L-BFGS inverse Hessian
         (with Woodbury correction for the proximal term) is passed to
         the QP solver as a CG preconditioner.
@@ -1386,6 +1437,24 @@ class SLSQP(optx.AbstractMinimiser):
         kkt_residual = jnp.linalg.norm(state.prev_grad_lagrangian)
 
         initial_active_set = state.prev_active_set
+
+        # LPEC-A: compute predicted active set from NLP-level data
+        predicted_active_set = None
+        if self.active_set_method in ("lpeca_init", "lpeca"):
+            m_ineq_total = A_ineq.shape[0]
+            if m_ineq_total > 0:
+                predicted_active_set = compute_lpeca_active_set(
+                    c_ineq=state.ineq_val,
+                    c_eq=state.eq_val,
+                    grad=state.grad,
+                    A_ineq=state.ineq_jac,
+                    A_eq=state.eq_jac,
+                    lambda_ineq=state.multipliers_ineq,
+                    mu_eq=state.multipliers_eq,
+                    sigma=self.lpeca_sigma,
+                    beta=self.lpeca_beta,
+                    use_lp=self.lpeca_use_lp,
+                )
 
         use_proximal = self.proximal_tau > 0
         if use_proximal:
@@ -1430,6 +1499,8 @@ class SLSQP(optx.AbstractMinimiser):
             cg_tol=adaptive_tol,
             cg_regularization=self.cg_regularization,
             use_proximal=use_proximal,
+            predicted_active_set=predicted_active_set,
+            active_set_method=self.active_set_method,
         )
 
         return QPResult(

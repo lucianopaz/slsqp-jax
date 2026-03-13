@@ -20,7 +20,11 @@ dependencies = [
 ]
 
 [dependency-groups]
+extras = [
+    "mpax",
+]
 dev = [
+    {include-group = "extras"},
     "pytest>=9.0.2",
     "pytest-cov",
     "matplotlib",

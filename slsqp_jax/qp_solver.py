@@ -369,6 +369,8 @@ def _solve_qp_proximal(
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
+    predicted_active_set: Bool[Array, " m_ineq"] | None = None,
+    use_expand: bool = True,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -435,7 +437,9 @@ def _solve_qp_proximal(
 
     # Determine starting active set
     residuals_init = A_ineq @ d_init - b_ineq
-    if initial_active_set is not None:
+    if predicted_active_set is not None:
+        init_active = predicted_active_set | (residuals_init < -base_tol)
+    elif initial_active_set is not None:
         init_active = initial_active_set | (residuals_init < -base_tol)
     else:
         init_active = residuals_init < -base_tol
@@ -454,9 +458,11 @@ def _solve_qp_proximal(
         return ~state.converged & (state.iteration < max_iter)
 
     tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+    # When EXPAND is disabled (lpeca mode), use fixed tolerance
+    effective_tau = tau if use_expand else 0.0
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = base_tol + state.iteration * tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set — inequalities only
         d_new, mult_ineq_new = _solve_projected_cg(
@@ -560,6 +566,8 @@ def _solve_qp_direct(
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
+    predicted_active_set: Bool[Array, " m_ineq"] | None = None,
+    use_expand: bool = True,
 ) -> QPResult:
     """Solve the QP with equality constraints enforced via direct projection.
 
@@ -620,7 +628,9 @@ def _solve_qp_direct(
     )
 
     residuals_init = A_ineq @ d_init - b_ineq
-    if initial_active_set is not None:
+    if predicted_active_set is not None:
+        init_ineq_active = predicted_active_set | (residuals_init < -base_tol)
+    elif initial_active_set is not None:
         init_ineq_active = initial_active_set | (residuals_init < -base_tol)
     else:
         init_ineq_active = residuals_init < -base_tol  # pragma: no cover
@@ -639,9 +649,10 @@ def _solve_qp_direct(
         return ~state.converged & (state.iteration < max_iter)
 
     tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+    effective_tau = tau if use_expand else 0.0
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = base_tol + state.iteration * tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         combined_active = jnp.concatenate([eq_active, state.active_set])
         d_new, mult_all = _solve_projected_cg(
@@ -744,6 +755,8 @@ def solve_qp(
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
     use_proximal: bool = True,
+    predicted_active_set: Bool[Array, " m_ineq"] | None = None,
+    active_set_method: str = "expand",
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -832,14 +845,46 @@ def solve_qp(
             When False, equality constraints are enforced via direct
             null-space projection, avoiding the ill-conditioning introduced
             by the ``(1/mu) A_eq^T A_eq`` term.
+        predicted_active_set: Optional LPEC-A predicted active set from
+            the outer NLP solver.  Used when ``active_set_method`` is
+            ``"lpeca_init"`` or ``"lpeca"`` to warm-start the active-set
+            loop with a better initial estimate.  Merged with violated
+            constraints (``residuals < -base_tol``) for the initial set.
+        active_set_method: Controls how the active set is initialized and
+            how tolerance grows during the active-set loop.  One of:
+
+            - ``"expand"`` (default): Standard EXPAND anti-cycling
+              procedure.  Uses ``initial_active_set`` for warm-starting
+              and monotonically increasing tolerance.
+            - ``"lpeca_init"``: Uses ``predicted_active_set`` from
+              LPEC-A for initialization, then runs the EXPAND loop
+              normally.  Provides a better starting point while
+              retaining anti-cycling guarantees.
+            - ``"lpeca"``: Uses ``predicted_active_set`` for
+              initialization and runs with a fixed tolerance (no
+              EXPAND growth).  Relies on LPEC-A accuracy for
+              anti-cycling; ``max_iter`` provides a hard stop.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
         convergence info.
     """
+    if active_set_method not in ("expand", "lpeca_init", "lpeca"):
+        raise ValueError(
+            f"active_set_method must be 'expand', 'lpeca_init', or 'lpeca', "
+            f"got {active_set_method!r}"
+        )
+
     m_eq = A_eq.shape[0]
     m_ineq = A_ineq.shape[0]
     m_total = m_eq + m_ineq
+
+    # LPEC-A modes: determine whether to use EXPAND and the effective
+    # predicted active set for initialization.
+    use_expand = active_set_method != "lpeca"
+    effective_predicted = (
+        predicted_active_set if active_set_method in ("lpeca_init", "lpeca") else None
+    )
 
     # Resolve CG tolerance: use cg_tol if provided, else fall back to tol.
     inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
@@ -886,6 +931,8 @@ def solve_qp(
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
             cg_regularization=cg_regularization,
+            predicted_active_set=effective_predicted,
+            use_expand=use_expand,
         )
 
     # ---- Direct projection path (no proximal) ----
@@ -909,6 +956,8 @@ def solve_qp(
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
             cg_regularization=cg_regularization,
+            predicted_active_set=effective_predicted,
+            use_expand=use_expand,
         )
 
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
@@ -926,9 +975,11 @@ def solve_qp(
     kkt_residual = jnp.asarray(kkt_residual, dtype=jnp.float64)
     base_tol = tol + jnp.minimum(kkt_residual, 1.0) * tol
 
-    # Determine starting active set: warm-start or cold-start
+    # Determine starting active set: LPEC-A predicted, warm-start, or cold-start
     residuals_init = A_ineq @ d_init - b_ineq
-    if initial_active_set is not None:
+    if effective_predicted is not None:
+        init_active = effective_predicted | (residuals_init < -base_tol)
+    elif initial_active_set is not None:
         init_active = initial_active_set | (residuals_init < -base_tol)
     else:
         init_active = residuals_init < -base_tol
@@ -948,10 +999,10 @@ def solve_qp(
 
     # EXPAND anti-cycling: per-iteration tolerance increment
     tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+    effective_tau = tau if use_expand else 0.0
 
     def body_fn(state: QPState) -> QPState:
-        # EXPAND: working tolerance grows monotonically each iteration
-        working_tol = base_tol + state.iteration * tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set using projected CG (ineq only)
         d_new, mult_ineq_new = _solve_projected_cg(
