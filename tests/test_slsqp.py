@@ -93,6 +93,7 @@ class TestSLSQPEqualityConstraints:
         np.testing.assert_allclose(y, [1.0, 1.0, 1.0], rtol=1e-4)
         np.testing.assert_allclose(eq_constraint(y, None), 0.0, atol=1e-5)
 
+    @pytest.mark.slow
     def test_quadratic_circle_constraint(self):
         """minimize (x-2)^2+(y-2)^2 s.t. x^2+y^2=1  =>  (1/sqrt2, 1/sqrt2)"""
 
@@ -162,6 +163,7 @@ class TestSLSQPInequalityConstraints:
 class TestSLSQPMixedConstraints:
     """Tests for mixed equality and inequality constraints."""
 
+    @pytest.mark.slow
     def test_sphere_plane_and_halfspace(self):
         """minimize x^2+y^2+z^2 s.t. x+y+z=3, x,y,z>=0  =>  (1,1,1)"""
 
@@ -336,6 +338,7 @@ class TestSLSQPUserSuppliedDerivatives:
         # Solution: x = y = z = 1 on the sphere
         np.testing.assert_allclose(jnp.sum(y**2), 3.0, rtol=1e-4)
 
+    @pytest.mark.slow
     def test_user_hvp_ad_fallback_for_ineq_constraints(self):
         """Test with user-supplied objective HVP but AD fallback for ineq constraints.
 
@@ -374,7 +377,7 @@ class TestSLSQPUserSuppliedDerivatives:
 class TestSLSQPModerateScale:
     """Tests at moderate scale to verify scalability."""
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_quadratic_n100(self):
         """Test on a 100-dimensional quadratic problem.
 
@@ -394,7 +397,6 @@ class TestSLSQPModerateScale:
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, jnp.zeros(n), atol=1e-2)
 
-    @pytest.mark.slow
     def test_quadratic_n100_with_equality(self):
         """Test 100-dimensional quadratic with a linear equality.
 
@@ -424,7 +426,7 @@ class TestSLSQPModerateScale:
         np.testing.assert_allclose(y, jnp.ones(n), rtol=1e-3)
         np.testing.assert_allclose(jnp.sum(y), float(n), atol=1e-4)
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_quadratic_n100_with_hvp(self):
         """Test 100-dimensional quadratic with user-supplied HVP.
 
@@ -742,6 +744,7 @@ class TestOptimistixMinimise:
 class TestSLSQPComparisonWithSciPy:
     """Compare SLSQP-JAX results with SciPy's SLSQP."""
 
+    @pytest.mark.slow
     def test_vs_scipy_unconstrained(self):
         """Compare unconstrained optimization with SciPy."""
 
@@ -760,6 +763,7 @@ class TestSLSQPComparisonWithSciPy:
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
         np.testing.assert_allclose(result_scipy.x, [0.0, 0.0], atol=1e-5)
 
+    @pytest.mark.slow
     def test_vs_scipy_equality_constrained(self):
         """Compare equality-constrained optimization with SciPy."""
 
@@ -815,6 +819,7 @@ class TestSLSQPBoxConstraints:
 
         np.testing.assert_allclose(y, [2.0], rtol=1e-4)
 
+    @pytest.mark.slow
     def test_simple_upper_bound(self):
         """Minimize -x subject to x <= 3  =>  x = 3"""
 
@@ -859,6 +864,7 @@ class TestSLSQPBoxConstraints:
         assert jnp.all(y >= 0.0 - 1e-5)
         assert jnp.all(y <= 3.0 + 1e-5)
 
+    @pytest.mark.slow
     def test_bounds_with_equality_constraint(self):
         """Minimize x^2 + y^2 subject to x + y = 4, 0 <= x,y <= 3  =>  (2, 2)"""
 
@@ -924,6 +930,7 @@ class TestSLSQPBoxConstraints:
         assert jnp.all(y >= 0.0 - 1e-5)
         assert jnp.all(y <= 2.0 + 1e-5)
 
+    @pytest.mark.slow
     def test_bounds_inactive(self):
         """Test when bounds exist but are not active at the solution.
 
@@ -1104,6 +1111,7 @@ class TestSLSQPBoundsComparisonWithSciPy:
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
         np.testing.assert_allclose(y, [3.0, 3.0], rtol=1e-3)
 
+    @pytest.mark.slow
     def test_bounds_match_scipy_with_constraint(self):
         """Compare bounded + constrained optimization with SciPy."""
 
@@ -1143,6 +1151,7 @@ class TestSLSQPBoundsComparisonWithSciPy:
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
 
+    @pytest.mark.slow
     def test_bounds_match_scipy_partial(self):
         """Compare partially bounded optimization with SciPy."""
 
@@ -1258,6 +1267,7 @@ class TestFrozenHVP:
             f"Expected 1 eq HVP call per step, got {call_count['eq']}"
         )
 
+    @pytest.mark.slow
     def test_frozen_hvp_gives_correct_solution(self):
         """Verify that using frozen L-BFGS with exact HVP probes converges.
 
@@ -1322,6 +1332,7 @@ class TestFrozenHVP:
 
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-4)
 
+    @pytest.mark.slow
     def test_frozen_hvp_multi_step_convergence(self):
         """Verify L-BFGS builds up curvature over multiple steps.
 
@@ -1690,6 +1701,7 @@ class TestStagnationDetection:
             y, state, _ = solver.step(objective, y, args, {}, state, frozenset())
         return y, state, result
 
+    @pytest.mark.slow
     def test_stagnation_on_infeasible_problem(self):
         """Infeasible constraints should cause merit stagnation.
 
@@ -1758,6 +1770,7 @@ class TestStagnationDetection:
 class TestProximalStabilization:
     """Tests for proximal multiplier stabilization (sSQP) in the full solver."""
 
+    @pytest.mark.slow
     def test_convergence_with_equality_and_inequality(self):
         """Adaptive proximal converges on a problem with equality and
         inequality constraints where the inequality is active."""
@@ -1785,6 +1798,7 @@ class TestProximalStabilization:
         np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-3)
         assert y[0] >= 0.6 - 1e-3
 
+    @pytest.mark.slow
     def test_non_degenerate_regression(self):
         """Adaptive proximal should not break well-conditioned problems."""
 
@@ -1866,6 +1880,7 @@ class TestPreconditionedSolver:
         np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-4)
         np.testing.assert_allclose(y[0], 0.5, atol=0.05)
 
+    @pytest.mark.slow
     def test_preconditioner_disabled_regression(self):
         """use_preconditioner=False matches behavior of unpreconditioned solver."""
 
@@ -1895,6 +1910,7 @@ class TestPreconditionedSolver:
 
         np.testing.assert_allclose(y_on, y_off, atol=0.05)
 
+    @pytest.mark.slow
     def test_adaptive_cg_tol(self):
         """Adaptive CG tolerance does not break convergence."""
 

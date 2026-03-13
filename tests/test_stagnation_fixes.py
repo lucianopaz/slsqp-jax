@@ -354,6 +354,7 @@ class TestSteepestDescentFallback:
 class TestStagnationRecovery:
     """Verify solver recovers from scenarios that previously stagnated."""
 
+    @pytest.mark.slow
     def test_eq_constrained_with_adaptive_proximal(self):
         """Equality-constrained problem with adaptive proximal that used to stagnate."""
 
@@ -375,6 +376,7 @@ class TestStagnationRecovery:
         np.testing.assert_allclose(y[0] + y[1], 3.0, atol=1e-4)
         assert float(state.f_val) < 1.0
 
+    @pytest.mark.slow
     def test_bounded_eq_constrained_with_adaptive_proximal(self):
         """Bounded + equality-constrained problem with adaptive proximal."""
 
@@ -397,6 +399,7 @@ class TestStagnationRecovery:
         y, state = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(jnp.sum(y), 3.0, atol=1e-4)
 
+    @pytest.mark.slow
     def test_cg_regularization_prevents_stagnation_with_bounds_and_eq(self):
         """Bounds + equality constraints with ill-conditioned Hessian.
 
@@ -539,6 +542,7 @@ class TestLBFGSIdentityReset:
 class TestEscalatingLBFGSRecovery:
     """Verify consecutive QP failures trigger identity reset."""
 
+    @pytest.mark.slow
     def test_consecutive_failures_trigger_identity_reset(self):
         """After qp_failure_patience consecutive QP failures, L-BFGS resets to identity.
 
@@ -776,6 +780,7 @@ class TestAdaptiveProximalMu:
         np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-4)
         np.testing.assert_allclose(y[0], 0.5, atol=0.05)
 
+    @pytest.mark.slow
     def test_adaptive_mu_with_custom_tau(self):
         """Different proximal_tau values should not break convergence."""
 

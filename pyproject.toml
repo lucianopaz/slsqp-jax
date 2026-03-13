@@ -62,6 +62,7 @@ testpaths = [
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "very_slow: marks tests as extremely slow (also deselected by '-m \"not slow\"')",
 ]
 
 [tool.coverage.report]
