@@ -260,6 +260,31 @@ Because $\delta_k$ increases at every step, marginally active or marginally infe
 
 EXPAND is the standard anti-cycling technique used in production solvers (MINOS, SNOPT, SQOPT) and is backed by a convergence guarantee: strict objective decrease within each expanding sequence. The `expand_factor` parameter on `solve_qp` controls the growth rate; set it to `0.0` to disable expansion entirely.
 
+### LPEC-A active set identification
+
+As an alternative to (or complement of) the EXPAND procedure, the solver supports **LPEC-A** (Oberlin & Wright, *Mathematical Programming*, 2005, Section 3.3), a method that predicts the active constraint set from the current NLP iterate before the QP active-set loop begins.
+
+LPEC-A computes a proximity measure $\bar{\rho}$ from the primal constraint values, dual multiplier estimates, and stationarity residual, then predicts constraint $i$ as active when $c_{\text{ineq},i} \leq (\beta \cdot \bar{\rho})^{\bar{\sigma}}$. Under MFCQ and second-order sufficiency conditions, this prediction is asymptotically exact as the iterate converges to the solution — including weakly active constraints (where $c_i^* = 0$ but $\lambda_i^* = 0$), which are notoriously difficult for active-set methods.
+
+The `active_set_method` parameter on `SLSQP` controls how LPEC-A interacts with the QP solver:
+
+- `"expand"` (default): Standard EXPAND procedure. No LPEC-A prediction.
+- `"lpeca_init"`: LPEC-A predicts the initial active set, then the EXPAND loop runs normally. This provides a better starting point (fewer active-set iterations) while retaining EXPAND's anti-cycling guarantee.
+- `"lpeca"`: LPEC-A predicts the initial active set and the active-set loop runs with a fixed tolerance (no EXPAND growth). Relies on the LPEC-A prediction for anti-cycling; `max_iter` provides a hard stop.
+
+The threshold parameters `lpeca_sigma` (default 0.9) and `lpeca_beta` (default $1/(m_{\text{ineq}} + n + m_{\text{eq}})$) control the sensitivity of the prediction.
+
+**Optional LP refinement.** By default, LPEC-A uses the multiplier estimates from the previous QP solve. Setting `lpeca_use_lp=True` solves a small LP (via `mpax.r2HPDHG`) to obtain tighter multiplier estimates, producing a more accurate prediction. This requires the `mpax` package (`pip install slsqp-jax[extras]`).
+
+```python
+solver = SLSQP(
+    active_set_method="lpeca_init",  # or "lpeca"
+    lpeca_sigma=0.9,
+    lpeca_use_lp=False,  # True requires mpax
+    ...
+)
+```
+
 ### Multiplier stability and convergence rate
 
 Wright (*Properties of the Log-Barrier Function on Degenerate Nonlinear Programs*, SIAM J. Optim., 2002, Theorem 5.3) proved that the convergence rate of SQP methods depends critically on **multiplier stability**: the rate at which Lagrange multipliers change between successive iterations. Specifically, superlinear convergence requires $\lVert \lambda_k - \lambda_{k+1} \rVert = O(\delta)$ where $\delta$ is the step norm. When the QP subproblem is degenerate, the multiplier solution may not be unique, and arbitrary choices across iterations can destroy this stability — even though the primal iterates converge.

@@ -21,6 +21,11 @@ from slsqp_jax.hessian import (
     lbfgs_inverse_hvp,
     lbfgs_reset,
 )
+from slsqp_jax.lpeca import (
+    compute_lpeca_active_set,
+    compute_rho_bar,
+    identify_active_set_lpeca,
+)
 from slsqp_jax.merit import (
     LineSearchResult,
     backtracking_line_search,
@@ -70,4 +75,8 @@ __all__ = [
     "update_penalty_parameter",
     # Hessian utilities
     "compute_lagrangian_gradient",
+    # LPEC-A active set identification
+    "compute_rho_bar",
+    "identify_active_set_lpeca",
+    "compute_lpeca_active_set",
 ]
