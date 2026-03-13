@@ -273,8 +273,8 @@ def lbfgs_append(
     If ||s|| is too small or the curvature ratio is too extreme,
     the update is skipped entirely to avoid numerical issues.
 
-    After appending, the initial Hessian scaling gamma is updated to
-    y_damped^T s / (y_damped^T y_damped), clipped to [1e-3, 100].
+    After appending, the initial direct-Hessian scaling gamma is updated
+    to y_damped^T y_damped / (y_damped^T s), clipped to [1e-2, 1e6].
 
     Args:
         history: Current L-BFGS history.
@@ -335,16 +335,19 @@ def lbfgs_append(
         theta = jnp.clip(theta, 0.0, 1.0)
         y_damped = theta * y + (1.0 - theta) * Bs
 
-        # Update gamma (initial Hessian scaling) based on new curvature
-        # gamma = s^T y / (y^T y) is the Barzilai-Borwein step length approximation
+        # Update gamma (initial direct-Hessian scaling B₀ = γI).
+        # γ = yᵀy / sᵀy approximates the average eigenvalue of the true
+        # Hessian (Byrd, Nocedal & Schnabel 1994, eq 3.6).  Note: the
+        # reciprocal sᵀy / yᵀy would be appropriate for the inverse
+        # Hessian H₀ in the two-loop recursion, but here we need the
+        # direct scaling because lbfgs_hvp builds B, not H.
         yTy = jnp.dot(y_damped, y_damped)
         yTs = jnp.dot(y_damped, s)
-        gamma_candidate = yTs / jnp.maximum(yTy, 1e-12)
+        gamma_candidate = yTy / jnp.maximum(yTs, 1e-12)
 
-        # Clip to a reasonable range - for most problems eigenvalues are O(1) to O(100)
         gamma_new = jax.lax.cond(
-            (yTy > 1e-12) & jnp.isfinite(gamma_candidate),
-            lambda: jnp.clip(gamma_candidate, 1e-3, 100.0),
+            (yTs > 1e-12) & jnp.isfinite(gamma_candidate),
+            lambda: jnp.clip(gamma_candidate, 1e-2, 1e6),
             lambda: history.gamma,
         )
 

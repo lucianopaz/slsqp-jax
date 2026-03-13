@@ -100,7 +100,7 @@ Each SLSQP iteration performs four steps:
 1. **QP subproblem**: Construct quadratic approximation of objective and linearise constraints. Solve QP to obtain search direction.
 2. **Line search**: Use Han-Powell L1 merit function with backtracking Armijo conditions.
 3. **Accept step**: Update iterate x_{k+1} = x_k + α·d_k.
-4. **Hessian update**: Append new curvature pair (s, y) to L-BFGS history (or skip if using exact HVPs).
+4. **Hessian update**: Append new curvature pair (s, y) to L-BFGS history (or skip if using exact HVPs). The gradient difference `y_k = ∇_x L(x_{k+1}, λ_{k+1}) − ∇_x L(x_k, λ_{k+1})` uses the **same** (blended) multipliers at both points to satisfy the secant condition (Nocedal & Wright §18.3). The initial direct-Hessian scaling uses `γ = yᵀy / sᵀy` (Byrd, Nocedal & Schnabel 1994, eq 3.6), giving B₀ = γI ≈ (average eigenvalue)·I.
 
 ### Robustness: Anti-cycling and Stagnation Detection
 
