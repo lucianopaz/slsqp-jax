@@ -163,7 +163,7 @@ Each SLSQP iteration performs four steps:
 1. **QP subproblem**: Construct a quadratic approximation of the objective using the frozen L-BFGS Hessian and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
 2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho (\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
 3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha d_k$.
-4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla L(x_{k+1}) - \nabla L(x_k)$.
+4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla_x L(x_{k+1}, \lambda_{k+1}) - \nabla_x L(x_k, \lambda_{k+1})$. The secant condition (Nocedal & Wright §18.3) requires both Lagrangian gradients to use the **same** multipliers $\lambda_{k+1}$ (the blended multipliers). The initial direct-Hessian scaling is $\gamma = y^T y\, /\, s^T y$ (Byrd, Nocedal & Schnabel, 1994), giving $B_0 = \gamma I$ that approximates the average Hessian eigenvalue.
 
 ### Scaling considerations: why L-BFGS over BFGS
 

@@ -1113,7 +1113,18 @@ class SLSQP(optx.AbstractMinimiser):
             )
             y_for_lbfgs = exact_hvp_fn(s)
         else:
-            y_for_lbfgs = grad_lagrangian_new - state.prev_grad_lagrangian
+            # Recompute grad_L at old point x_k with NEW blended multipliers.
+            # The secant condition (Nocedal & Wright §18.3) requires both
+            # Lagrangian gradients to use the same multipliers:
+            #   y_k = grad_L(x_{k+1}, lambda_{k+1}) - grad_L(x_k, lambda_{k+1})
+            grad_lagrangian_old = compute_lagrangian_gradient(
+                state.grad,
+                state.eq_jac,
+                state.ineq_jac,
+                blended_mult_eq,
+                blended_mult_ineq,
+            )
+            y_for_lbfgs = grad_lagrangian_new - grad_lagrangian_old
 
         new_lbfgs_history = lbfgs_append(state.lbfgs_history, s, y_for_lbfgs)
 
