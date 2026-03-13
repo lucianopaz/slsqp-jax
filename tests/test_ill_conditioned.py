@@ -178,7 +178,6 @@ class TestNearInfeasibleConstraints:
         # Tolerance is relaxed due to constraint inconsistency
         np.testing.assert_allclose(y, [0.5, 0.5], atol=0.1)
 
-    @pytest.mark.slow
     def test_nearly_parallel_constraints(self):
         """Problem with nearly parallel constraint gradients.
 
@@ -213,7 +212,6 @@ class TestNearInfeasibleConstraints:
         # Solution should be near (1, 1) where constraints are active
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-3)
 
-    @pytest.mark.slow
     def test_tight_feasible_region(self):
         """Problem with a very tight feasible region.
 
@@ -359,7 +357,7 @@ class TestProcessOptimizationBenchmarks:
     engineering process optimization, which the paper focuses on.
     """
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_reactor_cascade_simplified(self):
         """Simplified reactor cascade optimization.
 
@@ -467,7 +465,6 @@ class TestProcessOptimizationBenchmarks:
             f"Constraint violation too large: {constraint_violation}"
         )
 
-    @pytest.mark.slow
     def test_distillation_column_simplified(self):
         """Simplified distillation column optimization.
 
@@ -547,7 +544,6 @@ class TestProcessOptimizationBenchmarks:
 class TestNumericalStability:
     """Tests for numerical stability edge cases."""
 
-    @pytest.mark.slow
     def test_very_small_gradients(self):
         """Problem where gradients become very small near optimum."""
 
@@ -566,7 +562,6 @@ class TestNumericalStability:
         # Should converge despite flat gradients near optimum
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-2)
 
-    @pytest.mark.slow
     def test_large_initial_point(self):
         """Problem starting far from optimum."""
 
@@ -584,7 +579,6 @@ class TestNumericalStability:
         # Should still converge to origin
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-2)
 
-    @pytest.mark.slow
     def test_mixed_large_small_values(self):
         """Problem with variables of different magnitudes.
 

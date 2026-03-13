@@ -23,7 +23,9 @@ jobs:
         - -m "not slow"
         include:
         - python-version: '3.14'
-          marker: -m "slow"
+          marker: -m "slow and not very_slow"
+        - python-version: '3.14'
+          marker: -m "very_slow"
 
     steps:
     - uses: actions/checkout@v5
