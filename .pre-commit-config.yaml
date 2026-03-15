@@ -35,7 +35,7 @@ repos:
   - id: check-merge-conflict
   - id: check-added-large-files
     args: [--maxkb=500]
-    exclude: ^(docs/|notebooks/|pixi.lock|\.test_durations)$
+    exclude: ^(docs/|notebooks/|pixi.lock|\.test_durations\.xml)$
   - id: detect-private-key
   - id: check-json
   - id: check-yaml
