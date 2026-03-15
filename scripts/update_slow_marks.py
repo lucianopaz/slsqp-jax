@@ -1,26 +1,47 @@
 #!/usr/bin/env python
 """Identify tests that should be marked ``@pytest.mark.slow``.
 
-Parses the JUnit XML produced by ``pytest --junit-xml=.test_durations`` and
-selects the slowest tests such that the remaining (non-slow) tests finish
-within a given time budget.
+Parses the JUnit XML produced by ``pytest`` (written to ``.test_durations.xml``
+by the default ``addopts`` in ``pyproject.toml``) and selects the slowest tests
+such that the remaining (non-slow) tests finish within a given time budget.
 
 Usage::
 
-    uv run pytest --override-ini="addopts=" --junit-xml=.test_durations -v
-    python scripts/update_slow_marks.py              # default: 300s budget
+    uv run pytest                                     # generates .test_durations.xml
+    python scripts/update_slow_marks.py               # default: 300s budget
     python scripts/update_slow_marks.py --budget 120  # custom budget in seconds
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-DURATIONS_FILE = Path(__file__).resolve().parent.parent / ".test_durations"
+DURATIONS_FILE = Path(__file__).resolve().parent.parent / ".test_durations.xml"
 DEFAULT_BUDGET_SECONDS = 300
+FULL_SUITE_CMD = (
+    'uv run pytest --override-ini="addopts=" --junit-xml=.test_durations.xml -v'
+)
+
+
+def _count_all_tests() -> int | None:
+    """Run ``pytest --collect-only`` to discover the total number of tests."""
+    try:
+        result = subprocess.run(
+            ["uv", "run", "pytest", "--override-ini=addopts=", "--collect-only", "-q"],
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            # e.g. "284 tests collected in 0.96s"
+            if "tests collected" in line:
+                return int(line.split()[0])
+    except FileNotFoundError:
+        pass
+    return None
 
 
 def _file_from_classname(classname: str) -> str:
@@ -49,7 +70,7 @@ def main() -> None:
     if not args.durations_file.exists():
         print(
             f"ERROR: {args.durations_file} not found.\n"
-            'Run:  uv run pytest --override-ini="addopts=" --junit-xml=.test_durations -v',
+            f"Run the full test suite first:\n\n  {FULL_SUITE_CMD}\n",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -64,6 +85,17 @@ def main() -> None:
         duration = float(tc.attrib["time"])
         filepath = _file_from_classname(classname)
         tests.append((filepath, classname, name, duration))
+
+    expected = _count_all_tests()
+    if expected is not None and len(tests) < expected:
+        print(
+            f"ERROR: {args.durations_file} contains {len(tests)} tests "
+            f"but the full suite has {expected}.\n"
+            "The file appears to be from a partial run (e.g. with -m filters).\n"
+            f"Re-run the full test suite:\n\n  {FULL_SUITE_CMD}\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     total = sum(d for _, _, _, d in tests)
     slow_target = total - args.budget
