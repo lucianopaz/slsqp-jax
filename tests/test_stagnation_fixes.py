@@ -202,15 +202,18 @@ class TestLBFGSDiagonalHVP:
         roundtrip = lbfgs_inverse_hvp(h, Bv)
         np.testing.assert_allclose(roundtrip, v, atol=1e-5)
 
-    def test_append_after_reset_restores_uniform_diagonal(self):
-        """After lbfgs_append following a reset, diagonal = gamma * 1."""
+    def test_append_after_reset_uses_per_variable_diagonal(self):
+        """After lbfgs_append following a reset, diagonal uses Shanno-Phua scaling."""
         h = self._build_nonuniform_history(5)
         assert not jnp.allclose(h.diagonal, h.gamma * jnp.ones(5))
 
         s = jnp.array([0.1, -0.2, 0.3, -0.1, 0.05])
         y = jnp.array([0.5, 0.3, 0.8, 0.4, 0.2])
         h2 = lbfgs_append(h, s, y)
-        np.testing.assert_allclose(h2.diagonal, h2.gamma * jnp.ones(5), atol=1e-12)
+
+        yTs = jnp.dot(y, s)
+        expected = jnp.clip(y**2 / jnp.maximum(yTs, 1e-12), 1e-2, 1e6)
+        np.testing.assert_allclose(h2.diagonal, expected, atol=1e-12)
 
 
 # ===================================================================

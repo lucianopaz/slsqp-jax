@@ -602,3 +602,192 @@ class TestNumericalStability:
         initial_obj = objective(x0, None)[0]
         final_obj = objective(y, None)[0]
         assert final_obj < initial_obj * 0.1, "Objective should decrease by 90%"
+
+
+class TestNewtonCGMode:
+    """Tests for use_exact_hvp_in_qp=True (Newton-CG) mode."""
+
+    def test_newton_cg_unconstrained_quadratic(self):
+        """Newton-CG should converge in few iterations on a quadratic."""
+        n = 10
+        weights = 10 ** jnp.linspace(0, 3, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=50,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y, jnp.zeros(n), atol=1e-6)
+
+    def test_newton_cg_with_equality_constraint(self):
+        """Newton-CG with an equality constraint."""
+        n = 5
+        weights = 10 ** jnp.linspace(0, 2, n)
+
+        def objective(x, args):
+            return jnp.sum(weights * x**2), None
+
+        def eq_fn(x, args):
+            return jnp.array([jnp.sum(x) - float(n)])
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=50,
+            eq_constraint_fn=eq_fn,
+            n_eq_constraints=1,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(jnp.sum(y), float(n), atol=1e-4)
+        assert y[0] > y[-1], "Lower-weighted variables should be larger"
+
+    def test_newton_cg_ill_conditioned_converges(self):
+        """Newton-CG should handle ill-conditioned problems better than L-BFGS."""
+        n = 10
+        weights = 10 ** jnp.linspace(0, 4, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=100,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        final_obj = float(objective(y, None)[0])
+        initial_obj = float(objective(x0, None)[0])
+        assert final_obj < initial_obj * 1e-6, (
+            f"Newton-CG should converge on kappa=1e4: "
+            f"initial={initial_obj:.2e}, final={final_obj:.2e}"
+        )
+
+    def test_newton_cg_with_user_hvp(self):
+        """Newton-CG works when user provides obj_hvp_fn."""
+        n = 5
+        weights = jnp.array([1.0, 10.0, 100.0, 1000.0, 10000.0])
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        def obj_hvp(x, v, args):
+            return weights * v
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=50,
+            obj_hvp_fn=obj_hvp,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y, jnp.zeros(n), atol=1e-6)
+
+    def test_newton_cg_falls_back_without_hvp(self):
+        """When use_exact_hvp_in_qp=True, AD-computed HVP is used."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=30,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.array([1.0, 2.0, 3.0])
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y, jnp.zeros(3), atol=1e-6)
+
+
+class TestDampingThreshold:
+    """Tests for the exposed damping_threshold parameter."""
+
+    def test_zero_damping_preserves_curvature(self):
+        """With damping_threshold=0.0, curvature pairs are not damped."""
+        n = 5
+        weights = 10 ** jnp.linspace(0, 3, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=50,
+            damping_threshold=0.0,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y, jnp.zeros(n), atol=1e-4)
+
+    def test_high_damping_still_converges(self):
+        """With damping_threshold=0.5, solver still converges (slower)."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=50,
+            damping_threshold=0.5,
+        )
+        x0 = jnp.array([1.0, 2.0, 3.0])
+        y, state = _run_solver(solver, objective, x0)
+        np.testing.assert_allclose(y, jnp.zeros(3), atol=1e-4)
+
+    def test_default_damping_unchanged(self):
+        """Default damping_threshold is 0.2 (Powell's standard value)."""
+        solver = SLSQP(max_steps=10)
+        assert solver.damping_threshold == 0.2
+
+
+class TestPerVariableDiagonal:
+    """Tests for Shanno-Phua per-variable diagonal scaling."""
+
+    def test_diagonal_captures_scale_differences(self):
+        """After L-BFGS updates, diagonal reflects per-variable curvature."""
+        from slsqp_jax import lbfgs_append, lbfgs_init
+
+        n = 4
+        h = lbfgs_init(n, memory=5)
+
+        s = jnp.array([0.1, 0.1, 0.1, 0.1])
+        y = jnp.array([0.1, 1.0, 10.0, 100.0])
+
+        h2 = lbfgs_append(h, s, y)
+
+        assert h2.diagonal[0] < h2.diagonal[-1], (
+            "Diagonal should reflect curvature spread"
+        )
+        ratio = h2.diagonal[-1] / h2.diagonal[0]
+        assert ratio > 10, f"Expected large ratio, got {ratio}"
+
+    def test_per_variable_diagonal_improves_ill_conditioned(self):
+        """Per-variable diagonal should help with ill-conditioned problems."""
+        n = 5
+        weights = 10 ** jnp.linspace(0, 3, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=100,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        final_obj = float(objective(y, None)[0])
+        initial_obj = float(objective(x0, None)[0])
+        assert final_obj < initial_obj * 0.01, (
+            f"Per-variable diagonal should enable convergence: "
+            f"initial={initial_obj:.2e}, final={final_obj:.2e}"
+        )

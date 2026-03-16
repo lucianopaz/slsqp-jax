@@ -131,7 +131,9 @@ $$
 
 If you provide `obj_hvp_fn` but omit the constraint HVP functions, the solver automatically computes the missing constraint HVPs via forward-over-reverse AD on the scalar function $\lambda^T c(x)$, which costs one reverse pass plus one forward pass regardless of the number of constraints.
 
-**Frozen Hessian in the QP subproblem**: The QP inner loop always uses a frozen L-BFGS approximation to the Lagrangian Hessian, even when exact HVPs are available. The exact HVP is called only **once per main iteration** (to probe along the step direction and produce an exact secant pair for the L-BFGS update). This design ensures (1) the QP subproblem sees a truly constant quadratic model, and (2) expensive HVP evaluations are not repeated thousands of times inside the projected CG solver.
+**Frozen Hessian in the QP subproblem**: By default the QP inner loop uses a frozen L-BFGS approximation to the Lagrangian Hessian, even when exact HVPs are available. The exact HVP is called only **once per main iteration** (to probe along the step direction and produce an exact secant pair for the L-BFGS update). This design ensures (1) the QP subproblem sees a truly constant quadratic model, and (2) expensive HVP evaluations are not repeated inside the projected CG solver.
+
+**Newton-CG mode** (`use_exact_hvp_in_qp=True`): For ill-conditioned problems where L-BFGS cannot capture the curvature accurately, this option replaces the frozen L-BFGS HVP with the **exact Lagrangian HVP** inside the CG inner loop. Each CG step then costs one forward-over-reverse AD pass — the same as one gradient evaluation. L-BFGS is still updated and serves as the **preconditioner** (via two-loop recursion), so the number of CG iterations is typically small. When the user supplies `obj_hvp_fn`, that function is used; otherwise the solver auto-computes the objective HVP via `jax.jvp(jax.grad(f), ...)`. This is the standard Newton-CG approach used in production solvers such as KNITRO and Ipopt.
 
 ### Box constraints (bounds)
 
@@ -168,7 +170,7 @@ Each SLSQP iteration performs four steps:
 1. **QP subproblem**: Construct a quadratic approximation of the objective using the frozen L-BFGS Hessian and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
 2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho (\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
 3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha d_k$.
-4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla_x L(x_{k+1}, \lambda_{k+1}) - \nabla_x L(x_k, \lambda_{k+1})$. The secant condition (Nocedal & Wright §18.3) requires both Lagrangian gradients to use the **same** multipliers $\lambda_{k+1}$ (the blended multipliers). The initial direct-Hessian scaling is $\gamma = y^T y\, /\, s^T y$ (Byrd, Nocedal & Schnabel, 1994), giving $B_0 = \gamma I$ that approximates the average Hessian eigenvalue.
+4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla_x L(x_{k+1}, \lambda_{k+1}) - \nabla_x L(x_k, \lambda_{k+1})$. The secant condition (Nocedal & Wright §18.3) requires both Lagrangian gradients to use the **same** multipliers $\lambda_{k+1}$ (the blended multipliers). The initial Hessian uses **Shanno-Phua per-variable diagonal scaling**: $B_0 = \text{diag}(d)$ where $d_i = y_i^2 / (y^T s)$, clipped to $[10^{-2}, 10^{6}]$. Unlike the scalar $\gamma I$ scaling, this captures per-variable curvature differences, which is critical for ill-conditioned problems where Hessian eigenvalues span many orders of magnitude.
 
 ### Scaling considerations: why L-BFGS over BFGS
 
@@ -188,7 +190,7 @@ $$
 
 where $W = (\gamma S, Y)$ is the horizontal concatenation of matrices $\gamma S$ and $Y$, and $N$ is a small $2k \times 2k$ matrix built from inner products of the stored vectors. The $2k \times 2k$ system is solved directly — negligible cost for $k << n$.
 
-Powell's damping is applied to each curvature pair before storage to ensure positive definiteness, which is essential for constrained problems where the standard curvature condition $s^T y > 0$ can fail.
+Powell's damping is applied to each curvature pair before storage to ensure positive definiteness, which is essential for constrained problems where the standard curvature condition $s^T y > 0$ can fail. The damping threshold is configurable via `damping_threshold` (default 0.2, Powell's standard value). Setting `damping_threshold=0.0` disables damping entirely, which can improve convergence on well-conditioned positive-definite objectives where $s^T y > 0$ holds naturally without damping.
 
 ### Scaling considerations: why projected CG over dense KKT
 
@@ -402,13 +404,13 @@ The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG 
 
 ### L-BFGS diagonal reset
 
-The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal is uniform ($d = \gamma \mathbf{1}$), but when the QP solver or the line search fails, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
+The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal uses **Shanno-Phua per-variable scaling** ($d_i = y_i^2 / y^T s$), but when the QP solver or the line search fails, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
 
 1. Extract $\text{diag}(B_k)$ from the current L-BFGS compact representation in $O(k^2 n)$.
 2. Discard all stored $(s, y)$ pairs.
-3. Restart with $B_0 = \text{diag}(\text{clip}(\text{diag}(B_k),\, 10^{-3},\, 100))$.
+3. Restart with $B_0 = \text{diag}(\text{clip}(\text{diag}(B_k),\, 10^{-2},\, 10^{6}))$.
 
-This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the scalar $\gamma$ becomes very small and gets frozen by tiny steps. After the reset, the first successful L-BFGS append returns the diagonal to uniform scaling.
+This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the diagonal entries become very small and get frozen by tiny steps. The next `lbfgs_append` updates the diagonal per-variable rather than reverting to uniform scaling, so the curvature information accumulated by the reset is not lost.
 
 **Escalating identity reset.** When failures occur repeatedly, the SNOPT diagonal reset can re-extract the same problematic diagonal, perpetuating an ill-conditioning cycle. To break this deadlock, the solver tracks consecutive failures (QP and line search independently) and, after `qp_failure_patience` consecutive QP failures (default 3) or `ls_failure_patience` consecutive line search failures (default 3), performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal. This allows the L-BFGS to rebuild curvature from scratch.
 

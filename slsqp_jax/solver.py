@@ -395,9 +395,17 @@ class SLSQP(optx.AbstractMinimiser):
     _ineq_jac_impl: Callable = eqx.field(static=True, default=None)
     _eq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)
     _ineq_hvp_contrib_impl: Callable = eqx.field(static=True, default=None)
+    _obj_hvp_impl: Optional[Callable] = eqx.field(static=True, default=None)
 
     # L-BFGS parameters
     lbfgs_memory: int = eqx.field(static=True, default=10)
+
+    # Powell damping threshold for L-BFGS curvature pairs.  Damping
+    # ensures s^T y_damped >= threshold * s^T B s, which is needed for
+    # positive definiteness in constrained optimization.  For
+    # well-conditioned PD objectives where s^T y > 0 naturally holds,
+    # setting this to 0.0 avoids corrupting curvature information.
+    damping_threshold: float = 0.2
 
     # Line search parameters
     line_search_max_steps: int = eqx.field(static=True, default=20)
@@ -406,6 +414,13 @@ class SLSQP(optx.AbstractMinimiser):
     # QP solver parameters
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
+
+    # Newton-CG mode: use exact Lagrangian HVP (via AD) in the QP inner
+    # loop instead of the L-BFGS approximation.  This costs one
+    # forward-over-reverse HVP evaluation per CG step but can
+    # dramatically improve convergence on ill-conditioned problems.
+    # L-BFGS is still updated for preconditioning and as a fallback.
+    use_exact_hvp_in_qp: bool = eqx.field(static=True, default=False)
 
     # Adaptive proximal multiplier stabilization (sSQP).
     # Active for equality-constrained problems when tau > 0.  The proximal
@@ -689,6 +704,24 @@ class SLSQP(optx.AbstractMinimiser):
 
         object.__setattr__(self, "_ineq_hvp_contrib_impl", ineq_hvp_contrib)
 
+        # --- Objective HVP callable (for Newton-CG and secant probes) ---
+        if self.obj_hvp_fn is not None:
+            user_obj_hvp = self.obj_hvp_fn
+
+            def obj_hvp_impl(fn, y, v, args):
+                return user_obj_hvp(y, v, args)
+
+        elif self.use_exact_hvp_in_qp:
+
+            def obj_hvp_impl(fn, y, v, args):
+                _, hvp_val = jax.jvp(jax.grad(lambda x: fn(x, args)[0]), (y,), (v,))
+                return hvp_val
+
+        else:
+            obj_hvp_impl = None
+
+        object.__setattr__(self, "_obj_hvp_impl", obj_hvp_impl)
+
     def _clip_to_bounds(self, y: Vector) -> Vector:
         """Project ``y`` onto the box defined by ``self.bounds``.
 
@@ -753,17 +786,30 @@ class SLSQP(optx.AbstractMinimiser):
 
     def _build_lagrangian_hvp(
         self,
+        fn: Callable,
+        y: Vector,
+        args: Any,
         state: "SLSQPState",
     ) -> Callable[[Vector], Vector]:
-        """Build the frozen L-BFGS Lagrangian HVP for the QP subproblem.
+        """Build the Lagrangian HVP for the QP subproblem.
 
-        Always returns a closure v -> B_k @ v using the L-BFGS compact
-        representation, regardless of whether exact HVPs are available.
-        This ensures the QP subproblem uses a frozen (constant) Hessian
-        approximation, which is both mathematically correct (the QP is a
-        local quadratic model) and efficient (no expensive HVP calls
-        inside the CG inner loop).
+        In default mode, returns a closure v -> B_k @ v using the L-BFGS
+        compact representation (frozen, constant Hessian approximation).
+
+        In Newton-CG mode (``use_exact_hvp_in_qp=True``), returns the
+        exact Lagrangian HVP at the current iterate, computed via AD.
+        This costs one forward-over-reverse pass per CG step but can
+        dramatically improve convergence on ill-conditioned problems.
         """
+        if self.use_exact_hvp_in_qp and self._obj_hvp_impl is not None:
+            return self._build_exact_lagrangian_hvp(
+                fn,
+                y,
+                args,
+                state.multipliers_eq,
+                state.multipliers_ineq,
+            )
+
         lbfgs_history = state.lbfgs_history
 
         def lbfgs_lagrangian_hvp(v: Vector) -> Vector:
@@ -835,6 +881,7 @@ class SLSQP(optx.AbstractMinimiser):
 
     def _build_exact_lagrangian_hvp(
         self,
+        fn: Callable,
         y: Vector,
         args: Any,
         multipliers_eq: Float[Array, " m_eq"],
@@ -847,16 +894,17 @@ class SLSQP(optx.AbstractMinimiser):
 
         Called once per main iteration to probe the exact Hessian along the
         step direction, producing a high-quality secant pair for L-BFGS.
-        The dispatch to user-supplied vs AD-computed HVPs is resolved at
-        construction time in ``__check_init__``.
+        Also used in Newton-CG mode for the QP inner loop.  The dispatch
+        to user-supplied vs AD-computed HVPs is resolved at construction
+        time in ``__check_init__``.
         """
         m_ineq = self.n_ineq_constraints
-        obj_hvp_fn = cast(HVPFn, self.obj_hvp_fn)
+        obj_hvp_impl = cast(Callable, self._obj_hvp_impl)
         eq_hvp_contrib = self._eq_hvp_contrib_impl
         ineq_hvp_contrib = self._ineq_hvp_contrib_impl
 
         def lagrangian_hvp(v: Vector) -> Vector:
-            obj_val = obj_hvp_fn(y, v, args)
+            obj_val = obj_hvp_impl(fn, y, v, args)
             eq_val = eq_hvp_contrib(y, v, args, multipliers_eq)
             ineq_val = ineq_hvp_contrib(y, v, args, multipliers_ineq[:m_ineq])
             return obj_val - eq_val - ineq_val
@@ -996,7 +1044,8 @@ class SLSQP(optx.AbstractMinimiser):
         """Perform one SLSQP iteration.
 
         This method:
-        1. Builds the frozen L-BFGS HVP for the QP subproblem.
+        1. Builds the Lagrangian HVP for the QP subproblem (L-BFGS or
+           exact AD in Newton-CG mode).
         2. Solves the QP subproblem via projected CG to find direction d.
         3. Performs line search with L1 merit function to find step size.
         4. Updates x_{k+1} = x_k + alpha * d.
@@ -1019,8 +1068,8 @@ class SLSQP(optx.AbstractMinimiser):
         # the user-supplied y0 may violate bounds).
         y = self._clip_to_bounds(y)
 
-        # Step 1: Build the frozen L-BFGS HVP for the QP subproblem
-        hvp_fn = self._build_lagrangian_hvp(state)
+        # Step 1: Build the Lagrangian HVP for the QP subproblem
+        hvp_fn = self._build_lagrangian_hvp(fn, y, args, state)
 
         # Step 2: Solve QP subproblem for search direction
         qp_result = self._solve_qp_subproblem(state, hvp_fn)
@@ -1104,8 +1153,9 @@ class SLSQP(optx.AbstractMinimiser):
             blended_mult_ineq,
         )
 
-        if self.obj_hvp_fn is not None:
+        if self._obj_hvp_impl is not None:
             exact_hvp_fn = self._build_exact_lagrangian_hvp(
+                fn,
                 y,
                 args,
                 blended_mult_eq,
@@ -1126,7 +1176,12 @@ class SLSQP(optx.AbstractMinimiser):
             )
             y_for_lbfgs = grad_lagrangian_new - grad_lagrangian_old
 
-        new_lbfgs_history = lbfgs_append(state.lbfgs_history, s, y_for_lbfgs)
+        new_lbfgs_history = lbfgs_append(
+            state.lbfgs_history,
+            s,
+            y_for_lbfgs,
+            damping_threshold=self.damping_threshold,
+        )
 
         # SNOPT-style diagonal reset on QP failure: preserve per-variable
         # curvature from the current approximation and clear stale pairs.

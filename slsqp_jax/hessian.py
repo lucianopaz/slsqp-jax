@@ -151,19 +151,20 @@ def lbfgs_hvp(
     # B v = B_0 v - [B_0 S, Y]^T @ q = d*v - DS^T @ q[:k] - Y^T @ q[k:]
     result = dv - DS.T @ q[:k] - Y.T @ q[k:]
 
-    # Guard against NaN/inf or unreasonable values: fall back to identity scaling
-    # For well-conditioned problems, the Hessian eigenvalues should be O(1) to O(100)
+    # Guard against NaN/inf from numerical blowup in the compact form solve.
+    # The magnitude threshold scales with the diagonal so that it is never
+    # triggered by legitimate Hessian eigenvalues.  B₀ = diag(d), so the
+    # expected scale of ||Bv|| is O(max|d| · ||v||); using a 1000× margin
+    # on top of that catches only genuine numerical failures.
     v_norm = jnp.linalg.norm(v)
     result_norm = jnp.linalg.norm(result)
+    max_diag = jnp.max(jnp.abs(d))
+    threshold = 1000.0 * jnp.maximum(max_diag, 1.0)
 
-    # The ratio result_norm / v_norm should be bounded by max eigenvalue of B
-    # For most problems this is < 100; use a threshold of 1000
     is_bad = jnp.any(~jnp.isfinite(result)) | (
-        result_norm > 1000.0 * jnp.maximum(v_norm, 1e-10)
+        result_norm > threshold * jnp.maximum(v_norm, 1e-10)
     )
 
-    # When fallback triggers, use identity scaling (1.0 * v) not gamma * v
-    # because gamma can be very small and would create ill-conditioned QP
     result = jnp.where(is_bad, v, result)
 
     return result
@@ -243,8 +244,12 @@ def lbfgs_inverse_hvp(
     r_norm = jnp.linalg.norm(r)
 
     # Fall back to identity if the result is non-finite or unreasonably large.
-    # Use plain v so the fallback always has unit spectral radius.
-    is_bad = jnp.any(~jnp.isfinite(r)) | (r_norm > 1000.0 * jnp.maximum(v_norm, 1e-10))
+    # H₀ = diag(1/d), so expected scale of ||H v|| is O(max(1/d) · ||v||).
+    max_inv_diag = 1.0 / jnp.min(d_safe)
+    threshold = 1000.0 * jnp.maximum(max_inv_diag, 1.0)
+    is_bad = jnp.any(~jnp.isfinite(r)) | (
+        r_norm > threshold * jnp.maximum(v_norm, 1e-10)
+    )
     r = jnp.where(is_bad, v, r)
 
     return r
@@ -273,8 +278,11 @@ def lbfgs_append(
     If ||s|| is too small or the curvature ratio is too extreme,
     the update is skipped entirely to avoid numerical issues.
 
-    After appending, the initial direct-Hessian scaling gamma is updated
-    to y_damped^T y_damped / (y_damped^T s), clipped to [1e-2, 1e6].
+    After appending, the scalar gamma is updated to
+    y_damped^T y_damped / (y_damped^T s), clipped to [1e-2, 1e6].
+    The per-variable diagonal is updated using Shanno-Phua scaling:
+    d[i] = y_damped[i]^2 / (y_damped^T s), clipped to [1e-2, 1e6].
+    This captures per-variable curvature, unlike the scalar gamma * I.
 
     Args:
         history: Current L-BFGS history.
@@ -316,8 +324,6 @@ def lbfgs_append(
         | has_bad_values
     )
 
-    n = history.diagonal.shape[0]
-
     def do_append():
         # Compute B @ s using current L-BFGS approximation for damping
         Bs = lbfgs_hvp(history, s)
@@ -335,12 +341,8 @@ def lbfgs_append(
         theta = jnp.clip(theta, 0.0, 1.0)
         y_damped = theta * y + (1.0 - theta) * Bs
 
-        # Update gamma (initial direct-Hessian scaling B₀ = γI).
-        # γ = yᵀy / sᵀy approximates the average eigenvalue of the true
-        # Hessian (Byrd, Nocedal & Schnabel 1994, eq 3.6).  Note: the
-        # reciprocal sᵀy / yᵀy would be appropriate for the inverse
-        # Hessian H₀ in the two-loop recursion, but here we need the
-        # direct scaling because lbfgs_hvp builds B, not H.
+        # Update gamma (scalar summary of average Hessian eigenvalue).
+        # γ = yᵀy / sᵀy (Byrd, Nocedal & Schnabel 1994, eq 3.6).
         yTy = jnp.dot(y_damped, y_damped)
         yTs = jnp.dot(y_damped, s)
         gamma_candidate = yTy / jnp.maximum(yTs, 1e-12)
@@ -349,6 +351,20 @@ def lbfgs_append(
             (yTs > 1e-12) & jnp.isfinite(gamma_candidate),
             lambda: jnp.clip(gamma_candidate, 1e-2, 1e6),
             lambda: history.gamma,
+        )
+
+        # Per-variable diagonal update (Shanno-Phua scaling).
+        # d[i] = y_i^2 / (y^T s) approximates the i-th diagonal entry
+        # of the Hessian.  Unlike the scalar gamma * ones(n), this
+        # captures per-variable curvature differences, which is critical
+        # for ill-conditioned problems where eigenvalues span many orders
+        # of magnitude.
+        per_var_estimate = y_damped**2 / jnp.maximum(yTs, 1e-12)
+        per_var_clipped = jnp.clip(per_var_estimate, 1e-2, 1e6)
+        new_diagonal = jnp.where(
+            (yTs > 1e-12) & jnp.all(jnp.isfinite(per_var_estimate)),
+            per_var_clipped,
+            history.diagonal,
         )
 
         # Write to circular buffer at next_idx
@@ -363,7 +379,7 @@ def lbfgs_append(
             s_history=new_s_history,
             y_history=new_y_history,
             gamma=gamma_new,
-            diagonal=jnp.full(n, gamma_new),
+            diagonal=new_diagonal,
             count=new_count,
             next_idx=new_idx,
         )
@@ -453,7 +469,7 @@ def lbfgs_reset(
     Saunders, *SIAM Review*, 47(1), 2005, Section 3.3).
     """
     diag_B = lbfgs_compute_diagonal(history)
-    diag_clipped = jnp.clip(diag_B, 1e-3, 100.0)
+    diag_clipped = jnp.clip(diag_B, 1e-2, 1e6)
 
     # Ensure all values are finite; fall back to 1.0 otherwise
     diag_safe = jnp.where(jnp.isfinite(diag_clipped), diag_clipped, 1.0)
