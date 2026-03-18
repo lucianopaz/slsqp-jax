@@ -434,7 +434,7 @@ class TestStagnationRecovery:
         y, state = _run_solver(solver, objective, x0)
 
         np.testing.assert_allclose(jnp.sum(y), 5.0, atol=1e-3)
-        assert not state.x_stagnation
+        assert not state.stagnation
 
 
 # ===================================================================
@@ -667,12 +667,12 @@ class TestAlphaScaledMultipliers:
 
 
 # ===================================================================
-# 9. Sliding-window stagnation detection
+# 9. Merit-based stagnation detection
 # ===================================================================
 
 
-class TestSlidingWindowStagnation:
-    """Tests for the x-value sliding-window stagnation detection."""
+class TestMeritStagnation:
+    """Tests for the merit-based stagnation detection."""
 
     def test_stagnation_window_calculation(self):
         """_stagnation_window = max(1, max_steps // 10)."""
@@ -685,8 +685,8 @@ class TestSlidingWindowStagnation:
         solver3 = SLSQP(max_steps=200)
         assert solver3._stagnation_window == 20
 
-    def test_x_history_shape(self):
-        """x_history should have shape (W, n) after init."""
+    def test_best_merit_init(self):
+        """best_merit should be finite and steps_without_improvement == 0 after init."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -694,12 +694,12 @@ class TestSlidingWindowStagnation:
         solver = SLSQP(max_steps=100)
         x0 = jnp.array([1.0, 2.0, 3.0])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
-        assert state.x_history.shape == (10, 3)
-        np.testing.assert_allclose(state.x_history[0], x0)
-        np.testing.assert_allclose(state.x_history[9], x0)
+        assert jnp.isfinite(state.best_merit)
+        assert state.steps_without_improvement == 0
+        assert not state.stagnation
 
-    def test_x_stagnation_false_on_progress(self):
-        """x_stagnation should be False on a well-behaved problem."""
+    def test_stagnation_false_on_progress(self):
+        """stagnation should be False on a well-behaved problem."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -711,9 +711,9 @@ class TestSlidingWindowStagnation:
         )
         x0 = jnp.array([3.0, -2.0])
         y, state = _run_solver(solver, objective, x0)
-        assert not state.x_stagnation
+        assert not state.stagnation
 
-    def test_x_stagnation_guard_before_window(self):
+    def test_stagnation_guard_before_window(self):
         """Stagnation should not fire before W steps have elapsed."""
 
         def objective(x, args):
@@ -732,7 +732,7 @@ class TestSlidingWindowStagnation:
             if done:
                 break
             y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
-        assert not state.x_stagnation
+        assert not state.stagnation
 
 
 # ===================================================================

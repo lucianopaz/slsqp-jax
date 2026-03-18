@@ -56,9 +56,9 @@ from slsqp_jax.types import (
 from slsqp_jax.utils import args_closure
 
 STAGNATION_MESSAGE = (
-    "The solver stagnated: the iterates did not change significantly "
-    "over the sliding window (max_steps / 10 iterations). This may "
-    "indicate cycling in the QP subproblem or an infeasible/degenerate "
+    "The solver stagnated: the L1 merit function did not improve over "
+    "the patience window (max_steps / 10 consecutive iterations). This "
+    "may indicate cycling in the QP subproblem or an infeasible/degenerate "
     "problem."
 )
 
@@ -157,9 +157,10 @@ class SLSQPState(eqx.Module):
     # Consecutive line search failure tracking for escalating L-BFGS recovery
     consecutive_ls_failures: Int[Array, ""]
 
-    # Sliding-window stagnation detection (x-value based)
-    x_history: Float[Array, "W n"]
-    x_stagnation: Bool[Array, ""]
+    # Merit-based stagnation detection
+    best_merit: Scalar
+    steps_without_improvement: Int[Array, ""]
+    stagnation: Bool[Array, ""]
     last_alpha: Scalar
 
 
@@ -459,8 +460,22 @@ class SLSQP(optx.AbstractMinimiser):
     # the proximal term is active.  Default True; set False to disable.
     use_preconditioner: bool = eqx.field(static=True, default=True)
 
+    # Preconditioner type.  Controls which preconditioner is used for
+    # the inner CG solver when ``use_preconditioner=True``.
+    #   "lbfgs"    — L-BFGS inverse Hessian (two-loop recursion).
+    #                Default; works without an exact HVP.
+    #   "diagonal" — stochastic Hessian diagonal estimate (Bekas et al.,
+    #                2007).  Requires an exact HVP (``use_exact_hvp_in_qp
+    #                =True`` or ``obj_hvp_fn`` provided).  Probes the
+    #                true Hessian at the current iterate, immune to the
+    #                L-BFGS reset death spiral on ill-conditioned problems.
+    #                Uses ``diagonal_n_probes`` Rademacher probes per step.
     preconditioner_type: str = eqx.field(static=True, default="lbfgs")
 
+    # Number of Rademacher probes for the stochastic diagonal estimator.
+    # Each probe costs one forward-over-reverse AD pass (same as one
+    # gradient evaluation).  More probes reduce variance.  Only used
+    # when ``preconditioner_type="diagonal"``.  Default 20.
     diagonal_n_probes: int = eqx.field(static=True, default=20)
 
     # Adaptive CG tolerance (Eisenstat-Walker-inspired).  Instead of
@@ -490,12 +505,13 @@ class SLSQP(optx.AbstractMinimiser):
     # identity escalation fires only after the patience threshold.
     ls_failure_patience: int = 3
 
-    # Stagnation detection: sliding-window x-value comparison.
-    # If ||x_k - x_{k-W}|| / max(||x_k||, 1) < stagnation_tol
-    # (where W = max_steps // 10), the solver declares stagnation.
+    # Stagnation detection: merit-based patience counter.
+    # If the L1 merit function does not improve by at least
+    # stagnation_tol * max(|best_merit|, 1) for W = max_steps // 10
+    # consecutive steps, the solver declares stagnation.
     stagnation_tol: float = 1e-12
 
-    # Stagnation window size (computed in __check_init__)
+    # Stagnation patience (computed in __check_init__)
     _stagnation_window: int = eqx.field(static=True, default=10)
 
     # LPEC-A active set identification (Oberlin & Wright, 2005).
@@ -548,18 +564,6 @@ class SLSQP(optx.AbstractMinimiser):
                 f"got {self.proximal_tau}"
             )
 
-        # --- LPEC-A validation ---
-        if self.active_set_method not in ("expand", "lpeca_init", "lpeca"):
-            raise ValueError(
-                f"active_set_method must be 'expand', 'lpeca_init', or 'lpeca', "
-                f"got {self.active_set_method!r}"
-            )
-        if not (0 < self.lpeca_sigma < 1):
-            raise ValueError(
-                f"lpeca_sigma must be in the open interval (0, 1), "
-                f"got {self.lpeca_sigma}"
-            )
-
         # --- Preconditioner type validation ---
         if self.preconditioner_type not in ("lbfgs", "diagonal"):
             raise ValueError(
@@ -572,6 +576,18 @@ class SLSQP(optx.AbstractMinimiser):
             raise ValueError(
                 "preconditioner_type='diagonal' requires an exact HVP: "
                 "set use_exact_hvp_in_qp=True or provide obj_hvp_fn"
+            )
+
+        # --- LPEC-A validation ---
+        if self.active_set_method not in ("expand", "lpeca_init", "lpeca"):
+            raise ValueError(
+                f"active_set_method must be 'expand', 'lpeca_init', or 'lpeca', "
+                f"got {self.active_set_method!r}"
+            )
+        if not (0 < self.lpeca_sigma < 1):
+            raise ValueError(
+                f"lpeca_sigma must be in the open interval (0, 1), "
+                f"got {self.lpeca_sigma}"
             )
 
         # --- Verbose callable ---
@@ -950,6 +966,9 @@ class SLSQP(optx.AbstractMinimiser):
         diag_est = estimate_hessian_diagonal(
             lagrangian_hvp_fn, n, key, n_probes=self.diagonal_n_probes
         )
+        # Safeguard: clamp small/negative entries to a positive floor so
+        # the preconditioner is always positive definite.  Use the median
+        # absolute value as the scale reference.
         abs_diag = jnp.abs(diag_est)
         floor = jnp.maximum(1e-8, 1e-6 * jnp.median(abs_diag))
         diag_safe = jnp.maximum(abs_diag, floor)
@@ -960,6 +979,8 @@ class SLSQP(optx.AbstractMinimiser):
             mu = proximal_mu
             m_eq = A_eq.shape[0]
 
+            # Woodbury: (D + (1/mu) A^T A)^{-1}
+            #   = D^{-1} - D^{-1} A^T (mu I + A D^{-1} A^T)^{-1} A D^{-1}
             Dinv_AT = (A_eq * inv_diag[None, :]).T  # (n, m_eq)
             gram = A_eq @ Dinv_AT  # (m_eq, m_eq): A D^{-1} A^T
             inner = mu * jnp.eye(m_eq) + gram
@@ -1105,9 +1126,8 @@ class SLSQP(optx.AbstractMinimiser):
         # Initial merit penalty
         merit_penalty = jnp.array(1.0)
 
-        # Sliding-window stagnation: fill history with initial point
-        W = self._stagnation_window
-        x_history = jnp.tile(y, (W, 1))
+        # Initial merit for stagnation tracking
+        initial_merit = compute_merit(f_val, eq_val, ineq_val, merit_penalty)
 
         return SLSQPState(
             step_count=jnp.array(0),
@@ -1128,8 +1148,9 @@ class SLSQP(optx.AbstractMinimiser):
             prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
             consecutive_qp_failures=jnp.array(0),
             consecutive_ls_failures=jnp.array(0),
-            x_history=x_history,
-            x_stagnation=jnp.array(False),
+            best_merit=initial_merit,
+            steps_without_improvement=jnp.array(0),
+            stagnation=jnp.array(False),
             last_alpha=jnp.array(1.0),
         )
 
@@ -1175,24 +1196,33 @@ class SLSQP(optx.AbstractMinimiser):
         # Step 2: Solve QP subproblem for search direction
         qp_result = self._solve_qp_subproblem(state, hvp_fn, y)
 
-        # Projected steepest descent fallback when QP fails or returns a
-        # zero direction despite a non-zero gradient.  The fallback
-        # direction is projected onto null(J_eq) so that it satisfies
-        # J_eq d = 0, preventing catastrophic constraint violation
-        # (unprojected -grad can have ||J_eq d|| = O(n) for simplex
-        # constraints, making the L1 merit DD massively positive).
+        # Projected steepest descent fallback: project -grad_f onto
+        # null(J_eq) so that the fallback direction does not violate
+        # equality constraints.  Without projection, sum(d) can be O(n)
+        # for a simplex constraint, making the L1 merit DD massively
+        # positive and preventing the line search from finding a step.
         neg_grad = -state.grad
         if self.n_eq_constraints > 0:
-            A_eq = state.eq_jac
-            AAt = A_eq @ A_eq.T + 1e-8 * jnp.eye(self.n_eq_constraints)
-            fallback_direction = neg_grad - A_eq.T @ jnp.linalg.solve(
-                AAt, A_eq @ neg_grad
-            )
+            J = state.eq_jac  # (m_eq, n)
+            JJT = J @ J.T
+            m_eq = self.n_eq_constraints
+            JJT_reg = JJT + 1e-10 * jnp.eye(m_eq)
+            Jv = J @ neg_grad
+            w = jnp.linalg.solve(JJT_reg, Jv)
+            fallback_direction = neg_grad - J.T @ w
         else:
             fallback_direction = neg_grad
-        direction = qp_result.direction
+
+        direction = jnp.where(
+            qp_result.converged, qp_result.direction, fallback_direction
+        )
         zero_direction = jnp.linalg.norm(direction) < 1e-30
         grad_nonzero = jnp.linalg.norm(state.grad) > self.atol
+        # Only fall back to steepest descent when the QP failed to converge.
+        # When the QP converges but returns a zero direction (e.g. because
+        # bound clipping zeroed it out), the zero direction is correct —
+        # the iterate is at a bound-constrained optimum and the convergence
+        # check will detect it via the bound multipliers.
         direction = jnp.where(
             zero_direction & grad_nonzero & ~qp_result.converged,
             fallback_direction,
@@ -1226,8 +1256,10 @@ class SLSQP(optx.AbstractMinimiser):
             bounds=self.bounds,
             lower_bound_mask=self._lower_bound_mask,
             upper_bound_mask=self._upper_bound_mask,
-            eq_jac=state.eq_jac,
-            ineq_jac=state.ineq_jac,
+            eq_jac=state.eq_jac if self.n_eq_constraints > 0 else None,
+            ineq_jac=state.ineq_jac[: self.n_ineq_constraints]
+            if self.n_ineq_constraints > 0
+            else None,
         )
 
         alpha = ls_result.alpha
@@ -1300,6 +1332,7 @@ class SLSQP(optx.AbstractMinimiser):
 
         # VARCHEN-style conditioning control: soft reset (keep most recent
         # pair) when the inverse Hessian condition number exceeds kappa_max.
+        # This is less aggressive than the old diagonal/identity resets.
         kappa_est = new_lbfgs_history.eig_upper / jnp.maximum(
             new_lbfgs_history.eig_lower, 1e-30
         )
@@ -1355,16 +1388,21 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
-        # Sliding-window stagnation detection: compare current x with
-        # the x from W steps ago stored in the circular buffer.
-        W = self._stagnation_window
-        buf_idx = state.step_count % W
-        old_x = state.x_history[buf_idx]
-        new_x_history = state.x_history.at[buf_idx].set(y_new)
-        rel_x_change = jnp.linalg.norm(y_new - old_x) / jnp.maximum(
-            jnp.linalg.norm(y_new), 1.0
+        # Merit-based stagnation detection: track consecutive steps
+        # without sufficient improvement in the L1 merit function.
+        merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
+        merit_threshold = self.stagnation_tol * jnp.maximum(
+            jnp.abs(state.best_merit), 1.0
         )
-        x_stagnation = (state.step_count >= W) & (rel_x_change < self.stagnation_tol)
+        improved = merit_new < state.best_merit - merit_threshold
+        new_best_merit = jnp.where(improved, merit_new, state.best_merit)
+        new_steps_without = jnp.where(
+            improved, jnp.array(0), state.steps_without_improvement + 1
+        )
+        patience = self._stagnation_window
+        merit_stagnation = (state.step_count >= patience) & (
+            new_steps_without >= patience
+        )
 
         new_state = SLSQPState(
             step_count=state.step_count + 1,
@@ -1385,8 +1423,9 @@ class SLSQP(optx.AbstractMinimiser):
             prev_active_set=qp_result.active_set,
             consecutive_qp_failures=new_consecutive_qp_failures,
             consecutive_ls_failures=new_consecutive_ls_failures,
-            x_history=new_x_history,
-            x_stagnation=x_stagnation,
+            best_merit=new_best_merit,
+            steps_without_improvement=new_steps_without,
+            stagnation=merit_stagnation,
             last_alpha=alpha,
         )
 
@@ -1409,7 +1448,6 @@ class SLSQP(optx.AbstractMinimiser):
         diag_cond = jnp.max(new_lbfgs_history.diagonal) / jnp.maximum(
             jnp.min(new_lbfgs_history.diagonal), 1e-30
         )
-        merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
         self.verbose(
             num_steps=("Step", new_state.step_count),
             objective=("f", f_val_new, ".6e"),
@@ -1419,8 +1457,8 @@ class SLSQP(optx.AbstractMinimiser):
             step_size=("α", alpha, ".3e"),
             direction_norm=("|d|", dir_norm, ".3e"),
             merit=("merit", merit_new, ".6e"),
-            rel_x_change=("Δx", rel_x_change, ".3e"),
-            x_stagnation=("x_stag", x_stagnation),
+            stag_count=("stag#", new_steps_without),
+            stagnation=("stag", merit_stagnation),
             penalty=("ρ", merit_penalty, ".3e"),
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
             lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
@@ -1503,8 +1541,8 @@ class SLSQP(optx.AbstractMinimiser):
         # Check max iterations
         max_iters_reached = state.step_count >= self.max_steps
 
-        # Check sliding-window x-value stagnation
-        stagnation_detected = state.x_stagnation
+        # Check merit-based stagnation
+        stagnation_detected = state.stagnation
 
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
@@ -1569,7 +1607,7 @@ class SLSQP(optx.AbstractMinimiser):
             "qp_tolerance": 1e-8,
             "multipliers_eq": state.multipliers_eq,
             "multipliers_ineq": state.multipliers_ineq,
-            "x_stagnation": state.x_stagnation,
+            "stagnation": state.stagnation,
             "last_step_size": state.last_alpha,
             "consecutive_ls_failures": state.consecutive_ls_failures,
         }
@@ -1676,6 +1714,12 @@ class SLSQP(optx.AbstractMinimiser):
 
         use_proximal = self.proximal_tau > 0
         if use_proximal:
+            # Adaptive proximal mu (Wright, 2002, eq 6.6):
+            # mu = clip(kkt_residual^tau, mu_min, mu_max)
+            # Capped at mu_max so the proximal weight 1/mu >= 1/mu_max,
+            # ensuring adequate equality enforcement even far from the solution.
+            # Wright's local convergence analysis assumes eta < 1; when the
+            # KKT residual is large the cap keeps the penalty tight.
             mu = jnp.clip(
                 kkt_residual**self.proximal_tau,
                 self._proximal_mu_min,
@@ -1692,6 +1736,9 @@ class SLSQP(optx.AbstractMinimiser):
             ),
         )
 
+        # Eisenstat-Walker adaptive CG tolerance: solve loosely far from
+        # optimum (fast), tightly near the solution (accurate).
+        # Kept separate from `tol` so feasibility checking stays tight.
         if self.adaptive_cg_tol:
             adaptive_tol = jnp.minimum(0.1, jnp.maximum(self.atol, kkt_residual))
         else:
@@ -1722,6 +1769,15 @@ class SLSQP(optx.AbstractMinimiser):
         direction = qp_result.d
 
         # --- Bound post-processing (iterative Phase 2) ---
+        # Iterative bound-fixing active set: fix variables at bounds,
+        # re-solve CG in the free subspace, check for new violations
+        # and wrong-sign multipliers, repeat.  Each CG re-solve uses
+        # only (m_eq + m_gen_active) rows in the projection matrix,
+        # keeping cost at O((m_eq + m_gen)^3) instead of
+        # O((m_eq + m_gen + m_bounds)^3).
+        #
+        # The loop terminates when no variables are added to or
+        # dropped from the bound-active set.  Typically 2-5 passes.
         if m_bounds > 0:
             assert self.bounds is not None
             n_vars = g.shape[0]
@@ -1730,6 +1786,7 @@ class SLSQP(optx.AbstractMinimiser):
             finite_lower = jnp.isfinite(d_lower)
             finite_upper = jnp.isfinite(d_upper)
 
+            # Combined constraint matrix: equality + active gen ineq
             A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
             b_combined = jnp.concatenate([b_eq, b_ineq], axis=0)
             m_eq_static = self.n_eq_constraints
@@ -1744,6 +1801,7 @@ class SLSQP(optx.AbstractMinimiser):
 
             bound_fix_tol = 1e-12
             for _bound_pass in range(5):
+                # --- Add step: fix free variables that violate bounds ---
                 add_lower = (
                     (direction <= d_lower + bound_fix_tol) & finite_lower & free_mask
                 )
@@ -1752,6 +1810,11 @@ class SLSQP(optx.AbstractMinimiser):
                 )
                 add_set = add_lower | add_upper
 
+                # --- Drop step: release fixed variables with wrong-sign
+                # bound multipliers.  A lower-bound multiplier should be
+                # >= 0 (pushing the variable up); if negative, the variable
+                # wants to move away from the bound and should be freed.
+                # Similarly for upper bounds. ---
                 Bd_cur = hvp_fn(direction)
                 grad_qp_cur = Bd_cur + g
                 cf = jnp.zeros_like(g)
@@ -1801,6 +1864,7 @@ class SLSQP(optx.AbstractMinimiser):
                 direction = jnp.where(use_new, d_new, direction)
                 mult_combined = jnp.where(use_new, mult_new, mult_combined)
 
+            # Final bound-active identification from the converged direction
             at_lower_full = (direction <= d_lower + bound_fix_tol) & finite_lower
             at_upper_full = (direction >= d_upper - bound_fix_tol) & finite_upper
             any_bound_active = jnp.any(at_lower_full | at_upper_full)
@@ -1820,6 +1884,7 @@ class SLSQP(optx.AbstractMinimiser):
                 else qp_result.multipliers_ineq
             )
 
+            # Recover bound multipliers from the reduced gradient
             lower_idx = np.array(self._lower_indices)
             upper_idx = np.array(self._upper_indices)
 

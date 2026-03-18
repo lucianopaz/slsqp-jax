@@ -1731,10 +1731,10 @@ class TestStagnationDetection:
             solver, objective, x0, max_steps=200
         )
 
-        assert state.x_stagnation
+        assert state.stagnation
 
     def test_no_false_stagnation_on_progress(self):
-        """On a well-behaved problem, x_stagnation should remain False."""
+        """On a well-behaved problem, stagnation should remain False."""
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -1747,7 +1747,7 @@ class TestStagnationDetection:
         x0 = jnp.array([3.0, -2.0])
         _, state, _ = self._run_solver_with_result(solver, objective, x0)
 
-        assert not state.x_stagnation
+        assert not state.stagnation
 
     def test_stagnation_fields_in_postprocess(self):
         """Verify stagnation stats appear in postprocess output."""
@@ -1763,7 +1763,7 @@ class TestStagnationDetection:
             objective, y, None, None, {}, state, frozenset(), optx.RESULTS.successful
         )
 
-        assert "x_stagnation" in stats
+        assert "stagnation" in stats
         assert "last_step_size" in stats
 
 
