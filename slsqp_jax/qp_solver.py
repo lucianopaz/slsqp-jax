@@ -253,6 +253,7 @@ def _solve_projected_cg(
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
+    use_constraint_preconditioner: bool = False,
 ) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
     """Solve equality-constrained QP using projected (preconditioned) CG.
 
@@ -270,9 +271,20 @@ def _solve_projected_cg(
     3. Runs CG on the reduced problem in the null space of A.
     4. Recovers Lagrange multipliers from the KKT conditions.
 
-    When *precond_fn* is provided, the projected PCG algorithm is used:
-    z = P(M(P(r))) where M is the preconditioner (Nocedal & Wright,
-    Chapter 16). The extra projection ensures z stays in the null space.
+    When ``use_constraint_preconditioner`` is ``True`` and a
+    preconditioner is provided, the constraint preconditioner
+    (Gould, Hribar & Nocedal, 2001) is used instead of the naive
+    ``P(M(r))``.  This solves the saddle-point system to produce
+    ``z = Mr - M Aᵀ (A M Aᵀ)⁻¹ A M r``, preserving the
+    ``M⁻¹``-inner product in null(A).  This is essential when the
+    CG system matrix differs from ``M⁻¹`` (e.g. exact Hessian HVP
+    with L-BFGS preconditioner), where the naive formulation
+    destroys preconditioning quality.
+
+    When ``use_constraint_preconditioner`` is ``False`` (default),
+    the simpler projected preconditioner ``z = P(M(P(r)))`` is used.
+    This works well when the CG system matrix is the L-BFGS
+    approximation itself (so ``M B ≈ I``).
 
     The Cholesky factorization of AAt is computed once and reused for
     all CG iterations via cho_solve, amortizing the O(m^3) cost.
@@ -289,6 +301,11 @@ def _solve_projected_cg(
         cg_regularization: Minimum eigenvalue threshold for the curvature
             guard.  CG declares "bad curvature" when the projected
             eigenvalue falls below this value.  Based on SNOPT Section 4.5.
+        use_constraint_preconditioner: When ``True`` and a preconditioner
+            is provided, use the Gould-Hribar-Nocedal constraint
+            preconditioner instead of the naive ``P(M(r))``.  Required
+            when the CG system matrix differs from the preconditioner's
+            inverse (e.g. exact Hessian HVP with L-BFGS preconditioner).
 
     Returns:
         Tuple of (d, multipliers, cg_converged) where d is the solution,
@@ -315,12 +332,36 @@ def _solve_projected_cg(
     def project(v: Vector) -> Vector:
         return v - A_masked.T @ solve_AAt(A_masked @ v)
 
+    # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
+    # When the CG system matrix is the exact Hessian but the
+    # preconditioner M ≈ B⁻¹ is only approximate (L-BFGS or diagonal),
+    # the naive P(M(r)) destroys preconditioning quality.  The correct
+    # formulation solves the augmented saddle-point system:
+    #   z = M r - M Aᵀ (A M Aᵀ)⁻¹ A M r
+    if precond_fn is not None and use_constraint_preconditioner:
+        _raw_precond = precond_fn
+        M_AT = jax.vmap(_raw_precond)(A_masked).T  # (n, m)
+        A_M_AT = A_masked @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+        A_M_AT_chol = jnp.linalg.cholesky(A_M_AT)
+
+        def _solve_AMAT(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
+            return jax.scipy.linalg.cho_solve((A_M_AT_chol, True), rhs)
+
+        def _constraint_precond(r: Vector) -> Vector:
+            Mr = _raw_precond(r)
+            w = _solve_AMAT(A_masked @ Mr)
+            return Mr - M_AT @ w
+
+        effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
+    else:
+        effective_precond = precond_fn
+
     Bd_p = hvp_fn(d_p)
     r0 = project(-(g + Bd_p))
     r0_norm_sq = jnp.dot(r0, r0)
 
-    if precond_fn is not None:
-        z0 = project(precond_fn(r0))
+    if effective_precond is not None:
+        z0 = project(effective_precond(r0))
         rz0_raw = jnp.dot(r0, z0)
         z0 = jnp.where(rz0_raw > 0, z0, r0)
         rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
@@ -341,7 +382,7 @@ def _solve_projected_cg(
     cg_step = build_cg_step(
         hvp_fn=hvp_fn,
         cg_tol=cg_tol,
-        precond_fn=precond_fn,
+        precond_fn=effective_precond,
         project=project,
         cg_regularization=cg_regularization,
     )
@@ -378,6 +419,7 @@ def _solve_qp_proximal(
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
+    use_constraint_preconditioner: bool = False,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -485,6 +527,7 @@ def _solve_qp_proximal(
             inner_cg_tol,
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
         mult_eq_new = _recover_mult_eq(d_new)
@@ -578,6 +621,7 @@ def _solve_qp_direct(
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
+    use_constraint_preconditioner: bool = False,
 ) -> QPResult:
     """Solve the QP with equality constraints enforced via direct projection.
 
@@ -613,6 +657,7 @@ def _solve_qp_direct(
             inner_cg_tol,
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
         return QPResult(
             d=d,
@@ -638,6 +683,7 @@ def _solve_qp_direct(
         inner_cg_tol,
         precond_fn=precond_fn,
         cg_regularization=cg_regularization,
+        use_constraint_preconditioner=use_constraint_preconditioner,
     )
 
     residuals_init = A_ineq @ d_init - b_ineq
@@ -678,6 +724,7 @@ def _solve_qp_direct(
             inner_cg_tol,
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
         mult_eq_new = mult_all[:m_eq]
@@ -770,6 +817,7 @@ def solve_qp(
     use_proximal: bool = True,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     active_set_method: str = "expand",
+    use_constraint_preconditioner: bool = False,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -946,6 +994,7 @@ def solve_qp(
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
     # ---- Direct projection path (no proximal) ----
@@ -971,6 +1020,7 @@ def solve_qp(
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
@@ -1028,6 +1078,7 @@ def solve_qp(
             inner_cg_tol,
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
+            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
         # Check feasibility with expanding tolerance (stricter activation)
