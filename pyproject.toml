@@ -79,4 +79,5 @@ exclude_lines = [
 ignore_errors = true
 omit = [
   "tests/*",
+  "slsqp_jax/_benchmark_bootstrap.py",
 ]
