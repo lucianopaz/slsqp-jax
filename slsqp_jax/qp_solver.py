@@ -176,7 +176,7 @@ def _solve_unconstrained_cg(
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
-) -> Vector:
+) -> tuple[Vector, Bool[Array, ""]]:
     """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
 
     Uses (preconditioned) conjugate gradient to solve B d = -g without
@@ -196,7 +196,10 @@ def _solve_unconstrained_cg(
             Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
 
     Returns:
-        Solution vector d.
+        Tuple of (d, converged) where d is the solution vector and
+        converged indicates whether CG converged (residual below
+        tolerance) as opposed to hitting bad curvature or exhausting
+        the iteration budget.
     """
     # Sign convention: we define the residual as r = b - Ax = -g - Bd
     # (the "negative residual"), whereas Nocedal & Wright Algorithm 5.3 uses
@@ -237,7 +240,7 @@ def _solve_unconstrained_cg(
     )
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
-    return final_cg.d
+    return final_cg.d, final_cg.converged
 
 
 def _solve_projected_cg(
@@ -250,7 +253,7 @@ def _solve_projected_cg(
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
-) -> tuple[Vector, Float[Array, " m"]]:
+) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
     """Solve equality-constrained QP using projected (preconditioned) CG.
 
     Solves:
@@ -271,8 +274,8 @@ def _solve_projected_cg(
     z = P(M(P(r))) where M is the preconditioner (Nocedal & Wright,
     Chapter 16). The extra projection ensures z stays in the null space.
 
-    Complexity per CG iteration: O(kn) for HVP + O(mn) for projection,
-    where k is L-BFGS memory and m is the number of constraints.
+    The Cholesky factorization of AAt is computed once and reused for
+    all CG iterations via cho_solve, amortizing the O(m^3) cost.
 
     Args:
         hvp_fn: Hessian-vector product function v -> B @ v.
@@ -288,9 +291,12 @@ def _solve_projected_cg(
             eigenvalue falls below this value.  Based on SNOPT Section 4.5.
 
     Returns:
-        Tuple of (d, multipliers) where d is the solution and multipliers
-        is a vector of Lagrange multipliers for all m constraints (0 for
-        inactive constraints).
+        Tuple of (d, multipliers, cg_converged) where d is the solution,
+        multipliers is a vector of Lagrange multipliers for all m
+        constraints (0 for inactive), and cg_converged indicates whether
+        the inner CG solver converged (residual below tolerance) as
+        opposed to hitting bad curvature or exhausting the iteration
+        budget.
     """
     m = A.shape[0]
 
@@ -299,9 +305,10 @@ def _solve_projected_cg(
 
     reg_diag = jnp.where(active_mask, 0.0, 1.0)
     AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+    AAt_chol = jnp.linalg.cholesky(AAt)
 
     def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        return jnp.linalg.solve(AAt, rhs)
+        return jax.scipy.linalg.cho_solve((AAt_chol, True), rhs)
 
     d_p = A_masked.T @ solve_AAt(b_masked)
 
@@ -346,7 +353,7 @@ def _solve_projected_cg(
     multipliers = solve_AAt(kkt_residual)
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-    return final_cg.d, multipliers
+    return final_cg.d, multipliers, final_cg.converged
 
 
 def _solve_qp_proximal(
@@ -402,9 +409,12 @@ def _solve_qp_proximal(
     def _recover_mult_eq(d: Vector) -> Float[Array, " m_eq"]:
         return prev_mult_eq - inv_mu * (A_eq @ d - b_eq)
 
-    # Sub-case: no inequality constraints — just unconstrained CG
+    # Sub-case: no inequality constraints — just unconstrained CG.
+    # The QP always "succeeds" here (no active-set that can fail).
+    # Truncated CG still gives a valid descent direction for the
+    # quadratic model, so QPResult.converged is always True.
     if m_ineq == 0:
-        d = _solve_unconstrained_cg(
+        d, _cg_converged = _solve_unconstrained_cg(
             stabilized_hvp,
             g_mod,
             max_cg_iter,
@@ -426,7 +436,7 @@ def _solve_qp_proximal(
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
 
     # Initial unconstrained solve (equalities absorbed into objective)
-    d_init = _solve_unconstrained_cg(
+    d_init, _ = _solve_unconstrained_cg(
         stabilized_hvp,
         g_mod,
         max_cg_iter,
@@ -465,7 +475,7 @@ def _solve_qp_proximal(
         working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set — inequalities only
-        d_new, mult_ineq_new = _solve_projected_cg(
+        d_new, mult_ineq_new, _ = _solve_projected_cg(
             stabilized_hvp,
             g_mod,
             A_ineq,
@@ -589,8 +599,11 @@ def _solve_qp_direct(
 
     if m_ineq == 0:
         # Equality-only: single projected CG solve, no active-set loop.
+        # The QP always "succeeds" here (no active-set that can fail).
+        # Truncated CG still gives a valid descent direction for the
+        # quadratic model, so QPResult.converged is always True.
         combined_active = eq_active
-        d, multipliers = _solve_projected_cg(
+        d, multipliers, _cg_converged = _solve_projected_cg(
             hvp_fn,
             g,
             A_combined,
@@ -615,7 +628,7 @@ def _solve_qp_direct(
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
 
     # Initial solve with equalities only (inequalities inactive).
-    d_init, mult_init = _solve_projected_cg(
+    d_init, mult_init, _ = _solve_projected_cg(
         hvp_fn,
         g,
         A_combined,
@@ -655,7 +668,7 @@ def _solve_qp_direct(
         working_tol = base_tol + state.iteration * effective_tau
 
         combined_active = jnp.concatenate([eq_active, state.active_set])
-        d_new, mult_all = _solve_projected_cg(
+        d_new, mult_all, _ = _solve_projected_cg(
             hvp_fn,
             g,
             A_combined,
@@ -889,9 +902,9 @@ def solve_qp(
     # Resolve CG tolerance: use cg_tol if provided, else fall back to tol.
     inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
 
-    # Case 1: No constraints at all
+    # Case 1: No constraints at all — truncated CG is always valid.
     if m_total == 0:
-        d = _solve_unconstrained_cg(
+        d, _cg_converged = _solve_unconstrained_cg(
             hvp_fn,
             g,
             max_cg_iter,
@@ -963,7 +976,7 @@ def solve_qp(
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
 
     # Unconstrained initial solve
-    d_init = _solve_unconstrained_cg(
+    d_init, _ = _solve_unconstrained_cg(
         hvp_fn,
         g,
         max_cg_iter,
@@ -1005,7 +1018,7 @@ def solve_qp(
         working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set using projected CG (ineq only)
-        d_new, mult_ineq_new = _solve_projected_cg(
+        d_new, mult_ineq_new, _ = _solve_projected_cg(
             hvp_fn,
             g,
             A_ineq,
