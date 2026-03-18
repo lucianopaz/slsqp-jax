@@ -444,23 +444,21 @@ When the QP converges but the resulting direction is not a descent direction for
 
 ### Outer-loop stagnation detection
 
-Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this using a **sliding-window x-value comparison**.
+Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this using a **merit-based patience counter**.
 
-A circular buffer of size $W = \lfloor \texttt{max\_steps} / 10 \rfloor$ stores recent iterates. At each step $k \geq W$, the solver compares the current iterate with the one from $W$ steps ago:
+At each step, the solver computes the L1 merit value $\varphi = f + \rho \cdot (\lVert c_\text{eq} \rVert_1 + \lVert \max(0, -c_\text{ineq}) \rVert_1)$ and checks whether:
 
 $$
-\frac{\lVert x_k - x_{k-W} \rVert}{\max(\lVert x_k \rVert,\, 1)} < \texttt{stagnation\_tol}
+\varphi_\text{new} < \varphi_\text{best} - \texttt{stagnation\_tol} \cdot \max(|\varphi_\text{best}|, 1)
 $$
 
-If this relative change is below `stagnation_tol` (default $10^{-12}$), the solver terminates early with a `nonlinear_divergence` result code rather than running until `max_steps`. This avoids wasting computation on a problem the solver cannot solve.
-
-This approach is more robust than merit-based consecutive-counter detection, which can miss cases where merit improvements are minuscule but technically above the threshold — causing the solver to run to `max_steps` without being flagged as stagnant.
+If yes, $\varphi_\text{best}$ is updated and the patience counter resets. Otherwise, `steps_without_improvement` increments. Stagnation fires when `steps_without_improvement >= W` (where $W = \lfloor \texttt{max\_steps} / 10 \rfloor$) and at least $W$ steps have elapsed, terminating early with a `nonlinear_divergence` result code. This is O(1) state (vs O(Wn) for an x-history ring buffer) and directly measures optimization progress.
 
 ```python
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
-    stagnation_tol=1e-12,    # Minimum relative x-value change over window
+    stagnation_tol=1e-12,    # Minimum relative merit improvement
 )
 ```
 
@@ -468,7 +466,7 @@ The stagnation flag and last step size are included in `sol.stats` for diagnosti
 
 ```python
 sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100, throw=False)
-print(sol.stats["x_stagnation"])   # False if converged normally
+print(sol.stats["stagnation"])     # False if converged normally
 print(sol.stats["last_step_size"]) # Step size from final iteration
 ```
 
