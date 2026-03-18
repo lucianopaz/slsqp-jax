@@ -1577,6 +1577,7 @@ class SLSQP(optx.AbstractMinimiser):
             use_proximal=use_proximal,
             predicted_active_set=predicted_active_set,
             active_set_method=self.active_set_method,
+            use_constraint_preconditioner=self.use_exact_hvp_in_qp,
         )
 
         return QPResult(
