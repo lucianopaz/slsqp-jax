@@ -1083,6 +1083,32 @@ class TestDiagonalPreconditioner:
         np.testing.assert_allclose(jnp.sum(y), float(n), atol=1e-4)
         assert y[0] > y[-1], "Lower-weighted variables should be larger"
 
+    def test_diagonal_precond_with_equality_and_proximal(self):
+        """Diagonal preconditioner + proximal_tau > 0 activates Woodbury."""
+        n = 10
+        weights = 10 ** jnp.linspace(0, 2, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        def eq_fn(x, args):
+            return jnp.array([jnp.sum(x) - float(n)])
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=200,
+            eq_constraint_fn=eq_fn,
+            n_eq_constraints=1,
+            use_exact_hvp_in_qp=True,
+            preconditioner_type="diagonal",
+            proximal_tau=0.5,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(jnp.sum(y), float(n), atol=1e-4)
+        assert y[0] > y[-1], "Lower-weighted variables should be larger"
+
     def test_diagonal_precond_with_bounds(self):
         """Diagonal preconditioner with box constraints."""
         n = 5
