@@ -190,7 +190,13 @@ $$
 
 where $W = (\gamma S, Y)$ is the horizontal concatenation of matrices $\gamma S$ and $Y$, and $N$ is a small $2k \times 2k$ matrix built from inner products of the stored vectors. The $2k \times 2k$ system is solved directly — negligible cost for $k << n$.
 
-Powell's damping is applied to each curvature pair before storage to ensure positive definiteness, which is essential for constrained problems where the standard curvature condition $s^T y > 0$ can fail. The damping threshold is configurable via `damping_threshold` (default 0.2, Powell's standard value). Setting `damping_threshold=0.0` disables damping entirely, which can improve convergence on well-conditioned positive-definite objectives where $s^T y > 0$ holds naturally without damping.
+**VARCHEN-style B0 damping** (Lotfi et al., 2020) is applied to each curvature pair before storage.  Instead of damping toward the full L-BFGS approximation $Bs$ (which costs $O(k^2 n)$ and can be unreliable when $B$ is ill-conditioned), the implementation damps toward $B_0 s = \text{diag}(d) \cdot s$:
+
+$$y_{\text{damped}} = \theta \, y + (1 - \theta) \, B_0 s, \quad \text{where } \theta \text{ ensures } s^T y_{\text{damped}} \geq \eta \, s^T B_0 s$$
+
+This is $O(n)$, always well-conditioned (since $B_0 = \text{diag}(d)$ is clipped to $[10^{-2}, 10^6]$), and avoids the circular dependency where a badly-conditioned $B$ poisons its own damping.  The damping threshold $\eta$ is configurable via `damping_threshold` (default 0.2, Powell's standard value). Setting `damping_threshold=0.0` disables damping entirely.
+
+**Eigenvalue monitoring and soft reset.**  The solver tracks the condition number of $B_0$ via $\kappa = \max(d)/\min(d)$.  When $\kappa$ exceeds $10^6$, a **soft reset** drops all but the most recent $(s, y)$ pair (VARCHEN Algorithm 1, Step 7).  This is less aggressive than the full diagonal or identity reset, preserving the most relevant curvature information while shedding stale pairs that contribute to ill-conditioning.
 
 ### Scaling considerations: why projected CG over dense KKT
 
@@ -402,17 +408,15 @@ The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG 
 
 **Why not rational CG?** We evaluated the rational conjugate gradient method (Kindermann & Zellinger, arXiv:2306.03670, 2023), which alternates CG steps with Tikhonov regularization steps in a mixed rational Krylov space. It is designed for ill-posed inverse problems with compact operators, not finite-dimensional positive definite QPs. Each rational step requires an inner solve of $(B + \alpha I)^{-1} v$, the regularization parameters need spectrum knowledge, and adapting the method to null-space projection is non-trivial. Standard PCG is simpler, cheaper, and directly addresses the ill-conditioning source.
 
-### L-BFGS diagonal reset
+### L-BFGS reset strategies
 
-The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal uses **Shanno-Phua per-variable scaling** ($d_i = y_i^2 / y^T s$), but when the QP solver or the line search fails, the solver performs an **SNOPT-style diagonal reset** (Gill, Murray & Saunders, *SIAM Review*, 47(1), 2005, Section 3.3):
+The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal uses **Shanno-Phua per-variable scaling** ($d_i = y_i^2 / y^T s$).
 
-1. Extract $\text{diag}(B_k)$ from the current L-BFGS compact representation in $O(k^2 n)$.
-2. Discard all stored $(s, y)$ pairs.
-3. Restart with $B_0 = \text{diag}(\text{clip}(\text{diag}(B_k),\, 10^{-2},\, 10^{6}))$.
+The reset chain follows a VARCHEN-inspired escalating strategy:
 
-This preserves per-variable curvature information across the reset, preventing the "everything is flat" effect that occurs when the diagonal entries become very small and get frozen by tiny steps. The next `lbfgs_append` updates the diagonal per-variable rather than reverting to uniform scaling, so the curvature information accumulated by the reset is not lost.
-
-**Escalating identity reset.** When failures occur repeatedly, the SNOPT diagonal reset can re-extract the same problematic diagonal, perpetuating an ill-conditioning cycle. To break this deadlock, the solver tracks consecutive failures (QP and line search independently) and, after `qp_failure_patience` consecutive QP failures (default 3) or `ls_failure_patience` consecutive line search failures (default 3), performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal. This allows the L-BFGS to rebuild curvature from scratch.
+1. **Conditioning-triggered soft reset.**  After each `lbfgs_append`, the condition number $\kappa(B_0) = \max(d)/\min(d)$ is checked.  If $\kappa > 10^6$, all but the most recent $(s, y)$ pair are dropped.  This preserves the newest curvature information while shedding stale pairs that contribute to ill-conditioning.
+2. **Failure-triggered soft reset.**  When the QP solver fails or the line search fails, the same soft reset is applied (keep most recent pair, drop the rest).  This is less destructive than the previous SNOPT-style diagonal reset, which discarded all curvature information.
+3. **Escalating identity reset.**  After `qp_failure_patience` (default 3) consecutive QP failures or `ls_failure_patience` (default 3) consecutive line search failures, the soft reset may be keeping the same problematic pair.  The solver performs a hard identity reset: $B_0 = I$, discarding all stored pairs and the diagonal, allowing L-BFGS to rebuild curvature from scratch.
 
 ```python
 solver = SLSQP(
@@ -432,11 +436,11 @@ When the QP subproblem fails to converge (exhausts its iteration budget), the so
 
 **QP false convergence guard.** The EXPAND procedure's growing tolerance can cause the active-set loop to report convergence on its final iteration under relaxed tolerances, even though the QP did not truly converge at the base tolerance. To prevent this, the QP solver explicitly overrides the convergence flag to `False` whenever the iteration count reaches `max_iter`. This ensures the outer solver triggers L-BFGS resets and steepest descent fallback appropriately.
 
-Combined with the L-BFGS diagonal reset (above), these mechanisms allow the solver to recover from QP failures rather than entering a permanent stagnation loop.
+Combined with the L-BFGS soft reset (above), these mechanisms allow the solver to recover from QP failures rather than entering a permanent stagnation loop.
 
 ### Line search failure recovery
 
-When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). This typically occurs when the L-BFGS Hessian approximation is poorly conditioned — the QP solves the right problem with the wrong data. The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: SNOPT diagonal reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
+When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: soft reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
 
 ### Outer-loop stagnation detection
 

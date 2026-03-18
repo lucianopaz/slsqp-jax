@@ -15,9 +15,11 @@ vectors.  During normal operation ``diagonal = gamma * ones(n)`` and this
 reduces to the scalar-scaled form.  After an SNOPT-style diagonal reset,
 ``diagonal`` captures per-variable curvature from the discarded history.
 
-Powell's damping is applied to each (s, y) pair before storage to ensure
-positive definiteness is preserved even when the standard curvature
-condition s^T y > 0 is not satisfied (common in constrained optimization).
+VARCHEN-style Powell damping (Lotfi et al., 2020) is applied to each
+(s, y) pair before storage, damping toward B_0 = diag(diagonal) instead
+of the full L-BFGS approximation B.  This is cheaper (O(n) vs O(k^2 n)),
+always well-conditioned, and avoids the circular dependency where a
+badly-conditioned B poisons its own damping.
 """
 
 import equinox as eqx
@@ -44,6 +46,8 @@ class LBFGSHistory(eqx.Module):
             After an SNOPT-style reset it stores per-variable curvature.
         count: Number of valid pairs stored (0 to memory size).
         next_idx: Next write position in the circular buffer.
+        eig_lower: Estimate of lambda_min(H) from VARCHEN Theorem 2.
+        eig_upper: Estimate of lambda_max(H) from VARCHEN Theorem 2.
     """
 
     s_history: Float[Array, "memory n"]
@@ -52,6 +56,8 @@ class LBFGSHistory(eqx.Module):
     diagonal: Float[Array, " n"]
     count: Int[Array, ""]
     next_idx: Int[Array, ""]
+    eig_lower: Scalar
+    eig_upper: Scalar
 
 
 def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
@@ -71,6 +77,8 @@ def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
         diagonal=jnp.ones(n),
         count=jnp.array(0),
         next_idx=jnp.array(0),
+        eig_lower=jnp.array(1.0),
+        eig_upper=jnp.array(1.0),
     )
 
 
@@ -265,15 +273,18 @@ def lbfgs_append(
 ) -> LBFGSHistory:
     """Append a new (s, y) pair to the L-BFGS history with Powell damping.
 
-    Powell's damping modifies y to ensure the curvature condition:
-        s^T y_damped >= threshold * s^T B s
+    Uses VARCHEN-style damping toward B0 (Lotfi et al., 2020, eq 7-8):
+    damping is computed against the diagonal initial Hessian
+    ``B_0 = diag(diagonal)`` instead of the full L-BFGS approximation B.
+    This is O(n) instead of O(k^2 n), always well-conditioned (the
+    diagonal is clipped to [1e-2, 1e6]), and avoids the circular
+    dependency where a badly-conditioned B poisons its own damping.
 
     The damped gradient difference is:
-        y_damped = theta * y + (1 - theta) * B s
+        y_damped = theta * y + (1 - theta) * B0 s
 
-    where theta in [0, 1] is chosen to satisfy the condition above.
-    This is essential for constrained optimization where the standard
-    curvature condition s^T y > 0 may not hold.
+    where theta in [0, 1] is chosen to satisfy:
+        s^T y_damped >= threshold * s^T B0 s
 
     If ||s|| is too small or the curvature ratio is too extreme,
     the update is skipped entirely to avoid numerical issues.
@@ -325,21 +336,21 @@ def lbfgs_append(
     )
 
     def do_append():
-        # Compute B @ s using current L-BFGS approximation for damping
-        Bs = lbfgs_hvp(history, s)
-        sTBs = jnp.dot(s, Bs)
+        # VARCHEN-style damping toward B0 = diag(diagonal).
+        # O(n) and always well-conditioned, unlike the full lbfgs_hvp.
+        B0s = history.diagonal * s
+        sTB0s = jnp.dot(s, B0s)
         sTy = jnp.dot(s, y)
-        sTBs_safe = jnp.maximum(sTBs, 1e-12)
+        sTB0s_safe = jnp.maximum(sTB0s, 1e-12)
 
-        # Powell's damping: choose theta to ensure s^T r >= threshold * s^T B s
-        use_damping = sTy < damping_threshold * sTBs_safe
+        use_damping = sTy < damping_threshold * sTB0s_safe
         theta = jax.lax.cond(
             use_damping,
-            lambda: (1.0 - damping_threshold) * sTBs_safe / (sTBs_safe - sTy + 1e-12),
+            lambda: (1.0 - damping_threshold) * sTB0s_safe / (sTB0s_safe - sTy + 1e-12),
             lambda: jnp.array(1.0),
         )
         theta = jnp.clip(theta, 0.0, 1.0)
-        y_damped = theta * y + (1.0 - theta) * Bs
+        y_damped = theta * y + (1.0 - theta) * B0s
 
         # Update gamma (scalar summary of average Hessian eigenvalue).
         # γ = yᵀy / sᵀy (Byrd, Nocedal & Schnabel 1994, eq 3.6).
@@ -375,19 +386,104 @@ def lbfgs_append(
         new_count = jnp.minimum(history.count + 1, jnp.array(k))
         new_idx = (idx + 1) % k
 
-        return LBFGSHistory(
+        new_history = LBFGSHistory(
             s_history=new_s_history,
             y_history=new_y_history,
             gamma=gamma_new,
             diagonal=new_diagonal,
             count=new_count,
             next_idx=new_idx,
+            eig_lower=history.eig_lower,
+            eig_upper=history.eig_upper,
+        )
+
+        eig_lo, eig_hi = lbfgs_estimate_condition(new_history)
+        return LBFGSHistory(
+            s_history=new_history.s_history,
+            y_history=new_history.y_history,
+            gamma=new_history.gamma,
+            diagonal=new_history.diagonal,
+            count=new_history.count,
+            next_idx=new_history.next_idx,
+            eig_lower=eig_lo,
+            eig_upper=eig_hi,
         )
 
     def skip():
         return history
 
     return jax.lax.cond(~should_skip, do_append, skip)
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_estimate_condition(
+    history: LBFGSHistory,
+    damping_threshold: float = 0.2,
+) -> tuple[Scalar, Scalar]:
+    """Estimate eigenvalue bounds of the inverse Hessian approximation H.
+
+    Uses the diagonal ``B_0 = diag(d)`` as a proxy for the full L-BFGS
+    condition number.  The inverse Hessian eigenvalues are bounded by
+    ``[1/max(d), 1/min(d)]``, giving ``kappa(H) = max(d) / min(d)``.
+
+    This is a practical simplification of the VARCHEN Theorem 2 bounds
+    (Lotfi et al., 2020).  The full recursive bounds are theoretically
+    tight but overly pessimistic in practice because they propagate
+    worst-case Lipschitz estimates, leading to false soft-reset triggers
+    on moderately conditioned problems.  Since we damp toward B0
+    (not the full B), the diagonal condition number is the most
+    relevant quantity.
+
+    Returns:
+        (lambda_min_est, lambda_max_est) bounding the eigenvalues of H.
+    """
+    d = history.diagonal
+    d_safe = jnp.maximum(d, 1e-30)
+    lam_min = jnp.min(1.0 / d_safe)
+    lam_max = jnp.max(1.0 / d_safe)
+    return lam_min, lam_max
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_soft_reset(
+    history: LBFGSHistory,
+) -> LBFGSHistory:
+    """VARCHEN-style soft reset: keep only the most recent (s, y) pair.
+
+    When the estimated condition number of the inverse Hessian exceeds
+    a threshold, this drops all but the newest curvature pair.  This is
+    less aggressive than :func:`lbfgs_reset` (which extracts the diagonal
+    and drops everything) or :func:`lbfgs_identity_reset` (which restores
+    ``B = I``), preserving the most relevant curvature information.
+
+    Based on VARCHEN Algorithm 1, Step 7 (Lotfi et al., 2020).
+    """
+    k, n = history.s_history.shape
+
+    newest_idx = (history.next_idx - 1 + k) % k
+    newest_s = history.s_history[newest_idx]
+    newest_y = history.y_history[newest_idx]
+
+    new_s_history = jnp.zeros((k, n)).at[0].set(newest_s)
+    new_y_history = jnp.zeros((k, n)).at[0].set(newest_y)
+
+    has_pairs = history.count > 0
+    new_count = jnp.where(has_pairs, jnp.array(1), jnp.array(0))
+
+    d_safe = jnp.maximum(history.diagonal, 1e-30)
+    eig_lo = jnp.min(1.0 / d_safe)
+    eig_hi = jnp.max(1.0 / d_safe)
+
+    return LBFGSHistory(
+        s_history=new_s_history,
+        y_history=new_y_history,
+        gamma=history.gamma,
+        diagonal=history.diagonal,
+        count=new_count,
+        next_idx=jnp.where(has_pairs, jnp.array(1), jnp.array(0)),
+        eig_lower=eig_lo,
+        eig_upper=eig_hi,
+    )
 
 
 @jaxtyped(typechecker=beartype)
@@ -476,6 +572,10 @@ def lbfgs_reset(
 
     gamma_new = jnp.median(diag_safe)
 
+    d_safe = jnp.maximum(diag_safe, 1e-30)
+    eig_lo = jnp.min(1.0 / d_safe)
+    eig_hi = jnp.max(1.0 / d_safe)
+
     k, n = history.s_history.shape
     return LBFGSHistory(
         s_history=jnp.zeros((k, n)),
@@ -484,6 +584,8 @@ def lbfgs_reset(
         diagonal=diag_safe,
         count=jnp.array(0),
         next_idx=jnp.array(0),
+        eig_lower=eig_lo,
+        eig_upper=eig_hi,
     )
 
 
@@ -507,6 +609,8 @@ def lbfgs_identity_reset(
         diagonal=jnp.ones(n),
         count=jnp.array(0),
         next_idx=jnp.array(0),
+        eig_lower=jnp.array(1.0),
+        eig_upper=jnp.array(1.0),
     )
 
 

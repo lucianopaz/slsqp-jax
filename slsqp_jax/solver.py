@@ -34,7 +34,7 @@ from slsqp_jax.hessian import (
     lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
-    lbfgs_reset,
+    lbfgs_soft_reset,
 )
 from slsqp_jax.lpeca import compute_lpeca_active_set
 from slsqp_jax.merit import (
@@ -1183,18 +1183,30 @@ class SLSQP(optx.AbstractMinimiser):
             damping_threshold=self.damping_threshold,
         )
 
-        # SNOPT-style diagonal reset on QP failure: preserve per-variable
-        # curvature from the current approximation and clear stale pairs.
+        # VARCHEN-style conditioning control: soft reset (keep most recent
+        # pair) when the inverse Hessian condition number exceeds kappa_max.
+        kappa_est = new_lbfgs_history.eig_upper / jnp.maximum(
+            new_lbfgs_history.eig_lower, 1e-30
+        )
         new_lbfgs_history = jax.lax.cond(
-            qp_result.converged,
+            (new_lbfgs_history.count > 1) & (kappa_est > 1e6),
+            lbfgs_soft_reset,
             lambda h: h,
-            lbfgs_reset,
             new_lbfgs_history,
         )
 
-        # Escalating L-BFGS recovery: after qp_failure_patience consecutive
-        # QP failures, the SNOPT diagonal reset is re-extracting the same
-        # problematic diagonal. Hard-reset to identity to break the cycle.
+        # On QP failure: soft reset (keep most recent pair) to preserve
+        # the newest curvature information while discarding stale pairs.
+        new_lbfgs_history = jax.lax.cond(
+            qp_result.converged,
+            lambda h: h,
+            lbfgs_soft_reset,
+            new_lbfgs_history,
+        )
+
+        # Escalating recovery: after qp_failure_patience consecutive
+        # QP failures, soft resets are re-using the same problematic
+        # pair. Hard-reset to identity to break the cycle.
         new_consecutive_qp_failures = jnp.where(
             qp_result.converged,
             jnp.array(0),
@@ -1207,10 +1219,8 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
-        # Escalating L-BFGS recovery on line search failure: the QP
-        # converged but the direction is not a descent direction for the
-        # L1 merit function (ill-conditioned Hessian).  Diagonal reset
-        # on each failure; identity escalation after patience threshold.
+        # Line search failure recovery: soft reset on each failure,
+        # identity escalation after patience threshold.
         ls_failed = ~ls_result.success
         new_consecutive_ls_failures = jnp.where(
             ls_failed,
@@ -1219,7 +1229,7 @@ class SLSQP(optx.AbstractMinimiser):
         )
         new_lbfgs_history = jax.lax.cond(
             ls_failed & (new_consecutive_ls_failures < self.ls_failure_patience),
-            lbfgs_reset,
+            lbfgs_soft_reset,
             lambda h: h,
             new_lbfgs_history,
         )
