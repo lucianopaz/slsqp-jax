@@ -26,6 +26,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from beartype import beartype
+from beartype.typing import Callable
 from jaxtyping import Array, Float, Int, jaxtyped
 
 from slsqp_jax.types import Scalar, Vector
@@ -657,3 +658,37 @@ def compute_lagrangian_gradient(
         grad_L = grad_L - ineq_jac.T @ multipliers_ineq
 
     return grad_L
+
+
+@jaxtyped(typechecker=beartype)
+def estimate_hessian_diagonal(
+    hvp_fn: Callable[[Vector], Vector],
+    n: int,
+    key: jax.Array,
+    n_probes: int = 20,
+) -> Vector:
+    """Estimate the diagonal of a matrix given only its HVP.
+
+    Uses the Bekas-Kokiopoulou-Saad (2007) stochastic estimator:
+    for Rademacher random vectors z (entries i.i.d. from {-1, +1}),
+    E[z * (H z)] = diag(H).  Averaging over ``n_probes`` samples
+    gives an unbiased estimate with variance O(||off-diag||^2 / k).
+
+    The estimate is accurate when the matrix is diagonally dominant,
+    which is common for Hessians of smooth functions in the natural
+    coordinate basis.
+
+    Args:
+        hvp_fn: Function v -> H @ v (Hessian-vector product).
+        n: Dimension of the matrix.
+        key: JAX PRNG key for generating random probes.
+        n_probes: Number of Rademacher probes (default 20).  More
+            probes reduce variance at the cost of more HVP calls.
+            Each probe costs one forward-over-reverse AD pass.
+
+    Returns:
+        Estimated diagonal of H, shape (n,).
+    """
+    Z = 2.0 * jax.random.bernoulli(key, shape=(n_probes, n)).astype(jnp.float64) - 1.0
+    W = jax.vmap(hvp_fn)(Z)
+    return jnp.mean(Z * W, axis=0)
