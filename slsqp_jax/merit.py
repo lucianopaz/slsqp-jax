@@ -135,13 +135,22 @@ def backtracking_line_search(
     bounds: Float[Array, "n 2"] | None = None,
     lower_bound_mask: tuple[bool, ...] | None = None,
     upper_bound_mask: tuple[bool, ...] | None = None,
+    eq_jac: Float[Array, "m_eq n"] | None = None,
+    ineq_jac: Float[Array, "m_ineq_general n"] | None = None,
 ) -> LineSearchResult:
     """Perform backtracking line search with the L1 merit function.
 
     Finds α such that the Armijo condition is satisfied:
         φ(x + α*d; ρ) ≤ φ(x; ρ) + c1 * α * φ'(x; d, ρ)
 
-    where φ is the L1 merit function.
+    where φ is the L1 merit function and φ' is the proper directional
+    derivative including constraint Jacobian terms:
+
+        φ'(x; d, ρ) = ∇f·d + ρ Σ sign(c_eq_i)(J_eq d)_i
+                            - ρ Σ_{j: c_ineq_j<0} (J_ineq d)_j
+
+    When constraint Jacobians are not provided, falls back to the
+    simpler ``∇f·d`` approximation.
 
     Args:
         fn: Objective function fn(x, args) -> (f_val, aux).
@@ -162,6 +171,10 @@ def backtracking_line_search(
         bounds: Optional box constraints, shape (n, 2) with [lower, upper] per variable.
         lower_bound_mask: Tuple of bools indicating which lower bounds are finite.
         upper_bound_mask: Tuple of bools indicating which upper bounds are finite.
+        eq_jac: Equality constraint Jacobian at x (m_eq, n), or None.
+        ineq_jac: General inequality constraint Jacobian at x
+            (m_ineq_general, n), or None.  Does NOT include bound
+            constraint rows.
 
     Returns:
         LineSearchResult with the found step size and function values.
@@ -178,12 +191,21 @@ def backtracking_line_search(
     # Current merit value
     merit_0 = compute_merit(f_val, eq_val, ineq_val, penalty)
 
-    # Directional derivative of objective
+    # Proper L1 merit directional derivative:
+    #   D_phi = grad_f . d + rho * sum_i sign(c_eq_i) * (J_eq d)_i
+    #                      - rho * sum_{j: c_ineq_j < 0} (J_ineq d)_j
     grad_dot_d = jnp.dot(grad, direction)
 
-    # For the L1 merit function, the directional derivative is approximately:
-    # φ'(x; d) ≈ ∇f · d - ρ * (reduction in constraint violation)
-    # We use a simplified sufficient decrease condition
+    if eq_jac is not None and eq_val.shape[0] > 0:
+        Jd_eq = eq_jac @ direction
+        grad_dot_d = grad_dot_d + penalty * jnp.dot(jnp.sign(eq_val), Jd_eq)
+
+    if ineq_jac is not None and ineq_jac.shape[0] > 0:
+        Jd_ineq = ineq_jac @ direction
+        violated = ineq_val[: ineq_jac.shape[0]] < 0.0
+        grad_dot_d = grad_dot_d - penalty * jnp.dot(
+            jnp.where(violated, 1.0, 0.0), Jd_ineq
+        )
 
     # Initial state for the line search loop
     class LSState(NamedTuple):

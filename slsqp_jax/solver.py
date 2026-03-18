@@ -1175,16 +1175,28 @@ class SLSQP(optx.AbstractMinimiser):
         # Step 2: Solve QP subproblem for search direction
         qp_result = self._solve_qp_subproblem(state, hvp_fn, y)
 
-        # Steepest descent fallback when QP fails or returns a zero direction
-        # despite a non-zero gradient (defense-in-depth against stagnation).
-        fallback_direction = -state.grad
-        direction = jnp.where(
-            qp_result.converged, qp_result.direction, fallback_direction
-        )
+        # Projected steepest descent fallback when QP fails or returns a
+        # zero direction despite a non-zero gradient.  The fallback
+        # direction is projected onto null(J_eq) so that it satisfies
+        # J_eq d = 0, preventing catastrophic constraint violation
+        # (unprojected -grad can have ||J_eq d|| = O(n) for simplex
+        # constraints, making the L1 merit DD massively positive).
+        neg_grad = -state.grad
+        if self.n_eq_constraints > 0:
+            A_eq = state.eq_jac
+            AAt = A_eq @ A_eq.T + 1e-8 * jnp.eye(self.n_eq_constraints)
+            fallback_direction = neg_grad - A_eq.T @ jnp.linalg.solve(
+                AAt, A_eq @ neg_grad
+            )
+        else:
+            fallback_direction = neg_grad
+        direction = qp_result.direction
         zero_direction = jnp.linalg.norm(direction) < 1e-30
         grad_nonzero = jnp.linalg.norm(state.grad) > self.atol
         direction = jnp.where(
-            zero_direction & grad_nonzero, fallback_direction, direction
+            zero_direction & grad_nonzero & ~qp_result.converged,
+            fallback_direction,
+            direction,
         )
 
         # Step 3: Update penalty parameter — only trust multipliers
@@ -1214,6 +1226,8 @@ class SLSQP(optx.AbstractMinimiser):
             bounds=self.bounds,
             lower_bound_mask=self._lower_bound_mask,
             upper_bound_mask=self._upper_bound_mask,
+            eq_jac=state.eq_jac,
+            ineq_jac=state.ineq_jac,
         )
 
         alpha = ls_result.alpha
