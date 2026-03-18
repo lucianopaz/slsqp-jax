@@ -29,6 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
+    estimate_hessian_diagonal,
     lbfgs_append,
     lbfgs_hvp,
     lbfgs_identity_reset,
@@ -291,10 +292,17 @@ class SLSQP(optx.AbstractMinimiser):
             the L1 merit function descent.  Wright's local convergence
             theory assumes ``kkt_residual < 1``; this cap handles the
             regime where ``kkt_residual >> 1``.  Default 0.1.
-        use_preconditioner: When True (default), the L-BFGS inverse Hessian
-            (two-loop recursion) is used as a preconditioner for the inner
-            CG solver, dramatically improving convergence on ill-conditioned
-            QP subproblems.
+        use_preconditioner: When True (default), a preconditioner is used
+            for the inner CG solver, dramatically improving convergence on
+            ill-conditioned QP subproblems.
+        preconditioner_type: Which preconditioner to use.  ``"lbfgs"``
+            (default) uses the L-BFGS inverse Hessian (two-loop recursion).
+            ``"diagonal"`` uses a stochastic estimate of the true Hessian
+            diagonal (Bekas et al., 2007), requiring an exact HVP (set
+            ``use_exact_hvp_in_qp=True`` or provide ``obj_hvp_fn``).
+        diagonal_n_probes: Number of Rademacher probes for the stochastic
+            diagonal estimator.  Each probe costs one HVP evaluation.  Only
+            used when ``preconditioner_type="diagonal"``.  Default 20.
         adaptive_cg_tol: When True, the CG convergence tolerance is adapted
             based on the outer KKT residual (Eisenstat-Walker style).
             Default False preserves baseline behavior.
@@ -451,6 +459,10 @@ class SLSQP(optx.AbstractMinimiser):
     # the proximal term is active.  Default True; set False to disable.
     use_preconditioner: bool = eqx.field(static=True, default=True)
 
+    preconditioner_type: str = eqx.field(static=True, default="lbfgs")
+
+    diagonal_n_probes: int = eqx.field(static=True, default=20)
+
     # Adaptive CG tolerance (Eisenstat-Walker-inspired).  Instead of
     # a fixed CG tolerance of atol, the tolerance is set to
     # min(0.1, max(atol, ||grad_L||)) so early QPs are solved loosely
@@ -546,6 +558,20 @@ class SLSQP(optx.AbstractMinimiser):
             raise ValueError(
                 f"lpeca_sigma must be in the open interval (0, 1), "
                 f"got {self.lpeca_sigma}"
+            )
+
+        # --- Preconditioner type validation ---
+        if self.preconditioner_type not in ("lbfgs", "diagonal"):
+            raise ValueError(
+                f"preconditioner_type must be 'lbfgs' or 'diagonal', "
+                f"got {self.preconditioner_type!r}"
+            )
+        if self.preconditioner_type == "diagonal" and not (
+            self.obj_hvp_fn is not None or self.use_exact_hvp_in_qp
+        ):
+            raise ValueError(
+                "preconditioner_type='diagonal' requires an exact HVP: "
+                "set use_exact_hvp_in_qp=True or provide obj_hvp_fn"
             )
 
         # --- Verbose callable ---
@@ -821,15 +847,27 @@ class SLSQP(optx.AbstractMinimiser):
         self,
         state: "SLSQPState",
         proximal_mu: Scalar | float = 0.0,
+        lagrangian_hvp_fn: Callable[[Vector], Vector] | None = None,
     ) -> Callable[[Vector], Vector] | None:
         """Build the preconditioner for the PCG inner solver.
 
-        When equality constraints are present *and* sSQP proximal
-        stabilization is active (``proximal_tau > 0``), the QP system
-        matrix is ``B_tilde = B + (1/mu) A_eq^T A_eq``, so a plain
-        ``B^{-1}`` preconditioner can amplify the proximal eigenvalues
-        and make CG *worse*.  In that case the Woodbury identity is used
-        to build ``B_tilde^{-1}`` cheaply::
+        Two preconditioner types are supported:
+
+        **L-BFGS** (``preconditioner_type="lbfgs"``, default):
+        Uses the L-BFGS inverse Hessian (two-loop recursion).
+
+        **Diagonal** (``preconditioner_type="diagonal"``):
+        Estimates diag(H_L) via stochastic Rademacher probing of the
+        exact Lagrangian HVP, then uses M^{-1} = diag(1/d_hat).  This
+        is independent of L-BFGS history quality and immune to the
+        reset death spiral on ill-conditioned problems.  Requires
+        ``lagrangian_hvp_fn`` (the exact Lagrangian HVP at the current
+        iterate).
+
+        For both types, when equality constraints are present *and*
+        sSQP proximal stabilization is active (``proximal_tau > 0``),
+        the QP system matrix is ``B_tilde = B + (1/mu) A_eq^T A_eq``.
+        The Woodbury identity is used to build ``B_tilde^{-1}``::
 
             (B + (1/mu) A^T A)^{-1}
               = B^{-1} - B^{-1} A^T (mu I + A B^{-1} A^T)^{-1} A B^{-1}
@@ -837,18 +875,30 @@ class SLSQP(optx.AbstractMinimiser):
         The inner matrix ``(mu I + A B^{-1} A^T)`` is only m_eq x m_eq
         and is factored once per QP solve.
 
-        When there are no equality constraints, or when sSQP is disabled
-        (``proximal_tau == 0``), the standard ``B^{-1}`` preconditioner
-        is used.
-
         Args:
             state: Current solver state.
             proximal_mu: Adaptive proximal parameter (mu).
+            lagrangian_hvp_fn: Exact Lagrangian HVP at the current
+                iterate.  Required when ``preconditioner_type="diagonal"``.
 
         Returns ``None`` when preconditioning is disabled.
         """
         if not self.use_preconditioner:
             return None
+
+        if self.preconditioner_type == "diagonal":
+            return self._build_diagonal_preconditioner(
+                state, proximal_mu, lagrangian_hvp_fn
+            )
+
+        return self._build_lbfgs_preconditioner(state, proximal_mu)
+
+    def _build_lbfgs_preconditioner(
+        self,
+        state: "SLSQPState",
+        proximal_mu: Scalar | float = 0.0,
+    ) -> Callable[[Vector], Vector]:
+        """L-BFGS inverse Hessian preconditioner (two-loop recursion)."""
         lbfgs_history = state.lbfgs_history
 
         if self.n_eq_constraints > 0 and self.proximal_tau > 0:
@@ -876,6 +926,57 @@ class SLSQP(optx.AbstractMinimiser):
 
             def preconditioner(v: Vector) -> Vector:
                 return lbfgs_inverse_hvp(lbfgs_history, v)
+
+            return preconditioner
+
+    def _build_diagonal_preconditioner(
+        self,
+        state: "SLSQPState",
+        proximal_mu: Scalar | float = 0.0,
+        lagrangian_hvp_fn: Callable[[Vector], Vector] | None = None,
+    ) -> Callable[[Vector], Vector]:
+        """Stochastic diagonal Hessian preconditioner (Bekas et al., 2007).
+
+        Estimates diag(H_L) by probing the exact Lagrangian HVP with
+        Rademacher random vectors, then uses M^{-1} = diag(1/d_hat).
+        The estimate is recomputed each SLSQP step using a deterministic
+        PRNG key derived from the step count.
+        """
+        assert lagrangian_hvp_fn is not None, (
+            "diagonal preconditioner requires an exact Lagrangian HVP"
+        )
+        n = state.grad.shape[0]
+        key = jax.random.fold_in(jax.random.PRNGKey(42), state.step_count)
+        diag_est = estimate_hessian_diagonal(
+            lagrangian_hvp_fn, n, key, n_probes=self.diagonal_n_probes
+        )
+        abs_diag = jnp.abs(diag_est)
+        floor = jnp.maximum(1e-8, 1e-6 * jnp.median(abs_diag))
+        diag_safe = jnp.maximum(abs_diag, floor)
+        inv_diag = 1.0 / diag_safe
+
+        if self.n_eq_constraints > 0 and self.proximal_tau > 0:
+            A_eq = state.eq_jac
+            mu = proximal_mu
+            m_eq = A_eq.shape[0]
+
+            Dinv_AT = (A_eq * inv_diag[None, :]).T  # (n, m_eq)
+            gram = A_eq @ Dinv_AT  # (m_eq, m_eq): A D^{-1} A^T
+            inner = mu * jnp.eye(m_eq) + gram
+            inner_factor = jnp.linalg.cholesky(inner + 1e-10 * jnp.eye(m_eq))
+
+            def preconditioner(v: Vector) -> Vector:
+                Dinv_v = inv_diag * v
+                A_Dinv_v = A_eq @ Dinv_v  # (m_eq,)
+                w = jax.scipy.linalg.cho_solve((inner_factor, True), A_Dinv_v)
+                correction = Dinv_AT @ w  # (n,)
+                return Dinv_v - correction
+
+            return preconditioner
+        else:
+
+            def preconditioner(v: Vector) -> Vector:
+                return inv_diag * v
 
             return preconditioner
 
@@ -1569,7 +1670,13 @@ class SLSQP(optx.AbstractMinimiser):
         else:
             mu = 0.0
 
-        precond_fn = self._build_preconditioner(state, proximal_mu=mu)
+        precond_fn = self._build_preconditioner(
+            state,
+            proximal_mu=mu,
+            lagrangian_hvp_fn=(
+                hvp_fn if self.preconditioner_type == "diagonal" else None
+            ),
+        )
 
         if self.adaptive_cg_tol:
             adaptive_tol = jnp.minimum(0.1, jnp.maximum(self.atol, kkt_residual))

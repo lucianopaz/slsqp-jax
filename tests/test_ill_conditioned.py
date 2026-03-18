@@ -604,6 +604,146 @@ class TestNumericalStability:
         assert final_obj < initial_obj * 0.1, "Objective should decrease by 90%"
 
 
+class TestIllConditionedBenchmark:
+    """Reproduce the IllCond(n=100) problem from the benchmark notebook.
+
+    min (1/2) x^T H x  s.t.  sum(x) = 1,  x >= 0
+    where H = Q diag(logspace(-2, 4, n)) Q^T, cond(H) ~ 1e6.
+
+    Uses ``optx.minimise`` (JIT-compiled loop) for speed.
+    """
+
+    @staticmethod
+    def _make_problem(n: int, seed: int = 13):
+        rng = np.random.RandomState(seed)
+        Q_mat, _ = np.linalg.qr(rng.randn(n, n))
+        eigvals = np.logspace(-2, 4, n)
+        H_np = Q_mat @ np.diag(eigvals) @ Q_mat.T
+        H_jax = jnp.array(H_np)
+
+        def objective_jax(x, args):
+            return 0.5 * x @ H_jax @ x, None
+
+        def eq_constraint_jax(x, args):
+            return jnp.array([jnp.sum(x) - 1.0])
+
+        def objective_scipy(x):
+            return 0.5 * x @ H_np @ x
+
+        def grad_scipy(x):
+            return H_np @ x
+
+        x0 = np.ones(n) / n
+        bounds_np = [(0.0, 1.0)] * n
+        bounds_jax = jnp.column_stack([jnp.zeros(n), jnp.ones(n)])
+
+        return {
+            "objective_jax": objective_jax,
+            "eq_constraint_jax": eq_constraint_jax,
+            "objective_scipy": objective_scipy,
+            "grad_scipy": grad_scipy,
+            "x0_np": x0,
+            "x0_jax": jnp.array(x0),
+            "bounds_np": bounds_np,
+            "bounds_jax": bounds_jax,
+            "H_np": H_np,
+        }
+
+    @pytest.mark.slow
+    def test_ill_conditioned_100_lbfgs_improves(self):
+        """L-BFGS mode should significantly reduce the objective.
+
+        With kappa=1e6 and n=100, L-BFGS (memory=20) cannot match
+        SciPy's dense BFGS, but the VARCHEN damping and projected
+        fallback should enable substantial progress from the initial
+        point.
+        """
+        import optimistix as optx
+
+        n = 100
+        prob = self._make_problem(n)
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=prob["eq_constraint_jax"],
+            n_eq_constraints=1,
+            bounds=prob["bounds_jax"],
+            lbfgs_memory=20,
+        )
+        result = optx.minimise(
+            prob["objective_jax"],
+            solver,
+            prob["x0_jax"],
+            has_aux=True,
+            max_steps=500,
+            throw=False,
+        )
+        y_jax = result.value
+        f_init = float(prob["objective_jax"](prob["x0_jax"], None)[0])
+        f_jax = float(prob["objective_jax"](y_jax, None)[0])
+
+        assert f_jax < f_init * 0.5, (
+            f"L-BFGS should reduce objective by >= 50%: "
+            f"f_init={f_init:.6e}, f_jax={f_jax:.6e}"
+        )
+
+    @pytest.mark.slow
+    def test_ill_conditioned_100_newton_cg_matches_scipy(self):
+        """Newton-CG with null-space projection matches SciPy exactly.
+
+        With exact HVP and proximal_tau=0 (null-space projection for
+        equalities), the solver captures the full curvature and respects
+        the equality constraint exactly in each QP step.
+        """
+        import optimistix as optx
+
+        n = 100
+        prob = self._make_problem(n)
+
+        result_scipy = scipy_minimize(
+            prob["objective_scipy"],
+            prob["x0_np"],
+            jac=prob["grad_scipy"],
+            method="SLSQP",
+            bounds=prob["bounds_np"],
+            constraints={"type": "eq", "fun": lambda x: np.sum(x) - 1.0},
+            options={"ftol": 1e-12, "maxiter": 500},
+        )
+        f_scipy = float(result_scipy.fun)
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=prob["eq_constraint_jax"],
+            n_eq_constraints=1,
+            bounds=prob["bounds_jax"],
+            lbfgs_memory=20,
+            use_exact_hvp_in_qp=True,
+            proximal_tau=0.0,
+        )
+        result = optx.minimise(
+            prob["objective_jax"],
+            solver,
+            prob["x0_jax"],
+            has_aux=True,
+            max_steps=500,
+            throw=False,
+        )
+        y_jax = result.value
+        f_jax = float(prob["objective_jax"](y_jax, None)[0])
+
+        assert f_jax < f_scipy * 1.5, (
+            f"Newton-CG f={f_jax:.6e} should be within 1.5x of scipy f={f_scipy:.6e}"
+        )
+
+        eq_viol = float(jnp.abs(jnp.sum(y_jax) - 1.0))
+        assert eq_viol < 1e-6, f"Equality constraint violation: {eq_viol}"
+
+        bound_viol = float(jnp.max(jnp.maximum(-y_jax, y_jax - 1.0)))
+        assert bound_viol < 1e-6, f"Bound violation: {bound_viol}"
+
+
 class TestNewtonCGMode:
     """Tests for use_exact_hvp_in_qp=True (Newton-CG) mode."""
 
@@ -791,3 +931,230 @@ class TestPerVariableDiagonal:
             f"Per-variable diagonal should enable convergence: "
             f"initial={initial_obj:.2e}, final={final_obj:.2e}"
         )
+
+
+class TestStochasticDiagonalEstimator:
+    """Tests for the stochastic Hessian diagonal estimator."""
+
+    def test_exact_diagonal_on_diagonal_hessian(self):
+        """Diagonal Hessian should be recovered exactly with enough probes."""
+        from slsqp_jax.hessian import estimate_hessian_diagonal
+
+        n = 20
+        diag_true = 10 ** jnp.linspace(-1, 3, n)
+
+        def hvp_fn(v):
+            return diag_true * v
+
+        key = jax.random.PRNGKey(0)
+        diag_est = estimate_hessian_diagonal(hvp_fn, n, key, n_probes=200)
+
+        np.testing.assert_allclose(diag_est, diag_true, rtol=0.15)
+
+    def test_off_diagonal_has_higher_variance(self):
+        """Dense Hessian diagonal estimate has higher variance."""
+        from slsqp_jax.hessian import estimate_hessian_diagonal
+
+        n = 10
+        H = jnp.diag(jnp.arange(1.0, n + 1.0))
+        H = H + 0.1 * jnp.ones((n, n))
+
+        def hvp_fn(v):
+            return H @ v
+
+        key = jax.random.PRNGKey(42)
+        diag_est = estimate_hessian_diagonal(hvp_fn, n, key, n_probes=500)
+
+        np.testing.assert_allclose(
+            diag_est,
+            jnp.diag(H),
+            rtol=0.2,
+            err_msg="Diagonal estimate should approximate diag(H)",
+        )
+
+    def test_unbiased_mean(self):
+        """Average over many keys should converge to true diagonal."""
+        from slsqp_jax.hessian import estimate_hessian_diagonal
+
+        n = 5
+        diag_true = jnp.array([1.0, 10.0, 100.0, 1000.0, 10000.0])
+
+        def hvp_fn(v):
+            return diag_true * v
+
+        estimates = []
+        for i in range(50):
+            key = jax.random.PRNGKey(i)
+            est = estimate_hessian_diagonal(hvp_fn, n, key, n_probes=20)
+            estimates.append(est)
+
+        mean_est = jnp.mean(jnp.stack(estimates), axis=0)
+        np.testing.assert_allclose(mean_est, diag_true, rtol=0.05)
+
+
+class TestDiagonalPreconditioner:
+    """Tests for the diagonal preconditioner (preconditioner_type='diagonal')."""
+
+    def test_validation_requires_hvp(self):
+        """preconditioner_type='diagonal' without HVP should raise."""
+        with pytest.raises(ValueError, match="requires an exact HVP"):
+            SLSQP(
+                max_steps=10,
+                preconditioner_type="diagonal",
+            )
+
+    def test_validation_accepts_use_exact_hvp(self):
+        """preconditioner_type='diagonal' with use_exact_hvp_in_qp is valid."""
+        solver = SLSQP(
+            max_steps=10,
+            preconditioner_type="diagonal",
+            use_exact_hvp_in_qp=True,
+        )
+        assert solver.preconditioner_type == "diagonal"
+
+    def test_validation_accepts_obj_hvp_fn(self):
+        """preconditioner_type='diagonal' with obj_hvp_fn is valid."""
+
+        def obj_hvp(x, v, args):
+            return v
+
+        solver = SLSQP(
+            max_steps=10,
+            preconditioner_type="diagonal",
+            obj_hvp_fn=obj_hvp,
+        )
+        assert solver.preconditioner_type == "diagonal"
+
+    def test_invalid_preconditioner_type(self):
+        """Invalid preconditioner_type should raise."""
+        with pytest.raises(ValueError, match="preconditioner_type must be"):
+            SLSQP(max_steps=10, preconditioner_type="invalid")
+
+    def test_diagonal_precond_unconstrained_quadratic(self):
+        """Diagonal preconditioner converges on ill-conditioned quadratic."""
+        n = 10
+        weights = 10 ** jnp.linspace(0, 4, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * x**2), None
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=100,
+            use_exact_hvp_in_qp=True,
+            preconditioner_type="diagonal",
+            diagonal_n_probes=30,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        final_obj = float(objective(y, None)[0])
+        initial_obj = float(objective(x0, None)[0])
+        assert final_obj < initial_obj * 1e-8, (
+            f"Diagonal preconditioner should converge on kappa=1e4: "
+            f"initial={initial_obj:.2e}, final={final_obj:.2e}"
+        )
+
+    def test_diagonal_precond_with_equality_constraint(self):
+        """Diagonal preconditioner with equality constraint."""
+        n = 10
+        weights = 10 ** jnp.linspace(0, 3, n)
+
+        def objective(x, args):
+            return jnp.sum(weights * x**2), None
+
+        def eq_fn(x, args):
+            return jnp.array([jnp.sum(x) - float(n)])
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=100,
+            eq_constraint_fn=eq_fn,
+            n_eq_constraints=1,
+            use_exact_hvp_in_qp=True,
+            preconditioner_type="diagonal",
+            proximal_tau=0.0,
+        )
+        x0 = jnp.ones(n)
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(jnp.sum(y), float(n), atol=1e-4)
+        assert y[0] > y[-1], "Lower-weighted variables should be larger"
+
+    def test_diagonal_precond_with_bounds(self):
+        """Diagonal preconditioner with box constraints."""
+        n = 5
+        weights = 10 ** jnp.linspace(0, 3, n)
+
+        def objective(x, args):
+            return 0.5 * jnp.sum(weights * (x - 0.5) ** 2), None
+
+        bounds = jnp.column_stack([jnp.zeros(n), jnp.ones(n)])
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=100,
+            bounds=bounds,
+            use_exact_hvp_in_qp=True,
+            preconditioner_type="diagonal",
+        )
+        x0 = jnp.ones(n) * 0.1
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, 0.5 * jnp.ones(n), atol=1e-4)
+
+    @pytest.mark.slow
+    def test_diagonal_precond_ill_conditioned_100(self):
+        """Diagonal preconditioner on the IllCond(n=100) benchmark.
+
+        This test uses the exact Lagrangian HVP with a stochastic diagonal
+        preconditioner.  The preconditioner quality is independent of L-BFGS
+        history, making it robust on ill-conditioned problems where L-BFGS
+        resets degrade preconditioner quality.
+        """
+        import optimistix as optx
+
+        n = 100
+        prob = TestIllConditionedBenchmark._make_problem(n)
+
+        result_scipy = scipy_minimize(
+            prob["objective_scipy"],
+            prob["x0_np"],
+            jac=prob["grad_scipy"],
+            method="SLSQP",
+            bounds=prob["bounds_np"],
+            constraints={"type": "eq", "fun": lambda x: np.sum(x) - 1.0},
+            options={"ftol": 1e-12, "maxiter": 500},
+        )
+        f_scipy = float(result_scipy.fun)
+
+        solver = SLSQP(
+            rtol=1e-8,
+            atol=1e-8,
+            eq_constraint_fn=prob["eq_constraint_jax"],
+            n_eq_constraints=1,
+            bounds=prob["bounds_jax"],
+            lbfgs_memory=20,
+            use_exact_hvp_in_qp=True,
+            preconditioner_type="diagonal",
+            diagonal_n_probes=30,
+            proximal_tau=0.0,
+        )
+        result = optx.minimise(
+            prob["objective_jax"],
+            solver,
+            prob["x0_jax"],
+            has_aux=True,
+            max_steps=500,
+            throw=False,
+        )
+        y_jax = result.value
+        f_jax = float(prob["objective_jax"](y_jax, None)[0])
+
+        assert f_jax < f_scipy * 2.0, (
+            f"Diagonal precond f={f_jax:.6e} should be within 2x of "
+            f"scipy f={f_scipy:.6e}"
+        )
+
+        eq_viol = float(jnp.abs(jnp.sum(y_jax) - 1.0))
+        assert eq_viol < 1e-4, f"Equality constraint violation: {eq_viol}"

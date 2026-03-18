@@ -14,6 +14,7 @@ from slsqp_jax.compat import (
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
+    estimate_hessian_diagonal,
     lbfgs_append,
     lbfgs_compute_diagonal,
     lbfgs_estimate_condition,
@@ -74,6 +75,7 @@ __all__ = [
     "lbfgs_reset",
     "lbfgs_soft_reset",
     "lbfgs_identity_reset",
+    "estimate_hessian_diagonal",
     # Merit function
     "LineSearchResult",
     "compute_merit",
