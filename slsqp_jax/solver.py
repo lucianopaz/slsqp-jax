@@ -42,7 +42,7 @@ from slsqp_jax.merit import (
     compute_merit,
     update_penalty_parameter,
 )
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.qp_solver import _solve_projected_cg, solve_qp
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -1072,7 +1072,7 @@ class SLSQP(optx.AbstractMinimiser):
         hvp_fn = self._build_lagrangian_hvp(fn, y, args, state)
 
         # Step 2: Solve QP subproblem for search direction
-        qp_result = self._solve_qp_subproblem(state, hvp_fn)
+        qp_result = self._solve_qp_subproblem(state, hvp_fn, y)
 
         # Steepest descent fallback when QP fails or returns a zero direction
         # despite a non-zero gradient (defense-in-depth against stagnation).
@@ -1465,6 +1465,7 @@ class SLSQP(optx.AbstractMinimiser):
         self,
         state: SLSQPState,
         hvp_fn: Callable[[Vector], Vector],
+        y: Vector,
     ) -> QPResult:
         """Solve the QP subproblem for the search direction.
 
@@ -1472,8 +1473,20 @@ class SLSQP(optx.AbstractMinimiser):
             minimize    (1/2) d^T B d + g^T d
             subject to  A_eq d = -c_eq
                         A_ineq d >= -c_ineq
+                        bounds[:, 0] - y <= d <= bounds[:, 1] - y
 
         using the HVP function v -> B @ v for the Hessian.
+
+        **Bound handling.**  Box constraints are *not* passed to the QP
+        solver as general inequality constraints.  Only the
+        ``n_ineq_constraints`` general rows enter the QP's constraint
+        matrix ``A``.  After the QP solve, the direction is clipped to
+        ``[bounds[:, 0] - y, bounds[:, 1] - y]``.  Bound multipliers
+        are recovered from the reduced gradient ``Bd + g - A^T lambda``
+        at the clipped point.  This avoids forming a large projection
+        matrix when many bounds are present: the CG projection cost
+        drops from ``O((m_eq + m_gen + m_bounds)^3)`` to
+        ``O((m_eq + m_gen)^3)`` per CG step.
 
         The previous iteration's QP active set is passed as a warm-start
         hint, and the outer KKT residual norm is used for adaptive EXPAND
@@ -1497,6 +1510,7 @@ class SLSQP(optx.AbstractMinimiser):
         Args:
             state: Current solver state.
             hvp_fn: Hessian-vector product function for the Lagrangian.
+            y: Current iterate (used for computing box constraints on d).
 
         Returns:
             QPResult containing the search direction, multipliers, and
@@ -1507,19 +1521,29 @@ class SLSQP(optx.AbstractMinimiser):
         A_eq = state.eq_jac
         b_eq = -state.eq_val
 
-        A_ineq = state.ineq_jac
-        b_ineq = -state.ineq_val
+        m_ineq_general = self.n_ineq_constraints
+        m_bounds = self._n_lower_bounds + self._n_upper_bounds
+
+        # Only pass general inequality constraints to QP (not bounds).
+        # This keeps the projection matrix small: O((m_eq + m_gen_active)^3)
+        # instead of O((m_eq + m_gen_active + m_bounds_active)^3) per CG step.
+        A_ineq = state.ineq_jac[:m_ineq_general]
+        b_ineq = -state.ineq_val[:m_ineq_general]
 
         kkt_residual = jnp.linalg.norm(state.prev_grad_lagrangian)
 
-        initial_active_set = state.prev_active_set
+        initial_active_set = (
+            state.prev_active_set[:m_ineq_general] if m_ineq_general > 0 else None
+        )
 
-        # LPEC-A: compute predicted active set from NLP-level data
+        # LPEC-A: compute predicted active set from NLP-level data.
+        # Uses full ineq data (including bounds) for the prediction,
+        # then slices to the general-ineq portion for the QP.
         predicted_active_set = None
         if self.active_set_method in ("lpeca_init", "lpeca"):
-            m_ineq_total = A_ineq.shape[0]
+            m_ineq_total = m_ineq_general + m_bounds
             if m_ineq_total > 0:
-                predicted_active_set = compute_lpeca_active_set(
+                full_predicted = compute_lpeca_active_set(
                     c_ineq=state.ineq_val,
                     c_eq=state.eq_val,
                     grad=state.grad,
@@ -1531,15 +1555,12 @@ class SLSQP(optx.AbstractMinimiser):
                     beta=self.lpeca_beta,
                     use_lp=self.lpeca_use_lp,
                 )
+                predicted_active_set = (
+                    full_predicted[:m_ineq_general] if m_ineq_general > 0 else None
+                )
 
         use_proximal = self.proximal_tau > 0
         if use_proximal:
-            # Adaptive proximal mu (Wright, 2002, eq 6.6):
-            # mu = clip(kkt_residual^tau, mu_min, mu_max)
-            # Capped at mu_max so the proximal weight 1/mu >= 1/mu_max,
-            # ensuring adequate equality enforcement even far from the solution.
-            # Wright's local convergence analysis assumes eta < 1; when the
-            # KKT residual is large the cap keeps the penalty tight.
             mu = jnp.clip(
                 kkt_residual**self.proximal_tau,
                 self._proximal_mu_min,
@@ -1550,9 +1571,6 @@ class SLSQP(optx.AbstractMinimiser):
 
         precond_fn = self._build_preconditioner(state, proximal_mu=mu)
 
-        # Eisenstat-Walker adaptive CG tolerance: solve loosely far from
-        # optimum (fast), tightly near the solution (accurate).
-        # Kept separate from `tol` so feasibility checking stays tight.
         if self.adaptive_cg_tol:
             adaptive_tol = jnp.minimum(0.1, jnp.maximum(self.atol, kkt_residual))
         else:
@@ -1580,11 +1598,156 @@ class SLSQP(optx.AbstractMinimiser):
             use_constraint_preconditioner=self.use_exact_hvp_in_qp,
         )
 
+        direction = qp_result.d
+
+        # --- Bound post-processing (iterative Phase 2) ---
+        if m_bounds > 0:
+            assert self.bounds is not None
+            n_vars = g.shape[0]
+            d_lower = self.bounds[:, 0] - y
+            d_upper = self.bounds[:, 1] - y
+            finite_lower = jnp.isfinite(d_lower)
+            finite_upper = jnp.isfinite(d_upper)
+
+            A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
+            b_combined = jnp.concatenate([b_eq, b_ineq], axis=0)
+            m_eq_static = self.n_eq_constraints
+            eq_active = jnp.ones(m_eq_static, dtype=bool)
+            combined_active = jnp.concatenate([eq_active, qp_result.active_set])
+
+            inner_cg_tol = adaptive_tol if adaptive_tol is not None else 1e-8
+
+            free_mask = jnp.ones(n_vars, dtype=bool)
+            d_fixed = jnp.zeros(n_vars)
+            mult_combined = jnp.zeros(A_combined.shape[0])
+
+            bound_fix_tol = 1e-12
+            for _bound_pass in range(5):
+                add_lower = (
+                    (direction <= d_lower + bound_fix_tol) & finite_lower & free_mask
+                )
+                add_upper = (
+                    (direction >= d_upper - bound_fix_tol) & finite_upper & free_mask
+                )
+                add_set = add_lower | add_upper
+
+                Bd_cur = hvp_fn(direction)
+                grad_qp_cur = Bd_cur + g
+                cf = jnp.zeros_like(g)
+                if m_eq_static > 0:
+                    cf = cf + A_eq.T @ mult_combined[:m_eq_static]
+                if m_ineq_general > 0:
+                    cf = cf + A_ineq.T @ mult_combined[m_eq_static:]
+                reduced_grad_cur = grad_qp_cur - cf
+
+                at_lower_cur = ~free_mask & (d_fixed <= d_lower + bound_fix_tol)
+                at_upper_cur = ~free_mask & (d_fixed >= d_upper - bound_fix_tol)
+                drop_lower = at_lower_cur & (reduced_grad_cur < -bound_fix_tol)
+                drop_upper = at_upper_cur & (-reduced_grad_cur < -bound_fix_tol)
+                drop_set = drop_lower | drop_upper
+
+                any_change = jnp.any(add_set | drop_set)
+
+                new_free_mask = (free_mask & ~add_set) | drop_set
+                new_d_fixed = jnp.where(
+                    add_lower,
+                    d_lower,
+                    jnp.where(add_upper, d_upper, d_fixed),
+                )
+                new_d_fixed = jnp.where(drop_set, 0.0, new_d_fixed)
+
+                free_mask = jnp.where(any_change, new_free_mask, free_mask)
+                d_fixed = jnp.where(any_change, new_d_fixed, d_fixed)
+
+                any_fixed = ~jnp.all(free_mask)
+
+                d_new, mult_new, _ = _solve_projected_cg(
+                    hvp_fn,
+                    g,
+                    A_combined,
+                    b_combined,
+                    combined_active,
+                    self.qp_max_cg_iter,
+                    inner_cg_tol,
+                    precond_fn=precond_fn,
+                    cg_regularization=self.cg_regularization,
+                    free_mask=free_mask,
+                    d_fixed=d_fixed,
+                    use_constraint_preconditioner=self.use_exact_hvp_in_qp,
+                )
+
+                use_new = any_change & any_fixed
+                direction = jnp.where(use_new, d_new, direction)
+                mult_combined = jnp.where(use_new, mult_new, mult_combined)
+
+            at_lower_full = (direction <= d_lower + bound_fix_tol) & finite_lower
+            at_upper_full = (direction >= d_upper - bound_fix_tol) & finite_upper
+            any_bound_active = jnp.any(at_lower_full | at_upper_full)
+
+            mult_eq_final = jnp.where(
+                any_bound_active,
+                mult_combined[:m_eq_static],
+                qp_result.multipliers_eq,
+            )
+            mult_gen_final = (
+                jnp.where(
+                    any_bound_active,
+                    mult_combined[m_eq_static:],
+                    qp_result.multipliers_ineq,
+                )
+                if m_ineq_general > 0
+                else qp_result.multipliers_ineq
+            )
+
+            lower_idx = np.array(self._lower_indices)
+            upper_idx = np.array(self._upper_indices)
+
+            Bd = hvp_fn(direction)
+            grad_qp = Bd + g
+            constraint_force = jnp.zeros_like(g)
+            if self.n_eq_constraints > 0:
+                constraint_force = constraint_force + A_eq.T @ mult_eq_final
+            if m_ineq_general > 0:
+                constraint_force = constraint_force + A_ineq.T @ mult_gen_final
+            reduced_grad = grad_qp - constraint_force
+
+            at_lower = (
+                at_lower_full[lower_idx]
+                if len(lower_idx) > 0
+                else jnp.zeros((0,), dtype=bool)
+            )
+            at_upper = (
+                at_upper_full[upper_idx]
+                if len(upper_idx) > 0
+                else jnp.zeros((0,), dtype=bool)
+            )
+
+            bound_mult_lower = (
+                jnp.where(at_lower, reduced_grad[lower_idx], 0.0)
+                if len(lower_idx) > 0
+                else jnp.zeros((0,))
+            )
+            bound_mult_upper = (
+                jnp.where(at_upper, -reduced_grad[upper_idx], 0.0)
+                if len(upper_idx) > 0
+                else jnp.zeros((0,))
+            )
+
+            multipliers_eq = mult_eq_final
+            multipliers_ineq = jnp.concatenate(
+                [mult_gen_final, bound_mult_lower, bound_mult_upper]
+            )
+            active_set = jnp.concatenate([qp_result.active_set, at_lower, at_upper])
+        else:
+            multipliers_eq = qp_result.multipliers_eq
+            multipliers_ineq = qp_result.multipliers_ineq
+            active_set = qp_result.active_set
+
         return QPResult(
-            direction=qp_result.d,
-            multipliers_eq=qp_result.multipliers_eq,
-            multipliers_ineq=qp_result.multipliers_ineq,
-            active_set=qp_result.active_set,
+            direction=direction,
+            multipliers_eq=multipliers_eq,
+            multipliers_ineq=multipliers_ineq,
+            active_set=active_set,
             converged=qp_result.converged,
             iterations=qp_result.iterations,
         )

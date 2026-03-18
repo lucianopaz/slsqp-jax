@@ -253,6 +253,8 @@ def _solve_projected_cg(
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
+    free_mask: Bool[Array, " n"] | None = None,
+    d_fixed: Vector | None = None,
     use_constraint_preconditioner: bool = False,
 ) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
     """Solve equality-constrained QP using projected (preconditioned) CG.
@@ -260,16 +262,28 @@ def _solve_projected_cg(
     Solves:
         minimize    (1/2) d^T B d + g^T d
         subject to  A[active] d = b[active]
+                    d[i] = d_fixed[i]   for i where free_mask[i] is False
 
     where B is given implicitly via hvp_fn(v) = B @ v.
 
     The method:
     1. Computes a particular solution d_p satisfying A d_p = b for
-       active constraints.
+       active constraints (with fixed variables at their values).
     2. Defines the projection P(v) = v - A^T (A A^T)^{-1} A v onto
-       the null space of A (for active constraints only).
+       the null space of A (for active constraints only, in the
+       free-variable subspace when ``free_mask`` is provided).
     3. Runs CG on the reduced problem in the null space of A.
     4. Recovers Lagrange multipliers from the KKT conditions.
+
+    When ``free_mask`` and ``d_fixed`` are provided, bound-active
+    variables are fixed at their values.  The CG operates only on
+    free variables: the HVP is masked (zeroing fixed components),
+    the projection uses only free columns of A, and the effective
+    gradient accounts for the fixed-variable contribution.  This
+    reduces the effective constraint matrix size from
+    ``(m_eq + m_gen + m_bounds)`` to ``(m_eq + m_gen)``, dropping
+    the projection cost from ``O(m_total^3)`` to ``O(m_core^3)``
+    per CG step.
 
     When ``use_constraint_preconditioner`` is ``True`` and a
     preconditioner is provided, the constraint preconditioner
@@ -286,9 +300,6 @@ def _solve_projected_cg(
     This works well when the CG system matrix is the L-BFGS
     approximation itself (so ``M B ≈ I``).
 
-    The Cholesky factorization of AAt is computed once and reused for
-    all CG iterations via cho_solve, amortizing the O(m^3) cost.
-
     Args:
         hvp_fn: Hessian-vector product function v -> B @ v.
         g: Linear term (gradient of objective).
@@ -301,6 +312,14 @@ def _solve_projected_cg(
         cg_regularization: Minimum eigenvalue threshold for the curvature
             guard.  CG declares "bad curvature" when the projected
             eigenvalue falls below this value.  Based on SNOPT Section 4.5.
+        free_mask: Optional boolean mask (n,). When provided, only
+            variables with ``free_mask[i] = True`` are optimized;
+            the rest are fixed at ``d_fixed[i]``.  Used for
+            efficient bound handling without enlarging the
+            constraint matrix.
+        d_fixed: Values for fixed variables (n,).  Required when
+            ``free_mask`` is provided.  Entries where
+            ``free_mask[i] = True`` are ignored.
         use_constraint_preconditioner: When ``True`` and a preconditioner
             is provided, use the Gould-Hribar-Nocedal constraint
             preconditioner instead of the naive ``P(M(r))``.  Required
@@ -316,21 +335,39 @@ def _solve_projected_cg(
         budget.
     """
     m = A.shape[0]
+    has_fixed = free_mask is not None and d_fixed is not None
 
     A_masked = jnp.where(active_mask[:, None], A, 0.0)
     b_masked = jnp.where(active_mask, b, 0.0)
 
+    if has_fixed and free_mask is not None and d_fixed is not None:
+        # Zero out columns for fixed variables so the projection
+        # and particular solution only operate in the free subspace.
+        A_work = A_masked * free_mask[None, :]
+        b_work = b_masked - A_masked @ d_fixed
+    else:
+        A_work = A_masked
+        b_work = b_masked
+
     reg_diag = jnp.where(active_mask, 0.0, 1.0)
-    AAt = A_masked @ A_masked.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+    AAt = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
     AAt_chol = jnp.linalg.cholesky(AAt)
 
     def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
         return jax.scipy.linalg.cho_solve((AAt_chol, True), rhs)
 
-    d_p = A_masked.T @ solve_AAt(b_masked)
+    # Particular solution satisfying A d_p = b with fixed vars at d_fixed.
+    # Store narrowed references so all branches see the right types.
+    _free: Bool[Array, " n"] = (
+        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
+    )
+    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
+    d_p_free = A_work.T @ solve_AAt(b_work)
+    d_p = d_p_free + _dfixed if has_fixed else d_p_free
 
     def project(v: Vector) -> Vector:
-        return v - A_masked.T @ solve_AAt(A_masked @ v)
+        v_work = _free * v if has_fixed else v
+        return v_work - A_work.T @ solve_AAt(A_work @ v_work)
 
     # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
     # When the CG system matrix is the exact Hessian but the
@@ -340,8 +377,8 @@ def _solve_projected_cg(
     #   z = M r - M Aᵀ (A M Aᵀ)⁻¹ A M r
     if precond_fn is not None and use_constraint_preconditioner:
         _raw_precond = precond_fn
-        M_AT = jax.vmap(_raw_precond)(A_masked).T  # (n, m)
-        A_M_AT = A_masked @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+        M_AT = jax.vmap(_raw_precond)(A_work).T  # (n, m)
+        A_M_AT = A_work @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
         A_M_AT_chol = jnp.linalg.cholesky(A_M_AT)
 
         def _solve_AMAT(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
@@ -349,15 +386,25 @@ def _solve_projected_cg(
 
         def _constraint_precond(r: Vector) -> Vector:
             Mr = _raw_precond(r)
-            w = _solve_AMAT(A_masked @ Mr)
+            w = _solve_AMAT(A_work @ Mr)
             return Mr - M_AT @ w
 
         effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
     else:
         effective_precond = precond_fn
 
-    Bd_p = hvp_fn(d_p)
-    r0 = project(-(g + Bd_p))
+    if has_fixed:
+
+        def hvp_work(v: Vector) -> Vector:
+            return _free * hvp_fn(_free * v)
+
+        g_eff = _free * (g + hvp_fn(_dfixed))
+    else:
+        hvp_work = hvp_fn
+        g_eff = g
+
+    Bd_p = hvp_work(d_p)
+    r0 = project(-(g_eff + Bd_p))
     r0_norm_sq = jnp.dot(r0, r0)
 
     if effective_precond is not None:
@@ -380,7 +427,7 @@ def _solve_projected_cg(
     )
 
     cg_step = build_cg_step(
-        hvp_fn=hvp_fn,
+        hvp_fn=hvp_work,
         cg_tol=cg_tol,
         precond_fn=effective_precond,
         project=project,
@@ -389,8 +436,9 @@ def _solve_projected_cg(
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
+    # Multiplier recovery using the full (unmasked) HVP
     Bd = hvp_fn(final_cg.d)
-    kkt_residual = A_masked @ (Bd + g)
+    kkt_residual = A_work @ (Bd + g)
     multipliers = solve_AAt(kkt_residual)
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
