@@ -16,10 +16,13 @@ from slsqp_jax.hessian import (
     compute_lagrangian_gradient,
     lbfgs_append,
     lbfgs_compute_diagonal,
+    lbfgs_estimate_condition,
     lbfgs_hvp,
+    lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
     lbfgs_reset,
+    lbfgs_soft_reset,
 )
 from slsqp_jax.lpeca import (
     compute_lpeca_active_set,
@@ -67,7 +70,10 @@ __all__ = [
     "lbfgs_inverse_hvp",
     "lbfgs_append",
     "lbfgs_compute_diagonal",
+    "lbfgs_estimate_condition",
     "lbfgs_reset",
+    "lbfgs_soft_reset",
+    "lbfgs_identity_reset",
     # Merit function
     "LineSearchResult",
     "compute_merit",
