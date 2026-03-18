@@ -374,9 +374,24 @@ def lbfgs_append(
         # scalar normalizer, which produces d ∝ h_i^2 for multi-
         # component steps on diagonal problems, severely under-
         # estimating curvature and causing 10-100x slowdowns.
+        #
+        # Clipping is relative to gamma (the scalar average curvature)
+        # rather than absolute. On non-diagonal Hessians (e.g.
+        # Rosenbrock) the component-wise estimates are noisy: some
+        # variables see near-cancellation of off-diagonal terms while
+        # others see reinforcement, producing condition numbers of
+        # 1e7-1e8. Absolute clipping to [1e-2, 1e6] preserves this
+        # extreme spread, triggering the VARCHEN kappa > 1e6 soft
+        # reset every step and limiting L-BFGS to 1 pair. Gamma-
+        # relative clipping keeps kappa(B0) <= 1e4, preventing
+        # spurious resets while preserving genuine per-variable
+        # curvature differences (critical for ill-conditioned
+        # diagonal problems like WeightedQuad).
         s_sq = s**2
         per_var_estimate = jnp.abs(y_damped * s) / jnp.maximum(s_sq, 1e-12)
-        per_var_clipped = jnp.clip(per_var_estimate, 1e-2, 1e6)
+        clip_lo = jnp.maximum(gamma_new * 1e-2, 1e-6)
+        clip_hi = jnp.minimum(gamma_new * 1e2, 1e8)
+        per_var_clipped = jnp.clip(per_var_estimate, clip_lo, clip_hi)
         has_signal = s_sq > 1e-20
         new_diagonal = jnp.where(
             has_signal & jnp.isfinite(per_var_estimate),

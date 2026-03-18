@@ -211,7 +211,10 @@ class TestLBFGSDiagonalHVP:
         y = jnp.array([0.5, 0.3, 0.8, 0.4, 0.2])
         h2 = lbfgs_append(h, s, y)
 
-        expected = jnp.clip(jnp.abs(y * s) / jnp.maximum(s**2, 1e-12), 1e-2, 1e6)
+        gamma_new = jnp.dot(y, y) / jnp.maximum(jnp.dot(y, s), 1e-12)
+        clip_lo = jnp.maximum(gamma_new * 1e-2, 1e-6)
+        clip_hi = jnp.minimum(gamma_new * 1e2, 1e8)
+        expected = jnp.clip(jnp.abs(y * s) / jnp.maximum(s**2, 1e-12), clip_lo, clip_hi)
         np.testing.assert_allclose(h2.diagonal, expected, atol=1e-12)
 
 

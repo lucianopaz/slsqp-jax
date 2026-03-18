@@ -666,6 +666,7 @@ class TestIllConditionedBenchmark:
         solver = SLSQP(
             rtol=1e-8,
             atol=1e-8,
+            max_steps=500,
             eq_constraint_fn=prob["eq_constraint_jax"],
             n_eq_constraints=1,
             bounds=prob["bounds_jax"],
@@ -715,6 +716,7 @@ class TestIllConditionedBenchmark:
         solver = SLSQP(
             rtol=1e-8,
             atol=1e-8,
+            max_steps=500,
             eq_constraint_fn=prob["eq_constraint_jax"],
             n_eq_constraints=1,
             bounds=prob["bounds_jax"],
@@ -1131,6 +1133,7 @@ class TestDiagonalPreconditioner:
         solver = SLSQP(
             rtol=1e-8,
             atol=1e-8,
+            max_steps=500,
             eq_constraint_fn=prob["eq_constraint_jax"],
             n_eq_constraints=1,
             bounds=prob["bounds_jax"],
