@@ -291,9 +291,11 @@ def lbfgs_append(
 
     After appending, the scalar gamma is updated to
     y_damped^T y_damped / (y_damped^T s), clipped to [1e-2, 1e6].
-    The per-variable diagonal is updated using Shanno-Phua scaling:
-    d[i] = y_damped[i]^2 / (y_damped^T s), clipped to [1e-2, 1e6].
-    This captures per-variable curvature, unlike the scalar gamma * I.
+    The per-variable diagonal is updated using a component-wise secant:
+    d[i] = |y_damped[i] * s[i]| / (s[i]^2 + eps), clipped to [1e-2, 1e6].
+    This gives d[i] ≈ |H_{ii}| for diagonal Hessians regardless of step
+    direction, unlike the classical Shanno-Phua d[i] = y_i^2 / (y^T s)
+    which produces d ∝ h_i^2 for multi-component steps.
 
     Args:
         history: Current L-BFGS history.
@@ -364,16 +366,19 @@ def lbfgs_append(
             lambda: history.gamma,
         )
 
-        # Per-variable diagonal update (Shanno-Phua scaling).
-        # d[i] = y_i^2 / (y^T s) approximates the i-th diagonal entry
-        # of the Hessian.  Unlike the scalar gamma * ones(n), this
-        # captures per-variable curvature differences, which is critical
-        # for ill-conditioned problems where eigenvalues span many orders
-        # of magnitude.
-        per_var_estimate = y_damped**2 / jnp.maximum(yTs, 1e-12)
+        # Per-variable diagonal update (component-wise secant).
+        # d[i] = |y_i * s_i| / (s_i^2 + eps) ≈ |H_{ii}| for diagonal
+        # Hessians, regardless of the step direction.  The classical
+        # Shanno-Phua formula d[i] = y_i^2 / (y^T s) uses a single
+        # scalar normalizer, which produces d ∝ h_i^2 for multi-
+        # component steps on diagonal problems, severely under-
+        # estimating curvature and causing 10-100x slowdowns.
+        s_sq = s**2
+        per_var_estimate = jnp.abs(y_damped * s) / jnp.maximum(s_sq, 1e-12)
         per_var_clipped = jnp.clip(per_var_estimate, 1e-2, 1e6)
+        has_signal = s_sq > 1e-20
         new_diagonal = jnp.where(
-            (yTs > 1e-12) & jnp.all(jnp.isfinite(per_var_estimate)),
+            has_signal & jnp.isfinite(per_var_estimate),
             per_var_clipped,
             history.diagonal,
         )
