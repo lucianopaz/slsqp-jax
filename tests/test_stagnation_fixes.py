@@ -203,7 +203,7 @@ class TestLBFGSDiagonalHVP:
         np.testing.assert_allclose(roundtrip, v, atol=1e-5)
 
     def test_append_after_reset_uses_per_variable_diagonal(self):
-        """After lbfgs_append following a reset, diagonal uses Shanno-Phua scaling."""
+        """After lbfgs_append following a reset, diagonal uses component-wise secant."""
         h = self._build_nonuniform_history(5)
         assert not jnp.allclose(h.diagonal, h.gamma * jnp.ones(5))
 
@@ -211,8 +211,7 @@ class TestLBFGSDiagonalHVP:
         y = jnp.array([0.5, 0.3, 0.8, 0.4, 0.2])
         h2 = lbfgs_append(h, s, y)
 
-        yTs = jnp.dot(y, s)
-        expected = jnp.clip(y**2 / jnp.maximum(yTs, 1e-12), 1e-2, 1e6)
+        expected = jnp.clip(jnp.abs(y * s) / jnp.maximum(s**2, 1e-12), 1e-2, 1e6)
         np.testing.assert_allclose(h2.diagonal, expected, atol=1e-12)
 
 

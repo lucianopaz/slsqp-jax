@@ -750,7 +750,7 @@ class TestDampingThreshold:
 
 
 class TestPerVariableDiagonal:
-    """Tests for Shanno-Phua per-variable diagonal scaling."""
+    """Tests for component-wise secant per-variable diagonal scaling."""
 
     def test_diagonal_captures_scale_differences(self):
         """After L-BFGS updates, diagonal reflects per-variable curvature."""
