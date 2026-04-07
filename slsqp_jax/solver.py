@@ -1129,7 +1129,7 @@ class SLSQP(optx.AbstractMinimiser):
         # Initial merit for stagnation tracking
         initial_merit = compute_merit(f_val, eq_val, ineq_val, merit_penalty)
 
-        return SLSQPState(
+        return SLSQPState(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
             step_count=jnp.array(0),
             f_val=f_val,
             grad=grad,
@@ -1449,7 +1449,7 @@ class SLSQP(optx.AbstractMinimiser):
             jnp.min(new_lbfgs_history.diagonal), 1e-30
         )
         self.verbose(
-            num_steps=("Step", new_state.step_count),
+            num_steps=("Step", new_state.step_count),  # ty: ignore[unresolved-attribute]  # equinox @dataclass_transform
             objective=("f", f_val_new, ".6e"),
             constraint_violation=("|c|", c_viol, ".3e"),
             kkt_residual=("|∇L|", kkt, ".3e"),
@@ -1469,7 +1469,7 @@ class SLSQP(optx.AbstractMinimiser):
             ls_success=("LS ok", ls_result.success),
         )
 
-        return y_new, new_state, aux
+        return y_new, new_state, aux  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
 
     def terminate(
         self,
@@ -1929,7 +1929,7 @@ class SLSQP(optx.AbstractMinimiser):
             multipliers_ineq = qp_result.multipliers_ineq
             active_set = qp_result.active_set
 
-        return QPResult(
+        return QPResult(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
             direction=direction,
             multipliers_eq=multipliers_eq,
             multipliers_ineq=multipliers_ineq,

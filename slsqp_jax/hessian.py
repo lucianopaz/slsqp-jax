@@ -71,7 +71,7 @@ def lbfgs_init(n: int, memory: int) -> LBFGSHistory:
     Returns:
         An initialized LBFGSHistory with no stored pairs and gamma=1.
     """
-    return LBFGSHistory(
+    return LBFGSHistory(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
         s_history=jnp.zeros((memory, n)),
         y_history=jnp.zeros((memory, n)),
         gamma=jnp.array(1.0),
@@ -407,7 +407,9 @@ def lbfgs_append(
         new_count = jnp.minimum(history.count + 1, jnp.array(k))
         new_idx = (idx + 1) % k
 
-        new_history = LBFGSHistory(
+        # Build temporary history for condition estimation, then construct
+        # the final one with updated eigenvalue bounds.
+        tmp = LBFGSHistory(
             s_history=new_s_history,
             y_history=new_y_history,
             gamma=gamma_new,
@@ -417,15 +419,15 @@ def lbfgs_append(
             eig_lower=history.eig_lower,
             eig_upper=history.eig_upper,
         )
+        eig_lo, eig_hi = lbfgs_estimate_condition(tmp)  # ty: ignore[invalid-argument-type]  # equinox @dataclass_transform
 
-        eig_lo, eig_hi = lbfgs_estimate_condition(new_history)
         return LBFGSHistory(
-            s_history=new_history.s_history,
-            y_history=new_history.y_history,
-            gamma=new_history.gamma,
-            diagonal=new_history.diagonal,
-            count=new_history.count,
-            next_idx=new_history.next_idx,
+            s_history=new_s_history,
+            y_history=new_y_history,
+            gamma=gamma_new,
+            diagonal=new_diagonal,
+            count=new_count,
+            next_idx=new_idx,
             eig_lower=eig_lo,
             eig_upper=eig_hi,
         )
@@ -495,7 +497,7 @@ def lbfgs_soft_reset(
     eig_lo = jnp.min(1.0 / d_safe)
     eig_hi = jnp.max(1.0 / d_safe)
 
-    return LBFGSHistory(
+    return LBFGSHistory(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
         s_history=new_s_history,
         y_history=new_y_history,
         gamma=history.gamma,
@@ -598,7 +600,7 @@ def lbfgs_reset(
     eig_hi = jnp.max(1.0 / d_safe)
 
     k, n = history.s_history.shape
-    return LBFGSHistory(
+    return LBFGSHistory(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
         s_history=jnp.zeros((k, n)),
         y_history=jnp.zeros((k, n)),
         gamma=gamma_new,
@@ -623,7 +625,7 @@ def lbfgs_identity_reset(
     extracted diagonal perpetuates the same problematic scaling).
     """
     k, n = history.s_history.shape
-    return LBFGSHistory(
+    return LBFGSHistory(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
         s_history=jnp.zeros((k, n)),
         y_history=jnp.zeros((k, n)),
         gamma=jnp.array(1.0),

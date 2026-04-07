@@ -203,6 +203,8 @@ Classical SLSQP solves the QP subproblem by forming and factorising the $(n + m)
 
 Total cost per QP solve: $O(n \cdot k \cdot t)$, where $t$ is the number of CG iterations (typically $t << n$). Compared to $O(n^3)$ for the dense approach, this is orders of magnitude faster for $n > 1000$.
 
+**Multiplier iterative refinement.** The $A A^T$ factorization is regularised with $\varepsilon I$ ($\varepsilon = 10^{-8}$) for numerical stability, which introduces $O(\varepsilon \cdot \kappa(A A^T))$ error in the recovered multipliers. When many constraints are active and $\kappa$ is moderate (e.g. $10^3$), this error can reach $\sim 10^{-5}$ — large enough to prevent the outer convergence criterion from being satisfied even though the QP subproblem is solved to full accuracy. After the initial multiplier recovery $\hat\lambda = (A A^T + \varepsilon I)^{-1} A(Bd + g)$, one step of classical iterative refinement is applied: compute the primal KKT residual $r = Bd + g - A^T \hat\lambda$, then correct $\hat\lambda \leftarrow \hat\lambda + (A A^T + \varepsilon I)^{-1} A r$. This squares the relative error (e.g. from $10^{-5}$ to $10^{-10}$) at negligible cost since the Cholesky factor is already available.
+
 ### Reverse-mode AD and `while_loop`
 
 By default, the solver computes:
