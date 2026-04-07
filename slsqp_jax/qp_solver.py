@@ -442,6 +442,15 @@ def _solve_projected_cg(
     multipliers = solve_AAt(kkt_residual)
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
+    # Iterative refinement: the regularized Cholesky (AAt + eps*I) introduces
+    # O(eps * cond(AAt)) error in the multipliers.  One refinement step squares
+    # the relative error, e.g. from ~1e-5 to ~1e-10 for cond ~ 1e3.
+    grad_L_qp = Bd + g - A_work.T @ multipliers
+    refinement_rhs = A_work @ grad_L_qp
+    delta_mult = solve_AAt(refinement_rhs)
+    multipliers = multipliers + delta_mult
+    multipliers = jnp.where(active_mask, multipliers, 0.0)
+
     return final_cg.d, multipliers, final_cg.converged
 
 
