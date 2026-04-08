@@ -444,6 +444,16 @@ Combined with the L-BFGS soft reset (above), these mechanisms allow the solver t
 
 When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: soft reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
 
+### Zero-step convergence detection
+
+When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations, the solver declares **successful** convergence rather than waiting for the merit-based stagnation counter (which would report `nonlinear_divergence`).
+
+```python
+solver = SLSQP(
+    zero_step_patience=3,   # Default; declare convergence after 3 consecutive d≈0 steps
+)
+```
+
 ### Outer-loop stagnation detection
 
 Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress — for example, when the problem is infeasible, highly degenerate, or the QP solution is of poor quality. The solver detects this using a **merit-based patience counter**.

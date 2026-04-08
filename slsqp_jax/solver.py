@@ -157,6 +157,12 @@ class SLSQPState(eqx.Module):
     # Consecutive line search failure tracking for escalating L-BFGS recovery
     consecutive_ls_failures: Int[Array, ""]
 
+    # Zero-step convergence detection: consecutive iterations where the QP
+    # converged but returned ||d|| < atol, indicating the current point
+    # satisfies the QP's KKT conditions.
+    consecutive_zero_steps: Int[Array, ""]
+    qp_optimal: Bool[Array, ""]
+
     # Merit-based stagnation detection
     best_merit: Scalar
     steps_without_improvement: Int[Array, ""]
@@ -504,6 +510,12 @@ class SLSQP(optx.AbstractMinimiser):
     # individual failure a SNOPT diagonal reset is applied first; the
     # identity escalation fires only after the patience threshold.
     ls_failure_patience: int = 3
+
+    # Zero-step convergence: after this many consecutive iterations where
+    # the QP converges with ||d|| < atol, declare convergence.  The QP's
+    # KKT conditions are satisfied within cg_tol, so repeated d=0 steps
+    # mean the current point is a constrained optimum to QP precision.
+    zero_step_patience: int = 3
 
     # Stagnation detection: merit-based patience counter.
     # If the L1 merit function does not improve by at least
@@ -1148,6 +1160,8 @@ class SLSQP(optx.AbstractMinimiser):
             prev_active_set=jnp.zeros((m_ineq_total,), dtype=bool),
             consecutive_qp_failures=jnp.array(0),
             consecutive_ls_failures=jnp.array(0),
+            consecutive_zero_steps=jnp.array(0),
+            qp_optimal=jnp.array(False),
             best_merit=initial_merit,
             steps_without_improvement=jnp.array(0),
             stagnation=jnp.array(False),
@@ -1228,6 +1242,13 @@ class SLSQP(optx.AbstractMinimiser):
             fallback_direction,
             direction,
         )
+
+        # Zero-step convergence detection
+        is_zero_step = (jnp.linalg.norm(direction) < self.atol) & qp_result.converged
+        new_consecutive_zero_steps = jnp.where(
+            is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)
+        )
+        new_qp_optimal = new_consecutive_zero_steps >= self.zero_step_patience
 
         # Step 3: Update penalty parameter — only trust multipliers
         # from a converged QP to avoid permanently inflating rho.
@@ -1423,6 +1444,8 @@ class SLSQP(optx.AbstractMinimiser):
             prev_active_set=qp_result.active_set,
             consecutive_qp_failures=new_consecutive_qp_failures,
             consecutive_ls_failures=new_consecutive_ls_failures,
+            consecutive_zero_steps=new_consecutive_zero_steps,
+            qp_optimal=new_qp_optimal,
             best_merit=new_best_merit,
             steps_without_improvement=new_steps_without,
             stagnation=merit_stagnation,
@@ -1548,7 +1571,7 @@ class SLSQP(optx.AbstractMinimiser):
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
         has_min_steps = state.step_count >= self.min_steps
-        converged = stationarity & primal_feasible & has_min_steps
+        converged = (stationarity & primal_feasible & has_min_steps) | state.qp_optimal
 
         # Determine result code
         done = converged | max_iters_reached | stagnation_detected
