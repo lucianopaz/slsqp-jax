@@ -210,6 +210,56 @@ Total cost per QP solve: $O(n \cdot k \cdot t)$, where $t$ is the number of CG i
 
 **Multiplier iterative refinement.** The $A A^T$ factorization is regularised with $\varepsilon I$ ($\varepsilon = 10^{-8}$) for numerical stability, which introduces $O(\varepsilon \cdot \kappa(A A^T))$ error in the recovered multipliers. When many constraints are active and $\kappa$ is moderate (e.g. $10^3$), this error can reach $\sim 10^{-5}$ — large enough to prevent the outer convergence criterion from being satisfied even though the QP subproblem is solved to full accuracy. After the initial multiplier recovery $\hat\lambda = (A A^T + \varepsilon I)^{-1} A(Bd + g)$, one step of classical iterative refinement is applied: compute the primal KKT residual $r = Bd + g - A^T \hat\lambda$, then correct $\hat\lambda \leftarrow \hat\lambda + (A A^T + \varepsilon I)^{-1} A r$. This squares the relative error (e.g. from $10^{-5}$ to $10^{-10}$) at negligible cost since the Cholesky factor is already available.
 
+### Pluggable inner QP solvers
+
+The equality-constrained subproblem solved at each active-set iteration — minimise a quadratic subject to $A d = b$ for the currently active constraints — is delegated to a pluggable **inner solver**. All inner solvers implement the `AbstractInnerSolver` interface (an `equinox.Module`) and return an `InnerSolveResult` containing the search direction $d$, the Lagrange multipliers for the active constraints, and a convergence flag.
+
+Three strategies are provided:
+
+**`ProjectedCGCholesky`** (default). Null-space projected CG with Cholesky-based projection — the approach described in the previous section. Computes the Cholesky factorization of the regularised $A A^T + \varepsilon I$ once, then reuses it for all CG iterations and for multiplier recovery via iterative refinement. Cost: $O(m^3)$ factorization amortised over $t$ CG iterations, each costing $O(kn + m^2)$. Best when the number of active constraints $m$ is small relative to $n$.
+
+**`ProjectedCGCraig`**. Null-space projected CG with CRAIG's method (Golub-Kahan bidiagonalization) replacing the Cholesky factorization. Each projection computes the minimum-norm solution $x = A^T (A A^T)^{-1} b$ iteratively without forming $A A^T$, eliminating both the $O(m^3)$ factorization and the $\varepsilon I$ diagonal regularisation. This typically yields better equality constraint satisfaction since there is no regularisation bias. Multiplier recovery uses CG on the normal equations $A A^T \lambda = A(Bd + g)$. Cost: $O(mn \cdot t_{\text{craig}})$ per projection, where $t_{\text{craig}}$ is the number of CRAIG iterations (controlled by `craig_max_iter` and `craig_tol`).
+
+- Reference: Craig, *The Minimum Norm Solution of Certain Underdetermined Systems* (1981); Golub & Kahan, *Calculating the Singular Values and Pseudo-Inverse of a Matrix*, SIAM J. Numer. Anal. 2(2), 1965.
+
+**`MinresQLPSolver`**. Solves the full $(n + m) \times (n + m)$ saddle-point KKT system directly using MINRES-QLP:
+
+$$
+\begin{bmatrix} B & A^T \\ A & 0 \end{bmatrix}
+\begin{bmatrix} d \\ \lambda \end{bmatrix}
+=
+\begin{bmatrix} -g \\ b \end{bmatrix}
+$$
+
+This eliminates the need for null-space projection, particular solution computation, and separate multiplier recovery — the direction $d$ and multipliers $\lambda$ are obtained simultaneously. MINRES-QLP handles indefinite and singular systems natively, making it robust when the Hessian has negative curvature directions. An optional Schur complement preconditioner $S = A G^{-1} A^T$ (where $G = \text{diag}(B_0)$ is the L-BFGS diagonal) can accelerate convergence. Cost: $O((n + m) \cdot t_{\text{minres}})$ per solve, where $t_{\text{minres}}$ is the number of Lanczos iterations (controlled by `max_iter` and `tol`).
+
+- Reference: Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011.
+
+To use an alternative inner solver, construct the desired strategy and pass it to `SLSQP` (which forwards it to `solve_qp`):
+
+```python
+from slsqp_jax import SLSQP, ProjectedCGCraig, MinresQLPSolver
+
+# CRAIG-based projection (matrix-free, no regularisation)
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    inner_solver=ProjectedCGCraig(
+        max_cg_iter=50,
+        cg_tol=1e-8,
+        craig_tol=1e-12,
+        craig_max_iter=200,
+    ),
+)
+
+# MINRES-QLP on the full KKT system
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    inner_solver=MinresQLPSolver(max_iter=200, tol=1e-10),
+)
+```
+
 ### Reverse-mode AD and `while_loop`
 
 By default, the solver computes:

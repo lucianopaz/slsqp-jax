@@ -37,13 +37,14 @@ from slsqp_jax.hessian import (
     lbfgs_inverse_hvp,
     lbfgs_soft_reset,
 )
+from slsqp_jax.inner_solver import AbstractInnerSolver, ProjectedCGCholesky
 from slsqp_jax.lpeca import compute_lpeca_active_set
 from slsqp_jax.merit import (
     backtracking_line_search,
     compute_merit,
     update_penalty_parameter,
 )
-from slsqp_jax.qp_solver import _solve_projected_cg, solve_qp
+from slsqp_jax.qp_solver import solve_qp
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -334,6 +335,14 @@ class SLSQP(optx.AbstractMinimiser):
         lpeca_use_lp: When True, solve the LPEC-A LP to obtain tighter
             multiplier estimates before the threshold test.  Requires
             the ``mpax`` package.  Default False.
+        inner_solver: Optional pluggable inner QP solver strategy.  When
+            ``None`` (default), the solver constructs a
+            ``ProjectedCGCholesky`` with parameters derived from other
+            SLSQP settings.  Pass a ``ProjectedCGCraig`` or
+            ``MinresQLPSolver`` instance to use an alternative strategy
+            for the equality-constrained subproblem inside the QP
+            active-set loop.  See ``inner_solver.py`` for the
+            ``AbstractInnerSolver`` interface.
 
     Example:
         >>> import jax.numpy as jnp
@@ -429,6 +438,14 @@ class SLSQP(optx.AbstractMinimiser):
     # QP solver parameters
     qp_max_iter: int = eqx.field(static=True, default=100)
     qp_max_cg_iter: int = eqx.field(static=True, default=50)
+
+    # Pluggable inner QP solver strategy.  When None (default), the solver
+    # constructs a ProjectedCGCholesky with parameters derived from the
+    # other SLSQP settings (qp_max_cg_iter, atol, cg_regularization, etc.).
+    # To use an alternative strategy (ProjectedCGCraig or MinresQLPSolver),
+    # pass a fully-configured instance here.  The inner solver is forwarded
+    # to solve_qp and the bound-fixing loop unchanged.
+    inner_solver: Optional[AbstractInnerSolver] = eqx.field(static=True, default=None)
 
     # Newton-CG mode: use exact Lagrangian HVP (via AD) in the QP inner
     # loop instead of the L-BFGS approximation.  This costs one
@@ -1767,6 +1784,20 @@ class SLSQP(optx.AbstractMinimiser):
         else:
             adaptive_tol = None
 
+        inner_cg_tol = adaptive_tol if adaptive_tol is not None else self.atol
+        if self.inner_solver is not None:
+            inner_solver = cast(AbstractInnerSolver, self.inner_solver)
+        else:
+            inner_solver = cast(
+                AbstractInnerSolver,
+                ProjectedCGCholesky(
+                    max_cg_iter=self.qp_max_cg_iter,
+                    cg_tol=inner_cg_tol,
+                    cg_regularization=self.cg_regularization,
+                    use_constraint_preconditioner=self.use_exact_hvp_in_qp,
+                ),
+            )
+
         qp_result = solve_qp(
             hvp_fn=hvp_fn,
             g=g,
@@ -1787,6 +1818,7 @@ class SLSQP(optx.AbstractMinimiser):
             predicted_active_set=predicted_active_set,
             active_set_method=self.active_set_method,
             use_constraint_preconditioner=self.use_exact_hvp_in_qp,
+            inner_solver=inner_solver,
         )
 
         direction = qp_result.d
@@ -1868,20 +1900,18 @@ class SLSQP(optx.AbstractMinimiser):
 
                 any_fixed = ~jnp.all(free_mask)
 
-                d_new, mult_new, _ = _solve_projected_cg(
+                bound_result = inner_solver.solve(
                     hvp_fn,
                     g,
                     A_combined,
                     b_combined,
                     combined_active,
-                    self.qp_max_cg_iter,
-                    inner_cg_tol,
                     precond_fn=precond_fn,
-                    cg_regularization=self.cg_regularization,
                     free_mask=free_mask,
                     d_fixed=d_fixed,
-                    use_constraint_preconditioner=self.use_exact_hvp_in_qp,
                 )
+                d_new = bound_result.d
+                mult_new = bound_result.multipliers
 
                 use_new = any_change & any_fixed
                 direction = jnp.where(use_new, d_new, direction)
