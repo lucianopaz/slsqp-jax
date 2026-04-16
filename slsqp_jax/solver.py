@@ -1588,7 +1588,9 @@ class SLSQP(optx.AbstractMinimiser):
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
         has_min_steps = state.step_count >= self.min_steps
-        converged = (stationarity & primal_feasible & has_min_steps) | state.qp_optimal
+        converged = (stationarity & primal_feasible & has_min_steps) | (
+            state.qp_optimal & primal_feasible
+        )
 
         # Determine result code
         done = converged | max_iters_reached | stagnation_detected
