@@ -8,10 +8,10 @@ The QP subproblem has the form:
     subject to  A_eq d = b_eq
                 A_ineq d >= b_ineq
 
-The solver uses a **projected conjugate gradient** method for the inner
-equality-constrained QP solve, wrapped in an **active-set** method for
-inequality constraints. The Hessian is accessed only through a
-Hessian-vector product (HVP) function, enabling matrix-free operation
+The solver uses a pluggable inner solver (see ``inner_solver.py``) for
+the equality-constrained QP subproblem, wrapped in an **active-set**
+method for inequality constraints. The Hessian is accessed only through
+a Hessian-vector product (HVP) function, enabling matrix-free operation
 for large-scale problems (n > 5000).
 
 For inequality constraints A d >= b, the Lagrangian is:
@@ -36,7 +36,7 @@ infeasibility at degenerate vertices.
 """
 
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import equinox as eqx
 import jax
@@ -44,6 +44,11 @@ import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int, jaxtyped
 
+from slsqp_jax.inner_solver import (
+    AbstractInnerSolver,
+    ProjectedCGCholesky,
+    solve_unconstrained_cg,
+)
 from slsqp_jax.types import Scalar, Vector
 
 
@@ -69,391 +74,6 @@ class QPResult(NamedTuple):
     iterations: Int[Array, ""]
 
 
-class _CGState(NamedTuple):
-    """Internal state for the (preconditioned) conjugate gradient solver.
-
-    When a preconditioner M is used, ``rz`` stores r^T z (where z = M r)
-    instead of r^T r, and ``p`` is built from z rather than r.
-    """
-
-    d: Vector
-    r: Vector
-    p: Vector
-    rz: Scalar  # r^T z (preconditioned) or r^T r (unpreconditioned)
-    iteration: Int[Array, ""]
-    converged: Bool[Array, ""]
-
-
-def build_cg_step(
-    hvp_fn,
-    cg_tol: Scalar | float,
-    precond_fn: Callable[[Vector], Vector] | None = None,
-    project: Callable[[Vector], Vector] | None = None,
-    cg_regularization: float = 1e-6,
-):
-    """Build a CG step function.
-
-    Args:
-        hvp_fn: Hessian-vector product function v -> B @ v.
-        cg_tol: Convergence tolerance on residual norm.
-        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
-        project: Optional projection function v -> P(v) where P is the projection onto the null space of A.
-        cg_regularization: Minimum eigenvalue threshold for the curvature guard.
-
-    Returns:
-        A CG step function.
-    """
-    if project is None:
-
-        def project(v: Vector) -> Vector:
-            return v
-
-    def cg_step(i, state):
-        def do_step(state: _CGState) -> _CGState:
-            Bp = hvp_fn(state.p)
-            PBp = project(Bp)
-            pPBp = jnp.dot(state.p, PBp)
-
-            # SNOPT-style curvature guard (see unconstrained CG for detail).
-            # For projected CG, p is in the null space, so this checks the
-            # effective eigenvalue of the reduced Hessian Z^T B Z along p.
-            pp = jnp.dot(state.p, state.p)
-            has_bad_curvature = pPBp <= cg_regularization * pp
-
-            alpha = jnp.where(
-                has_bad_curvature,
-                jnp.array(0.0),
-                state.rz / jnp.maximum(pPBp, 1e-30),
-            )
-
-            d_new = state.d + alpha * state.p
-            r_new = state.r - alpha * PBp
-            r_new_norm_sq = jnp.dot(r_new, r_new)
-
-            if precond_fn is not None:
-                z_new_raw = project(precond_fn(r_new))
-                rz_raw = jnp.dot(r_new, z_new_raw)
-                z_new = jnp.where(rz_raw > 0, z_new_raw, r_new)
-                rz_new = jnp.where(rz_raw > 0, rz_raw, r_new_norm_sq)
-            else:
-                z_new = r_new
-                rz_new = r_new_norm_sq
-
-            beta = rz_new / jnp.maximum(state.rz, 1e-30)
-            p_new = z_new + beta * state.p
-
-            converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
-
-            return jax.lax.cond(
-                has_bad_curvature,
-                lambda: _CGState(
-                    d=state.d,
-                    r=state.r,
-                    p=state.p,
-                    rz=state.rz,
-                    iteration=state.iteration + 1,
-                    converged=jnp.array(True),
-                ),
-                lambda: _CGState(
-                    d=d_new,
-                    r=r_new,
-                    p=p_new,
-                    rz=rz_new,
-                    iteration=state.iteration + 1,
-                    converged=converged,
-                ),
-            )
-
-        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
-
-    return cg_step
-
-
-def _solve_unconstrained_cg(
-    hvp_fn: Callable[[Vector], Vector],
-    g: Vector,
-    max_cg_iter: int,
-    cg_tol: Scalar | float,
-    precond_fn: Callable[[Vector], Vector] | None = None,
-    cg_regularization: float = 1e-6,
-) -> tuple[Vector, Bool[Array, ""]]:
-    """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
-
-    Uses (preconditioned) conjugate gradient to solve B d = -g without
-    forming B.  When *precond_fn* is provided, the standard PCG algorithm
-    is used: z = M r, beta = r_new^T z_new / r_old^T z_old, and p is
-    built from z (Nocedal & Wright, Algorithm 5.3).
-
-    Args:
-        hvp_fn: Hessian-vector product function v -> B @ v.
-        g: Linear term (gradient).
-        max_cg_iter: Maximum CG iterations.
-        cg_tol: Convergence tolerance on residual norm.
-        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
-        cg_regularization: Minimum eigenvalue threshold for the curvature
-            guard.  CG declares "bad curvature" when the effective
-            eigenvalue ``p^T B p / ||p||^2`` falls below this value.
-            Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
-
-    Returns:
-        Tuple of (d, converged) where d is the solution vector and
-        converged indicates whether CG converged (residual below
-        tolerance) as opposed to hitting bad curvature or exhausting
-        the iteration budget.
-    """
-    # Sign convention: we define the residual as r = b - Ax = -g - Bd
-    # (the "negative residual"), whereas Nocedal & Wright Algorithm 5.3 uses
-    # r = Ax - b = Bd + g. So r_here = -r_NW throughout. The sign flip
-    # propagates to z (via the preconditioner) but cancels in the scalar
-    # products that define alpha, beta, and the search direction p, so those
-    # quantities are identical to the textbook. See the summary table in
-    # cg_sign_convention_analysis for the full derivation.
-    n = g.shape[0]
-    r0 = -g
-    r0_norm_sq = jnp.dot(r0, r0)
-
-    if precond_fn is not None:
-        z0 = precond_fn(r0)
-        rz0_raw = jnp.dot(r0, z0)
-        # Fall back to identity if preconditioner is not SPD for this residual
-        z0 = jnp.where(rz0_raw > 0, z0, r0)
-        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
-        p0 = z0
-    else:
-        rz0 = r0_norm_sq
-        p0 = r0
-
-    init_cg = _CGState(
-        d=jnp.zeros(n),
-        r=r0,
-        p=p0,
-        rz=rz0,
-        iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
-    )
-
-    cg_step = build_cg_step(
-        hvp_fn=hvp_fn,
-        cg_tol=cg_tol,
-        precond_fn=precond_fn,
-        cg_regularization=cg_regularization,
-    )
-
-    final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
-    return final_cg.d, final_cg.converged
-
-
-def _solve_projected_cg(
-    hvp_fn: Callable[[Vector], Vector],
-    g: Vector,
-    A: Float[Array, "m n"],
-    b: Float[Array, " m"],
-    active_mask: Bool[Array, " m"],
-    max_cg_iter: int,
-    cg_tol: Scalar | float,
-    precond_fn: Callable[[Vector], Vector] | None = None,
-    cg_regularization: float = 1e-6,
-    free_mask: Bool[Array, " n"] | None = None,
-    d_fixed: Vector | None = None,
-    use_constraint_preconditioner: bool = False,
-) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
-    """Solve equality-constrained QP using projected (preconditioned) CG.
-
-    Solves:
-        minimize    (1/2) d^T B d + g^T d
-        subject to  A[active] d = b[active]
-                    d[i] = d_fixed[i]   for i where free_mask[i] is False
-
-    where B is given implicitly via hvp_fn(v) = B @ v.
-
-    The method:
-    1. Computes a particular solution d_p satisfying A d_p = b for
-       active constraints (with fixed variables at their values).
-    2. Defines the projection P(v) = v - A^T (A A^T)^{-1} A v onto
-       the null space of A (for active constraints only, in the
-       free-variable subspace when ``free_mask`` is provided).
-    3. Runs CG on the reduced problem in the null space of A.
-    4. Recovers Lagrange multipliers from the KKT conditions.
-
-    When ``free_mask`` and ``d_fixed`` are provided, bound-active
-    variables are fixed at their values.  The CG operates only on
-    free variables: the HVP is masked (zeroing fixed components),
-    the projection uses only free columns of A, and the effective
-    gradient accounts for the fixed-variable contribution.  This
-    reduces the effective constraint matrix size from
-    ``(m_eq + m_gen + m_bounds)`` to ``(m_eq + m_gen)``, dropping
-    the projection cost from ``O(m_total^3)`` to ``O(m_core^3)``
-    per CG step.
-
-    When ``use_constraint_preconditioner`` is ``True`` and a
-    preconditioner is provided, the constraint preconditioner
-    (Gould, Hribar & Nocedal, 2001) is used instead of the naive
-    ``P(M(r))``.  This solves the saddle-point system to produce
-    ``z = Mr - M Aᵀ (A M Aᵀ)⁻¹ A M r``, preserving the
-    ``M⁻¹``-inner product in null(A).  This is essential when the
-    CG system matrix differs from ``M⁻¹`` (e.g. exact Hessian HVP
-    with L-BFGS preconditioner), where the naive formulation
-    destroys preconditioning quality.
-
-    When ``use_constraint_preconditioner`` is ``False`` (default),
-    the simpler projected preconditioner ``z = P(M(P(r)))`` is used.
-    This works well when the CG system matrix is the L-BFGS
-    approximation itself (so ``M B ≈ I``).
-
-    Args:
-        hvp_fn: Hessian-vector product function v -> B @ v.
-        g: Linear term (gradient of objective).
-        A: Combined constraint matrix (m x n), rows are constraint normals.
-        b: Combined RHS vector (m,).
-        active_mask: Boolean mask (m,) indicating which constraints are active.
-        max_cg_iter: Maximum CG iterations.
-        cg_tol: CG convergence tolerance.
-        precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
-        cg_regularization: Minimum eigenvalue threshold for the curvature
-            guard.  CG declares "bad curvature" when the projected
-            eigenvalue falls below this value.  Based on SNOPT Section 4.5.
-        free_mask: Optional boolean mask (n,). When provided, only
-            variables with ``free_mask[i] = True`` are optimized;
-            the rest are fixed at ``d_fixed[i]``.  Used for
-            efficient bound handling without enlarging the
-            constraint matrix.
-        d_fixed: Values for fixed variables (n,).  Required when
-            ``free_mask`` is provided.  Entries where
-            ``free_mask[i] = True`` are ignored.
-        use_constraint_preconditioner: When ``True`` and a preconditioner
-            is provided, use the Gould-Hribar-Nocedal constraint
-            preconditioner instead of the naive ``P(M(r))``.  Required
-            when the CG system matrix differs from the preconditioner's
-            inverse (e.g. exact Hessian HVP with L-BFGS preconditioner).
-
-    Returns:
-        Tuple of (d, multipliers, cg_converged) where d is the solution,
-        multipliers is a vector of Lagrange multipliers for all m
-        constraints (0 for inactive), and cg_converged indicates whether
-        the inner CG solver converged (residual below tolerance) as
-        opposed to hitting bad curvature or exhausting the iteration
-        budget.
-    """
-    m = A.shape[0]
-    has_fixed = free_mask is not None and d_fixed is not None
-
-    A_masked = jnp.where(active_mask[:, None], A, 0.0)
-    b_masked = jnp.where(active_mask, b, 0.0)
-
-    if has_fixed and free_mask is not None and d_fixed is not None:
-        # Zero out columns for fixed variables so the projection
-        # and particular solution only operate in the free subspace.
-        A_work = A_masked * free_mask[None, :]
-        b_work = b_masked - A_masked @ d_fixed
-    else:
-        A_work = A_masked
-        b_work = b_masked
-
-    reg_diag = jnp.where(active_mask, 0.0, 1.0)
-    AAt = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
-    AAt_chol = jnp.linalg.cholesky(AAt)
-
-    def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        return jax.scipy.linalg.cho_solve((AAt_chol, True), rhs)
-
-    # Particular solution satisfying A d_p = b with fixed vars at d_fixed.
-    # Store narrowed references so all branches see the right types.
-    _free: Bool[Array, " n"] = (
-        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
-    )
-    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
-    d_p_free = A_work.T @ solve_AAt(b_work)
-    d_p = d_p_free + _dfixed if has_fixed else d_p_free
-
-    def project(v: Vector) -> Vector:
-        v_work = _free * v if has_fixed else v
-        return v_work - A_work.T @ solve_AAt(A_work @ v_work)
-
-    # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
-    # When the CG system matrix is the exact Hessian but the
-    # preconditioner M ≈ B⁻¹ is only approximate (L-BFGS or diagonal),
-    # the naive P(M(r)) destroys preconditioning quality.  The correct
-    # formulation solves the augmented saddle-point system:
-    #   z = M r - M Aᵀ (A M Aᵀ)⁻¹ A M r
-    if precond_fn is not None and use_constraint_preconditioner:
-        _raw_precond = precond_fn
-        M_AT = jax.vmap(_raw_precond)(A_work).T  # (n, m)
-        A_M_AT = A_work @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
-        A_M_AT_chol = jnp.linalg.cholesky(A_M_AT)
-
-        def _solve_AMAT(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-            return jax.scipy.linalg.cho_solve((A_M_AT_chol, True), rhs)
-
-        def _constraint_precond(r: Vector) -> Vector:
-            Mr = _raw_precond(r)
-            w = _solve_AMAT(A_work @ Mr)
-            return Mr - M_AT @ w
-
-        effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
-    else:
-        effective_precond = precond_fn
-
-    if has_fixed:
-
-        def hvp_work(v: Vector) -> Vector:
-            return _free * hvp_fn(_free * v)
-
-        g_eff = _free * (g + hvp_fn(_dfixed))
-    else:
-        hvp_work = hvp_fn
-        g_eff = g
-
-    Bd_p = hvp_work(d_p)
-    r0 = project(-(g_eff + Bd_p))
-    r0_norm_sq = jnp.dot(r0, r0)
-
-    if effective_precond is not None:
-        z0 = project(effective_precond(r0))
-        rz0_raw = jnp.dot(r0, z0)
-        z0 = jnp.where(rz0_raw > 0, z0, r0)
-        rz0 = jnp.where(rz0_raw > 0, rz0_raw, r0_norm_sq)
-        p0 = z0
-    else:
-        rz0 = r0_norm_sq
-        p0 = r0
-
-    init_cg = _CGState(
-        d=d_p,
-        r=r0,
-        p=p0,
-        rz=rz0,
-        iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
-    )
-
-    cg_step = build_cg_step(
-        hvp_fn=hvp_work,
-        cg_tol=cg_tol,
-        precond_fn=effective_precond,
-        project=project,
-        cg_regularization=cg_regularization,
-    )
-
-    final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
-
-    # Multiplier recovery using the full (unmasked) HVP
-    Bd = hvp_fn(final_cg.d)
-    kkt_residual = A_work @ (Bd + g)
-    multipliers = solve_AAt(kkt_residual)
-    multipliers = jnp.where(active_mask, multipliers, 0.0)
-
-    # Iterative refinement: the regularized Cholesky (AAt + eps*I) introduces
-    # O(eps * cond(AAt)) error in the multipliers.  One refinement step squares
-    # the relative error, e.g. from ~1e-5 to ~1e-10 for cond ~ 1e3.
-    grad_L_qp = Bd + g - A_work.T @ multipliers
-    refinement_rhs = A_work @ grad_L_qp
-    delta_mult = solve_AAt(refinement_rhs)
-    multipliers = multipliers + delta_mult
-    multipliers = jnp.where(active_mask, multipliers, 0.0)
-
-    return final_cg.d, multipliers, final_cg.converged
-
-
 def _solve_qp_proximal(
     hvp_fn: Callable[[Vector], Vector],
     g: Vector,
@@ -471,12 +91,12 @@ def _solve_qp_proximal(
     kkt_residual: Scalar | float,
     proximal_mu: Scalar | float,
     prev_multipliers_eq: Float[Array, " m_eq"] | None,
+    inner_solver: AbstractInnerSolver,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
-    use_constraint_preconditioner: bool = False,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -509,11 +129,8 @@ def _solve_qp_proximal(
         return prev_mult_eq - inv_mu * (A_eq @ d - b_eq)
 
     # Sub-case: no inequality constraints — just unconstrained CG.
-    # The QP always "succeeds" here (no active-set that can fail).
-    # Truncated CG still gives a valid descent direction for the
-    # quadratic model, so QPResult.converged is always True.
     if m_ineq == 0:
-        d, _cg_converged = _solve_unconstrained_cg(
+        d, _cg_converged = solve_unconstrained_cg(
             stabilized_hvp,
             g_mod,
             max_cg_iter,
@@ -535,7 +152,7 @@ def _solve_qp_proximal(
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
 
     # Initial unconstrained solve (equalities absorbed into objective)
-    d_init, _ = _solve_unconstrained_cg(
+    d_init, _ = solve_unconstrained_cg(
         stabilized_hvp,
         g_mod,
         max_cg_iter,
@@ -574,18 +191,16 @@ def _solve_qp_proximal(
         working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set — inequalities only
-        d_new, mult_ineq_new, _ = _solve_projected_cg(
+        result = inner_solver.solve(
             stabilized_hvp,
             g_mod,
             A_ineq,
             b_ineq,
             state.active_set,
-            max_cg_iter,
-            inner_cg_tol,
             precond_fn=precond_fn,
-            cg_regularization=cg_regularization,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
+        d_new = result.d
+        mult_ineq_new = result.multipliers
 
         mult_eq_new = _recover_mult_eq(d_new)
 
@@ -668,32 +283,29 @@ def _solve_qp_direct(
     m_eq: int,
     m_ineq: int,
     max_iter: int,
-    max_cg_iter: int,
     tol: Scalar | float,
     expand_factor: float,
     initial_active_set: Bool[Array, " m_ineq"] | None,
     kkt_residual: Scalar | float,
+    inner_solver: AbstractInnerSolver,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_tol: Scalar | float | None = None,
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
-    use_constraint_preconditioner: bool = False,
 ) -> QPResult:
     """Solve the QP with equality constraints enforced via direct projection.
 
     Unlike ``_solve_qp_proximal``, equality constraints are not absorbed
     into the objective via an augmented-Lagrangian penalty.  Instead,
-    they are enforced exactly through the null-space projector in
-    ``_solve_projected_cg``.  This avoids the ill-conditioning from the
+    they are enforced exactly through the null-space projector in the
+    inner solver.  This avoids the ill-conditioning from the
     ``(1/mu) A_eq^T A_eq`` proximal term.
 
     A combined constraint matrix ``[A_eq; A_ineq]`` is formed.  Equality
     rows are permanently active; the active-set loop only adds/drops
     inequality rows.
     """
-    inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
-
     A_combined = jnp.concatenate([A_eq, A_ineq], axis=0)
     b_combined = jnp.concatenate([b_eq, b_ineq], axis=0)
     eq_active = jnp.ones(m_eq, dtype=bool)
@@ -704,21 +316,17 @@ def _solve_qp_direct(
         # Truncated CG still gives a valid descent direction for the
         # quadratic model, so QPResult.converged is always True.
         combined_active = eq_active
-        d, multipliers, _cg_converged = _solve_projected_cg(
+        result = inner_solver.solve(
             hvp_fn,
             g,
             A_combined,
             b_combined,
             combined_active,
-            max_cg_iter,
-            inner_cg_tol,
             precond_fn=precond_fn,
-            cg_regularization=cg_regularization,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
         return QPResult(
-            d=d,
-            multipliers_eq=multipliers[:m_eq],
+            d=result.d,
+            multipliers_eq=result.multipliers[:m_eq],
             multipliers_ineq=jnp.zeros((0,)),
             active_set=jnp.zeros((0,), dtype=bool),
             converged=jnp.array(True),
@@ -730,18 +338,16 @@ def _solve_qp_direct(
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
 
     # Initial solve with equalities only (inequalities inactive).
-    d_init, mult_init, _ = _solve_projected_cg(
+    init_result = inner_solver.solve(
         hvp_fn,
         g,
         A_combined,
         b_combined,
         jnp.concatenate([eq_active, jnp.zeros(m_ineq, dtype=bool)]),
-        max_cg_iter,
-        inner_cg_tol,
         precond_fn=precond_fn,
-        cg_regularization=cg_regularization,
-        use_constraint_preconditioner=use_constraint_preconditioner,
     )
+    d_init = init_result.d
+    mult_init = init_result.multipliers
 
     residuals_init = A_ineq @ d_init - b_ineq
     if predicted_active_set is not None:
@@ -771,18 +377,16 @@ def _solve_qp_direct(
         working_tol = base_tol + state.iteration * effective_tau
 
         combined_active = jnp.concatenate([eq_active, state.active_set])
-        d_new, mult_all, _ = _solve_projected_cg(
+        result = inner_solver.solve(
             hvp_fn,
             g,
             A_combined,
             b_combined,
             combined_active,
-            max_cg_iter,
-            inner_cg_tol,
             precond_fn=precond_fn,
-            cg_regularization=cg_regularization,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
+        d_new = result.d
+        mult_all = result.multipliers
 
         mult_eq_new = mult_all[:m_eq]
         mult_ineq_new = mult_all[m_eq:]
@@ -875,6 +479,7 @@ def solve_qp(
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     active_set_method: str = "expand",
     use_constraint_preconditioner: bool = False,
+    inner_solver: AbstractInnerSolver | None = None,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -888,7 +493,8 @@ def solve_qp(
 
     Uses a primal active-set method: at each iteration, active inequality
     constraints are treated as equalities, and the resulting
-    equality-constrained QP is solved using projected conjugate gradient.
+    equality-constrained QP is solved using the provided ``inner_solver``
+    (defaulting to projected CG with Cholesky projection).
     Constraints are added/removed from the active set based on
     feasibility violations and multiplier signs until optimality is reached.
 
@@ -918,7 +524,8 @@ def solve_qp(
         A_ineq: Inequality constraint matrix (m_ineq x n).
         b_ineq: Inequality constraint RHS (m_ineq,).
         max_iter: Maximum active-set iterations.
-        max_cg_iter: Maximum CG iterations per active-set step.
+        max_cg_iter: Maximum CG iterations per active-set step.  Used
+            to construct a default ``inner_solver`` when none is provided.
         tol: Feasibility and optimality tolerance.
         expand_factor: Controls the EXPAND tolerance growth rate.
             The per-iteration increment is ``tol * expand_factor / max_iter``.
@@ -982,6 +589,15 @@ def solve_qp(
               initialization and runs with a fixed tolerance (no
               EXPAND growth).  Relies on LPEC-A accuracy for
               anti-cycling; ``max_iter`` provides a hard stop.
+        use_constraint_preconditioner: When ``True`` and a preconditioner
+            is provided, use the Gould-Hribar-Nocedal constraint
+            preconditioner.  Only used when constructing a default
+            ``inner_solver``.
+        inner_solver: Pluggable strategy for the inner
+            equality-constrained QP solve.  When ``None`` (default),
+            a ``ProjectedCGCholesky`` is constructed from the
+            ``max_cg_iter``, ``cg_regularization``, and
+            ``use_constraint_preconditioner`` arguments.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -1007,9 +623,21 @@ def solve_qp(
     # Resolve CG tolerance: use cg_tol if provided, else fall back to tol.
     inner_cg_tol: Scalar | float = cg_tol if cg_tol is not None else tol
 
+    # Construct default inner solver when none is provided.
+    if inner_solver is None:
+        inner_solver = cast(
+            AbstractInnerSolver,
+            ProjectedCGCholesky(
+                max_cg_iter=max_cg_iter,
+                cg_tol=inner_cg_tol,
+                cg_regularization=cg_regularization,
+                use_constraint_preconditioner=use_constraint_preconditioner,
+            ),
+        )
+
     # Case 1: No constraints at all — truncated CG is always valid.
     if m_total == 0:
-        d, _cg_converged = _solve_unconstrained_cg(
+        d, _cg_converged = solve_unconstrained_cg(
             hvp_fn,
             g,
             max_cg_iter,
@@ -1046,12 +674,12 @@ def solve_qp(
             kkt_residual=kkt_residual,
             proximal_mu=proximal_mu,
             prev_multipliers_eq=prev_multipliers_eq,
+            inner_solver=inner_solver,
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
     # ---- Direct projection path (no proximal) ----
@@ -1067,23 +695,22 @@ def solve_qp(
             m_eq=m_eq,
             m_ineq=m_ineq,
             max_iter=max_iter,
-            max_cg_iter=max_cg_iter,
             tol=tol,
             expand_factor=expand_factor,
             initial_active_set=initial_active_set,
             kkt_residual=kkt_residual,
+            inner_solver=inner_solver,
             precond_fn=precond_fn,
             cg_tol=inner_cg_tol,
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
 
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
 
     # Unconstrained initial solve
-    d_init, _ = _solve_unconstrained_cg(
+    d_init, _ = solve_unconstrained_cg(
         hvp_fn,
         g,
         max_cg_iter,
@@ -1125,18 +752,16 @@ def solve_qp(
         working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set using projected CG (ineq only)
-        d_new, mult_ineq_new, _ = _solve_projected_cg(
+        result = inner_solver.solve(
             hvp_fn,
             g,
             A_ineq,
             b_ineq,
             state.active_set,
-            max_cg_iter,
-            inner_cg_tol,
             precond_fn=precond_fn,
-            cg_regularization=cg_regularization,
-            use_constraint_preconditioner=use_constraint_preconditioner,
         )
+        d_new = result.d
+        mult_ineq_new = result.multipliers
 
         # Check feasibility with expanding tolerance (stricter activation)
         residuals = A_ineq @ d_new - b_ineq

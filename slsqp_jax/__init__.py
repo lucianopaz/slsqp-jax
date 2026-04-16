@@ -25,6 +25,13 @@ from slsqp_jax.hessian import (
     lbfgs_reset,
     lbfgs_soft_reset,
 )
+from slsqp_jax.inner_solver import (
+    AbstractInnerSolver,
+    InnerSolveResult,
+    MinresQLPSolver,
+    ProjectedCGCholesky,
+    ProjectedCGCraig,
+)
 from slsqp_jax.lpeca import (
     compute_lpeca_active_set,
     compute_rho_bar,
@@ -62,6 +69,12 @@ __all__ = [
     "ParsedConstraints",
     "parse_constraints",
     "minimize_like_scipy",
+    # Inner solver strategies
+    "AbstractInnerSolver",
+    "InnerSolveResult",
+    "MinresQLPSolver",
+    "ProjectedCGCholesky",
+    "ProjectedCGCraig",
     # QP solver
     "solve_qp",
     # L-BFGS
