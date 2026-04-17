@@ -150,6 +150,7 @@ def _solve_qp_proximal(
     # Sub-case: inequalities present — active-set loop on A_ineq only
     kkt_res = jnp.asarray(kkt_residual, dtype=jnp.float64)
     base_tol = tol + jnp.minimum(kkt_res, 1.0) * tol
+    _adaptive_tol: Scalar | float | None = cg_tol
 
     # Initial unconstrained solve (equalities absorbed into objective)
     d_init, _ = solve_unconstrained_cg(
@@ -198,6 +199,7 @@ def _solve_qp_proximal(
             b_ineq,
             state.active_set,
             precond_fn=precond_fn,
+            adaptive_tol=_adaptive_tol,
         )
         d_new = result.d
         mult_ineq_new = result.multipliers
@@ -310,6 +312,8 @@ def _solve_qp_direct(
     b_combined = jnp.concatenate([b_eq, b_ineq], axis=0)
     eq_active = jnp.ones(m_eq, dtype=bool)
 
+    _adaptive_tol: Scalar | float | None = cg_tol
+
     if m_ineq == 0:
         # Equality-only: single projected CG solve, no active-set loop.
         # The QP always "succeeds" here (no active-set that can fail).
@@ -323,6 +327,7 @@ def _solve_qp_direct(
             b_combined,
             combined_active,
             precond_fn=precond_fn,
+            adaptive_tol=_adaptive_tol,
         )
         return QPResult(
             d=result.d,
@@ -345,6 +350,7 @@ def _solve_qp_direct(
         b_combined,
         jnp.concatenate([eq_active, jnp.zeros(m_ineq, dtype=bool)]),
         precond_fn=precond_fn,
+        adaptive_tol=_adaptive_tol,
     )
     d_init = init_result.d
     mult_init = init_result.multipliers
@@ -384,6 +390,7 @@ def _solve_qp_direct(
             b_combined,
             combined_active,
             precond_fn=precond_fn,
+            adaptive_tol=_adaptive_tol,
         )
         d_new = result.d
         mult_all = result.multipliers
@@ -759,6 +766,7 @@ def solve_qp(
             b_ineq,
             state.active_set,
             precond_fn=precond_fn,
+            adaptive_tol=cg_tol,
         )
         d_new = result.d
         mult_ineq_new = result.multipliers

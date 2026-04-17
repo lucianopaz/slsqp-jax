@@ -231,9 +231,13 @@ $$
 \begin{bmatrix} -g \\ b \end{bmatrix}
 $$
 
-This eliminates the need for null-space projection, particular solution computation, and separate multiplier recovery — the direction $d$ and multipliers $\lambda$ are obtained simultaneously. MINRES-QLP handles indefinite and singular systems natively, making it robust when the Hessian has negative curvature directions. An optional Schur complement preconditioner $S = A G^{-1} A^T$ (where $G = \text{diag}(B_0)$ is the L-BFGS diagonal) can accelerate convergence. Cost: $O((n + m) \cdot t_{\text{minres}})$ per solve, where $t_{\text{minres}}$ is the number of Lanczos iterations (controlled by `max_iter` and `tol`).
+This eliminates the need for null-space projection, particular solution computation, and separate multiplier recovery — the direction $d$ and multipliers $\lambda$ are obtained simultaneously. The implementation follows the full Preconditioned MINRES-QLP (PMINRES-QLP) algorithm from Table 3.5 of Choi (2006), including both left (QR) and right (QLP) orthogonalizations. The QLP extension yields minimum-length solutions for singular/near-singular systems and improved numerical stability over plain MINRES. All iterations use QLP mode (equivalent to `TranCond=1` in the reference implementation). Givens rotations use the numerically stable SymOrtho procedure (Table 2.9).
 
-- Reference: Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011.
+The preconditioner is a **block-diagonal SPD** matrix $M^{-1} = \text{diag}(B_{\text{diag}}^{-1}, S^{-1})$, where $B_{\text{diag}}^{-1}$ is the L-BFGS inverse Hessian diagonal and $S = A B_{\text{diag}}^{-1} A^T$ is the Schur complement. This satisfies the SPD requirement from Section 3.4 of Choi (2006), which is essential for the correctness of the preconditioned Lanczos process. When box-constraint handling fixes variables via `free_mask`, the primal preconditioner block is masked to the free subspace ($v \mapsto \mathbf{f} \odot B^{-1}(\mathbf{f} \odot v)$ where $\mathbf{f}$ is the free-variable indicator) to prevent L-BFGS cross-coupling from leaking into the zero rows/columns of the reduced KKT system.
+
+Cost: $O((n + m) \cdot t_{\text{minres}})$ per solve, where $t_{\text{minres}}$ is the number of Lanczos iterations (controlled by `max_iter` and `tol`).
+
+- Reference: Choi, *Iterative Methods for Singular Linear Equations and Least-Squares Problems*, PhD thesis, Stanford University, 2006. Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011.
 
 To use an alternative inner solver, construct the desired strategy and pass it to `SLSQP` (which forwards it to `solve_qp`):
 
@@ -456,7 +460,7 @@ solver = SLSQP(
 
 The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG to continue through directions with eigenvalues as small as $10^{-6}$ while still stopping on numerical noise. The CG step length and residual update use the true (unregularized) curvature, so the solution is unbiased. Set to `0.0` to disable (CG only stops on truly non-positive curvature).
 
-**Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$, where `atol` is the feasibility tolerance. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior.
+**Adaptive CG tolerance (Eisenstat-Walker).** When `adaptive_cg_tol=True`, the CG convergence tolerance is adapted based on the outer KKT residual: $\eta_k = \min(0.1,\, \max(\texttt{atol},\, \lVert \nabla_x L \rVert))$, where `atol` is the feasibility tolerance. This avoids over-solving early QPs (when the outer iterate is far from optimal) and tightens the tolerance as convergence proceeds (Eisenstat & Walker, *SIAM J. Sci. Comput.*, 17(1), 1996). This is off by default to preserve baseline convergence behavior. The adaptive tolerance is threaded through to user-provided inner solvers via the `adaptive_tol` parameter on `AbstractInnerSolver.solve()`. `ProjectedCGCholesky` and `ProjectedCGCraig` use it to override their instance CG tolerance; `MinresQLPSolver` ignores it because constraint satisfaction in the full KKT system requires tight tolerance (loosening the MINRES-QLP residual threshold would degrade primal feasibility $\lVert A d - b \rVert$).
 
 **Why not rational CG?** We evaluated the rational conjugate gradient method (Kindermann & Zellinger, arXiv:2306.03670, 2023), which alternates CG steps with Tikhonov regularization steps in a mixed rational Krylov space. It is designed for ill-posed inverse problems with compact operators, not finite-dimensional positive definite QPs. Each rational step requires an inner solve of $(B + \alpha I)^{-1} v$, the regularization parameters need spectrum knowledge, and adapting the method to null-space projection is non-trivial. Standard PCG is simpler, cheaper, and directly addresses the ill-conditioning source.
 
@@ -497,6 +501,8 @@ When the QP converges but the resulting direction is not a descent direction for
 ### Zero-step convergence detection
 
 When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations, the solver declares **successful** convergence rather than waiting for the merit-based stagnation counter (which would report `nonlinear_divergence`).
+
+The zero-step check has two stages: a **pre-line-search** check ($\lVert d \rVert < \texttt{atol}$) that catches null-space CG solvers returning $d = 0$ exactly, and a **post-line-search** check ($\alpha \lVert d \rVert < \texttt{atol}$) that catches full-KKT solvers like `MinresQLPSolver`. MINRES-QLP always returns $\lVert d \rVert > 0$ even when the projected gradient is negligible, because the coupled $(d, \lambda)$ KKT system always has a non-trivial solution. The line search then accepts only a tiny $\alpha$, making the effective step negligible. The post-line-search check detects this and correctly triggers zero-step convergence.
 
 ```python
 solver = SLSQP(
