@@ -1260,12 +1260,10 @@ class SLSQP(optx.AbstractMinimiser):
             direction,
         )
 
-        # Zero-step convergence detection
-        is_zero_step = (jnp.linalg.norm(direction) < self.atol) & qp_result.converged
-        new_consecutive_zero_steps = jnp.where(
-            is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)
-        )
-        new_qp_optimal = new_consecutive_zero_steps >= self.zero_step_patience
+        # Zero-step convergence detection (pre–line-search):
+        # catches inner solvers like CG that return d ≈ 0.
+        d_norm = jnp.linalg.norm(direction)
+        is_zero_step_pre = (d_norm < self.atol) & qp_result.converged
 
         # Step 3: Update penalty parameter — only trust multipliers
         # from a converged QP to avoid permanently inflating rho.
@@ -1425,6 +1423,20 @@ class SLSQP(optx.AbstractMinimiser):
             lambda h: h,
             new_lbfgs_history,
         )
+
+        # Zero-step convergence detection (post–line-search):
+        # Full KKT solvers (MINRES-QLP) return ||d|| > 0 even when the
+        # projected gradient is negligible, because the coupled (d, λ)
+        # system always has a non-trivial solution.  The line search then
+        # accepts only a tiny α, so the effective step α·||d|| is
+        # negligible.  Detect this as a zero step so that MINRES-QLP
+        # benefits from zero_step_patience just like null-space CG.
+        is_zero_step_post = (alpha * d_norm < self.atol) & qp_result.converged
+        is_zero_step = is_zero_step_pre | is_zero_step_post
+        new_consecutive_zero_steps = jnp.where(
+            is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)
+        )
+        new_qp_optimal = new_consecutive_zero_steps >= self.zero_step_patience
 
         # Merit-based stagnation detection: track consecutive steps
         # without sufficient improvement in the L1 merit function.
@@ -1911,6 +1923,7 @@ class SLSQP(optx.AbstractMinimiser):
                     precond_fn=precond_fn,
                     free_mask=free_mask,
                     d_fixed=d_fixed,
+                    adaptive_tol=adaptive_tol,
                 )
                 d_new = bound_result.d
                 mult_new = bound_result.multipliers

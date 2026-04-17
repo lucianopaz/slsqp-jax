@@ -249,6 +249,7 @@ class AbstractInnerSolver(eqx.Module):
         precond_fn: Callable[[Vector], Vector] | None = None,
         free_mask: Bool[Array, " n"] | None = None,
         d_fixed: Vector | None = None,
+        adaptive_tol: Scalar | float | None = None,
     ) -> InnerSolveResult:
         """Solve the equality-constrained QP subproblem.
 
@@ -271,6 +272,9 @@ class AbstractInnerSolver(eqx.Module):
                 variables with ``free_mask[i] = True`` are optimized.
             d_fixed: Values for fixed variables (n,).  Required when
                 ``free_mask`` is provided.
+            adaptive_tol: Optional Eisenstat-Walker tolerance override.
+                When provided, overrides the solver's default convergence
+                tolerance for this call only.
 
         Returns:
             ``InnerSolveResult`` with the direction, multipliers, and
@@ -313,7 +317,9 @@ class ProjectedCGCholesky(AbstractInnerSolver):
         precond_fn: Callable[[Vector], Vector] | None = None,
         free_mask: Bool[Array, " n"] | None = None,
         d_fixed: Vector | None = None,
+        adaptive_tol: Scalar | float | None = None,
     ) -> InnerSolveResult:
+        effective_tol = adaptive_tol if adaptive_tol is not None else self.cg_tol
         d, multipliers, converged = _solve_projected_cg_cholesky(
             hvp_fn=hvp_fn,
             g=g,
@@ -321,7 +327,7 @@ class ProjectedCGCholesky(AbstractInnerSolver):
             b=b,
             active_mask=active_mask,
             max_cg_iter=self.max_cg_iter,
-            cg_tol=self.cg_tol,
+            cg_tol=effective_tol,
             precond_fn=precond_fn,
             cg_regularization=self.cg_regularization,
             free_mask=free_mask,
@@ -698,7 +704,9 @@ class ProjectedCGCraig(AbstractInnerSolver):
         precond_fn: Callable[[Vector], Vector] | None = None,
         free_mask: Bool[Array, " n"] | None = None,
         d_fixed: Vector | None = None,
+        adaptive_tol: Scalar | float | None = None,
     ) -> InnerSolveResult:
+        effective_tol = adaptive_tol if adaptive_tol is not None else self.cg_tol
         d, multipliers, converged = _solve_projected_cg_craig(
             hvp_fn=hvp_fn,
             g=g,
@@ -706,7 +714,7 @@ class ProjectedCGCraig(AbstractInnerSolver):
             b=b,
             active_mask=active_mask,
             max_cg_iter=self.max_cg_iter,
-            cg_tol=self.cg_tol,
+            cg_tol=effective_tol,
             precond_fn=precond_fn,
             cg_regularization=self.cg_regularization,
             free_mask=free_mask,
@@ -867,76 +875,139 @@ def _solve_projected_cg_craig(
 
 
 # ---------------------------------------------------------------------------
-# MINRES-QLP solver
+# MINRES-QLP solver  (Choi, Paige & Saunders, SIAM J. Sci. Comput. 2011)
 # ---------------------------------------------------------------------------
 
 
-class _MinresQLPState(NamedTuple):
-    """Internal state for the MINRES-QLP iteration.
+def _sym_ortho(a: Scalar, b: Scalar) -> tuple[Scalar, Scalar, Scalar]:
+    """Numerically stable symmetric Givens rotation (SymOrtho).
 
-    Tracks the symmetric Lanczos process (v, z vectors), the QR
-    factorization of the tridiagonal (Givens rotations), and the
-    three-term solution update (w vectors).
+    Computes (c, s, r) such that r = sqrt(a^2 + b^2) >= 0, c = a/r,
+    s = b/r.  Handles a=0, b=0, and |a|>|b| vs |b|>|a| separately
+    to avoid overflow/underflow.
+
+    Reference: Choi (2006), Table 2.9 / Algorithm 937 (TOMS 2014).
+    """
+    abs_a = jnp.abs(a)
+    abs_b = jnp.abs(b)
+
+    def _b_zero(_: None) -> tuple[Scalar, Scalar, Scalar]:
+        c = jnp.where(a == 0.0, 1.0, jnp.sign(a))
+        return c, jnp.array(0.0), abs_a
+
+    def _a_zero(_: None) -> tuple[Scalar, Scalar, Scalar]:
+        return jnp.array(0.0), jnp.sign(b), abs_b
+
+    def _both_nonzero(_: None) -> tuple[Scalar, Scalar, Scalar]:
+        def _a_ge_b(_: None) -> tuple[Scalar, Scalar, Scalar]:
+            t = b / a
+            r_local = abs_a * jnp.sqrt(1.0 + t * t)
+            c_local = jnp.sign(a) / jnp.sqrt(1.0 + t * t)
+            s_local = c_local * t
+            return c_local, s_local, r_local
+
+        def _b_gt_a(_: None) -> tuple[Scalar, Scalar, Scalar]:
+            t = a / b
+            r_local = abs_b * jnp.sqrt(1.0 + t * t)
+            s_local = jnp.sign(b) / jnp.sqrt(1.0 + t * t)
+            c_local = s_local * t
+            return c_local, s_local, r_local
+
+        return jax.lax.cond(abs_a >= abs_b, _a_ge_b, _b_gt_a, None)
+
+    return jax.lax.cond(
+        b == 0.0,
+        _b_zero,
+        lambda _: jax.lax.cond(a == 0.0, _a_zero, _both_nonzero, None),
+        None,
+    )
+
+
+class _PMinresQLPState(NamedTuple):
+    """Internal state for the Preconditioned MINRES-QLP iteration.
+
+    Follows the reference implementation by Choi, Paige & Saunders.
+    Variables use the same names as the reference code for traceability.
     """
 
-    v_prev: Vector  # Lanczos vector v_{k-1}
-    v_curr: Vector  # Lanczos vector v_k
-    z_prev: Vector  # preconditioned z_{k-1} (= v_{k-1} if no precond)
-    z_curr: Vector  # preconditioned z_k (= v_k if no precond)
+    # Lanczos vectors (raw, NOT normalized by beta)
+    r1: Vector
+    r2: Vector
+    r3: Vector
 
-    beta: Scalar  # beta from Lanczos (0 at init, then beta_{k+1})
+    # Betas: previous (betal) and current (betan)
+    betal: Scalar
+    betan: Scalar
 
-    # Two most recent Givens rotations for the QR factorization
-    cs_prev: Scalar  # cs from rotation k-2 (init: 1.0 = identity)
-    sn_prev: Scalar  # sn from rotation k-2 (init: 0.0 = identity)
-    cs_curr: Scalar  # cs from rotation k-1 (init: 1.0 = identity)
-    sn_curr: Scalar  # sn from rotation k-1 (init: 0.0 = identity)
+    # Left rotation (previous)
+    cs: Scalar
+    sn: Scalar
 
-    # Solution update vectors (three-term recurrence for w)
-    w_prev: Vector  # w_{k-2}
-    w_curr: Vector  # w_{k-1}
+    # Right rotation P_{k-2,k}
+    cr2: Scalar
+    sr2: Scalar
 
-    x: Vector  # current solution
-    phi: Scalar  # residual norm (|phi_k| = ||K x_k - rhs||)
+    # QR/QLP intermediates
+    dltan: Scalar
+    eplnn: Scalar
+    gama: Scalar
+    gamal: Scalar
+    gamal2: Scalar
+
+    # Eta / vepln (for mu recurrence)
+    eta: Scalar
+    etal: Scalar
+    etal2: Scalar
+    vepln: Scalar
+    veplnl: Scalar
+    veplnl2: Scalar
+
+    # Tau (for mu recurrence)
+    tau: Scalar
+    taul: Scalar
+
+    # Mu / u coefficients
+    u: Scalar
+    ul: Scalar
+    ul2: Scalar
+    ul3: Scalar
+
+    # w-vectors and solution
+    w: Vector
+    wl: Vector
+    x: Vector
+    xl2: Vector
+
+    # Residual and norms
+    phi: Scalar
+    xl2norm: Scalar
+    Anorm: Scalar
+    gmin: Scalar
+    gminl: Scalar
 
     iteration: Int[Array, ""]
     converged: Bool[Array, ""]
 
 
-def _givens_rotation(a: Scalar, b: Scalar) -> tuple[Scalar, Scalar, Scalar]:
-    """Compute Givens rotation to zero out b in [a; b].
-
-    Returns (cs, sn, r) where:
-        [cs  sn] [a]   [r]
-        [-sn cs] [b] = [0]
-    """
-    r = jnp.sqrt(a**2 + b**2)
-    r_safe = jnp.maximum(r, 1e-30)
-    cs = a / r_safe
-    sn = b / r_safe
-    return cs, sn, r
-
-
-def minres_qlp_solve(
+def pminres_qlp_solve(
     matvec: Callable[[Vector], Vector],
     rhs: Vector,
     tol: float = 1e-10,
     max_iter: int = 200,
     precond: Callable[[Vector], Vector] | None = None,
 ) -> tuple[Vector, Bool[Array, ""]]:
-    """Solve a symmetric (possibly indefinite) system Kx = rhs via MINRES.
+    """Solve a symmetric (possibly indefinite/singular) system Ax = b.
 
-    Uses the symmetric Lanczos process to build a tridiagonal T_k, then
-    applies Givens rotations for residual minimization (Paige & Saunders,
-    1975).  Handles indefinite systems without breakdown.
+    Implements the full Preconditioned MINRES-QLP algorithm (Table 3.5
+    of Choi, Paige & Saunders, SIAM J. Sci. Comput. 33(4), 2011).
 
-    For preconditioned MINRES, the Lanczos process operates on the
-    preconditioned operator ``M^{-1} K`` in the ``M``-inner product.
+    All iterations use QLP mode (equivalent to TranCond=1 in the
+    reference implementation).
 
     Args:
-        matvec: Symmetric operator v -> K @ v.
+        matvec: Symmetric operator v -> A @ v.
         rhs: Right-hand side vector.
-        tol: Convergence tolerance on ``||K x - rhs|| / ||rhs||``.
+        tol: Convergence tolerance on relative residual.
         max_iter: Maximum Lanczos iterations.
         precond: Optional SPD preconditioner v -> M^{-1} @ v.
 
@@ -944,112 +1015,261 @@ def minres_qlp_solve(
         Tuple of (x, converged).
     """
     n = rhs.shape[0]
-    rhs_norm = jnp.linalg.norm(rhs)
-    rhs_norm_safe = jnp.maximum(rhs_norm, 1e-30)
-
-    # Lanczos init: beta_1 v_1 = rhs
-    if precond is not None:
-        z0 = precond(rhs)
-        beta1 = jnp.sqrt(jnp.abs(jnp.dot(rhs, z0)))
+    r2 = rhs
+    if precond is None:
+        r3 = r2
+        beta1 = jnp.linalg.norm(r2)
     else:
-        z0 = rhs
-        beta1 = jnp.linalg.norm(rhs)
+        r3 = precond(r2)
+        beta1 = jnp.sqrt(jnp.maximum(jnp.dot(r2, r3), 0.0))
 
     beta1_safe = jnp.maximum(beta1, 1e-30)
-    v1 = rhs / beta1_safe
-    z1 = z0 / beta1_safe
-
     zeros = jnp.zeros(n)
 
-    init_state = _MinresQLPState(
-        v_prev=zeros,
-        v_curr=v1,
-        z_prev=zeros,
-        z_curr=z1,
-        beta=jnp.array(0.0),  # no sub-diagonal for the 1st column
-        cs_prev=jnp.array(1.0),  # identity rotation
-        sn_prev=jnp.array(0.0),
-        cs_curr=jnp.array(1.0),  # identity rotation
-        sn_curr=jnp.array(0.0),
-        w_prev=zeros,
-        w_curr=zeros,
+    init_state = _PMinresQLPState(
+        r1=zeros,
+        r2=r2,
+        r3=r3,
+        betal=jnp.array(0.0),
+        betan=beta1,
+        cs=jnp.array(-1.0),
+        sn=jnp.array(0.0),
+        cr2=jnp.array(-1.0),
+        sr2=jnp.array(0.0),
+        dltan=jnp.array(0.0),
+        eplnn=jnp.array(0.0),
+        gama=jnp.array(0.0),
+        gamal=jnp.array(0.0),
+        gamal2=jnp.array(0.0),
+        eta=jnp.array(0.0),
+        etal=jnp.array(0.0),
+        etal2=jnp.array(0.0),
+        vepln=jnp.array(0.0),
+        veplnl=jnp.array(0.0),
+        veplnl2=jnp.array(0.0),
+        tau=jnp.array(0.0),
+        taul=jnp.array(0.0),
+        u=jnp.array(0.0),
+        ul=jnp.array(0.0),
+        ul2=jnp.array(0.0),
+        ul3=jnp.array(0.0),
+        w=zeros,
+        wl=zeros,
         x=zeros,
+        xl2=zeros,
         phi=beta1,
+        xl2norm=jnp.array(0.0),
+        Anorm=jnp.array(0.0),
+        gmin=jnp.array(0.0),
+        gminl=jnp.array(0.0),
         iteration=jnp.array(0),
-        converged=beta1 < tol * rhs_norm_safe,
+        converged=beta1 < 1e-30,
     )
 
-    def minres_step(i, state: _MinresQLPState) -> _MinresQLPState:
-        def do_step(state: _MinresQLPState) -> _MinresQLPState:
+    def step_fn(_i: int, state: _PMinresQLPState) -> _PMinresQLPState:
+        def do_step(state: _PMinresQLPState) -> _PMinresQLPState:
+            k = state.iteration + 1  # 1-based iteration count
+
             # --- Lanczos step ---
-            Kz = matvec(state.z_curr)  # K z_k (z_k = M^{-1} v_k)
-            alpha = jnp.dot(state.v_curr, Kz)
+            betal = state.betan  # beta_{k-1} (from PREVIOUS iter's betan)
+            beta = state.betan  # beta_k for k=1, see below
+            # At k=1: betal=beta1 and the "previous" beta (state.betal) is 0.
+            # At k>1: betal=state.betan is beta_k (set at end of previous iter),
+            #         and state.betal is the beta_{k-1} from previous iter.
+            betal = state.betal  # beta_{k-1}
+            beta = state.betan  # beta_k
+            beta_safe = jnp.maximum(beta, 1e-30)
+            betal_safe = jnp.maximum(betal, 1e-30)
 
-            # v_next_raw = K z_k - alpha v_k - beta v_{k-1}
-            v_next_raw = Kz - alpha * state.v_curr - state.beta * state.v_prev
+            v = state.r3 / beta_safe
+            r3_new = matvec(v)
 
-            if precond is not None:
-                z_next_raw = precond(v_next_raw)
-                beta_next = jnp.sqrt(jnp.abs(jnp.dot(v_next_raw, z_next_raw)))
+            # Three-term subtraction (skip at k=1 via jnp.where)
+            r3_new = r3_new - jnp.where(
+                k > 1,
+                state.r1 * (beta / betal_safe),
+                zeros,
+            )
+
+            alfa = jnp.dot(r3_new, v)
+            r3_new = r3_new - state.r2 * (alfa / beta_safe)
+
+            r1_new = state.r2
+            r2_new = r3_new
+
+            if precond is None:
+                betan_new = jnp.linalg.norm(r3_new)
             else:
-                z_next_raw = v_next_raw
-                beta_next = jnp.linalg.norm(v_next_raw)
+                r3_new = precond(r2_new)
+                betan_new = jnp.sqrt(jnp.maximum(jnp.dot(r2_new, r3_new), 0.0))
 
-            beta_next_safe = jnp.maximum(beta_next, 1e-30)
-            v_next = v_next_raw / beta_next_safe
-            z_next = z_next_raw / beta_next_safe
+            pnorm = jnp.sqrt(betal**2 + alfa**2 + betan_new**2)
 
-            # --- QR factorization of the new tridiagonal column ---
-            # Column k of the extended tridiagonal:
-            #   [0, ..., 0, beta_k, alpha_k, beta_{k+1}]
-            #
-            # Apply G_{k-2} (rows k-2, k-1) to [0; beta_k]:
-            eps_k = state.sn_prev * state.beta
-            delta_hat = state.cs_prev * state.beta
-            #
-            # Apply G_{k-1} (rows k-1, k) to [delta_hat; alpha]:
-            delta = state.cs_curr * delta_hat + state.sn_curr * alpha
-            gamma_hat = -state.sn_curr * delta_hat + state.cs_curr * alpha
-            #
-            # New rotation G_k to zero out beta_{k+1}:
-            cs_new, sn_new, gamma = _givens_rotation(gamma_hat, beta_next)
+            # --- Previous left rotation Q_{k-1} ---
+            dbar = state.dltan
+            dlta = state.cs * dbar + state.sn * alfa
+            gbar = state.sn * dbar - state.cs * alfa
+            eplnn_new = state.sn * betan_new
+            dltan_new = -state.cs * betan_new
 
-            # --- Residual and solution update ---
-            # Apply G_k to the transformed RHS: [phi_{k-1}; 0]
-            tau_k = cs_new * state.phi
-            phi_new = -sn_new * state.phi
+            # --- Current left rotation Q_k ---
+            gamal2 = state.gamal
+            gamal = state.gama
+            cs_new, sn_new, gama_new = _sym_ortho(gbar, betan_new)
+            taul2 = state.taul
+            taul_new = state.tau
+            tau_new = cs_new * state.phi
+            phi_new = sn_new * state.phi
 
-            # Solution update vector (three-term recurrence)
-            gamma_safe = jnp.where(jnp.abs(gamma) > 1e-30, gamma, 1e-30)
-            w_new = (
-                state.z_curr - delta * state.w_curr - eps_k * state.w_prev
-            ) / gamma_safe
+            # --- Previous right rotation P_{k-2,k} (active when k > 2) ---
+            veplnl2 = state.veplnl
+            etal2 = state.etal
+            etal_new = state.eta
+            dlta_tmp = state.sr2 * state.vepln - state.cr2 * dlta
+            veplnl_new = state.cr2 * state.vepln + state.sr2 * dlta
+            dlta_k2 = jnp.where(k > 2, dlta_tmp, dlta)
+            veplnl_new = jnp.where(k > 2, veplnl_new, state.veplnl)
+            etal_new = jnp.where(k > 2, etal_new, state.etal)
+            eta_new = jnp.where(k > 2, state.sr2 * gama_new, jnp.array(0.0))
+            gama_k2 = jnp.where(k > 2, -state.cr2 * gama_new, gama_new)
 
-            x_new = state.x + tau_k * w_new
+            # --- Current right rotation P_{k-1,k} (active when k > 1) ---
+            cr1_new, sr1_new, gamal_new = _sym_ortho(gamal, dlta_k2)
+            cr1_new = jnp.where(k > 1, cr1_new, jnp.array(-1.0))
+            sr1_new = jnp.where(k > 1, sr1_new, jnp.array(0.0))
+            gamal_new = jnp.where(k > 1, gamal_new, gamal)
+            vepln_new = jnp.where(k > 1, sr1_new * gama_k2, jnp.array(0.0))
+            gama_final = jnp.where(k > 1, -cr1_new * gama_k2, gama_k2)
 
-            converged = jnp.abs(phi_new) < tol * rhs_norm_safe
+            # --- Update mu coefficients ---
+            ul4 = state.ul3
+            ul3_new = state.ul2
 
-            return _MinresQLPState(
-                v_prev=state.v_curr,
-                v_curr=v_next,
-                z_prev=state.z_curr,
-                z_curr=z_next,
-                beta=beta_next,
-                cs_prev=state.cs_curr,
-                sn_prev=state.sn_curr,
-                cs_curr=cs_new,
-                sn_curr=sn_new,
-                w_prev=state.w_curr,
-                w_curr=w_new,
+            gamal2_safe = jnp.where(jnp.abs(gamal2) > 1e-30, gamal2, 1e-30)
+            ul2_new = jnp.where(
+                k > 2,
+                (taul2 - etal2 * ul4 - veplnl2 * ul3_new) / gamal2_safe,
+                state.ul2,
+            )
+
+            gamal_safe = jnp.where(jnp.abs(gamal_new) > 1e-30, gamal_new, 1e-30)
+            ul_new = jnp.where(
+                k > 1,
+                (taul_new - etal_new * ul3_new - veplnl_new * ul2_new) / gamal_safe,
+                state.ul,
+            )
+
+            gama_safe = jnp.where(jnp.abs(gama_final) > 1e-30, gama_final, 1e-30)
+            u_new = jnp.where(
+                jnp.abs(gama_final) > 1e-30,
+                (tau_new - eta_new * ul2_new - vepln_new * ul_new) / gama_safe,
+                jnp.array(0.0),
+            )
+
+            xl2norm_new = jnp.sqrt(state.xl2norm**2 + ul2_new**2)
+
+            # --- Update w-vectors and solution (QLP mode) ---
+            # k == 1: wl2=wl, wl=v*sr1, w=-v*cr1
+            # k == 2: wl2=wl, wl=w*cr1+v*sr1, w=w*sr1-v*cr1
+            # k > 2:  full P_{k-2,k} and P_{k-1,k} rotations
+            w_old = state.w
+            wl_old = state.wl
+
+            # k > 2 path (general case)
+            wl2_g = wl_old
+            wl_g = w_old
+            w_g = wl2_g * state.sr2 - v * state.cr2
+            wl2_g = wl2_g * state.cr2 + v * state.sr2
+            v_tmp = wl_g * cr1_new + w_g * sr1_new
+            w_g = wl_g * sr1_new - w_g * cr1_new
+            wl_g = v_tmp
+
+            # k == 2 path
+            wl2_2 = wl_old
+            wl_2 = w_old * cr1_new + v * sr1_new
+            w_2 = w_old * sr1_new - v * cr1_new
+
+            # k == 1 path
+            wl2_1 = wl_old
+            wl_1 = v * sr1_new
+            w_1 = -v * cr1_new
+
+            wl2_out = jnp.where(k > 2, wl2_g, jnp.where(k == 2, wl2_2, wl2_1))
+            wl_out = jnp.where(k > 2, wl_g, jnp.where(k == 2, wl_2, wl_1))
+            w_out = jnp.where(k > 2, w_g, jnp.where(k == 2, w_2, w_1))
+
+            xl2_new = state.xl2 + wl2_out * ul2_new
+            x_new = xl2_new + wl_out * ul_new + w_out * u_new
+
+            # --- Next right rotation P_{k-1,k+1} (for next iter) ---
+            cr2_new, sr2_new, gamal_store = _sym_ortho(gamal_new, eplnn_new)
+
+            # --- Update norms and condition estimate ---
+            abs_gama = jnp.abs(gama_final)
+            Anorm_new = jnp.maximum(state.Anorm, pnorm)
+            Anorm_new = jnp.maximum(Anorm_new, gamal_new)
+            Anorm_new = jnp.maximum(Anorm_new, abs_gama)
+
+            gminl_new = jnp.where(k == 1, gama_final, state.gmin)
+            gmin_new = jnp.where(
+                k == 1,
+                gama_final,
+                jnp.minimum(
+                    jnp.minimum(state.gminl, gamal_new),
+                    abs_gama,
+                ),
+            )
+
+            # --- Convergence check ---
+            xnorm = jnp.sqrt(xl2norm_new**2 + ul_new**2 + u_new**2)
+            relres = jnp.abs(phi_new) / (
+                Anorm_new * jnp.maximum(xnorm, 1e-30) + beta1_safe
+            )
+            converged = relres < tol
+
+            return _PMinresQLPState(
+                r1=r1_new,
+                r2=r2_new,
+                r3=r3_new,
+                betal=beta,
+                betan=betan_new,
+                cs=cs_new,
+                sn=sn_new,
+                cr2=cr2_new,
+                sr2=sr2_new,
+                dltan=dltan_new,
+                eplnn=eplnn_new,
+                gama=gama_final,
+                gamal=gamal_store,
+                gamal2=gamal_new,
+                eta=eta_new,
+                etal=etal_new,
+                etal2=etal2,
+                vepln=vepln_new,
+                veplnl=veplnl_new,
+                veplnl2=veplnl2,
+                tau=tau_new,
+                taul=taul_new,
+                u=u_new,
+                ul=ul_new,
+                ul2=ul2_new,
+                ul3=ul3_new,
+                w=w_out,
+                wl=wl_out,
                 x=x_new,
+                xl2=xl2_new,
                 phi=phi_new,
+                xl2norm=xl2norm_new,
+                Anorm=Anorm_new,
+                gmin=gmin_new,
+                gminl=gminl_new,
                 iteration=state.iteration + 1,
                 converged=converged,
             )
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
-    final = jax.lax.fori_loop(0, max_iter, minres_step, init_state)
+    final = jax.lax.fori_loop(0, max_iter, step_fn, init_state)
     return final.x, final.converged
 
 
@@ -1059,20 +1279,21 @@ def minres_qlp_solve(
 
 
 class MinresQLPSolver(AbstractInnerSolver):
-    """MINRES-QLP on the full saddle-point KKT system.
+    """Preconditioned MINRES-QLP on the full saddle-point KKT system.
 
     Solves the KKT system directly::
 
         [B    A^T] [d]       [-g]
         [A    0  ] [lambda] = [b ]
 
-    using MINRES-QLP with an optional constraint preconditioner.
-    This eliminates the need for explicit null-space projection,
-    particular solution computation, and multiplier recovery.
+    using PMINRES-QLP (Choi, Paige & Saunders, SISC 2011, Table 3.5)
+    with a block-diagonal SPD preconditioner::
 
-    The constraint preconditioner uses the Schur complement
-    ``A G^{-1} A^T`` where ``G^{-1}`` is the user-supplied
-    preconditioner (e.g. L-BFGS inverse Hessian).
+        M = [B_diag^{-1}    0      ]
+            [0              S^{-1} ]
+
+    where ``B_diag = diag(B_0)`` (L-BFGS diagonal) and
+    ``S = A B_diag^{-1} A^T`` is the Schur complement.
     """
 
     max_iter: int = 200
@@ -1089,7 +1310,12 @@ class MinresQLPSolver(AbstractInnerSolver):
         precond_fn: Callable[[Vector], Vector] | None = None,
         free_mask: Bool[Array, " n"] | None = None,
         d_fixed: Vector | None = None,
+        adaptive_tol: Scalar | float | None = None,
     ) -> InnerSolveResult:
+        # MINRES-QLP solves the full KKT system where constraints A d = b
+        # are part of the linear system. Loosening the tolerance would
+        # degrade constraint satisfaction (unlike null-space CG where
+        # constraints are enforced by the projector). Keep self.tol.
         d, multipliers, converged = _solve_kkt_minres_qlp(
             hvp_fn=hvp_fn,
             g=g,
@@ -1117,15 +1343,21 @@ def _solve_kkt_minres_qlp(
     free_mask: Bool[Array, " n"] | None = None,
     d_fixed: Vector | None = None,
 ) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
-    """Solve equality-constrained QP via MINRES-QLP on the full KKT system.
+    """Solve equality-constrained QP via PMINRES-QLP on the full KKT system.
 
     The KKT system::
 
         [B    A^T] [d]       [-g]
         [A    0  ] [lambda] = [b ]
 
-    is symmetric indefinite.  MINRES-QLP solves it directly, producing
+    is symmetric indefinite.  PMINRES-QLP solves it directly, producing
     both d and the Lagrange multipliers lambda.
+
+    Uses a block-diagonal SPD preconditioner ``M^{-1} = diag(B_diag^{-1},
+    S^{-1})`` where ``B_diag^{-1}`` is the user-supplied preconditioner
+    (typically L-BFGS inverse Hessian diagonal) and ``S = A B_diag^{-1}
+    A^T`` is the Schur complement.  This satisfies the SPD requirement
+    from Choi (2006, Section 3.4).
     """
     n = g.shape[0]
     m = A.shape[0]
@@ -1167,12 +1399,28 @@ def _solve_kkt_minres_qlp(
     # RHS: [-g_eff; b_work]
     kkt_rhs = jnp.concatenate([-g_eff, b_work])
 
-    # Constraint preconditioner (Schur complement based)
+    # Block-diagonal SPD preconditioner (Section 3.4 of Choi 2006)
     if precond_fn is not None:
         _raw_precond = precond_fn
         reg_diag = jnp.where(active_mask, 0.0, 1.0)
 
-        M_AT = jax.vmap(_raw_precond)(A_work).T  # (n, m)
+        # When free_mask is active, the KKT system has zero rows/columns
+        # at fixed-variable positions.  The L-BFGS inverse Hessian has
+        # cross-coupling between all variables, so applying it unmasked
+        # leaks non-zero values into those zero dimensions, contaminating
+        # the preconditioned Lanczos vectors and degrading MINRES-QLP
+        # convergence (particularly constraint satisfaction).  Masking
+        # the primal block to the free subspace eliminates the leakage.
+        if has_fixed:
+            _free_f = _free.astype(g.dtype)
+
+            def _primal_precond(v: Vector) -> Vector:
+                return _free_f * _raw_precond(_free_f * v)
+        else:
+            _primal_precond = _raw_precond
+
+        # Schur complement S = A M^{-1} A^T  (m x m, SPD)
+        M_AT = jax.vmap(_primal_precond)(A_work).T  # (n, m)
         A_M_AT = A_work @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
         A_M_AT_chol = jnp.linalg.cholesky(A_M_AT)
 
@@ -1182,17 +1430,15 @@ def _solve_kkt_minres_qlp(
         def kkt_precond(z: Vector) -> Vector:
             r1 = z[:n]
             r2 = z[n:]
-            Mr1 = _raw_precond(r1)
-            schur_rhs = A_work @ Mr1 - r2
-            w = _solve_schur(schur_rhs)
-            v = Mr1 - M_AT @ w
-            return jnp.concatenate([v, w])
+            v1 = _primal_precond(r1)
+            v2 = _solve_schur(r2)
+            return jnp.concatenate([v1, v2])
 
-        solution, converged = minres_qlp_solve(
+        solution, converged = pminres_qlp_solve(
             kkt_matvec, kkt_rhs, tol=tol, max_iter=max_iter, precond=kkt_precond
         )
     else:
-        solution, converged = minres_qlp_solve(
+        solution, converged = pminres_qlp_solve(
             kkt_matvec, kkt_rhs, tol=tol, max_iter=max_iter
         )
 
