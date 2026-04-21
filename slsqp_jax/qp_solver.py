@@ -53,7 +53,13 @@ from slsqp_jax.types import Scalar, Vector
 
 
 class QPState(eqx.Module):
-    """State for the Active Set QP solver."""
+    """State for the Active Set QP solver.
+
+    ``any_inner_failure`` accumulates whether any inner-solver call
+    during the active-set loop reported non-convergence or produced a
+    non-finite direction.  The final ``QPResult.converged`` combines
+    this with the active-set completion check.
+    """
 
     d: Vector
     active_set: Bool[Array, " m_ineq"]
@@ -61,6 +67,22 @@ class QPState(eqx.Module):
     multipliers_ineq: Float[Array, " m_ineq"]
     iteration: Int[Array, ""]
     converged: Bool[Array, ""]
+    any_inner_failure: Bool[Array, ""]
+
+
+def _inner_ok(result) -> Bool[Array, ""]:
+    """Did the inner solve return a usable (finite) direction?
+
+    NOTE: we deliberately do *not* require ``result.converged`` here.
+    For an outer SQP solver an imprecise inner CG/MINRES direction is
+    usually still a productive descent direction -- failing the QP just
+    because CG ran out of iterations would trigger an L-BFGS reset and
+    a projected-gradient fallback at every outer step, which is far
+    worse than taking a slightly stale Newton direction.  We flag only
+    unusable directions (NaN/Inf), and track CG non-convergence via the
+    diagnostic counters in ``SLSQPState`` instead.
+    """
+    return jnp.isfinite(result.d).all()
 
 
 class QPResult(NamedTuple):
@@ -138,12 +160,13 @@ def _solve_qp_proximal(
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
         )
+        finite_d = jnp.isfinite(d).all()
         return QPResult(
             d=d,
             multipliers_eq=_recover_mult_eq(d),
             multipliers_ineq=jnp.zeros((0,)),
             active_set=jnp.zeros((0,), dtype=bool),
-            converged=jnp.array(True),
+            converged=finite_d,
             iterations=jnp.array(1),
         )
 
@@ -153,7 +176,7 @@ def _solve_qp_proximal(
     _adaptive_tol: Scalar | float | None = cg_tol
 
     # Initial unconstrained solve (equalities absorbed into objective)
-    d_init, _ = solve_unconstrained_cg(
+    d_init, _d_init_converged = solve_unconstrained_cg(
         stabilized_hvp,
         g_mod,
         max_cg_iter,
@@ -161,6 +184,7 @@ def _solve_qp_proximal(
         precond_fn=precond_fn,
         cg_regularization=cg_regularization,
     )
+    init_inner_failure = ~jnp.isfinite(d_init).all()
 
     # Determine starting active set
     residuals_init = A_ineq @ d_init - b_ineq
@@ -179,6 +203,7 @@ def _solve_qp_proximal(
         multipliers_ineq=jnp.zeros((m_ineq,)),
         iteration=jnp.array(0),
         converged=init_converged,
+        any_inner_failure=init_inner_failure,
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -203,6 +228,8 @@ def _solve_qp_proximal(
         )
         d_new = result.d
         mult_ineq_new = result.multipliers
+        inner_failed = ~_inner_ok(result)
+        new_any_inner_failure = state.any_inner_failure | inner_failed
 
         mult_eq_new = _recover_mult_eq(d_new)
 
@@ -229,6 +256,7 @@ def _solve_qp_proximal(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def drop_constraint():
@@ -240,6 +268,7 @@ def _solve_qp_proximal(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def mark_converged():
@@ -250,6 +279,7 @@ def _solve_qp_proximal(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
+                any_inner_failure=new_any_inner_failure,
             )
 
         return jax.lax.cond(
@@ -262,8 +292,13 @@ def _solve_qp_proximal(
 
     # The EXPAND procedure's growing tolerance can cause mark_converged()
     # to fire on the last iteration under relaxed tolerances.  Override
-    # convergence when the iteration limit was actually reached.
-    final_converged = final_state.converged & (final_state.iteration < max_iter)
+    # convergence when the iteration limit was actually reached or when
+    # any inner solve failed.
+    final_converged = (
+        final_state.converged
+        & (final_state.iteration < max_iter)
+        & ~final_state.any_inner_failure
+    )
 
     return QPResult(
         d=final_state.d,
@@ -315,10 +350,10 @@ def _solve_qp_direct(
     _adaptive_tol: Scalar | float | None = cg_tol
 
     if m_ineq == 0:
-        # Equality-only: single projected CG solve, no active-set loop.
-        # The QP always "succeeds" here (no active-set that can fail).
-        # Truncated CG still gives a valid descent direction for the
-        # quadratic model, so QPResult.converged is always True.
+        # Equality-only: single projected CG/MINRES solve, no active-set
+        # loop.  Forward the inner solver's convergence flag so outer
+        # logic (penalty gating, steepest-descent fallback) can react to
+        # inner-solver stagnation instead of trusting a spurious success.
         combined_active = eq_active
         result = inner_solver.solve(
             hvp_fn,
@@ -334,7 +369,7 @@ def _solve_qp_direct(
             multipliers_eq=result.multipliers[:m_eq],
             multipliers_ineq=jnp.zeros((0,)),
             active_set=jnp.zeros((0,), dtype=bool),
-            converged=jnp.array(True),
+            converged=_inner_ok(result),
             iterations=jnp.array(1),
         )
 
@@ -354,6 +389,7 @@ def _solve_qp_direct(
     )
     d_init = init_result.d
     mult_init = init_result.multipliers
+    init_inner_failure = ~_inner_ok(init_result)
 
     residuals_init = A_ineq @ d_init - b_ineq
     if predicted_active_set is not None:
@@ -371,6 +407,7 @@ def _solve_qp_direct(
         multipliers_ineq=jnp.zeros((m_ineq,)),
         iteration=jnp.array(0),
         converged=init_converged,
+        any_inner_failure=init_inner_failure,
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -394,6 +431,8 @@ def _solve_qp_direct(
         )
         d_new = result.d
         mult_all = result.multipliers
+        inner_failed = ~_inner_ok(result)
+        new_any_inner_failure = state.any_inner_failure | inner_failed
 
         mult_eq_new = mult_all[:m_eq]
         mult_ineq_new = mult_all[m_eq:]
@@ -420,6 +459,7 @@ def _solve_qp_direct(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def drop_constraint():
@@ -431,6 +471,7 @@ def _solve_qp_direct(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def mark_converged():
@@ -441,6 +482,7 @@ def _solve_qp_direct(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
+                any_inner_failure=new_any_inner_failure,
             )
 
         return jax.lax.cond(
@@ -451,7 +493,11 @@ def _solve_qp_direct(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
-    final_converged = final_state.converged & (final_state.iteration < max_iter)
+    final_converged = (
+        final_state.converged
+        & (final_state.iteration < max_iter)
+        & ~final_state.any_inner_failure
+    )
 
     return QPResult(
         d=final_state.d,
@@ -652,12 +698,13 @@ def solve_qp(
             precond_fn=precond_fn,
             cg_regularization=cg_regularization,
         )
+        finite_d = jnp.isfinite(d).all()
         return QPResult(
             d=d,
             multipliers_eq=jnp.zeros((0,)),
             multipliers_ineq=jnp.zeros((0,)),
             active_set=jnp.zeros((0,), dtype=bool),
-            converged=jnp.array(True),
+            converged=finite_d,
             iterations=jnp.array(1),
         )
 
@@ -717,7 +764,7 @@ def solve_qp(
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
 
     # Unconstrained initial solve
-    d_init, _ = solve_unconstrained_cg(
+    d_init, _d_init_converged = solve_unconstrained_cg(
         hvp_fn,
         g,
         max_cg_iter,
@@ -725,6 +772,7 @@ def solve_qp(
         precond_fn=precond_fn,
         cg_regularization=cg_regularization,
     )
+    init_inner_failure = ~jnp.isfinite(d_init).all()
 
     kkt_residual = jnp.asarray(kkt_residual, dtype=jnp.float64)
     base_tol = tol + jnp.minimum(kkt_residual, 1.0) * tol
@@ -746,6 +794,7 @@ def solve_qp(
         multipliers_ineq=jnp.zeros((m_ineq,)),
         iteration=jnp.array(0),
         converged=init_converged,
+        any_inner_failure=init_inner_failure,
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -770,6 +819,8 @@ def solve_qp(
         )
         d_new = result.d
         mult_ineq_new = result.multipliers
+        inner_failed = ~_inner_ok(result)
+        new_any_inner_failure = state.any_inner_failure | inner_failed
 
         # Check feasibility with expanding tolerance (stricter activation)
         residuals = A_ineq @ d_new - b_ineq
@@ -798,6 +849,7 @@ def solve_qp(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def drop_constraint():
@@ -809,6 +861,7 @@ def solve_qp(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(False),
+                any_inner_failure=new_any_inner_failure,
             )
 
         def mark_converged():
@@ -819,6 +872,7 @@ def solve_qp(
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
+                any_inner_failure=new_any_inner_failure,
             )
 
         return jax.lax.cond(
@@ -829,7 +883,11 @@ def solve_qp(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
-    final_converged = final_state.converged & (final_state.iteration < max_iter)
+    final_converged = (
+        final_state.converged
+        & (final_state.iteration < max_iter)
+        & ~final_state.any_inner_failure
+    )
 
     return QPResult(
         d=final_state.d,

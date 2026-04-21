@@ -23,6 +23,7 @@ from slsqp_jax.hessian import (
     lbfgs_init,
     lbfgs_inverse_hvp,
     lbfgs_reset,
+    lbfgs_should_skip,
     lbfgs_soft_reset,
 )
 from slsqp_jax.inner_solver import (
@@ -44,7 +45,14 @@ from slsqp_jax.merit import (
     update_penalty_parameter,
 )
 from slsqp_jax.qp_solver import solve_qp
-from slsqp_jax.solver import SLSQP, STAGNATION_MESSAGE, QPResult, SLSQPState
+from slsqp_jax.solver import (
+    SLSQP,
+    STAGNATION_MESSAGE,
+    QPResult,
+    SLSQPDiagnostics,
+    SLSQPState,
+    get_diagnostics,
+)
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -58,6 +66,8 @@ __all__ = [
     "SLSQP",
     "STAGNATION_MESSAGE",
     "SLSQPState",
+    "SLSQPDiagnostics",
+    "get_diagnostics",
     "QPResult",
     # Types
     "ConstraintFn",
@@ -86,6 +96,7 @@ __all__ = [
     "lbfgs_compute_diagonal",
     "lbfgs_estimate_condition",
     "lbfgs_reset",
+    "lbfgs_should_skip",
     "lbfgs_soft_reset",
     "lbfgs_identity_reset",
     "estimate_hessian_diagonal",

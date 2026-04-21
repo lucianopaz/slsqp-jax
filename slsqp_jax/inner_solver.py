@@ -553,16 +553,21 @@ class _CraigState(NamedTuple):
     v: Vector  # right bidiag vector (n,)
     alpha: Scalar  # current alpha
     beta: Scalar  # current beta (beta_{k+1})
+    residual: Scalar  # |beta_{k+1} * s_k|  (||A x_k - rhs||)
     converged: Bool[Array, ""]
+    breakdown: Bool[Array, ""]
     iteration: Int[Array, ""]
+
+
+_CRAIG_BREAKDOWN_TOL = 1e-14
 
 
 def craig_solve(
     A: Float[Array, "m n"],
     rhs: Float[Array, " m"],
-    tol: float = 1e-12,
+    tol: float = 1e-10,
     max_iter: int = 100,
-) -> Vector:
+) -> tuple[Vector, Bool[Array, ""]]:
     """Solve ``min ||x||  s.t.  A x = rhs`` via CRAIG's method.
 
     CRAIG's method (Paige & Saunders, 1982) uses Golub-Kahan
@@ -587,34 +592,43 @@ def craig_solve(
         max_iter: Maximum bidiagonalization steps.
 
     Returns:
-        Minimum-norm solution x (n,).
+        Tuple ``(x, converged)``.  ``converged`` is ``True`` only when the
+        relative residual fell below ``tol``; it is ``False`` if CRAIG
+        broke down (``alpha`` / ``beta`` below an absolute threshold,
+        signalling rank deficiency or numerical collapse) or exhausted
+        its iteration budget.  When ``converged`` is ``False`` the
+        returned ``x`` is still the best iterate produced before the
+        failure.
     """
     m, n = A.shape
 
-    # Initialize: beta_1 u_1 = rhs
     beta1 = jnp.linalg.norm(rhs)
     beta1_safe = jnp.maximum(beta1, 1e-30)
     u1 = rhs / beta1_safe
 
-    # alpha_1 v_1 = A^T u_1
     Atu1 = A.T @ u1
     alpha1 = jnp.linalg.norm(Atu1)
+    breakdown_init = alpha1 < _CRAIG_BREAKDOWN_TOL
     alpha1_safe = jnp.maximum(alpha1, 1e-30)
     v1 = Atu1 / alpha1_safe
 
-    # First CRAIG iterate: x_1 = s_1 v_1 where s_1 = beta_1 / alpha_1
     s1 = beta1 / alpha1_safe
     x1 = s1 * v1
 
-    # Advance bidiag: beta_2 u_2 = A v_1 - alpha_1 u_1
     Av1 = A @ v1
     u_hat = Av1 - alpha1 * u1
     beta2 = jnp.linalg.norm(u_hat)
     beta2_safe = jnp.maximum(beta2, 1e-30)
     u2 = u_hat / beta2_safe
 
-    # Residual: ||A x_k - rhs|| = |beta_{k+1} * s_k|
-    init_converged = (beta1 < tol) | (jnp.abs(beta2 * s1) < tol * beta1_safe)
+    # If beta1 is already zero, rhs is zero and x=0 is exact.
+    trivially_converged = beta1 < tol * jnp.maximum(beta1_safe, 1.0)
+    residual_init = jnp.abs(beta2 * s1)
+    init_converged = trivially_converged | (residual_init < tol * beta1_safe)
+    # Breakdown: A^T rhs is (numerically) zero.  Only report a breakdown
+    # when we would otherwise report non-convergence; a zero rhs is not
+    # an error.
+    init_breakdown = breakdown_init & ~trivially_converged
 
     init_state = _CraigState(
         x=x1,
@@ -623,34 +637,43 @@ def craig_solve(
         v=v1,
         alpha=alpha1,
         beta=beta2,
-        converged=init_converged,
+        residual=residual_init,
+        converged=init_converged | init_breakdown,
+        breakdown=init_breakdown,
         iteration=jnp.array(1),
     )
 
     def craig_step(i, state: _CraigState) -> _CraigState:
         def do_step(state: _CraigState) -> _CraigState:
-            # Bidiag: alpha_{k+1} v_{k+1} = A^T u_{k+1} - beta_{k+1} v_k
             Atu = A.T @ state.u
             v_hat = Atu - state.beta * state.v
+            # One step of re-orthogonalisation against v_k to keep the
+            # short recurrence honest in the presence of floating-point
+            # drift (partial reorthogonalisation).
+            v_hat = v_hat - jnp.dot(state.v, v_hat) * state.v
             alpha_new = jnp.linalg.norm(v_hat)
+            alpha_breakdown = alpha_new < _CRAIG_BREAKDOWN_TOL
             alpha_safe = jnp.maximum(alpha_new, 1e-30)
             v_new = v_hat / alpha_safe
 
-            # CRAIG coefficient: s_{k+1} = -beta_{k+1} * s_k / alpha_{k+1}
             s_new = -state.beta * state.s / alpha_safe
 
-            # Update solution: x_{k+1} = x_k + s_{k+1} v_{k+1}
             x_new = state.x + s_new * v_new
 
-            # Bidiag: beta_{k+2} u_{k+2} = A v_{k+1} - alpha_{k+1} u_{k+1}
             Av = A @ v_new
             u_hat = Av - alpha_new * state.u
+            # Partial reorthogonalisation against u_{k+1} (state.u).
+            u_hat = u_hat - jnp.dot(state.u, u_hat) * state.u
             beta_new = jnp.linalg.norm(u_hat)
+            beta_breakdown = beta_new < _CRAIG_BREAKDOWN_TOL
             beta_safe = jnp.maximum(beta_new, 1e-30)
             u_new = u_hat / beta_safe
 
-            # Residual: ||A x_{k+1} - rhs|| = |beta_{k+2} * s_{k+1}|
-            conv = jnp.abs(beta_new * s_new) < tol * beta1_safe
+            residual_new = jnp.abs(beta_new * s_new)
+            converged = residual_new < tol * beta1_safe
+
+            broke = alpha_breakdown | beta_breakdown
+            done = converged | broke
 
             return _CraigState(
                 x=x_new,
@@ -659,14 +682,19 @@ def craig_solve(
                 v=v_new,
                 alpha=alpha_new,
                 beta=beta_new,
-                converged=conv,
+                residual=residual_new,
+                converged=done,
+                breakdown=state.breakdown | (broke & ~converged),
                 iteration=state.iteration + 1,
             )
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
     final = jax.lax.fori_loop(0, max_iter, craig_step, init_state)
-    return final.x
+    # A "true" success requires the residual to be below tolerance at
+    # termination and not having flagged a breakdown.
+    success = (final.residual < tol * beta1_safe) & ~final.breakdown
+    return final.x, success
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +719,14 @@ class ProjectedCGCraig(AbstractInnerSolver):
     cg_tol: Scalar | float
     cg_regularization: float = 1e-6
     use_constraint_preconditioner: bool = False
-    craig_tol: float = 1e-12
+    craig_tol: float = 1e-10
     craig_max_iter: int = 200
+    # Multiplier recovery uses CG on the normal equations. Its tolerance
+    # is kept tight (and independent of craig_tol) so the Lagrangian
+    # residual is not polluted by imprecise multipliers, without forcing
+    # the inner CRAIG projections to the same accuracy.
+    mult_recovery_tol: float = 1e-12
+    mult_recovery_max_iter: int = 200
 
     def solve(
         self,
@@ -722,6 +756,8 @@ class ProjectedCGCraig(AbstractInnerSolver):
             use_constraint_preconditioner=self.use_constraint_preconditioner,
             craig_tol=self.craig_tol,
             craig_max_iter=self.craig_max_iter,
+            mult_recovery_tol=self.mult_recovery_tol,
+            mult_recovery_max_iter=self.mult_recovery_max_iter,
         )
         return InnerSolveResult(d=d, multipliers=multipliers, converged=converged)
 
@@ -744,8 +780,10 @@ def _solve_projected_cg_craig(
     free_mask: Bool[Array, " n"] | None = None,
     d_fixed: Vector | None = None,
     use_constraint_preconditioner: bool = False,
-    craig_tol: float = 1e-12,
+    craig_tol: float = 1e-10,
     craig_max_iter: int = 200,
+    mult_recovery_tol: float = 1e-12,
+    mult_recovery_max_iter: int = 200,
 ) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
     """Projected CG using CRAIG for the null-space projection.
 
@@ -775,15 +813,22 @@ def _solve_projected_cg_craig(
     _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
 
     # Particular solution: d_p = A^T (A A^T)^{-1} b = craig_solve(A, b)
-    d_p_free = craig_solve(A_work, b_work, tol=craig_tol, max_iter=craig_max_iter)
+    d_p_free, d_p_craig_conv = craig_solve(
+        A_work, b_work, tol=craig_tol, max_iter=craig_max_iter
+    )
     d_p = d_p_free + _dfixed if has_fixed else d_p_free
 
-    # Projection: P(v) = v - A^T (A A^T)^{-1} A v = v - craig_solve(A, Av)
+    # Projection: P(v) = v - A^T (A A^T)^{-1} A v = v - craig_solve(A, Av).
+    # We deliberately do not propagate per-call CRAIG convergence from
+    # inside the CG iteration (would require threading state into
+    # ``_CGState``); breakdown of CRAIG would manifest as a non-finite
+    # direction, which the outer QP solver checks via ``isfinite``.
     def project(v: Vector) -> Vector:
         v_work = _free * v if has_fixed else v
-        return v_work - craig_solve(
+        x_proj, _ = craig_solve(
             A_work, A_work @ v_work, tol=craig_tol, max_iter=craig_max_iter
         )
+        return v_work - x_proj
 
     # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
     # With CRAIG, the A M A^T system is also solved iteratively.
@@ -807,7 +852,9 @@ def _solve_projected_cg_craig(
             def amat_hvp_reg(v: Float[Array, " m"]) -> Float[Array, " m"]:
                 return amat_hvp(v) + reg_diag * v
 
-            w, _ = solve_unconstrained_cg(amat_hvp_reg, -AMr, craig_max_iter, craig_tol)
+            w, _ = solve_unconstrained_cg(
+                amat_hvp_reg, -AMr, mult_recovery_max_iter, mult_recovery_tol
+            )
             return Mr - _raw_precond(A_work.T @ w)
 
         effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
@@ -866,12 +913,18 @@ def _solve_projected_cg_craig(
     def normal_hvp(v: Float[Array, " m"]) -> Float[Array, " m"]:
         return A_work @ (A_work.T @ v) + reg_diag * v
 
-    multipliers, _ = solve_unconstrained_cg(
-        normal_hvp, -kkt_rhs, craig_max_iter, craig_tol
+    multipliers, mult_cg_converged = solve_unconstrained_cg(
+        normal_hvp, -kkt_rhs, mult_recovery_max_iter, mult_recovery_tol
     )
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-    return final_cg.d, multipliers, final_cg.converged
+    finite_d = jnp.isfinite(final_cg.d).all()
+    finite_mult = jnp.isfinite(multipliers).all()
+    converged = (
+        final_cg.converged & d_p_craig_conv & mult_cg_converged & finite_d & finite_mult
+    )
+
+    return final_cg.d, multipliers, converged
 
 
 # ---------------------------------------------------------------------------
@@ -1071,13 +1124,9 @@ def pminres_qlp_solve(
             k = state.iteration + 1  # 1-based iteration count
 
             # --- Lanczos step ---
-            betal = state.betan  # beta_{k-1} (from PREVIOUS iter's betan)
-            beta = state.betan  # beta_k for k=1, see below
-            # At k=1: betal=beta1 and the "previous" beta (state.betal) is 0.
-            # At k>1: betal=state.betan is beta_k (set at end of previous iter),
-            #         and state.betal is the beta_{k-1} from previous iter.
-            betal = state.betal  # beta_{k-1}
-            beta = state.betan  # beta_k
+            # state.betal is beta_{k-1} (zero at k=1); state.betan is beta_k.
+            betal = state.betal
+            beta = state.betan
             beta_safe = jnp.maximum(beta, 1e-30)
             betal_safe = jnp.maximum(betal, 1e-30)
 
@@ -1225,7 +1274,19 @@ def pminres_qlp_solve(
             relres = jnp.abs(phi_new) / (
                 Anorm_new * jnp.maximum(xnorm, 1e-30) + beta1_safe
             )
-            converged = relres < tol
+            # Lanczos breakdown: betan collapses either because the
+            # system is solved (phi_new is small) or because of numerical
+            # collapse.  In the former case we flag convergence; in the
+            # latter we short-circuit to stop accumulating garbage.
+            lanczos_breakdown = betan_new < 1e-30 * jnp.maximum(beta1_safe, 1.0)
+            residual_small = jnp.abs(phi_new) < tol * beta1_safe
+            converged = (relres < tol) | (lanczos_breakdown & residual_small)
+            # If breakdown happened without the residual being small, we
+            # stop the iteration by setting ``converged`` true so the
+            # `jax.lax.cond` guard short-circuits subsequent calls; the
+            # final success flag below will see relres >= tol and report
+            # failure to the caller.
+            stop_now = converged | lanczos_breakdown
 
             return _PMinresQLPState(
                 r1=r1_new,
@@ -1264,13 +1325,21 @@ def pminres_qlp_solve(
                 gmin=gmin_new,
                 gminl=gminl_new,
                 iteration=state.iteration + 1,
-                converged=converged,
+                converged=stop_now,
             )
 
         return jax.lax.cond(state.converged, lambda s: s, do_step, state)
 
     final = jax.lax.fori_loop(0, max_iter, step_fn, init_state)
-    return final.x, final.converged
+    # Report genuine success only when the last residual dropped below
+    # tolerance; breakdown or budget exhaustion returns converged=False
+    # so the QP layer triggers its fallback paths.
+    final_relres = jnp.abs(final.phi) / (
+        jnp.maximum(final.Anorm, 1e-30) * jnp.maximum(jnp.linalg.norm(final.x), 1e-30)
+        + beta1_safe
+    )
+    success = (final_relres < tol) & jnp.isfinite(final.x).all()
+    return final.x, success
 
 
 # ---------------------------------------------------------------------------
@@ -1444,10 +1513,16 @@ def _solve_kkt_minres_qlp(
 
     d = solution[:n]
     if has_fixed:
-        d = d + _dfixed
+        # Force the direction to respect the fixed mask.  The KKT matvec
+        # and preconditioner branches already keep fixed positions at
+        # zero; this final projection guards against floating-point
+        # drift and preconditioner implementations that may leak small
+        # cross-coupling through the free/fixed boundary.
+        d = _free * d + _dfixed
     # KKT system uses L = ... + λ^T(Ad - b), but the active-set QP
     # solver uses L = ... - μ^T(Ad - b) with μ >= 0, so μ = -λ.
     multipliers = -solution[n:]
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
-    return d, multipliers, converged
+    finite = jnp.isfinite(d).all() & jnp.isfinite(multipliers).all()
+    return d, multipliers, converged & finite
