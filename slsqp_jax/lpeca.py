@@ -133,7 +133,19 @@ def identify_active_set_lpeca(
 
     rho_bar = compute_rho_bar(c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq)
 
-    threshold = (beta * rho_bar) ** sigma
+    # Raw LPEC-A threshold (Oberlin & Wright 2005, Eq. 43).  Far from
+    # the solution ``rho_bar`` can be large, which inflates the
+    # threshold so much that nearly every inequality is predicted
+    # active; the resulting over-saturated working set typically causes
+    # the QP equality solve to fail.  Clamp the threshold with the
+    # current ``max|c_ineq|`` so the predicted active set stays within
+    # the scale of the constraint residuals.  This preserves the
+    # asymptotic correctness of LPEC-A (near the solution ``rho_bar``
+    # is small and the clamp is inactive) while containing the
+    # far-from-optimum over-prediction.
+    threshold_raw = (beta * rho_bar) ** sigma
+    c_scale = jnp.maximum(jnp.max(jnp.abs(c_ineq)), 1e-12)
+    threshold = jnp.minimum(threshold_raw, c_scale)
     return c_ineq <= threshold
 
 

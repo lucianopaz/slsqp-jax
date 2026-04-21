@@ -466,7 +466,7 @@ The default value `cg_regularization=1e-6` ($\delta \approx 10^{-3}$) allows CG 
 
 ### L-BFGS reset strategies
 
-The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal uses **component-wise secant scaling** ($d_i = |y_i \cdot s_i| / (s_i^2 + \epsilon)$).
+The L-BFGS initial Hessian is stored as a per-variable diagonal $B_0 = \text{diag}(d)$ rather than a scalar $\gamma I$. During normal operation the diagonal uses **component-wise secant scaling** ($d_i = |y_i \cdot s_i| / (s_i^2 + \epsilon)$). The diagonal is clipped to a user-configurable range `[lbfgs_diag_floor, lbfgs_diag_ceil]` (default `[1e-4, 1e6]`). The floor is deliberately higher than the machine-epsilon scale: values below $10^{-4}$ indicate that either the secant step is essentially zero (numerical noise) or the curvature on that coordinate is vanishing, both of which are better handled by re-estimating from the next pair than by extrapolating an inverse that is close to a division by zero. `lbfgs_append` and `lbfgs_reset` share these bounds so the clipping regime is consistent across cold starts, soft resets, and ordinary updates.
 
 The reset chain follows a VARCHEN-inspired escalating strategy:
 
@@ -497,6 +497,8 @@ Combined with the L-BFGS soft reset (above), these mechanisms allow the solver t
 ### Line search failure recovery
 
 When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: soft reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
+
+If `consecutive_ls_failures` reaches `2 * ls_failure_patience`, the solver flags the run as fatally stagnant (`state.ls_fatal = True`) and `terminate()` returns `RESULTS.nonlinear_divergence`. Previously, `terminate()` declared **success** as soon as the QP reported optimality *and* the current iterate was primally feasible, regardless of stationarity. That path masked chronic line-search failure because `qp_optimal` latches after `zero_step_patience` consecutive zero-norm steps, which is exactly what a collapsed line search produces. The `qp_optimal & primal_feasible` disjunct has been removed; convergence now strictly requires both the relative-stationarity condition $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(\lvert L \rvert, 1)$ *and* primal feasibility $\max \lvert c_{\text{eq}} \rvert \leq \texttt{atol}$ and $\max(0, -c_{\text{ineq}}) \leq \texttt{atol}$.
 
 ### Zero-step convergence detection
 
@@ -537,6 +539,56 @@ sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=100, throw=Fa
 print(sol.stats["stagnation"])     # False if converged normally
 print(sol.stats["last_step_size"]) # Step size from final iteration
 ```
+
+### Diagnostics
+
+`SLSQPState` carries a `diagnostics` field of type `SLSQPDiagnostics` that accumulates lightweight counters and summary statistics on every call to `step()` (branch-free, so they work under JIT). Use `slsqp_jax.get_diagnostics(state)` on the final state to retrieve them:
+
+```python
+from slsqp_jax import SLSQP, get_diagnostics
+
+sol = optx.minimise(objective, solver, x0, has_aux=True, max_steps=200, throw=False)
+diag = get_diagnostics(sol.state)
+
+print(diag.n_qp_inner_failures)  # inner-CG/MINRES non-convergence count
+print(diag.n_ls_failures)        # line-search non-descent count
+print(diag.n_lbfgs_skips)        # pairs rejected by the curvature filter
+print(diag.n_nan_directions)     # non-finite QP directions observed
+print(diag.max_gamma)            # largest scalar gamma seen during the run
+print(diag.min_diag, diag.max_diag)  # per-variable diagonal extremes
+print(diag.eq_jac_min_sv_est)    # lower bound on min singular value of J_eq
+print(diag.ls_alpha_min)         # smallest line-search step accepted
+print(diag.tail_ls_failures)     # consecutive LS failures at termination
+print(diag.n_bound_fix_solves)   # non-trivial bound-fixing inner solves
+print(diag.max_bound_fixed)      # peak number of variables pinned to bounds
+print(diag.max_active_ineq)      # peak active general-ineq / bound count
+print(diag.n_merit_regressions)  # steps where merit increased despite LS ok
+```
+
+Because a line search that can only take $\alpha \approx 2^{-20}$ no longer counts as convergence, these counters are the recommended way to assess the quality of a run whose result code is `RESULTS.successful` but whose objective / constraints look suspect. Large `n_qp_inner_failures` together with a small `eq_jac_min_sv_est` usually indicates a near-rank-deficient equality Jacobian; a non-zero `tail_ls_failures` at termination means the solver bailed out on stagnation and the returned iterate is a best-merit point, not a stationary point.
+
+`n_bound_fix_solves` grows with the number of *non-trivial* bound-fixing passes (no-op passes where the free mask did not change are short-circuited and do not contribute). `max_bound_fixed` is the peak count of variables pinned to a box bound in any single iteration; when this tracks `n` closely you are essentially solving a degenerate LP and the outer SLSQP step tends to be very short. `n_merit_regressions` flags iterations whose line search reported success but whose L1 merit nonetheless went up - a sign that `rho` is undersized or the HVP approximation is stale.
+
+#### L-BFGS skip counter fix
+
+Prior to this release `n_lbfgs_skips` was computed as `new.count == state.count`, which misfires as soon as the ring buffer saturates (`count == memory`): every subsequent step was (incorrectly) flagged as a skipped pair. The counter is now based on the *same* `should_skip` predicate that `lbfgs_append` evaluates internally, exposed publicly as `slsqp_jax.lbfgs_should_skip(s, y)` so downstream code can reproduce the decision without diffing history fields.
+
+#### Expanded verbose output
+
+The built-in `verbose=True` callback now prints, in addition to the step summary:
+
+- `|∇L|/|L|` - the relative stationarity ratio used by the convergence test.
+- `Δmerit` - signed change of the L1 merit versus the best-so-far.
+- `skip` - whether this step skipped the L-BFGS curvature update.
+- `#fix` - number of variables pinned at box bounds in the final QP direction.
+- `fix#` - number of non-trivial bound-fixing inner solves used this step.
+- `LS tail` - current consecutive line-search failure counter.
+
+Together these let you distinguish "the solver is slow because of active-set churn" (`#fix` oscillating) from "the QP is producing bad directions" (`skip` or `LS ok: False` repeatedly) from "we are simply running out of iterations" (`|∇L|/|L|` decreasing monotonically but not below `rtol`).
+
+#### Bound-fix inner-solve short-circuit
+
+The bound-handling loop after the QP direction used to run exactly `5` reduced-space inner solves per outer iteration, even when the free-variable mask was already stable. On problems such as `Portfolio(n=5000)` with `MinresQLPSolver` this meant `5 * 500 = 2500` full `(n + m)` MINRES-QLP solves per run, the vast majority of which had their results masked out by `use_new=False`. The loop now wraps each inner solve in `jax.lax.cond(any_change & any_fixed, ...)` and records the number of non-trivial solves in `QPResult.bound_fix_solves` (surfaced as `diag.n_bound_fix_solves`). On the portfolio benchmark this cut the average from 5 to well under 1 solve per outer step with no change in the accepted direction.
 
 ## License
 

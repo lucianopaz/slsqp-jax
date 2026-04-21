@@ -35,9 +35,14 @@ from slsqp_jax.hessian import (
     lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
+    lbfgs_should_skip,
     lbfgs_soft_reset,
 )
-from slsqp_jax.inner_solver import AbstractInnerSolver, ProjectedCGCholesky
+from slsqp_jax.inner_solver import (
+    AbstractInnerSolver,
+    InnerSolveResult,
+    ProjectedCGCholesky,
+)
 from slsqp_jax.lpeca import compute_lpeca_active_set
 from slsqp_jax.merit import (
     backtracking_line_search,
@@ -89,6 +94,95 @@ def _no_verbose(**kwargs: tuple) -> None:
     pass
 
 
+class SLSQPDiagnostics(eqx.Module):
+    """Diagnostic counters and statistics accumulated during an SLSQP run.
+
+    These fields are populated inside ``step()`` without Python-side
+    branching, and can be inspected by the user after a solve to decide
+    whether the ``optimistix`` result code is meaningful (e.g. to detect
+    a ``RESULTS.successful`` that actually came from chronic line-search
+    failure rather than real convergence).
+
+    Attributes:
+        n_qp_inner_failures: Number of iterations where the QP solver
+            reported ``converged=False``.
+        n_ls_failures: Number of iterations where the line search
+            reported ``success=False``.
+        n_lbfgs_skips: Number of iterations where the L-BFGS append
+            skipped the new curvature pair.
+        n_nan_directions: Number of iterations where the QP returned
+            a non-finite search direction.
+        max_gamma: Maximum L-BFGS ``gamma`` observed across iterations.
+        min_diag: Minimum L-BFGS per-variable diagonal entry observed.
+        max_diag: Maximum L-BFGS per-variable diagonal entry observed.
+        eq_jac_min_sv_est: A lower bound on the smallest singular value
+            of ``J_eq`` estimated from the Cholesky factor of
+            ``J_eq J_eq^T``.  Small values indicate near rank-deficiency.
+        ls_alpha_min: Smallest line-search step accepted across the run.
+        tail_ls_failures: Consecutive line-search failure count at
+            termination.  Non-zero values suggest stagnation.
+        n_bound_fix_solves: Total number of non-trivial bound-fixing inner
+            solves that actually ran (no-op passes are skipped via
+            ``jax.lax.cond`` and do not count).  Growing unboundedly is a
+            sign that the bound active set never stabilises.
+        max_bound_fixed: Largest number of variables pinned to their box
+            bounds across all iterations (from the final per-iteration
+            ``free_mask``).
+        max_active_ineq: Largest number of active general inequalities
+            observed across iterations.
+        n_merit_regressions: Number of iterations where the L1 merit
+            function value *increased* despite the line search reporting
+            success.  A non-zero count points to merit-function
+            mis-calibration (too-small ``rho``) or line-search slippage.
+    """
+
+    n_qp_inner_failures: Int[Array, ""]
+    n_ls_failures: Int[Array, ""]
+    n_lbfgs_skips: Int[Array, ""]
+    n_nan_directions: Int[Array, ""]
+    max_gamma: Scalar
+    min_diag: Scalar
+    max_diag: Scalar
+    eq_jac_min_sv_est: Scalar
+    ls_alpha_min: Scalar
+    tail_ls_failures: Int[Array, ""]
+    n_bound_fix_solves: Int[Array, ""]
+    max_bound_fixed: Int[Array, ""]
+    max_active_ineq: Int[Array, ""]
+    n_merit_regressions: Int[Array, ""]
+
+
+def _init_diagnostics() -> SLSQPDiagnostics:
+    """Construct a zero-initialized ``SLSQPDiagnostics`` container."""
+    return SLSQPDiagnostics(  # ty: ignore[invalid-return-type]
+        n_qp_inner_failures=jnp.array(0),
+        n_ls_failures=jnp.array(0),
+        n_lbfgs_skips=jnp.array(0),
+        n_nan_directions=jnp.array(0),
+        max_gamma=jnp.array(0.0),
+        min_diag=jnp.array(jnp.inf),
+        max_diag=jnp.array(0.0),
+        eq_jac_min_sv_est=jnp.array(jnp.inf),
+        ls_alpha_min=jnp.array(1.0),
+        tail_ls_failures=jnp.array(0),
+        n_bound_fix_solves=jnp.array(0),
+        max_bound_fixed=jnp.array(0),
+        max_active_ineq=jnp.array(0),
+        n_merit_regressions=jnp.array(0),
+    )
+
+
+def get_diagnostics(state: "SLSQPState") -> SLSQPDiagnostics:
+    """Return the ``SLSQPDiagnostics`` accumulator from a final state.
+
+    Use this after ``optimistix.minimise`` (or a manual ``solve / step``
+    loop) to inspect solver health indicators that the Optimistix result
+    code alone does not expose.  See :class:`SLSQPDiagnostics` for field
+    meanings.
+    """
+    return state.diagnostics
+
+
 class SLSQPState(eqx.Module):
     """State for the SLSQP solver.
 
@@ -107,6 +201,11 @@ class SLSQPState(eqx.Module):
         multipliers_eq: Lagrange multipliers for equality constraints.
         multipliers_ineq: Lagrange multipliers for inequality constraints.
         prev_grad_lagrangian: Previous Lagrangian gradient (for L-BFGS update).
+        grad_lagrangian: Current gradient of the Lagrangian evaluated at
+            the accepted iterate using the *blended* multipliers
+            consistent with the line-search step size.  Reused by
+            ``terminate`` so the stationarity check does not fall out
+            of sync with the L-BFGS secant pair.
         merit_penalty: Current penalty parameter for L1 merit function.
         bound_jac: Constant Jacobian for bound constraints (computed once in init).
         qp_iterations: Total accumulated QP active-set iterations across all steps.
@@ -137,6 +236,12 @@ class SLSQPState(eqx.Module):
 
     # Previous Lagrangian gradient for L-BFGS y = grad_L_new - grad_L_old
     prev_grad_lagrangian: Vector
+
+    # Current Lagrangian gradient at the accepted iterate, computed with
+    # the *blended* multipliers (matching the L-BFGS secant pair).  Reused
+    # by ``terminate`` for stationarity so the check is consistent with
+    # what ``step`` saw.
+    grad_lagrangian: Vector
 
     # Merit function penalty parameter
     merit_penalty: Scalar
@@ -170,6 +275,20 @@ class SLSQPState(eqx.Module):
     stagnation: Bool[Array, ""]
     last_alpha: Scalar
 
+    # Whether the most recent line search reported success (Armijo satisfied
+    # or at least a strictly decreasing merit).  Used by ``terminate`` to
+    # distinguish genuine convergence from tiny-alpha stagnation.
+    ls_success: Bool[Array, ""]
+
+    # Whether the most recent line search failed AND the escalated
+    # identity reset also failed (``consecutive_ls_failures`` exceeded
+    # ``2 * ls_failure_patience``).  Triggers early termination with
+    # ``RESULTS.nonlinear_divergence`` to surface chronic LS failure.
+    ls_fatal: Bool[Array, ""]
+
+    # Diagnostic accumulators (see :class:`SLSQPDiagnostics`).
+    diagnostics: SLSQPDiagnostics
+
 
 class QPResult(eqx.Module):
     """Result from solving the QP subproblem.
@@ -181,6 +300,14 @@ class QPResult(eqx.Module):
         active_set: Boolean mask of active inequality constraints at the solution.
         converged: Whether the QP solver converged successfully.
         iterations: Number of active-set iterations taken.
+        bound_fix_solves: Number of non-trivial bound-fixing passes that
+            actually ran the reduced-space inner solve (passes where the
+            free mask did not change are short-circuited).  Useful for
+            debugging bound-handling overhead; 0 when the problem has no
+            bound constraints.
+        n_bound_fixed: Number of variables pinned to a box bound in the
+            final QP direction (counts both lower- and upper-bound
+            activations).
     """
 
     direction: Vector
@@ -189,6 +316,8 @@ class QPResult(eqx.Module):
     active_set: Bool[Array, " m_ineq"]
     converged: Bool[Array, ""]
     iterations: Int[Array, ""]
+    bound_fix_solves: Int[Array, ""]
+    n_bound_fixed: Int[Array, ""]
 
 
 class SLSQP(optx.AbstractMinimiser):
@@ -430,6 +559,15 @@ class SLSQP(optx.AbstractMinimiser):
     # well-conditioned PD objectives where s^T y > 0 naturally holds,
     # setting this to 0.0 avoids corrupting curvature information.
     damping_threshold: float = 0.2
+
+    # L-BFGS per-variable diagonal clip bounds for B_0 = diag(d).  The
+    # inverse Hessian H_0 = diag(1/d) drives the initial CG search
+    # direction magnitude.  The default floor 1e-4 bounds ||H_0||_inf
+    # at 1e4; lowering this to 1e-6 (the old hardcoded value) let H_0
+    # balloon to 1e6, which was the most likely cause of non-descent
+    # directions that exhausted the backtracking line search.
+    lbfgs_diag_floor: float = 1e-4
+    lbfgs_diag_ceil: float = 1e6
 
     # Line search parameters
     line_search_max_steps: int = eqx.field(static=True, default=20)
@@ -1170,6 +1308,7 @@ class SLSQP(optx.AbstractMinimiser):
             multipliers_eq=multipliers_eq,
             multipliers_ineq=multipliers_ineq,
             prev_grad_lagrangian=prev_grad_lagrangian,
+            grad_lagrangian=prev_grad_lagrangian,
             merit_penalty=merit_penalty,
             bound_jac=bound_jac,
             qp_iterations=jnp.array(0),
@@ -1183,6 +1322,9 @@ class SLSQP(optx.AbstractMinimiser):
             steps_without_improvement=jnp.array(0),
             stagnation=jnp.array(False),
             last_alpha=jnp.array(1.0),
+            ls_success=jnp.array(True),
+            ls_fatal=jnp.array(False),
+            diagnostics=_init_diagnostics(),
         )
 
     def step(
@@ -1259,6 +1401,12 @@ class SLSQP(optx.AbstractMinimiser):
             fallback_direction,
             direction,
         )
+
+        # Track whether the QP direction contained any non-finite values.
+        # We replaced it with the steepest-descent fallback above only when
+        # ``qp_result.converged`` is False, so a NaN while ``converged=True``
+        # should still be logged as a diagnostic failure.
+        direction_nonfinite = ~jnp.isfinite(qp_result.direction).all()
 
         # Zero-step convergence detection (pre–line-search):
         # catches inner solvers like CG that return d ≈ 0.
@@ -1364,6 +1512,8 @@ class SLSQP(optx.AbstractMinimiser):
             s,
             y_for_lbfgs,
             damping_threshold=self.damping_threshold,
+            diag_floor=self.lbfgs_diag_floor,
+            diag_ceil=self.lbfgs_diag_ceil,
         )
 
         # VARCHEN-style conditioning control: soft reset (keep most recent
@@ -1431,12 +1581,28 @@ class SLSQP(optx.AbstractMinimiser):
         # accepts only a tiny α, so the effective step α·||d|| is
         # negligible.  Detect this as a zero step so that MINRES-QLP
         # benefits from zero_step_patience just like null-space CG.
-        is_zero_step_post = (alpha * d_norm < self.atol) & qp_result.converged
+        #
+        # Critically, this must be gated on ``ls_result.success``: a
+        # line search that exhausted its budget without satisfying the
+        # Armijo / merit-descent condition also returns a tiny alpha,
+        # but that is a *failure* rather than the KKT-optimal d ≈ 0
+        # signal we want to accept as convergence.
+        is_zero_step_post = (
+            (alpha * d_norm < self.atol) & qp_result.converged & ls_result.success
+        )
         is_zero_step = is_zero_step_pre | is_zero_step_post
         new_consecutive_zero_steps = jnp.where(
             is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)
         )
         new_qp_optimal = new_consecutive_zero_steps >= self.zero_step_patience
+
+        # Fatal line-search failure: even the identity-reset escalation
+        # (triggered at ls_failure_patience) could not produce a descent
+        # direction.  After 2 * ls_failure_patience consecutive LS
+        # failures we conclude that the problem is either infeasible or
+        # catastrophically ill-conditioned and terminate with
+        # ``nonlinear_divergence`` rather than silently converging.
+        ls_fatal = new_consecutive_ls_failures >= 2 * self.ls_failure_patience
 
         # Merit-based stagnation detection: track consecutive steps
         # without sufficient improvement in the L1 merit function.
@@ -1454,6 +1620,73 @@ class SLSQP(optx.AbstractMinimiser):
             new_steps_without >= patience
         )
 
+        # Update diagnostic accumulators.  All updates are branch-free so
+        # the tracing inside jit/while_loop stays constant-shape.
+        #
+        # ``lbfgs_skipped`` intentionally mirrors the ``should_skip``
+        # decision inside ``lbfgs_append`` rather than comparing counts
+        # before and after.  Once the circular buffer saturates,
+        # ``count`` stays pinned at ``memory`` across every subsequent
+        # append, which made the old ``new.count == state.count`` check
+        # report a "skip" on every iteration after memory is full and
+        # saturate ``n_lbfgs_skips`` to (max_steps - memory).
+        prev_diag = state.diagnostics
+        lbfgs_skipped = lbfgs_should_skip(s, y_for_lbfgs)
+        # Estimate of the smallest singular value of J_eq from the
+        # Cholesky factor of J_eq J_eq^T (when equality constraints are
+        # present).  This is ``sqrt(min_i diag(L)^2)`` which is a lower
+        # bound on sigma_min(J_eq).  Tiny values flag near rank deficiency.
+        if self.n_eq_constraints > 0:
+            JJT_reg = state.eq_jac @ state.eq_jac.T + 1e-12 * jnp.eye(
+                self.n_eq_constraints
+            )
+            # cholesky may produce nan on indefinite matrices; fall back
+            # to +inf (i.e. "no finite estimate") in that case.
+            L_eq = jnp.linalg.cholesky(JJT_reg)
+            diag_L = jnp.abs(jnp.diag(L_eq))
+            eq_sv_est = jnp.where(
+                jnp.all(jnp.isfinite(diag_L)),
+                jnp.min(diag_L),
+                jnp.inf,
+            )
+        else:
+            eq_sv_est = jnp.inf
+
+        # A line search that reports ``success=True`` but produces a
+        # merit *increase* is a red flag: either ``rho`` is too small
+        # (descent direction of merit no longer dominated) or the
+        # approximate HVP is badly out of date.  Count such regressions.
+        merit_regression = ls_result.success & (merit_new > state.best_merit)
+
+        n_active_ineq_now = jnp.sum(qp_result.active_set.astype(jnp.int32))
+
+        new_diagnostics = SLSQPDiagnostics(
+            n_qp_inner_failures=prev_diag.n_qp_inner_failures
+            + jnp.where(~qp_result.converged, 1, 0),
+            n_ls_failures=prev_diag.n_ls_failures + jnp.where(ls_failed, 1, 0),
+            n_lbfgs_skips=prev_diag.n_lbfgs_skips + jnp.where(lbfgs_skipped, 1, 0),
+            n_nan_directions=prev_diag.n_nan_directions
+            + jnp.where(direction_nonfinite, 1, 0),
+            max_gamma=jnp.maximum(prev_diag.max_gamma, new_lbfgs_history.gamma),
+            min_diag=jnp.minimum(
+                prev_diag.min_diag, jnp.min(new_lbfgs_history.diagonal)
+            ),
+            max_diag=jnp.maximum(
+                prev_diag.max_diag, jnp.max(new_lbfgs_history.diagonal)
+            ),
+            eq_jac_min_sv_est=jnp.minimum(prev_diag.eq_jac_min_sv_est, eq_sv_est),
+            ls_alpha_min=jnp.minimum(prev_diag.ls_alpha_min, alpha),
+            tail_ls_failures=new_consecutive_ls_failures,
+            n_bound_fix_solves=prev_diag.n_bound_fix_solves
+            + qp_result.bound_fix_solves,
+            max_bound_fixed=jnp.maximum(
+                prev_diag.max_bound_fixed, qp_result.n_bound_fixed
+            ),
+            max_active_ineq=jnp.maximum(prev_diag.max_active_ineq, n_active_ineq_now),
+            n_merit_regressions=prev_diag.n_merit_regressions
+            + jnp.where(merit_regression, 1, 0),
+        )
+
         new_state = SLSQPState(
             step_count=state.step_count + 1,
             f_val=f_val_new,
@@ -1466,6 +1699,7 @@ class SLSQP(optx.AbstractMinimiser):
             multipliers_eq=qp_result.multipliers_eq,
             multipliers_ineq=qp_result.multipliers_ineq,
             prev_grad_lagrangian=grad_lagrangian_new,
+            grad_lagrangian=grad_lagrangian_new,
             merit_penalty=merit_penalty,
             bound_jac=state.bound_jac,
             qp_iterations=state.qp_iterations + qp_result.iterations,
@@ -1479,6 +1713,9 @@ class SLSQP(optx.AbstractMinimiser):
             steps_without_improvement=new_steps_without,
             stagnation=merit_stagnation,
             last_alpha=alpha,
+            ls_success=ls_result.success,
+            ls_fatal=ls_fatal,
+            diagnostics=new_diagnostics,
         )
 
         # Verbose output
@@ -1494,31 +1731,47 @@ class SLSQP(optx.AbstractMinimiser):
         )
         c_viol = jnp.maximum(eq_viol, ineq_viol)
         kkt = jnp.linalg.norm(grad_lagrangian_new)
+        # Relative stationarity: the actual termination criterion uses
+        # ``||∇L|| <= rtol * max(|L|, 1)``.  Exposing the ratio tells
+        # the user how close we are.
+        lagrangian_val_est = (
+            f_val_new
+            - jnp.dot(qp_result.multipliers_eq, eq_val_new)
+            - jnp.dot(qp_result.multipliers_ineq, ineq_val_new)
+        )
+        rel_kkt = kkt / jnp.maximum(jnp.abs(lagrangian_val_est), 1.0)
         dir_norm = jnp.linalg.norm(direction)
         grad_norm = jnp.linalg.norm(grad_new)
         n_active = jnp.sum(qp_result.active_set.astype(jnp.int32))
         diag_cond = jnp.max(new_lbfgs_history.diagonal) / jnp.maximum(
             jnp.min(new_lbfgs_history.diagonal), 1e-30
         )
+        merit_delta = merit_new - state.best_merit
         self.verbose(
             num_steps=("Step", new_state.step_count),  # ty: ignore[unresolved-attribute]  # equinox @dataclass_transform
             objective=("f", f_val_new, ".6e"),
             constraint_violation=("|c|", c_viol, ".3e"),
             kkt_residual=("|∇L|", kkt, ".3e"),
+            kkt_relative=("|∇L|/|L|", rel_kkt, ".3e"),
             grad_norm=("|∇f|", grad_norm, ".3e"),
             step_size=("α", alpha, ".3e"),
             direction_norm=("|d|", dir_norm, ".3e"),
             merit=("merit", merit_new, ".6e"),
+            merit_delta=("Δmerit", merit_delta, "+.2e"),
             stag_count=("stag#", new_steps_without),
             stagnation=("stag", merit_stagnation),
             penalty=("ρ", merit_penalty, ".3e"),
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
             lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
+            lbfgs_skipped=("skip", lbfgs_skipped),
             qp_iters=("QP it", qp_result.iterations),
             qp_converged=("QP ok", qp_result.converged),
             n_active=("#act", n_active),
+            n_bound_fixed=("#fix", qp_result.n_bound_fixed),
+            bound_fix_solves=("fix#", qp_result.bound_fix_solves),
             ls_steps=("LS it", ls_result.n_evals),
             ls_success=("LS ok", ls_result.success),
+            ls_tail=("LS tail", new_consecutive_ls_failures),
         )
 
         return y_new, new_state, aux  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
@@ -1555,14 +1808,13 @@ class SLSQP(optx.AbstractMinimiser):
             self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
         )
 
-        # Compute gradient of Lagrangian
-        grad_lagrangian = compute_lagrangian_gradient(
-            state.grad,
-            state.eq_jac,
-            state.ineq_jac,
-            state.multipliers_eq,
-            state.multipliers_ineq,
-        )
+        # Reuse the Lagrangian gradient computed in ``step`` with the
+        # blended multipliers — these are the ones consistent with the
+        # accepted iterate (the raw QP multipliers can be out of sync
+        # when the line search accepts only a partial step).  On the
+        # first call (before any ``step``) ``grad_lagrangian`` is
+        # initialized to ``prev_grad_lagrangian`` from ``init``.
+        grad_lagrangian = state.grad_lagrangian
 
         # Lagrangian value: L = f - lambda_eq^T c_eq - mu_ineq^T c_ineq
         lagrangian_val = state.f_val
@@ -1596,22 +1848,31 @@ class SLSQP(optx.AbstractMinimiser):
         # Check merit-based stagnation
         stagnation_detected = state.stagnation
 
+        # Check chronic line-search failure (see step()).
+        ls_stagnation = state.ls_fatal
+
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
+        #
+        # The old code also declared success via
+        #     state.qp_optimal & primal_feasible
+        # without any stationarity check.  That disjunct let repeated
+        # tiny-alpha line searches masquerade as convergence because
+        # ``qp_optimal`` is latched once ``zero_step_patience``
+        # consecutive "zero steps" are seen.  We drop it; ``qp_optimal``
+        # is now a diagnostic flag only.
         has_min_steps = state.step_count >= self.min_steps
-        converged = (stationarity & primal_feasible & has_min_steps) | (
-            state.qp_optimal & primal_feasible
-        )
+        converged = stationarity & primal_feasible & has_min_steps
 
         # Determine result code
-        done = converged | max_iters_reached | stagnation_detected
+        done = converged | max_iters_reached | stagnation_detected | ls_stagnation
 
         result = jax.lax.cond(
             converged,
             lambda: optx.RESULTS.successful,
             lambda: jax.lax.cond(
-                stagnation_detected,
+                stagnation_detected | ls_stagnation,
                 lambda: optx.RESULTS.nonlinear_divergence,
                 lambda: jax.lax.cond(
                     max_iters_reached,
@@ -1746,6 +2007,16 @@ class SLSQP(optx.AbstractMinimiser):
         # LPEC-A: compute predicted active set from NLP-level data.
         # Uses full ineq data (including bounds) for the prediction,
         # then slices to the general-ineq portion for the QP.
+        #
+        # Oversize guard: when LPEC-A predicts more active inequalities
+        # than ``n - m_eq`` degrees of freedom, the working set is
+        # overdetermined and the inner equality solve typically reports
+        # infeasibility.  In that case we discard the prediction for the
+        # current iteration (mask to all-False) and let the QP active
+        # set fall back to the warm-start / cold-start path.  The
+        # prediction is only asymptotically exact; an oversize verdict
+        # far from the solution is a strong signal that the current
+        # ``rho_bar`` is not informative.
         predicted_active_set = None
         if self.active_set_method in ("lpeca_init", "lpeca"):
             m_ineq_total = m_ineq_general + m_bounds
@@ -1762,9 +2033,16 @@ class SLSQP(optx.AbstractMinimiser):
                     beta=self.lpeca_beta,
                     use_lp=self.lpeca_use_lp,
                 )
-                predicted_active_set = (
-                    full_predicted[:m_ineq_general] if m_ineq_general > 0 else None
-                )
+                if m_ineq_general > 0:
+                    general_predicted = full_predicted[:m_ineq_general]
+                    n_free_dof = max(g.shape[0] - self.n_eq_constraints, 1)
+                    predicted_count = jnp.sum(general_predicted.astype(jnp.int32))
+                    oversize = predicted_count > n_free_dof
+                    predicted_active_set = jnp.where(
+                        oversize, jnp.zeros_like(general_predicted), general_predicted
+                    )
+                else:
+                    predicted_active_set = None
 
         use_proximal = self.proximal_tau > 0
         if use_proximal:
@@ -1868,6 +2146,18 @@ class SLSQP(optx.AbstractMinimiser):
             d_fixed = jnp.zeros(n_vars)
             mult_combined = jnp.zeros(A_combined.shape[0])
 
+            # Counter for "non-trivial" bound-fixing passes: incremented
+            # only when the pass performs a reduced-space inner solve
+            # (``any_change & any_fixed``).  Passes where ``free_mask``
+            # did not move are short-circuited below, avoiding an
+            # unnecessary ``inner_solver.solve`` call that would be
+            # discarded anyway.  This matters a lot on large problems
+            # (e.g. Portfolio(n=5000) with MINRES-QLP) where each
+            # inner solve is O((n+m) * t_minres): with no bounds ever
+            # active we were paying for ``5 * max_steps`` MINRES solves
+            # whose results were masked out by ``use_new=False``.
+            bound_fix_solves = jnp.array(0)
+
             bound_fix_tol = 1e-12
             for _bound_pass in range(5):
                 # --- Add step: fix free variables that violate bounds ---
@@ -1913,22 +2203,37 @@ class SLSQP(optx.AbstractMinimiser):
                 d_fixed = jnp.where(any_change, new_d_fixed, d_fixed)
 
                 any_fixed = ~jnp.all(free_mask)
+                needs_solve = any_change & any_fixed
 
-                bound_result = inner_solver.solve(
-                    hvp_fn,
-                    g,
-                    A_combined,
-                    b_combined,
-                    combined_active,
-                    precond_fn=precond_fn,
-                    free_mask=free_mask,
-                    d_fixed=d_fixed,
-                    adaptive_tol=adaptive_tol,
+                def _do_solve(_=None):
+                    return inner_solver.solve(
+                        hvp_fn,
+                        g,
+                        A_combined,
+                        b_combined,
+                        combined_active,
+                        precond_fn=precond_fn,
+                        free_mask=free_mask,
+                        d_fixed=d_fixed,
+                        adaptive_tol=adaptive_tol,
+                    )
+
+                def _skip_solve(_=None):
+                    return InnerSolveResult(
+                        d=direction,
+                        multipliers=mult_combined,
+                        converged=jnp.array(True),
+                    )
+
+                bound_result = jax.lax.cond(
+                    needs_solve, _do_solve, _skip_solve, operand=None
                 )
                 d_new = bound_result.d
                 mult_new = bound_result.multipliers
 
-                use_new = any_change & any_fixed
+                bound_fix_solves = bound_fix_solves + jnp.where(needs_solve, 1, 0)
+
+                use_new = needs_solve
                 direction = jnp.where(use_new, d_new, direction)
                 mult_combined = jnp.where(use_new, mult_new, mult_combined)
 
@@ -1992,10 +2297,13 @@ class SLSQP(optx.AbstractMinimiser):
                 [mult_gen_final, bound_mult_lower, bound_mult_upper]
             )
             active_set = jnp.concatenate([qp_result.active_set, at_lower, at_upper])
+            n_bound_fixed = jnp.sum((at_lower_full | at_upper_full).astype(jnp.int32))
         else:
             multipliers_eq = qp_result.multipliers_eq
             multipliers_ineq = qp_result.multipliers_ineq
             active_set = qp_result.active_set
+            bound_fix_solves = jnp.array(0)
+            n_bound_fixed = jnp.array(0)
 
         return QPResult(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
             direction=direction,
@@ -2004,4 +2312,6 @@ class SLSQP(optx.AbstractMinimiser):
             active_set=active_set,
             converged=qp_result.converged,
             iterations=qp_result.iterations,
+            bound_fix_solves=bound_fix_solves,
+            n_bound_fixed=n_bound_fixed,
         )

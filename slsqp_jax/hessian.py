@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 from beartype import beartype
 from beartype.typing import Callable
-from jaxtyping import Array, Float, Int, jaxtyped
+from jaxtyping import Array, Bool, Float, Int, jaxtyped
 
 from slsqp_jax.types import Scalar, Vector
 
@@ -265,12 +265,53 @@ def lbfgs_inverse_hvp(
 
 
 @jaxtyped(typechecker=beartype)
+def lbfgs_should_skip(
+    s: Vector,
+    y: Vector,
+    skip_threshold: float = 1e-8,
+) -> Bool[Array, ""]:
+    """Return the scalar ``should_skip`` decision that ``lbfgs_append`` uses.
+
+    Exposed so callers can *observe* the skip decision without having to
+    diff fields on the returned history (which becomes meaningless once
+    the circular buffer saturates, since ``count`` stays at ``memory``
+    from then on regardless of whether a real append happened).
+    """
+    s_norm = jnp.linalg.norm(s)
+    y_norm = jnp.linalg.norm(y)
+
+    step_too_small = s_norm < skip_threshold
+    grad_diff_too_small = y_norm < skip_threshold
+
+    curvature_ratio = y_norm / jnp.maximum(s_norm, 1e-30)
+    curvature_too_extreme = (curvature_ratio > 1e8) | (curvature_ratio < 1e-8)
+
+    sTy_raw = jnp.dot(s, y)
+    relative_curvature = jnp.abs(sTy_raw) / jnp.maximum(s_norm * y_norm, 1e-30)
+    curvature_too_small = (relative_curvature < 1e-8) & (sTy_raw > 0)
+
+    has_bad_values = ~(
+        jnp.isfinite(s_norm) & jnp.isfinite(y_norm) & jnp.isfinite(sTy_raw)
+    )
+
+    return (
+        step_too_small
+        | grad_diff_too_small
+        | curvature_too_extreme
+        | curvature_too_small
+        | has_bad_values
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def lbfgs_append(
     history: LBFGSHistory,
     s: Vector,
     y: Vector,
     damping_threshold: float = 0.2,
     skip_threshold: float = 1e-8,
+    diag_floor: float = 1e-4,
+    diag_ceil: float = 1e6,
 ) -> LBFGSHistory:
     """Append a new (s, y) pair to the L-BFGS history with Powell damping.
 
@@ -278,8 +319,9 @@ def lbfgs_append(
     damping is computed against the diagonal initial Hessian
     ``B_0 = diag(diagonal)`` instead of the full L-BFGS approximation B.
     This is O(n) instead of O(k^2 n), always well-conditioned (the
-    diagonal is clipped to [1e-2, 1e6]), and avoids the circular
-    dependency where a badly-conditioned B poisons its own damping.
+    diagonal is clipped to ``[diag_floor, diag_ceil]``), and avoids the
+    circular dependency where a badly-conditioned B poisons its own
+    damping.
 
     The damped gradient difference is:
         y_damped = theta * y + (1 - theta) * B0 s
@@ -287,16 +329,31 @@ def lbfgs_append(
     where theta in [0, 1] is chosen to satisfy:
         s^T y_damped >= threshold * s^T B0 s
 
-    If ||s|| is too small or the curvature ratio is too extreme,
-    the update is skipped entirely to avoid numerical issues.
+    If ``||s||`` is too small or the curvature ratio is too extreme, the
+    update is skipped entirely to avoid numerical issues.  The
+    ``curvature_ratio`` bracket is ``[1e-8, 1e8]`` (more permissive than
+    the previous ``[1e-6, 1e6]``) so we no longer drop noisy-but-
+    informative pairs on high-dimensional problems; these pairs instead
+    flow through Powell damping.  The ``relative_curvature < 1e-8`` skip
+    is now gated on ``sᵀy > 0`` (positive curvature) so negative-
+    curvature pairs are handled by damping rather than dropped.
 
-    After appending, the scalar gamma is updated to
-    y_damped^T y_damped / (y_damped^T s), clipped to [1e-2, 1e6].
-    The per-variable diagonal is updated using a component-wise secant:
-    d[i] = |y_damped[i] * s[i]| / (s[i]^2 + eps), clipped to [1e-2, 1e6].
-    This gives d[i] ≈ |H_{ii}| for diagonal Hessians regardless of step
-    direction, unlike the classical Shanno-Phua d[i] = y_i^2 / (y^T s)
-    which produces d ∝ h_i^2 for multi-component steps.
+    After appending, the scalar ``gamma`` is updated to
+    ``y_damped^T y_damped / (y_damped^T s)`` and clipped to
+    ``[diag_floor, diag_ceil]``.  The per-variable diagonal is updated
+    using a component-wise secant:
+    ``d[i] = |y_damped[i] * s[i]| / (s[i]^2 + eps)`` and clipped to the
+    same bracket.  This gives ``d[i] ≈ |H_{ii}|`` for diagonal Hessians
+    regardless of step direction, unlike the classical Shanno-Phua
+    formula ``d[i] = y_i^2 / (y^T s)`` which produces ``d ∝ h_i^2`` for
+    multi-component steps.
+
+    The old ``1e-6`` floor on ``clip_lo`` allowed the inverse-Hessian
+    diagonal ``H_0 = 1/d`` to balloon to ``1e6``, producing very large
+    CG directions that the line search could not backtrack.  Raising the
+    floor to ``1e-4`` keeps the inverse diagonal bounded by ``1e4`` and
+    dramatically reduces the "non-descent direction + chronic line-
+    search backtracking" failure mode.
 
     Args:
         history: Current L-BFGS history.
@@ -304,39 +361,13 @@ def lbfgs_append(
         y: Gradient difference y = nabla L_{k+1} - nabla L_k.
         damping_threshold: Powell damping threshold (default 0.2).
         skip_threshold: Minimum step norm for update (default 1e-8).
+        diag_floor: Minimum per-variable diagonal entry (default 1e-4).
+        diag_ceil: Maximum per-variable diagonal entry (default 1e6).
 
     Returns:
         Updated L-BFGS history with the new pair appended.
     """
-    s_norm = jnp.linalg.norm(s)
-    y_norm = jnp.linalg.norm(y)
-
-    # Skip if step or gradient difference is too small (absolute threshold)
-    step_too_small = s_norm < skip_threshold
-    grad_diff_too_small = y_norm < skip_threshold
-
-    # Skip if curvature ratio is too extreme (y_norm / s_norm too large or too small)
-    # This prevents ill-conditioning when curvature doesn't match step size
-    curvature_ratio = y_norm / jnp.maximum(s_norm, 1e-30)
-    curvature_too_extreme = (curvature_ratio > 1e6) | (curvature_ratio < 1e-6)
-
-    # Also check that s^T y is not too small relative to ||s|| ||y||
-    sTy_raw = jnp.dot(s, y)
-    relative_curvature = jnp.abs(sTy_raw) / jnp.maximum(s_norm * y_norm, 1e-30)
-    curvature_too_small = relative_curvature < 1e-6
-
-    # Skip if any values are non-finite
-    has_bad_values = ~(
-        jnp.isfinite(s_norm) & jnp.isfinite(y_norm) & jnp.isfinite(sTy_raw)
-    )
-
-    should_skip = (
-        step_too_small
-        | grad_diff_too_small
-        | curvature_too_extreme
-        | curvature_too_small
-        | has_bad_values
-    )
+    should_skip = lbfgs_should_skip(s, y, skip_threshold=skip_threshold)
 
     def do_append():
         # VARCHEN-style damping toward B0 = diag(diagonal).
@@ -363,7 +394,7 @@ def lbfgs_append(
 
         gamma_new = jax.lax.cond(
             (yTs > 1e-12) & jnp.isfinite(gamma_candidate),
-            lambda: jnp.clip(gamma_candidate, 1e-2, 1e6),
+            lambda: jnp.clip(gamma_candidate, diag_floor, diag_ceil),
             lambda: history.gamma,
         )
 
@@ -389,8 +420,8 @@ def lbfgs_append(
         # diagonal problems like WeightedQuad).
         s_sq = s**2
         per_var_estimate = jnp.abs(y_damped * s) / jnp.maximum(s_sq, 1e-12)
-        clip_lo = jnp.maximum(gamma_new * 1e-2, 1e-6)
-        clip_hi = jnp.minimum(gamma_new * 1e2, 1e8)
+        clip_lo = jnp.maximum(gamma_new * 1e-2, diag_floor)
+        clip_hi = jnp.minimum(gamma_new * 1e2, diag_ceil)
         per_var_clipped = jnp.clip(per_var_estimate, clip_lo, clip_hi)
         has_signal = s_sq > 1e-20
         new_diagonal = jnp.where(
@@ -575,6 +606,8 @@ def lbfgs_compute_diagonal(
 @jaxtyped(typechecker=beartype)
 def lbfgs_reset(
     history: LBFGSHistory,
+    diag_floor: float = 1e-4,
+    diag_ceil: float = 1e6,
 ) -> LBFGSHistory:
     """SNOPT-style diagonal reset of the L-BFGS history.
 
@@ -584,11 +617,16 @@ def lbfgs_reset(
     preventing the "everything is flat" effect that occurs when the scalar
     ``gamma`` becomes very small.
 
+    The extracted diagonal is clipped to ``[diag_floor, diag_ceil]`` to
+    keep the reset point aligned with the clipping used inside
+    :func:`lbfgs_append`; previous versions used a hardcoded ``[1e-2,
+    1e6]`` that diverged from the append-path floor.
+
     Based on the SNOPT limited-memory reset strategy (Gill, Murray &
     Saunders, *SIAM Review*, 47(1), 2005, Section 3.3).
     """
     diag_B = lbfgs_compute_diagonal(history)
-    diag_clipped = jnp.clip(diag_B, 1e-2, 1e6)
+    diag_clipped = jnp.clip(diag_B, diag_floor, diag_ceil)
 
     # Ensure all values are finite; fall back to 1.0 otherwise
     diag_safe = jnp.where(jnp.isfinite(diag_clipped), diag_clipped, 1.0)
