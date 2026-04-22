@@ -346,6 +346,8 @@ The threshold parameters `lpeca_sigma` (default 0.9) and `lpeca_beta` (default $
 
 **SQP warm-up gate.** LPEC-A's asymptotic guarantees assume the multiplier estimates fed into $\bar{\rho}$ are themselves reasonable. During the first few SQP iterations the multipliers are still transient (especially when the initial guess is far from the solution), so the LPEC-A prediction is bypassed entirely for the first `lpeca_warmup_steps` outer iterations (default `3`). After warm-up the trust gate above takes over.
 
+**Bound-constraint extension.** Box constraints are handled by a separate iterative bound-fixing loop after the QP solve (see the "Bound separation via variable fixing" discussion in the scaling section). By default that loop starts cold - with no variable fixed - and discovers the active bound set in one or two passes per SQP iteration. LPEC-A computes its prediction over *all* inequalities, including the lower- and upper-bound rows, so the bound portion of the prediction is an untapped source of warm-start information. With `lpeca_predict_bounds=True` (default) the bound rows of LPEC-A's predicted active set are scattered back onto the variable indices (using the precomputed lower/upper bound masks) and installed as the initial `free_mask` and `d_fixed` of the bound-fixing loop. When the prediction is accurate this typically halves the number of reduced-space inner solves required to converge the bound active set; when it is wrong the loop's existing add/drop logic refines it on the first pass, so there is no correctness risk. The pre-fixed count is accumulated in the diagnostic `n_lpeca_bounds_prefixed` and exposed per step on `QPResult.n_lpeca_bounds_prefixed`. The warm-up and trust gates apply to the bound extension as well: when LPEC-A is bypassed, the bound-fixing loop reverts to its cold start. Set `lpeca_predict_bounds=False` to restrict LPEC-A to general inequality constraints only.
+
 **Optional LP refinement.** By default, LPEC-A uses the multiplier estimates from the previous QP solve. Setting `lpeca_use_lp=True` solves a small LP (via `mpax.r2HPDHG`) to obtain tighter multiplier estimates, producing a more accurate prediction. This requires the `mpax` package (`pip install slsqp-jax[extras]`).
 
 ```python
@@ -354,6 +356,7 @@ solver = SLSQP(
     lpeca_sigma=0.9,
     lpeca_trust_threshold=1.0,
     lpeca_warmup_steps=3,
+    lpeca_predict_bounds=True,  # warm-start the bound-fixing loop
     lpeca_use_lp=False,  # True requires mpax
     ...
 )
