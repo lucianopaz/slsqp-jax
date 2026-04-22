@@ -779,7 +779,7 @@ class SLSQP(optx.AbstractMinimiser):
     # (Oberlin & Wright Theorem 5 only guarantees correctness near the
     # solution) and is replaced by an empty prediction so the QP
     # active-set loop falls back to the warm-start path.  Default 1.0.
-    lpeca_trust_threshold: float = eqx.field(static=True, default=0.1)
+    lpeca_trust_threshold: float = eqx.field(static=True, default=1.0)
 
     # LPEC-A warm-up: the first ``lpeca_warmup_steps`` outer SLSQP
     # iterations bypass the LPEC-A prediction entirely.  Rationale:
@@ -789,7 +789,7 @@ class SLSQP(optx.AbstractMinimiser):
     # noisy.  Default 3 (matches the ping-pong threshold).  Set to 0
     # to disable the warm-up and apply LPEC-A from step 0.  Only
     # affects ``active_set_method`` in ``("lpeca_init", "lpeca")``.
-    lpeca_warmup_steps: int = eqx.field(static=True, default=10)
+    lpeca_warmup_steps: int = eqx.field(static=True, default=3)
 
     # Whether to extend LPEC-A's prediction to box (bound) constraints.
     # When True (default), the bound portion of the LPEC-A-predicted
@@ -820,8 +820,15 @@ class SLSQP(optx.AbstractMinimiser):
     # QP active-set loop.  When the threshold is hit, the QP returns
     # its current direction with ``ping_ponged=True`` and
     # ``converged=True`` instead of exhausting ``qp_max_iter``.
-    # Default 3.
-    qp_ping_pong_threshold: int = eqx.field(static=True, default=3)
+    #
+    # Default is effectively disabled (``2**31 - 1``): historical
+    # production paths relied on the v0.9.2 behaviour where a stalled
+    # add/drop pair kept iterating until ``qp_max_iter`` was hit, which
+    # allowed truncated QP directions to still make SQP progress.  The
+    # short-circuit mechanism stays in place for opt-in use (e.g.
+    # setting this to 3--8 helps on problems with confirmed degenerate
+    # vertices where ``qp_max_iter`` was being exhausted regularly).
+    qp_ping_pong_threshold: int = eqx.field(static=True, default=2**31 - 1)
 
     # Verbose output (resolved to Callable[..., None] in __check_init__)
     verbose: Callable = eqx.field(static=True, default=False)
@@ -2232,13 +2239,13 @@ class SLSQP(optx.AbstractMinimiser):
                         pred_lower = full_predicted[
                             m_ineq_general : m_ineq_general + n_lower
                         ]
-                        lower_idx = np.array(self._lower_indices)
+                        lower_idx = jnp.asarray(self._lower_indices, dtype=jnp.int32)
                         lpeca_bound_lower = lpeca_bound_lower.at[lower_idx].set(
                             pred_lower
                         )
                     if n_upper > 0:
                         pred_upper = full_predicted[m_ineq_general + n_lower :]
-                        upper_idx = np.array(self._upper_indices)
+                        upper_idx = jnp.asarray(self._upper_indices, dtype=jnp.int32)
                         lpeca_bound_upper_raw = jnp.zeros(n_vars_static, dtype=bool)
                         lpeca_bound_upper_raw = lpeca_bound_upper_raw.at[upper_idx].set(
                             pred_upper

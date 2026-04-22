@@ -1343,12 +1343,12 @@ class TestQPCyclingDiagnostics:
         )
 
     def test_expand_ramp_default_increases_working_tol(self):
-        """The recalibrated EXPAND ramp grows ``working_tol`` over the budget.
+        """The v0.9.2 EXPAND ramp grows ``working_tol`` monotonically.
 
-        A run that needs at least a few active-set iterations should
-        have ``final_working_tol`` strictly between the initial
-        ``0.5 * tol`` and the final ``tol`` (with default
-        ``expand_factor=1.0``).
+        ``working_tol = base_tol + k * tau`` with ``tau =
+        base_tol * expand_factor / max_iter``.  With the default
+        ``expand_factor=1.0`` the final tolerance sits in
+        ``[base_tol, 2 * base_tol]``.
         """
         n = 4
         H = jnp.diag(jnp.array([1.0, 2.0, 3.0, 4.0]))
@@ -1367,15 +1367,15 @@ class TestQPCyclingDiagnostics:
             max_iter=20,
         )
         assert bool(result.converged)
-        # ``final_working_tol`` must be in the half-open ramp band:
-        # [0.5*tol, tol] (inclusive at the lower end since iter=0 is
-        # possible if the warm start is already optimal).
         wt = float(result.final_working_tol)
-        assert wt >= 0.5 * tol * 0.999, (
-            f"final_working_tol {wt:e} below 0.5*tol {0.5 * tol:e}"
+        # ``base_tol = tol + min(kkt_res, 1.0) * tol`` so it sits in
+        # ``[tol, 2 * tol]`` even at iter=0; the ramp can then push
+        # ``working_tol`` up to ``2 * base_tol``.
+        assert wt >= tol * 0.999, (
+            f"final_working_tol {wt:e} below base_tol lower bound {tol:e}"
         )
-        assert wt <= tol * 1.001, (
-            f"final_working_tol {wt:e} above tol {tol:e} (ramp overshoot)"
+        assert wt <= 4.0 * tol * 1.001, (
+            f"final_working_tol {wt:e} above 4*tol {4.0 * tol:e} (ramp overshoot)"
         )
 
 

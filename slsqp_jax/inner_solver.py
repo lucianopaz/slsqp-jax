@@ -613,7 +613,16 @@ def craig_solve(
     v1 = Atu1 / alpha1_safe
 
     s1 = beta1 / alpha1_safe
-    x1 = s1 * v1
+    x1_raw = s1 * v1
+    # Guard against alpha1 ≈ 0 with beta1 != 0: ``s1`` gets amplified by
+    # ``1 / 1e-30`` and the resulting ``x1`` is numerical garbage (often
+    # catastrophically large).  When ``alpha1`` is below the breakdown
+    # threshold the right answer is *no update from the CRAIG iterate*:
+    # return ``x = 0`` so downstream consumers (projection, HVP) receive
+    # a bounded vector instead of one that overflows.  We still signal
+    # breakdown via ``init_breakdown`` so the outer solver knows CRAIG
+    # did not actually solve the system.
+    x1 = jnp.where(breakdown_init, jnp.zeros_like(x1_raw), x1_raw)
 
     Av1 = A @ v1
     u_hat = Av1 - alpha1 * u1
@@ -658,7 +667,17 @@ def craig_solve(
 
             s_new = -state.beta * state.s / alpha_safe
 
-            x_new = state.x + s_new * v_new
+            # Guard against ``alpha_breakdown``: if ``alpha_new`` is
+            # below the breakdown threshold then ``s_new`` and ``v_new``
+            # are both amplified by ``1 / 1e-30``.  The nominal update
+            # ``state.x + s_new * v_new`` would therefore absorb the
+            # ``1e60`` scaling and poison every downstream consumer
+            # (including the HVP call inside the CG loop).  Stay at the
+            # last safe iterate instead; the breakdown flag on the
+            # returned state records the failure so the outer solver
+            # can react.
+            x_candidate = state.x + s_new * v_new
+            x_new = jnp.where(alpha_breakdown, state.x, x_candidate)
 
             Av = A @ v_new
             u_hat = Av - alpha_new * state.u
@@ -812,22 +831,34 @@ def _solve_projected_cg_craig(
     )
     _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
 
-    # Particular solution: d_p = A^T (A A^T)^{-1} b = craig_solve(A, b)
+    # Particular solution: d_p = A^T (A A^T)^{-1} b = craig_solve(A, b).
+    # Guard against a non-finite result (e.g. the rhs is non-zero but
+    # the active Jacobian is numerically rank-deficient and CRAIG
+    # breakdown-guarded back to ``x = 0``, or extreme magnitudes escaped
+    # the breakdown detector): fall back to ``d_p = 0`` so the CG loop
+    # at least starts from a finite iterate.
     d_p_free, d_p_craig_conv = craig_solve(
         A_work, b_work, tol=craig_tol, max_iter=craig_max_iter
     )
+    d_p_free_finite = jnp.isfinite(d_p_free).all()
+    d_p_free = jnp.where(d_p_free_finite, d_p_free, jnp.zeros_like(d_p_free))
     d_p = d_p_free + _dfixed if has_fixed else d_p_free
 
     # Projection: P(v) = v - A^T (A A^T)^{-1} A v = v - craig_solve(A, Av).
     # We deliberately do not propagate per-call CRAIG convergence from
     # inside the CG iteration (would require threading state into
-    # ``_CGState``); breakdown of CRAIG would manifest as a non-finite
-    # direction, which the outer QP solver checks via ``isfinite``.
+    # ``_CGState``).  If CRAIG breaks down on the projection solve we
+    # fall back to the identity on that component, which degrades the
+    # projector to "no projection" for the problematic input but keeps
+    # the CG iterates finite.  Without this guard, a breakdown-induced
+    # non-finite ``x_proj`` would be subtracted from ``v_work`` and
+    # poison every subsequent HVP/projection call.
     def project(v: Vector) -> Vector:
         v_work = _free * v if has_fixed else v
         x_proj, _ = craig_solve(
             A_work, A_work @ v_work, tol=craig_tol, max_iter=craig_max_iter
         )
+        x_proj = jnp.where(jnp.isfinite(x_proj).all(), x_proj, jnp.zeros_like(x_proj))
         return v_work - x_proj
 
     # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
