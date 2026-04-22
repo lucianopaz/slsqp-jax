@@ -1037,3 +1037,204 @@ class TestLpecaWarmupGate:
         assert int(state.diagnostics.n_lpeca_bypassed) >= 1, (
             "Warm-up gate should bypass LPEC-A for the first few SQP steps"
         )
+
+
+# ============================================================
+# Bound-prediction extension tests
+# ============================================================
+
+
+class TestLpecaBoundPrediction:
+    """Verify that LPEC-A's active-set prediction is extended to box bounds.
+
+    Checks three invariants:
+
+    1. When the bound extension is enabled, the solver produces the same
+       solution as the ``expand`` baseline (correctness).
+    2. When LPEC-A's prediction is accurate, the ``n_lpeca_bounds_prefixed``
+       counter records the warm-started bounds and the total bound-fixing
+       ``inner_solver`` invocations do not inflate.
+    3. When the warm-up / trust gate suppresses the LPEC-A prediction,
+       the bound warm-start is also skipped and ``n_lpeca_bounds_prefixed``
+       remains ``0``.
+    """
+
+    @staticmethod
+    def _box_problem():
+        target = jnp.array([-2.0, 0.5, 3.0, 0.1, -1.5])
+
+        def objective(x, args):
+            return jnp.sum((x - target) ** 2), None
+
+        n = target.shape[0]
+        bounds = jnp.stack([jnp.zeros(n), jnp.ones(n)], axis=1)
+        x0 = jnp.full(n, 0.5)
+        # Optimum: clamp(target, 0, 1) = [0, 0.5, 1, 0.1, 0]
+        expected = jnp.clip(target, 0.0, 1.0)
+        return objective, bounds, x0, expected
+
+    def test_bound_extension_matches_expand(self):
+        """Solution is unchanged regardless of the bound-extension flag."""
+        objective, bounds, x0, expected = self._box_problem()
+
+        common = dict(atol=1e-7, max_steps=80, bounds=bounds)
+        solver_expand = SLSQP(**common, active_set_method="expand")
+        solver_bounds_off = SLSQP(
+            **common,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=0,
+            lpeca_predict_bounds=False,
+        )
+        solver_bounds_on = SLSQP(
+            **common,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=0,
+            lpeca_predict_bounds=True,
+        )
+
+        y_expand, _ = _run_solver(solver_expand, objective, x0)
+        y_off, _ = _run_solver(solver_bounds_off, objective, x0)
+        y_on, _ = _run_solver(solver_bounds_on, objective, x0)
+
+        np.testing.assert_allclose(y_expand, expected, atol=1e-5)
+        np.testing.assert_allclose(y_off, expected, atol=1e-5)
+        np.testing.assert_allclose(y_on, expected, atol=1e-5)
+
+    def test_bound_prefix_counter_accumulates(self):
+        """When the prediction is trusted and non-empty, the counter is > 0."""
+        objective, bounds, x0, _ = self._box_problem()
+
+        solver = SLSQP(
+            atol=1e-7,
+            max_steps=80,
+            bounds=bounds,
+            active_set_method="lpeca_init",
+            # Disable warm-up so LPEC-A fires from the first step.
+            lpeca_warmup_steps=0,
+            # Very loose trust threshold so the trust gate does not veto.
+            lpeca_trust_threshold=1e6,
+            lpeca_predict_bounds=True,
+        )
+        _, state = _run_solver(solver, objective, x0)
+
+        # At least one SQP step must pre-fix at least one bound.
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) > 0, (
+            "Expected LPEC-A to pre-fix at least one bound across the run; "
+            f"got n_lpeca_bounds_prefixed={int(state.diagnostics.n_lpeca_bounds_prefixed)}"
+        )
+
+    def test_bound_prefix_zero_when_flag_off(self):
+        """With ``lpeca_predict_bounds=False`` no bounds are pre-fixed."""
+        objective, bounds, x0, _ = self._box_problem()
+
+        solver = SLSQP(
+            atol=1e-7,
+            max_steps=80,
+            bounds=bounds,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=0,
+            lpeca_trust_threshold=1e6,
+            lpeca_predict_bounds=False,
+        )
+        _, state = _run_solver(solver, objective, x0)
+
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) == 0, (
+            "Bound pre-fix counter must stay at 0 when the flag is off"
+        )
+
+    def test_bound_prefix_zero_when_trust_gate_vetoes(self):
+        """With a very tight trust threshold, no prefix is ever applied."""
+        objective, bounds, x0, _ = self._box_problem()
+
+        solver = SLSQP(
+            atol=1e-7,
+            max_steps=80,
+            bounds=bounds,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=0,
+            # Threshold small enough that rho_bar always exceeds it.
+            lpeca_trust_threshold=1e-30,
+            lpeca_predict_bounds=True,
+        )
+        _, state = _run_solver(solver, objective, x0)
+
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) == 0, (
+            "Bound pre-fix must not fire when the trust gate vetoes LPEC-A"
+        )
+        assert int(state.diagnostics.n_lpeca_bypassed) > 0, (
+            "Trust gate must have fired on at least one step"
+        )
+
+    def test_bound_prefix_skipped_during_warmup(self):
+        """During the LPEC-A warm-up window, no bound prefix is applied."""
+        objective, bounds, x0, _ = self._box_problem()
+
+        solver = SLSQP(
+            atol=1e-7,
+            # Cap max_steps at the warm-up window so LPEC-A never fires.
+            max_steps=3,
+            bounds=bounds,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=100,
+            lpeca_trust_threshold=1e6,
+            lpeca_predict_bounds=True,
+        )
+        _, state = _run_solver(solver, objective, x0)
+
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) == 0, (
+            "Warm-up must suppress LPEC-A bound pre-fix"
+        )
+
+    def test_expand_method_has_zero_bound_prefix(self):
+        """When ``active_set_method='expand'`` the counter stays at 0."""
+        objective, bounds, x0, _ = self._box_problem()
+
+        solver = SLSQP(
+            atol=1e-7,
+            max_steps=80,
+            bounds=bounds,
+            active_set_method="expand",
+        )
+        _, state = _run_solver(solver, objective, x0)
+
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) == 0
+
+    def test_bound_prefix_handles_mixed_general_and_bounds(self):
+        """Predicted bound active set is consistent with optimum when
+        the problem mixes a general inequality and box bounds.
+
+        Minimise (x - target)^2 + (y - target)^2 subject to
+            x + y >= 0.5,  0 <= x <= 1, 0 <= y <= 1.
+        With target = (-1, 2) the unconstrained optimum is outside the
+        box on both coordinates, so the optimum is x=0, y=1 and the
+        general inequality is inactive.
+        """
+        target = jnp.array([-1.0, 2.0])
+
+        def objective(x, args):
+            return jnp.sum((x - target) ** 2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 0.5])
+
+        bounds = jnp.stack([jnp.zeros(2), jnp.ones(2)], axis=1)
+        x0 = jnp.array([0.5, 0.5])
+        expected = jnp.array([0.0, 1.0])
+
+        solver = SLSQP(
+            atol=1e-7,
+            max_steps=80,
+            bounds=bounds,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=0,
+            lpeca_trust_threshold=1e6,
+            lpeca_predict_bounds=True,
+        )
+        y, state = _run_solver(solver, objective, x0)
+
+        np.testing.assert_allclose(y, expected, atol=1e-5)
+        # The bound counter should record at least one prefix on this
+        # bound-dominated problem.
+        assert int(state.diagnostics.n_lpeca_bounds_prefixed) > 0
