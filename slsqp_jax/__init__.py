@@ -34,6 +34,7 @@ from slsqp_jax.inner_solver import (
     ProjectedCGCraig,
 )
 from slsqp_jax.lpeca import (
+    LPECAResult,
     compute_lpeca_active_set,
     compute_rho_bar,
     identify_active_set_lpeca,
@@ -111,4 +112,5 @@ __all__ = [
     "compute_rho_bar",
     "identify_active_set_lpeca",
     "compute_lpeca_active_set",
+    "LPECAResult",
 ]
