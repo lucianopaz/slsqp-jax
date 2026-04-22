@@ -145,7 +145,7 @@ def _solve_qp_proximal(
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
     mult_drop_floor: float = 1e-6,
-    ping_pong_threshold: int = 3,
+    ping_pong_threshold: int = 2**31 - 1,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -243,17 +243,15 @@ def _solve_qp_proximal(
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    # SNOPT-style EXPAND (Gill, Murray, Saunders & Wright, 1989, §3.2):
-    # ``working_tol = featol/2 + k * (featol / (2*max_iter))`` ramps the
-    # feasibility tolerance from ``featol/2`` at k=0 to ``featol`` at
-    # k=max_iter.  The previous formula ``working_tol = featol +
-    # k*(featol/max_iter)`` only widened by ~1 ULP per iteration, which
-    # was insufficient to break ties at degenerate vertices.  The
-    # ``expand_factor`` knob now scales the ramp amplitude (default 1
-    # = SNOPT recipe; 0 disables EXPAND).
-    delta0 = 0.5 * base_tol * expand_factor
-    tau = delta0 / jnp.maximum(max_iter, 1)
-    effective_delta0 = delta0 if use_expand else base_tol
+    # EXPAND anti-cycling: ``working_tol = base_tol + k * tau`` with
+    # ``tau = base_tol * expand_factor / max_iter``.  The tolerance
+    # grows from ``base_tol`` at k=0 to ``base_tol * (1 + expand_factor)``
+    # at k=max_iter, which widens both the constraint-violation and
+    # multiplier-drop tests enough to break ties at degenerate vertices
+    # while keeping the QP's working-set decisions coherent with the
+    # outer SLSQP convergence tolerance.  Setting ``expand_factor = 0``
+    # disables the ramp entirely.
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
     effective_tau = tau if use_expand else 0.0
 
     # Floor for the negative-multiplier drop test.  Multiplier recovery
@@ -265,7 +263,7 @@ def _solve_qp_proximal(
     drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = effective_delta0 + state.iteration * effective_tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set — inequalities only
         result = inner_solver.solve(
@@ -390,14 +388,16 @@ def _solve_qp_proximal(
 
     # The EXPAND procedure's growing tolerance can cause mark_converged()
     # to fire on the last iteration under relaxed tolerances.  Override
-    # convergence when the iteration limit was actually reached or when
-    # any inner solve failed.  A genuine ping-pong short-circuit also
-    # counts as convergence (the loop did not exhaust its budget).
+    # convergence when the iteration limit was actually reached.  A
+    # genuine ping-pong short-circuit also counts as convergence (the
+    # loop did not exhaust its budget).  any_inner_failure is kept
+    # on QPState for diagnostics only — treating a merely-imprecise
+    # inner CG/MINRES iterate as a QP failure would trigger the outer
+    # steepest-descent fallback on every truncated solve and regress
+    # production paths that rely on those directions for progress.
     reached_max_iter = final_state.iteration >= max_iter
-    final_converged = (
-        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
-    )
-    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
+    final_converged = final_state.converged & ~reached_max_iter
+    final_working_tol = base_tol + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
@@ -433,7 +433,7 @@ def _solve_qp_direct(
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
     mult_drop_floor: float = 1e-6,
-    ping_pong_threshold: int = 3,
+    ping_pong_threshold: int = 2**31 - 1,
 ) -> QPResult:
     """Solve the QP with equality constraints enforced via direct projection.
 
@@ -524,15 +524,13 @@ def _solve_qp_direct(
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    # SNOPT-style EXPAND ramp (see ``_solve_qp_proximal``).
-    delta0 = 0.5 * base_tol * expand_factor
-    tau = delta0 / jnp.maximum(max_iter, 1)
-    effective_delta0 = delta0 if use_expand else base_tol
+    # EXPAND ramp (see ``_solve_qp_proximal``).
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
     effective_tau = tau if use_expand else 0.0
     drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = effective_delta0 + state.iteration * effective_tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         combined_active = jnp.concatenate([eq_active, state.active_set])
         result = inner_solver.solve(
@@ -648,10 +646,8 @@ def _solve_qp_direct(
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
     reached_max_iter = final_state.iteration >= max_iter
-    final_converged = (
-        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
-    )
-    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
+    final_converged = final_state.converged & ~reached_max_iter
+    final_working_tol = base_tol + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
@@ -691,7 +687,7 @@ def solve_qp(
     use_constraint_preconditioner: bool = False,
     inner_solver: AbstractInnerSolver | None = None,
     mult_drop_floor: float = 1e-6,
-    ping_pong_threshold: int = 3,
+    ping_pong_threshold: int = 2**31 - 1,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -986,15 +982,13 @@ def solve_qp(
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    # SNOPT-style EXPAND ramp (see ``_solve_qp_proximal``).
-    delta0 = 0.5 * base_tol * expand_factor
-    tau = delta0 / jnp.maximum(max_iter, 1)
-    effective_delta0 = delta0 if use_expand else base_tol
+    # EXPAND ramp (see ``_solve_qp_proximal``).
+    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
     effective_tau = tau if use_expand else 0.0
     drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = effective_delta0 + state.iteration * effective_tau
+        working_tol = base_tol + state.iteration * effective_tau
 
         # Solve with current active set using projected CG (ineq only)
         result = inner_solver.solve(
@@ -1114,10 +1108,8 @@ def solve_qp(
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
     reached_max_iter = final_state.iteration >= max_iter
-    final_converged = (
-        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
-    )
-    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
+    final_converged = final_state.converged & ~reached_max_iter
+    final_working_tol = base_tol + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
