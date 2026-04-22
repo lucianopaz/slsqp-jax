@@ -123,9 +123,10 @@ class TestIdentifyActiveSet:
         lambda_ineq = jnp.array([1.0, 0.0, 0.0])
         mu_eq = jnp.zeros(0)
 
-        active = identify_active_set_lpeca(
+        result = identify_active_set_lpeca(
             c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq
         )
+        active = result.predicted
         # c_ineq[0] = 0 should be active; c_ineq[2] = 0.001 might be
         assert active[0], "Constraint with c=0 must be active"
 
@@ -140,9 +141,10 @@ class TestIdentifyActiveSet:
         lambda_ineq = jnp.zeros(2)
         mu_eq = jnp.zeros(0)
 
-        active = identify_active_set_lpeca(
+        result = identify_active_set_lpeca(
             c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq
         )
+        active = result.predicted
         assert not jnp.any(active), "Well-feasible constraints should be inactive"
 
     def test_sigma_affects_threshold(self):
@@ -155,7 +157,7 @@ class TestIdentifyActiveSet:
         lambda_ineq = jnp.array([0.5])
         mu_eq = jnp.zeros(0)
 
-        active_high_sigma = identify_active_set_lpeca(
+        result_high = identify_active_set_lpeca(
             c_ineq,
             c_eq,
             grad,
@@ -165,7 +167,7 @@ class TestIdentifyActiveSet:
             mu_eq,
             sigma=0.99,
         )
-        active_low_sigma = identify_active_set_lpeca(
+        result_low = identify_active_set_lpeca(
             c_ineq,
             c_eq,
             grad,
@@ -178,8 +180,8 @@ class TestIdentifyActiveSet:
         # With sigma=0.5, threshold = (beta * rho_bar)^0.5 which is larger
         # than (beta * rho_bar)^0.99 when beta*rho_bar < 1
         # Both should give consistent results
-        assert active_low_sigma.shape == (1,)
-        assert active_high_sigma.shape == (1,)
+        assert result_low.predicted.shape == (1,)
+        assert result_high.predicted.shape == (1,)
 
 
 class TestSolveLpecaLp:
@@ -211,6 +213,16 @@ class TestSolveLpecaLp:
             else:
                 del sys.modules["mpax"]
             importlib.reload(lpeca_mod)
+            # Rebind module-level references so that subsequent tests
+            # (and beartype-cached return-type checks) see the freshly
+            # reloaded class identities.  Without this, the symbols
+            # imported at the top of this file still point to the
+            # pre-reload function objects whose `__globals__` now look
+            # up the *new* LPECAResult, which fails beartype's identity
+            # check on the return type.
+            globals()["compute_lpeca_active_set"] = lpeca_mod.compute_lpeca_active_set
+            globals()["compute_rho_bar"] = lpeca_mod.compute_rho_bar
+            globals()["identify_active_set_lpeca"] = lpeca_mod.identify_active_set_lpeca
 
     def test_solve_lp_inequality_only(self):
         """LP solve returns valid multipliers for an inequality-only problem.
@@ -323,7 +335,7 @@ class TestComputeLpecaActiveSet:
         lambda_ineq = jnp.array([1.0, 0.0])
         mu_eq = jnp.zeros(0)
 
-        active = compute_lpeca_active_set(
+        result = compute_lpeca_active_set(
             c_ineq,
             c_eq,
             grad,
@@ -333,7 +345,7 @@ class TestComputeLpecaActiveSet:
             mu_eq,
             use_lp=False,
         )
-        assert active[0], "Constraint with c=0 should be active"
+        assert result.predicted[0], "Constraint with c=0 should be active"
 
     def test_with_lp_refinement(self):
         """Calling with use_lp=True exercises the mpax LP path.
@@ -351,7 +363,7 @@ class TestComputeLpecaActiveSet:
         lambda_ineq = jnp.array([0.0])  # bad initial guess
         mu_eq = jnp.zeros(0)
 
-        active = compute_lpeca_active_set(
+        result = compute_lpeca_active_set(
             c_ineq,
             c_eq,
             grad,
@@ -363,7 +375,9 @@ class TestComputeLpecaActiveSet:
             lp_eps=1e-4,
             lp_max_iter=5000,
         )
-        assert active[0], "Active constraint must be identified with LP refinement"
+        assert result.predicted[0], (
+            "Active constraint must be identified with LP refinement"
+        )
 
     def test_with_lp_equality_and_inequality(self):
         """LP refinement with both equality and inequality constraints."""
@@ -375,7 +389,7 @@ class TestComputeLpecaActiveSet:
         lambda_ineq = jnp.array([0.0])
         mu_eq = jnp.array([0.0])
 
-        active = compute_lpeca_active_set(
+        result = compute_lpeca_active_set(
             c_ineq,
             c_eq,
             grad,
@@ -387,7 +401,9 @@ class TestComputeLpecaActiveSet:
             lp_eps=1e-4,
             lp_max_iter=5000,
         )
-        assert not active[0], "Feasible inactive constraint should not be active"
+        assert not result.predicted[0], (
+            "Feasible inactive constraint should not be active"
+        )
 
 
 # ============================================================
@@ -773,3 +789,251 @@ class TestSLSQPLpecaModes:
         y, state = _run_solver(solver, objective, x0)
 
         np.testing.assert_allclose(y[0], 1.0, atol=1e-3)
+
+
+# ============================================================
+# Bundle 2 regression tests: trust gate + size cap
+# ============================================================
+
+
+class TestLpecaTrustGate:
+    """Verify the rho_bar-based trust gate replaces the broken clamp.
+
+    The pre-Bundle-2 implementation used ``min(threshold_raw, max|c_ineq|)``
+    which trivially flagged every inequality as active early in SQP.
+    Bundle 2 replaces it with ``rho_bar <= trust_threshold``.
+    """
+
+    def test_far_from_solution_returns_empty_prediction(self):
+        """With large ``rho_bar``, the trust gate disables LPEC-A."""
+        # Construct a scenario with huge equality violation so rho_bar is large.
+        c_ineq = jnp.array([0.0, 0.0, 0.0])  # would be flagged by raw threshold
+        c_eq = jnp.array([1e3])  # massive feasibility violation
+        grad = jnp.array([1.0, 0.0])
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        A_eq = jnp.array([[1.0, 0.0]])
+        lambda_ineq = jnp.zeros(3)
+        mu_eq = jnp.array([0.0])
+
+        result = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=1.0,
+        )
+        assert not bool(result.valid), (
+            f"rho_bar={float(result.rho_bar):e} should fail trust gate"
+        )
+        assert not bool(jnp.any(result.predicted)), (
+            "Prediction must be empty when LPEC-A is not trusted"
+        )
+
+    def test_near_solution_identifies_active_set(self):
+        """Near a KKT point, the prediction must match (modulo at most
+        one false positive) the true active set."""
+        # min x^2 + y^2 s.t. x >= 1 (active), y >= -10 (inactive).
+        # Optimum: x=1, y=0, lambda = (2, 0).
+        c_ineq = jnp.array([1e-9, 10.0])  # near active / well-feasible
+        c_eq = jnp.zeros(0)
+        grad = jnp.array([2.0, 0.0])  # 2x, 2y at (1, 0)
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+        A_eq = jnp.zeros((0, 2))
+        lambda_ineq = jnp.array([2.0, 0.0])
+        mu_eq = jnp.zeros(0)
+
+        result = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=1.0,
+        )
+        assert bool(result.valid), (
+            f"Near solution rho_bar={float(result.rho_bar):e} should pass gate"
+        )
+        true_active = jnp.array([True, False])
+        # At most one false positive (LPEC-A may overshoot by one).
+        false_positives = int(jnp.sum(result.predicted & ~true_active))
+        assert bool(result.predicted[0]), "Active constraint must be flagged"
+        assert false_positives <= 1, (
+            f"Expected <= 1 false positive, got {false_positives}"
+        )
+
+    def test_trust_threshold_parameter_is_respected(self):
+        """A loose threshold lets a borderline case through; a tight
+        threshold rejects it."""
+        c_ineq = jnp.array([0.0])
+        c_eq = jnp.zeros(0)
+        # rho_bar contribution: |grad - A_ineq^T lambda| = |1 - 0.5| = 0.5
+        grad = jnp.array([1.0])
+        A_ineq = jnp.array([[1.0]])
+        A_eq = jnp.zeros((0, 1))
+        lambda_ineq = jnp.array([0.5])
+        mu_eq = jnp.zeros(0)
+
+        loose = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=10.0,
+        )
+        tight = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=1e-6,
+        )
+        assert bool(loose.valid)
+        assert not bool(tight.valid)
+        assert not bool(jnp.any(tight.predicted))
+
+
+class TestLpecaSizeCap:
+    """Verify the rank-aware size cap on the LPEC-A prediction."""
+
+    def test_size_cap_truncates_overprediction(self):
+        """When the raw threshold would activate too many constraints,
+        the cap keeps at most ``n - m_eq - 1`` of them."""
+        n = 10
+        m_eq = 5
+        m_ineq = 30
+        n_dof = n - m_eq - 1  # = 4
+
+        # Use a moderate rho_bar (driven by the stationarity residual)
+        # so threshold = (beta * rho_bar)^sigma is large enough that
+        # every nearly-feasible inequality is below it.
+        c_eq = jnp.zeros(m_eq)
+        # Ranked feasibility: c_ineq[i] = i * 1e-3, all small.
+        c_ineq = jnp.arange(m_ineq, dtype=jnp.float64) * 1e-3
+        # Stationarity residual = |grad - A_ineq^T lambda - A_eq^T mu| = 0.5
+        grad = jnp.full(n, 0.5)
+        A_ineq = jnp.eye(m_ineq, n)
+        A_eq = jnp.zeros((m_eq, n)).at[jnp.arange(m_eq), jnp.arange(m_eq)].set(1.0)
+        lambda_ineq = jnp.zeros(m_ineq)
+        mu_eq = jnp.zeros(m_eq)
+
+        result = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=10.0,  # allow rho_bar ~ 5 (sqrt(0.25 * n))
+            sigma=0.3,  # large threshold so raw test fires on all
+            beta=1.0,
+        )
+        assert bool(result.valid)
+        predicted_count = int(jnp.sum(result.predicted))
+        assert predicted_count <= n_dof, (
+            f"Expected at most {n_dof} constraints, got {predicted_count}"
+        )
+        if predicted_count > 0:
+            # The cap should keep the most confidently active (smallest
+            # c_ineq).  c_ineq[0] is smallest, so it must be in the set.
+            assert bool(result.predicted[0])
+        # The capped flag must report the truncation.
+        assert bool(result.capped), "Size cap must set the capped flag"
+
+    def test_size_cap_inactive_when_under_budget(self):
+        """When the prediction count is already under the rank budget,
+        the cap is a no-op and ``capped=False``."""
+        n = 5
+        c_ineq = jnp.array([0.0, 5.0, 10.0])  # only one active
+        c_eq = jnp.zeros(0)
+        grad = jnp.zeros(n)
+        A_ineq = jnp.zeros((3, n)).at[0, 0].set(1.0)
+        A_eq = jnp.zeros((0, n))
+        lambda_ineq = jnp.zeros(3)
+        mu_eq = jnp.zeros(0)
+
+        result = identify_active_set_lpeca(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            trust_threshold=1.0,
+        )
+        assert bool(result.valid)
+        assert int(jnp.sum(result.predicted)) <= 1
+        assert not bool(result.capped)
+
+    def test_compute_lpeca_active_set_propagates_trust_threshold(self):
+        """``compute_lpeca_active_set`` forwards ``trust_threshold``."""
+        c_ineq = jnp.zeros(2)
+        c_eq = jnp.array([1e3])  # huge violation -> large rho_bar
+        grad = jnp.array([1.0, 0.0])
+        A_ineq = jnp.eye(2)
+        A_eq = jnp.array([[1.0, 0.0]])
+        lambda_ineq = jnp.zeros(2)
+        mu_eq = jnp.array([0.0])
+
+        result = compute_lpeca_active_set(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+            use_lp=False,
+            trust_threshold=1.0,
+        )
+        assert not bool(result.valid)
+        assert not bool(jnp.any(result.predicted))
+
+
+class TestLpecaWarmupGate:
+    """Verify the SQP-level warm-up gate bypasses LPEC-A early."""
+
+    def test_lpeca_warmup_steps_parameter_exists(self):
+        """``SLSQP`` accepts ``lpeca_warmup_steps`` and stores it."""
+        solver = SLSQP(
+            atol=1e-6,
+            active_set_method="lpeca",
+            lpeca_warmup_steps=5,
+        )
+        assert solver.lpeca_warmup_steps == 5
+
+    def test_lpeca_warmup_diagnostic_increments(self):
+        """When the warm-up gate fires, the LPEC-A bypass counter grows."""
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            return jnp.array([x[0] - 1.0])
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=20,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            active_set_method="lpeca_init",
+            lpeca_warmup_steps=3,
+            verbose=False,
+        )
+        x0 = jnp.array([5.0, 0.5])
+        _, state = _run_solver(solver, objective, x0)
+        assert int(state.diagnostics.n_lpeca_bypassed) >= 1, (
+            "Warm-up gate should bypass LPEC-A for the first few SQP steps"
+        )

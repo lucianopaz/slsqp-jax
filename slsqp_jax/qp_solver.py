@@ -59,6 +59,16 @@ class QPState(eqx.Module):
     during the active-set loop reported non-convergence or produced a
     non-finite direction.  The final ``QPResult.converged`` combines
     this with the active-set completion check.
+
+    ``last_add_idx`` / ``last_drop_idx`` / ``ping_pong_count`` /
+    ``ping_ponged`` implement an explicit anti-cycling guard on top of
+    EXPAND: when the active-set loop alternately adds and drops the
+    *same* constraint several times in a row (typical signature of
+    multiplier-recovery noise on a degenerate vertex) the loop is
+    short-circuited as ``converged=True`` with the sticky
+    ``ping_ponged`` flag set so the outer solver can surface it
+    through the diagnostic counters.  Indices are initialised to
+    ``-1`` to mean "no add/drop yet".
     """
 
     d: Vector
@@ -68,6 +78,10 @@ class QPState(eqx.Module):
     iteration: Int[Array, ""]
     converged: Bool[Array, ""]
     any_inner_failure: Bool[Array, ""]
+    last_add_idx: Int[Array, ""]
+    last_drop_idx: Int[Array, ""]
+    ping_pong_count: Int[Array, ""]
+    ping_ponged: Bool[Array, ""]
 
 
 def _inner_ok(result) -> Bool[Array, ""]:
@@ -86,7 +100,15 @@ def _inner_ok(result) -> Bool[Array, ""]:
 
 
 class QPResult(NamedTuple):
-    """Result from the QP solver."""
+    """Result from the QP solver.
+
+    The Bundle 1 diagnostic fields ``ping_ponged`` / ``reached_max_iter``
+    / ``final_working_tol`` are surfaced from the active-set loop so
+    the outer solver can track *why* the QP stopped (clean convergence
+    versus cycling versus iteration-budget exhaustion).  They default
+    to ``False`` / ``False`` / ``0.0`` for the trivial QP paths that
+    do not run an active-set loop.
+    """
 
     d: Vector
     multipliers_eq: Float[Array, " m_eq"]
@@ -94,6 +116,9 @@ class QPResult(NamedTuple):
     active_set: Bool[Array, " m_ineq"]
     converged: Bool[Array, ""]
     iterations: Int[Array, ""]
+    ping_ponged: Bool[Array, ""]
+    reached_max_iter: Bool[Array, ""]
+    final_working_tol: Scalar
 
 
 def _solve_qp_proximal(
@@ -119,6 +144,8 @@ def _solve_qp_proximal(
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
+    mult_drop_floor: float = 1e-6,
+    ping_pong_threshold: int = 3,
 ) -> QPResult:
     """Solve the QP using the stabilized SQP (sSQP) formulation.
 
@@ -168,6 +195,9 @@ def _solve_qp_proximal(
             active_set=jnp.zeros((0,), dtype=bool),
             converged=finite_d,
             iterations=jnp.array(1),
+            ping_ponged=jnp.array(False),
+            reached_max_iter=jnp.array(False),
+            final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
         )
 
     # Sub-case: inequalities present — active-set loop on A_ineq only
@@ -204,17 +234,38 @@ def _solve_qp_proximal(
         iteration=jnp.array(0),
         converged=init_converged,
         any_inner_failure=init_inner_failure,
+        last_add_idx=jnp.array(-1),
+        last_drop_idx=jnp.array(-1),
+        ping_pong_count=jnp.array(0),
+        ping_ponged=jnp.array(False),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
-    # When EXPAND is disabled (lpeca mode), use fixed tolerance
+    # SNOPT-style EXPAND (Gill, Murray, Saunders & Wright, 1989, §3.2):
+    # ``working_tol = featol/2 + k * (featol / (2*max_iter))`` ramps the
+    # feasibility tolerance from ``featol/2`` at k=0 to ``featol`` at
+    # k=max_iter.  The previous formula ``working_tol = featol +
+    # k*(featol/max_iter)`` only widened by ~1 ULP per iteration, which
+    # was insufficient to break ties at degenerate vertices.  The
+    # ``expand_factor`` knob now scales the ramp amplitude (default 1
+    # = SNOPT recipe; 0 disables EXPAND).
+    delta0 = 0.5 * base_tol * expand_factor
+    tau = delta0 / jnp.maximum(max_iter, 1)
+    effective_delta0 = delta0 if use_expand else base_tol
     effective_tau = tau if use_expand else 0.0
 
+    # Floor for the negative-multiplier drop test.  Multiplier recovery
+    # via ``(AAᵀ + εI)^{-1}`` typically incurs O(eps · cond(AAᵀ))
+    # error; with the default 1e-6 floor, a freshly-added constraint
+    # with true multiplier ~0 will not be dropped just because CG
+    # recovered a slightly negative value, which is the canonical
+    # add/drop ping-pong source.
+    drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
+
     def body_fn(state: QPState) -> QPState:
-        working_tol = base_tol + state.iteration * effective_tau
+        working_tol = effective_delta0 + state.iteration * effective_tau
 
         # Solve with current active set — inequalities only
         result = inner_solver.solve(
@@ -241,34 +292,77 @@ def _solve_qp_proximal(
         violation_scores = jnp.where(violated, -residuals, -jnp.inf)
         most_violated_idx = jnp.argmax(violation_scores)
 
-        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
+        # Noise-aware drop: ignore negative multipliers smaller in
+        # magnitude than ``drop_floor``; these are the residual
+        # multiplier-recovery noise that triggers ping-pong.
+        drop_tol = jnp.maximum(working_tol, drop_floor)
+        negative_mult = (mult_ineq_new < -drop_tol) & state.active_set
         any_negative = jnp.any(negative_mult)
 
         mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)
         most_negative_idx = jnp.argmin(mult_scores)
 
         def add_constraint():
-            new_active = state.active_set.at[most_violated_idx].set(True)
+            # Ping-pong detector: if we are about to add the constraint
+            # we just dropped, count it.  When the run hits the
+            # threshold, freeze the loop (do NOT apply the add) and
+            # mark converged with the sticky ``ping_ponged`` flag so
+            # the outer solver knows.
+            is_pp = (state.last_drop_idx >= 0) & (
+                most_violated_idx == state.last_drop_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_violated_idx].set(True),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=mult_eq_new,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=jnp.where(
+                    triggered, state.last_add_idx, most_violated_idx
+                ),
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def drop_constraint():
-            new_active = state.active_set.at[most_negative_idx].set(False)
+            is_pp = (state.last_add_idx >= 0) & (
+                most_negative_idx == state.last_add_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_negative_idx].set(False),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=mult_eq_new,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=jnp.where(
+                    triggered, state.last_drop_idx, most_negative_idx
+                ),
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def mark_converged():
@@ -280,6 +374,10 @@ def _solve_qp_proximal(
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=state.ping_pong_count,
+                ping_ponged=state.ping_ponged,
             )
 
         return jax.lax.cond(
@@ -293,12 +391,13 @@ def _solve_qp_proximal(
     # The EXPAND procedure's growing tolerance can cause mark_converged()
     # to fire on the last iteration under relaxed tolerances.  Override
     # convergence when the iteration limit was actually reached or when
-    # any inner solve failed.
+    # any inner solve failed.  A genuine ping-pong short-circuit also
+    # counts as convergence (the loop did not exhaust its budget).
+    reached_max_iter = final_state.iteration >= max_iter
     final_converged = (
-        final_state.converged
-        & (final_state.iteration < max_iter)
-        & ~final_state.any_inner_failure
+        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
     )
+    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
@@ -307,6 +406,9 @@ def _solve_qp_proximal(
         active_set=final_state.active_set,
         converged=final_converged,
         iterations=final_state.iteration,
+        ping_ponged=final_state.ping_ponged,
+        reached_max_iter=reached_max_iter,
+        final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
     )
 
 
@@ -330,6 +432,8 @@ def _solve_qp_direct(
     cg_regularization: float = 1e-6,
     predicted_active_set: Bool[Array, " m_ineq"] | None = None,
     use_expand: bool = True,
+    mult_drop_floor: float = 1e-6,
+    ping_pong_threshold: int = 3,
 ) -> QPResult:
     """Solve the QP with equality constraints enforced via direct projection.
 
@@ -371,6 +475,9 @@ def _solve_qp_direct(
             active_set=jnp.zeros((0,), dtype=bool),
             converged=_inner_ok(result),
             iterations=jnp.array(1),
+            ping_ponged=jnp.array(False),
+            reached_max_iter=jnp.array(False),
+            final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
         )
 
     # Equality + inequality: active-set loop on the inequality portion.
@@ -408,16 +515,24 @@ def _solve_qp_direct(
         iteration=jnp.array(0),
         converged=init_converged,
         any_inner_failure=init_inner_failure,
+        last_add_idx=jnp.array(-1),
+        last_drop_idx=jnp.array(-1),
+        ping_pong_count=jnp.array(0),
+        ping_ponged=jnp.array(False),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+    # SNOPT-style EXPAND ramp (see ``_solve_qp_proximal``).
+    delta0 = 0.5 * base_tol * expand_factor
+    tau = delta0 / jnp.maximum(max_iter, 1)
+    effective_delta0 = delta0 if use_expand else base_tol
     effective_tau = tau if use_expand else 0.0
+    drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = base_tol + state.iteration * effective_tau
+        working_tol = effective_delta0 + state.iteration * effective_tau
 
         combined_active = jnp.concatenate([eq_active, state.active_set])
         result = inner_solver.solve(
@@ -444,34 +559,69 @@ def _solve_qp_direct(
         violation_scores = jnp.where(violated, -residuals, -jnp.inf)
         most_violated_idx = jnp.argmax(violation_scores)
 
-        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
+        drop_tol = jnp.maximum(working_tol, drop_floor)
+        negative_mult = (mult_ineq_new < -drop_tol) & state.active_set
         any_negative = jnp.any(negative_mult)
 
         mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)
         most_negative_idx = jnp.argmin(mult_scores)
 
         def add_constraint():
-            new_active = state.active_set.at[most_violated_idx].set(True)
+            is_pp = (state.last_drop_idx >= 0) & (
+                most_violated_idx == state.last_drop_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_violated_idx].set(True),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=mult_eq_new,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=jnp.where(
+                    triggered, state.last_add_idx, most_violated_idx
+                ),
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def drop_constraint():
-            new_active = state.active_set.at[most_negative_idx].set(False)
+            is_pp = (state.last_add_idx >= 0) & (
+                most_negative_idx == state.last_add_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_negative_idx].set(False),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=mult_eq_new,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=jnp.where(
+                    triggered, state.last_drop_idx, most_negative_idx
+                ),
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def mark_converged():
@@ -483,6 +633,10 @@ def _solve_qp_direct(
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=state.ping_pong_count,
+                ping_ponged=state.ping_ponged,
             )
 
         return jax.lax.cond(
@@ -493,11 +647,11 @@ def _solve_qp_direct(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
+    reached_max_iter = final_state.iteration >= max_iter
     final_converged = (
-        final_state.converged
-        & (final_state.iteration < max_iter)
-        & ~final_state.any_inner_failure
+        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
     )
+    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
@@ -506,6 +660,9 @@ def _solve_qp_direct(
         active_set=final_state.active_set,
         converged=final_converged,
         iterations=final_state.iteration,
+        ping_ponged=final_state.ping_ponged,
+        reached_max_iter=reached_max_iter,
+        final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
     )
 
 
@@ -533,6 +690,8 @@ def solve_qp(
     active_set_method: str = "expand",
     use_constraint_preconditioner: bool = False,
     inner_solver: AbstractInnerSolver | None = None,
+    mult_drop_floor: float = 1e-6,
+    ping_pong_threshold: int = 3,
 ) -> QPResult:
     """Solve a QP with equality and inequality constraints.
 
@@ -651,6 +810,22 @@ def solve_qp(
             a ``ProjectedCGCholesky`` is constructed from the
             ``max_cg_iter``, ``cg_regularization``, and
             ``use_constraint_preconditioner`` arguments.
+        mult_drop_floor: Minimum magnitude (lower bound) on the
+            negative-multiplier drop test.  An active inequality is
+            only dropped when its recovered multiplier is *more
+            negative* than ``-max(working_tol, mult_drop_floor)``.
+            This prevents multiplier-recovery noise from the inner
+            CG/MINRES solve from triggering spurious add/drop cycles
+            on ill-conditioned ``AAᵀ``.  Default ``1e-6`` matches the
+            typical iterative-refinement floor of the Cholesky
+            projection.
+        ping_pong_threshold: Number of consecutive add/drop reversals
+            on the *same* index that triggers an explicit ping-pong
+            short-circuit.  When the threshold is hit, the active-set
+            loop returns its current direction with
+            ``QPResult.ping_ponged=True`` and ``converged=True`` (the
+            QP did not exhaust its budget; it stopped on a stable
+            cycle).  Default 3.
 
     Returns:
         QPResult containing the solution, multipliers, active set, and
@@ -706,6 +881,9 @@ def solve_qp(
             active_set=jnp.zeros((0,), dtype=bool),
             converged=finite_d,
             iterations=jnp.array(1),
+            ping_ponged=jnp.array(False),
+            reached_max_iter=jnp.array(False),
+            final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
         )
 
     # ---- Proximal stabilized path (sSQP) ----
@@ -734,6 +912,8 @@ def solve_qp(
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
+            mult_drop_floor=mult_drop_floor,
+            ping_pong_threshold=ping_pong_threshold,
         )
 
     # ---- Direct projection path (no proximal) ----
@@ -759,6 +939,8 @@ def solve_qp(
             cg_regularization=cg_regularization,
             predicted_active_set=effective_predicted,
             use_expand=use_expand,
+            mult_drop_floor=mult_drop_floor,
+            ping_pong_threshold=ping_pong_threshold,
         )
 
     # ---- Inequality-only path (m_eq == 0 guaranteed here) ----
@@ -795,17 +977,24 @@ def solve_qp(
         iteration=jnp.array(0),
         converged=init_converged,
         any_inner_failure=init_inner_failure,
+        last_add_idx=jnp.array(-1),
+        last_drop_idx=jnp.array(-1),
+        ping_pong_count=jnp.array(0),
+        ping_ponged=jnp.array(False),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
         return ~state.converged & (state.iteration < max_iter)
 
-    # EXPAND anti-cycling: per-iteration tolerance increment
-    tau = base_tol * expand_factor / jnp.maximum(max_iter, 1)
+    # SNOPT-style EXPAND ramp (see ``_solve_qp_proximal``).
+    delta0 = 0.5 * base_tol * expand_factor
+    tau = delta0 / jnp.maximum(max_iter, 1)
+    effective_delta0 = delta0 if use_expand else base_tol
     effective_tau = tau if use_expand else 0.0
+    drop_floor = jnp.asarray(mult_drop_floor, dtype=jnp.float64)
 
     def body_fn(state: QPState) -> QPState:
-        working_tol = base_tol + state.iteration * effective_tau
+        working_tol = effective_delta0 + state.iteration * effective_tau
 
         # Solve with current active set using projected CG (ineq only)
         result = inner_solver.solve(
@@ -831,8 +1020,11 @@ def solve_qp(
         violation_scores = jnp.where(violated, -residuals, -jnp.inf)
         most_violated_idx = jnp.argmax(violation_scores)
 
-        # Check multiplier signs with expanding tolerance (stricter deactivation)
-        negative_mult = (mult_ineq_new < -working_tol) & state.active_set
+        # Noise-aware drop: ignore negative multipliers smaller in
+        # magnitude than ``drop_floor`` to suppress add/drop ping-pong
+        # driven by multiplier-recovery noise.
+        drop_tol = jnp.maximum(working_tol, drop_floor)
+        negative_mult = (mult_ineq_new < -drop_tol) & state.active_set
         any_negative = jnp.any(negative_mult)
 
         mult_scores = jnp.where(state.active_set, mult_ineq_new, jnp.inf)
@@ -841,27 +1033,61 @@ def solve_qp(
         empty_eq = jnp.zeros((0,))
 
         def add_constraint():
-            new_active = state.active_set.at[most_violated_idx].set(True)
+            is_pp = (state.last_drop_idx >= 0) & (
+                most_violated_idx == state.last_drop_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_violated_idx].set(True),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=empty_eq,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=jnp.where(
+                    triggered, state.last_add_idx, most_violated_idx
+                ),
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def drop_constraint():
-            new_active = state.active_set.at[most_negative_idx].set(False)
+            is_pp = (state.last_add_idx >= 0) & (
+                most_negative_idx == state.last_add_idx
+            )
+            new_pp_count = jnp.where(is_pp, state.ping_pong_count + 1, 0)
+            triggered = new_pp_count >= ping_pong_threshold
+            new_active = jnp.where(
+                triggered,
+                state.active_set,
+                state.active_set.at[most_negative_idx].set(False),
+            )
             return QPState(
                 d=d_new,
                 active_set=new_active,
                 multipliers_eq=empty_eq,
                 multipliers_ineq=mult_ineq_new,
                 iteration=state.iteration + 1,
-                converged=jnp.array(False),
+                converged=triggered,
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=jnp.where(
+                    triggered, state.last_drop_idx, most_negative_idx
+                ),
+                ping_pong_count=jnp.where(
+                    triggered, state.ping_pong_count, new_pp_count
+                ),
+                ping_ponged=state.ping_ponged | triggered,
             )
 
         def mark_converged():
@@ -873,6 +1099,10 @@ def solve_qp(
                 iteration=state.iteration + 1,
                 converged=jnp.array(True),
                 any_inner_failure=new_any_inner_failure,
+                last_add_idx=state.last_add_idx,
+                last_drop_idx=state.last_drop_idx,
+                ping_pong_count=state.ping_pong_count,
+                ping_ponged=state.ping_ponged,
             )
 
         return jax.lax.cond(
@@ -883,11 +1113,11 @@ def solve_qp(
 
     final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
+    reached_max_iter = final_state.iteration >= max_iter
     final_converged = (
-        final_state.converged
-        & (final_state.iteration < max_iter)
-        & ~final_state.any_inner_failure
+        final_state.converged & ~reached_max_iter & ~final_state.any_inner_failure
     )
+    final_working_tol = effective_delta0 + final_state.iteration * effective_tau
 
     return QPResult(
         d=final_state.d,
@@ -896,4 +1126,7 @@ def solve_qp(
         active_set=final_state.active_set,
         converged=final_converged,
         iterations=final_state.iteration,
+        ping_ponged=final_state.ping_ponged,
+        reached_max_iter=reached_max_iter,
+        final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
     )

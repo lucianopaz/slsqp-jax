@@ -15,6 +15,25 @@ An optional LP refinement step (via ``mpax.r2HPDHG``) can tighten
 the multiplier estimates used in the threshold computation, but is
 not required for asymptotic correctness.
 
+**Far-from-solution trust gate.**  Theorem 5 of Oberlin & Wright only
+guarantees asymptotic exactness when the iterate is *close* to a
+solution (so ``rho_bar`` is small).  Far from the solution, the raw
+``threshold = (beta * rho_bar) ** sigma`` can grow large enough that
+the test ``c_ineq_i <= threshold`` includes nearly every constraint,
+producing an over-saturated working set that destroys QP convergence.
+The implementation guards against this with a configurable
+``trust_threshold`` on ``rho_bar``: when ``rho_bar > trust_threshold``,
+LPEC-A returns an *empty* prediction so the QP active-set loop falls
+back to its warm-start / cold-start path.
+
+**Rank-aware size cap.**  As a secondary safety net, even when the
+trust gate passes, the prediction is truncated so that at most
+``n - m_eq - 1`` constraints are predicted active.  This preserves a
+LICQ-like rank margin in the working-set Jacobian
+``[A_eq; A_active]`` (which has at most ``n`` rows).  Selection
+prioritises the most-violated / most-confident constraints
+(smallest ``c_ineq_i``).
+
 Sign convention
 ---------------
 This module uses the ``slsqp-jax`` convention where
@@ -29,11 +48,37 @@ for equations with semismooth Jacobians and nonlinear complementarity
 problems." *Mathematical Programming*, 117(1-2), 355-386.
 """
 
+from typing import NamedTuple
+
 import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, jaxtyped
 
 from slsqp_jax.types import Scalar, Vector
+
+
+class LPECAResult(NamedTuple):
+    """LPEC-A active-set identification result.
+
+    Attributes:
+        predicted: Boolean mask of shape ``(m_ineq,)``.  ``True`` means
+            the constraint is predicted active.  When ``valid=False``
+            this is the all-``False`` mask (the trust gate fired).
+        valid: ``True`` when ``rho_bar`` is below the trust threshold,
+            so the prediction is theoretically meaningful.  ``False``
+            indicates the iterate is too far from the solution for
+            LPEC-A to be reliable.
+        capped: ``True`` when the rank-aware size cap truncated the
+            prediction (the raw threshold predicted more than
+            ``n - m_eq - 1`` constraints active, so the most confident
+            entries were kept).
+        rho_bar: The scalar proximity measure used for the trust gate.
+    """
+
+    predicted: Bool[Array, " m_ineq"]
+    valid: Bool[Array, ""]
+    capped: Bool[Array, ""]
+    rho_bar: Scalar
 
 
 @jaxtyped(typechecker=beartype)
@@ -100,12 +145,19 @@ def identify_active_set_lpeca(
     mu_eq: Float[Array, " m_eq"],
     sigma: float = 0.9,
     beta: float | None = None,
-) -> Bool[Array, " m_ineq"]:
+    trust_threshold: float = 1.0,
+) -> LPECAResult:
     """Predict the active inequality set using the LPEC-A threshold test.
 
     Applies Eq. 43 of Oberlin & Wright (2005), adapted to our sign
     convention.  An inequality constraint ``i`` is predicted active when
-    ``c_ineq_i <= (beta * rho_bar) ** sigma``.
+    ``c_ineq_i <= (beta * rho_bar) ** sigma`` *and* ``rho_bar`` is
+    below the trust threshold (otherwise the prediction is empty).
+
+    The result is wrapped in an :class:`LPECAResult` so the caller can
+    distinguish "no constraints predicted active" (a valid prediction)
+    from "LPEC-A bypassed" (``valid=False``) or "size cap fired"
+    (``capped=True``).
 
     Args:
         c_ineq: Inequality constraint values at current point.
@@ -119,10 +171,15 @@ def identify_active_set_lpeca(
             Must be in (0, 1).  Default 0.9 per paper recommendation.
         beta: Threshold scaling factor.  Default ``None`` uses the
             paper's recommendation ``1 / (m_ineq + n + m_eq)``.
+        trust_threshold: Maximum ``rho_bar`` for which the LPEC-A
+            prediction is trusted.  When ``rho_bar > trust_threshold``,
+            the predicted set is empty (the iterate is considered too
+            far from the solution for the asymptotic guarantees to
+            apply).  Default ``1.0``.
 
     Returns:
-        Boolean mask of shape ``(m_ineq,)`` where ``True`` means
-        the constraint is predicted active.
+        :class:`LPECAResult` containing the boolean prediction mask
+        and the diagnostic flags ``valid`` / ``capped`` / ``rho_bar``.
     """
     m_ineq = c_ineq.shape[0]
     n = grad.shape[0]
@@ -133,20 +190,60 @@ def identify_active_set_lpeca(
 
     rho_bar = compute_rho_bar(c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq)
 
-    # Raw LPEC-A threshold (Oberlin & Wright 2005, Eq. 43).  Far from
-    # the solution ``rho_bar`` can be large, which inflates the
-    # threshold so much that nearly every inequality is predicted
-    # active; the resulting over-saturated working set typically causes
-    # the QP equality solve to fail.  Clamp the threshold with the
-    # current ``max|c_ineq|`` so the predicted active set stays within
-    # the scale of the constraint residuals.  This preserves the
-    # asymptotic correctness of LPEC-A (near the solution ``rho_bar``
-    # is small and the clamp is inactive) while containing the
-    # far-from-optimum over-prediction.
+    # LPEC-A threshold (Oberlin & Wright 2005, Eq. 43).  Far from the
+    # solution ``rho_bar`` can be large, which inflates the threshold
+    # so much that nearly every inequality is predicted active; the
+    # resulting over-saturated working set typically causes the QP
+    # equality solve to fail.  Two layers of protection:
+    #
+    # 1. Trust gate: when ``rho_bar > trust_threshold`` (default 1.0)
+    #    the asymptotic correctness conditions of Theorem 5 are not
+    #    even approximately satisfied, so we return an empty prediction
+    #    and let the QP active-set loop fall back to warm-start.  This
+    #    replaces the previous ``min(threshold, max|c_ineq|)`` clamp
+    #    which trivially evaluated to "all constraints active" because
+    #    every ``c_ineq_i <= max|c_ineq_i|`` by construction.
+    # 2. Size cap: even when the trust gate passes, the prediction is
+    #    truncated so at most ``n - m_eq - 1`` constraints are
+    #    predicted active.  This guarantees the working-set Jacobian
+    #    ``[A_eq; A_active]`` retains a LICQ-like rank margin (at most
+    #    ``n`` rows out of ``n + 1`` columns of slack).  Truncation
+    #    keeps the most-violated constraints (smallest ``c_ineq_i``).
     threshold_raw = (beta * rho_bar) ** sigma
-    c_scale = jnp.maximum(jnp.max(jnp.abs(c_ineq)), 1e-12)
-    threshold = jnp.minimum(threshold_raw, c_scale)
-    return c_ineq <= threshold
+    valid = rho_bar <= trust_threshold
+    threshold = jnp.where(valid, threshold_raw, 0.0)
+    raw_predicted = (c_ineq <= threshold) & valid
+
+    # Rank-aware size cap.  ``n_dof`` is static (computed from shape
+    # constants), so the cap can be expressed with a static mask
+    # ``rank < n_dof`` which is jit-friendly.
+    n_dof_static = max(n - m_eq - 1, 1)
+    if m_ineq == 0:
+        return LPECAResult(
+            predicted=raw_predicted,
+            valid=valid,
+            capped=jnp.array(False),
+            rho_bar=rho_bar,
+        )
+
+    n_dof = min(n_dof_static, m_ineq)
+    # Score: most violated (smallest c_ineq_i) wins.  Non-predicted
+    # entries get -inf so they are never selected.
+    scores = jnp.where(raw_predicted, -c_ineq, -jnp.inf)
+    # ``argsort(argsort(-scores))`` produces 0-indexed descending
+    # rank: 0 = largest score = most violated predicted entry.
+    ranks = jnp.argsort(jnp.argsort(-scores))
+    capped_predicted = raw_predicted & (ranks < n_dof)
+
+    predicted_count = jnp.sum(raw_predicted.astype(jnp.int32))
+    capped_flag = predicted_count > n_dof
+
+    return LPECAResult(
+        predicted=capped_predicted,
+        valid=valid,
+        capped=capped_flag,
+        rho_bar=rho_bar,
+    )
 
 
 @jaxtyped(typechecker=beartype)
@@ -290,16 +387,18 @@ def compute_lpeca_active_set(
     mu_eq: Float[Array, " m_eq"],
     sigma: float = 0.9,
     beta: float | None = None,
+    trust_threshold: float = 1.0,
     use_lp: bool = False,
     lp_lambda_bound: float = 1e6,
     lp_eps: float = 1e-6,
     lp_max_iter: int = 1000,
-) -> Bool[Array, " m_ineq"]:
+) -> LPECAResult:
     """Compute the LPEC-A predicted active set, optionally refining multipliers.
 
     This is the main entry point for LPEC-A active set identification.
     It optionally solves the LPEC-A LP to obtain tighter multiplier
-    estimates, then applies the threshold test.
+    estimates, then applies the threshold test (with the trust gate
+    and rank-aware size cap from :func:`identify_active_set_lpeca`).
 
     Args:
         c_ineq: Inequality constraint values at current point.
@@ -311,6 +410,8 @@ def compute_lpeca_active_set(
         mu_eq: Current multiplier estimates for equalities.
         sigma: Threshold exponent (default 0.9).
         beta: Threshold scaling factor (default: paper recommendation).
+        trust_threshold: Maximum ``rho_bar`` for which the prediction
+            is trusted (see :func:`identify_active_set_lpeca`).
         use_lp: If True, solve the LPEC-A LP to refine multiplier
             estimates before the threshold test.  Requires ``mpax``.
         lp_lambda_bound: Upper bound K_1 on lambda in the LP.
@@ -318,8 +419,8 @@ def compute_lpeca_active_set(
         lp_max_iter: Maximum LP solver iterations.
 
     Returns:
-        Boolean mask of shape ``(m_ineq,)`` where ``True`` means the
-        constraint is predicted active.
+        :class:`LPECAResult` with the predicted active mask and
+        diagnostic flags.
     """
     if use_lp:
         lambda_ineq, mu_eq = solve_lpeca_lp(
@@ -344,4 +445,5 @@ def compute_lpeca_active_set(
         mu_eq=mu_eq,
         sigma=sigma,
         beta=beta,
+        trust_threshold=trust_threshold,
     )

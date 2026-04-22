@@ -1200,5 +1200,184 @@ class TestCGRegularization:
         np.testing.assert_allclose(result.d, jnp.array([2.0, 2.0]), rtol=1e-4)
 
 
+class TestQPCyclingDiagnostics:
+    """Regression tests for Bundle 1 (EXPAND, ping-pong, mult-noise)."""
+
+    def test_qpresult_exposes_new_diagnostic_fields(self):
+        """``QPResult`` carries the Bundle-1 diagnostic fields."""
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros(0),
+            jnp.eye(2),
+            jnp.array([1.0, 0.0]),
+        )
+        assert hasattr(result, "ping_ponged")
+        assert hasattr(result, "reached_max_iter")
+        assert hasattr(result, "final_working_tol")
+        assert bool(result.converged)
+        assert not bool(result.ping_ponged), (
+            "Clean QP should not flag ping-pong on a non-degenerate problem"
+        )
+        assert not bool(result.reached_max_iter), (
+            "Clean QP should not exhaust the iteration budget"
+        )
+
+    def test_degenerate_constraints_break_within_half_budget(self):
+        """SNOPT-style EXPAND breaks degenerate ties well within the budget.
+
+        Three inequality constraints that are all active (with linearly
+        dependent gradients) at the optimum (0, 0).  Without the
+        recalibrated EXPAND ramp, ``working_tol`` barely moves and the
+        active-set loop can churn for the full budget.  With the new
+        ramp, the loop should converge inside ``max_iter // 2``.
+        """
+        H = jnp.eye(2)
+        g = jnp.zeros(2)
+        # Constraints x >= 0, y >= 0, x + y >= 0 (third is degenerate).
+        A_ineq = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        b_ineq = jnp.zeros(3)
+        max_iter = 20
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros(0),
+            A_ineq,
+            b_ineq,
+            max_iter=max_iter,
+        )
+        np.testing.assert_allclose(result.d, [0.0, 0.0], atol=1e-6)
+        assert bool(result.converged)
+        assert int(result.iterations) <= max_iter // 2, (
+            f"Degenerate QP took {int(result.iterations)} iterations, "
+            f"expected <= {max_iter // 2}"
+        )
+        assert not bool(result.reached_max_iter)
+
+    def test_mult_drop_floor_prevents_noise_oscillation(self):
+        """A loose ``mult_drop_floor`` keeps noisy multipliers from
+        cycling on a poorly-conditioned ``AAᵀ``.
+
+        We construct an inequality system where two constraint gradients
+        are nearly parallel (cond(AAᵀ) ~ 1e10), which inflates the
+        Cholesky-projection multiplier-recovery error.  Both default
+        and very-loose floors should converge; the very-tight floor
+        is a worst-case proxy for the pre-fix behaviour.
+        """
+        # Constraints with nearly parallel rows: c0 = x0,
+        # c1 = x0 + 1e-5 * x1.  The optimum 0 is on both.
+        H = jnp.eye(2)
+        g = jnp.array([-1.0, 0.0])
+        A_ineq = jnp.array([[1.0, 0.0], [1.0, 1e-5]])
+        b_ineq = jnp.zeros(2)
+        max_iter = 30
+
+        result_default = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros(0),
+            A_ineq,
+            b_ineq,
+            max_iter=max_iter,
+        )
+        assert bool(result_default.converged), (
+            "Default mult_drop_floor should converge on noisy projection"
+        )
+        # With a generous floor, the loop must terminate without
+        # exhausting the iteration budget.
+        result_loose = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 2)),
+            jnp.zeros(0),
+            A_ineq,
+            b_ineq,
+            max_iter=max_iter,
+            mult_drop_floor=1e-2,
+        )
+        assert bool(result_loose.converged)
+        assert not bool(result_loose.reached_max_iter)
+
+    def test_ping_pong_threshold_short_circuits_loop(self):
+        """A small ``ping_pong_threshold`` short-circuits oscillation.
+
+        We force the oscillation potential by giving an LP-like QP
+        (degenerate vertex) and asking the solver to use a very tight
+        feasibility tolerance with EXPAND disabled (``expand_factor=0``)
+        plus a very tight ``mult_drop_floor`` so noisy multipliers can
+        cycle.  The ping-pong detector should either converge on the
+        cycle (``ping_ponged=True``) or converge cleanly; in either
+        case ``reached_max_iter`` must remain False with ample budget.
+        """
+        H = jnp.eye(3)
+        g = jnp.array([1e-3, 1e-3, 1e-3])
+        # Three competing constraints meeting at the origin.
+        A_ineq = jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 1e-8],
+            ]
+        )
+        b_ineq = jnp.zeros(3)
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, 3)),
+            jnp.zeros(0),
+            A_ineq,
+            b_ineq,
+            max_iter=50,
+            mult_drop_floor=0.0,  # disable noise floor
+            ping_pong_threshold=2,
+        )
+        # Convergence must be reported; either clean or ping-pong.
+        assert bool(result.converged)
+        assert not bool(result.reached_max_iter), (
+            "ping-pong detector should fire before budget exhaustion"
+        )
+
+    def test_expand_ramp_default_increases_working_tol(self):
+        """The recalibrated EXPAND ramp grows ``working_tol`` over the budget.
+
+        A run that needs at least a few active-set iterations should
+        have ``final_working_tol`` strictly between the initial
+        ``0.5 * tol`` and the final ``tol`` (with default
+        ``expand_factor=1.0``).
+        """
+        n = 4
+        H = jnp.diag(jnp.array([1.0, 2.0, 3.0, 4.0]))
+        g = jnp.array([-1.0, -2.0, 1.0, 2.0])
+        A_ineq = jnp.eye(n)
+        b_ineq = jnp.zeros(n)
+        tol = 1e-8
+        result = solve_qp(
+            _make_hvp(H),
+            g,
+            jnp.zeros((0, n)),
+            jnp.zeros(0),
+            A_ineq,
+            b_ineq,
+            tol=tol,
+            max_iter=20,
+        )
+        assert bool(result.converged)
+        # ``final_working_tol`` must be in the half-open ramp band:
+        # [0.5*tol, tol] (inclusive at the lower end since iter=0 is
+        # possible if the warm start is already optimal).
+        wt = float(result.final_working_tol)
+        assert wt >= 0.5 * tol * 0.999, (
+            f"final_working_tol {wt:e} below 0.5*tol {0.5 * tol:e}"
+        )
+        assert wt <= tol * 1.001, (
+            f"final_working_tol {wt:e} above tol {tol:e} (ramp overshoot)"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -134,6 +134,32 @@ class SLSQPDiagnostics(eqx.Module):
             function value *increased* despite the line search reporting
             success.  A non-zero count points to merit-function
             mis-calibration (too-small ``rho``) or line-search slippage.
+        n_qp_budget_exhausted: Number of SQP steps where the QP
+            active-set loop hit ``qp_max_iter`` (i.e. exited because
+            the budget ran out, not because of clean convergence or a
+            ping-pong short-circuit).  A non-zero count usually
+            indicates degeneracy, multiplier-noise cycling, or an
+            LPEC-A over-prediction that was not caught by the trust
+            gate; consider raising ``mult_drop_floor`` or tightening
+            ``lpeca_trust_threshold``.
+        n_qp_ping_pong: Number of SQP steps where the QP loop's
+            anti-cycling ping-pong detector fired.  These are *good*
+            short-circuits (the loop avoided wasting its full budget)
+            but a chronic non-zero value still points to a degenerate
+            constraint pair worth investigating.
+        max_qp_iterations: Peak active-set iteration count observed
+            across all SQP steps.  Useful for sizing
+            ``qp_max_iter``: if this is consistently equal to
+            ``qp_max_iter`` the budget is too tight.
+        max_qp_active_size: Peak ``|active_set|`` (general
+            inequalities only) observed across all SQP steps.
+        n_lpeca_bypassed: Number of SQP steps where the LPEC-A
+            prediction was skipped, either because of the warm-up
+            window (``step_count < lpeca_warmup_steps``) or because
+            the trust gate vetoed it (``rho_bar > lpeca_trust_threshold``).
+            Always 0 when ``active_set_method == "expand"``.
+        n_lpeca_capped: Number of SQP steps where the LPEC-A
+            rank-aware size cap truncated the prediction.
     """
 
     n_qp_inner_failures: Int[Array, ""]
@@ -150,6 +176,12 @@ class SLSQPDiagnostics(eqx.Module):
     max_bound_fixed: Int[Array, ""]
     max_active_ineq: Int[Array, ""]
     n_merit_regressions: Int[Array, ""]
+    n_qp_budget_exhausted: Int[Array, ""]
+    n_qp_ping_pong: Int[Array, ""]
+    max_qp_iterations: Int[Array, ""]
+    max_qp_active_size: Int[Array, ""]
+    n_lpeca_bypassed: Int[Array, ""]
+    n_lpeca_capped: Int[Array, ""]
 
 
 def _init_diagnostics() -> SLSQPDiagnostics:
@@ -169,6 +201,12 @@ def _init_diagnostics() -> SLSQPDiagnostics:
         max_bound_fixed=jnp.array(0),
         max_active_ineq=jnp.array(0),
         n_merit_regressions=jnp.array(0),
+        n_qp_budget_exhausted=jnp.array(0),
+        n_qp_ping_pong=jnp.array(0),
+        max_qp_iterations=jnp.array(0),
+        max_qp_active_size=jnp.array(0),
+        n_lpeca_bypassed=jnp.array(0),
+        n_lpeca_capped=jnp.array(0),
     )
 
 
@@ -308,6 +346,14 @@ class QPResult(eqx.Module):
         n_bound_fixed: Number of variables pinned to a box bound in the
             final QP direction (counts both lower- and upper-bound
             activations).
+        ping_ponged: True when the QP active-set loop short-circuited
+            on a detected add/drop ping-pong cycle.
+        reached_max_iter: True when the QP active-set loop exhausted
+            its iteration budget (``qp_max_iter``).
+        lpeca_bypassed: True when the LPEC-A prediction was skipped
+            for this step (warm-up window or trust gate fired).
+        lpeca_capped: True when the LPEC-A prediction was truncated
+            by the rank-aware size cap.
     """
 
     direction: Vector
@@ -318,6 +364,10 @@ class QPResult(eqx.Module):
     iterations: Int[Array, ""]
     bound_fix_solves: Int[Array, ""]
     n_bound_fixed: Int[Array, ""]
+    ping_ponged: Bool[Array, ""]
+    reached_max_iter: Bool[Array, ""]
+    lpeca_bypassed: Bool[Array, ""]
+    lpeca_capped: Bool[Array, ""]
 
 
 class SLSQP(optx.AbstractMinimiser):
@@ -700,6 +750,39 @@ class SLSQP(optx.AbstractMinimiser):
     # When True, solve the LPEC-A LP (via mpax.r2HPDHG) for tighter
     # multiplier estimates before the threshold test.  Requires mpax.
     lpeca_use_lp: bool = eqx.field(static=True, default=False)
+
+    # Trust threshold on rho_bar for LPEC-A.  When ``rho_bar`` exceeds
+    # this value, the predicted active set is considered unreliable
+    # (Oberlin & Wright Theorem 5 only guarantees correctness near the
+    # solution) and is replaced by an empty prediction so the QP
+    # active-set loop falls back to the warm-start path.  Default 1.0.
+    lpeca_trust_threshold: float = eqx.field(static=True, default=1.0)
+
+    # LPEC-A warm-up: the first ``lpeca_warmup_steps`` outer SLSQP
+    # iterations bypass the LPEC-A prediction entirely.  Rationale:
+    # asymptotic correctness of LPEC-A requires proximity to ``x*``;
+    # the very first SQP steps are typically transient and the
+    # multiplier estimates carried over from the previous QP are
+    # noisy.  Default 3 (matches the ping-pong threshold).  Set to 0
+    # to disable the warm-up and apply LPEC-A from step 0.  Only
+    # affects ``active_set_method`` in ``("lpeca_init", "lpeca")``.
+    lpeca_warmup_steps: int = eqx.field(static=True, default=3)
+
+    # Floor for the negative-multiplier drop test inside the QP
+    # active-set loop.  An active inequality is only dropped when its
+    # recovered multiplier is more negative than
+    # ``-max(working_tol, mult_drop_floor)``.  This suppresses
+    # add/drop ping-pong driven by O(eps · cond(AAᵀ)) noise in the
+    # Cholesky-based multiplier recovery.  Default 1e-6.
+    mult_drop_floor: float = eqx.field(static=True, default=1e-6)
+
+    # Number of consecutive add/drop reversals on the same constraint
+    # index that triggers an explicit ping-pong short-circuit in the
+    # QP active-set loop.  When the threshold is hit, the QP returns
+    # its current direction with ``ping_ponged=True`` and
+    # ``converged=True`` instead of exhausting ``qp_max_iter``.
+    # Default 3.
+    qp_ping_pong_threshold: int = eqx.field(static=True, default=3)
 
     # Verbose output (resolved to Callable[..., None] in __check_init__)
     verbose: Callable = eqx.field(static=True, default=False)
@@ -1685,6 +1768,20 @@ class SLSQP(optx.AbstractMinimiser):
             max_active_ineq=jnp.maximum(prev_diag.max_active_ineq, n_active_ineq_now),
             n_merit_regressions=prev_diag.n_merit_regressions
             + jnp.where(merit_regression, 1, 0),
+            n_qp_budget_exhausted=prev_diag.n_qp_budget_exhausted
+            + jnp.where(qp_result.reached_max_iter, 1, 0),
+            n_qp_ping_pong=prev_diag.n_qp_ping_pong
+            + jnp.where(qp_result.ping_ponged, 1, 0),
+            max_qp_iterations=jnp.maximum(
+                prev_diag.max_qp_iterations, qp_result.iterations
+            ),
+            max_qp_active_size=jnp.maximum(
+                prev_diag.max_qp_active_size, n_active_ineq_now
+            ),
+            n_lpeca_bypassed=prev_diag.n_lpeca_bypassed
+            + jnp.where(qp_result.lpeca_bypassed, 1, 0),
+            n_lpeca_capped=prev_diag.n_lpeca_capped
+            + jnp.where(qp_result.lpeca_capped, 1, 0),
         )
 
         new_state = SLSQPState(
@@ -1747,6 +1844,13 @@ class SLSQP(optx.AbstractMinimiser):
             jnp.min(new_lbfgs_history.diagonal), 1e-30
         )
         merit_delta = merit_new - state.best_merit
+        # ``QPcyc`` packs the QP exit reason as a 2-bit code:
+        #   bit 0 — ping-pong detector fired (sticky cycle short-circuit)
+        #   bit 1 — active-set loop reached ``qp_max_iter``
+        # 0 = clean convergence; 1 = ping-pong; 2 = budget exhausted.
+        qp_cyc = (qp_result.ping_ponged.astype(jnp.int32)) | (
+            qp_result.reached_max_iter.astype(jnp.int32) << 1
+        )
         self.verbose(
             num_steps=("Step", new_state.step_count),  # ty: ignore[unresolved-attribute]  # equinox @dataclass_transform
             objective=("f", f_val_new, ".6e"),
@@ -1764,7 +1868,8 @@ class SLSQP(optx.AbstractMinimiser):
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
             lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
             lbfgs_skipped=("skip", lbfgs_skipped),
-            qp_iters=("QP it", qp_result.iterations),
+            qp_iters=("QPiter", qp_result.iterations),
+            qp_cyc=("QPcyc", qp_cyc),
             qp_converged=("QP ok", qp_result.converged),
             n_active=("#act", n_active),
             n_bound_fixed=("#fix", qp_result.n_bound_fixed),
@@ -2008,20 +2113,27 @@ class SLSQP(optx.AbstractMinimiser):
         # Uses full ineq data (including bounds) for the prediction,
         # then slices to the general-ineq portion for the QP.
         #
-        # Oversize guard: when LPEC-A predicts more active inequalities
-        # than ``n - m_eq`` degrees of freedom, the working set is
-        # overdetermined and the inner equality solve typically reports
-        # infeasibility.  In that case we discard the prediction for the
-        # current iteration (mask to all-False) and let the QP active
-        # set fall back to the warm-start / cold-start path.  The
-        # prediction is only asymptotically exact; an oversize verdict
-        # far from the solution is a strong signal that the current
-        # ``rho_bar`` is not informative.
+        # Two-stage gating:
+        #   1. Warm-up gate (Python-static): bypass LPEC-A for the
+        #      first ``lpeca_warmup_steps`` outer iterations so the
+        #      predictor is not run on the noisy initial multipliers.
+        #   2. Trust gate (JAX-runtime, inside ``identify_active_set
+        #      _lpeca``): empty prediction when ``rho_bar`` exceeds
+        #      ``lpeca_trust_threshold``.
+        # An additional rank-aware size cap inside the LPEC-A routine
+        # truncates the prediction to ``n - m_eq - 1`` constraints to
+        # preserve LICQ-like rank in the working-set Jacobian.
         predicted_active_set = None
+        lpeca_bypassed = jnp.array(False)
+        lpeca_capped = jnp.array(False)
         if self.active_set_method in ("lpeca_init", "lpeca"):
             m_ineq_total = m_ineq_general + m_bounds
             if m_ineq_total > 0:
-                full_predicted = compute_lpeca_active_set(
+                # Warm-up gate (Python-static across step_count): run
+                # the LPEC-A computation unconditionally for jit
+                # compatibility but mask the result to all-False for
+                # the first ``lpeca_warmup_steps`` outer iterations.
+                lpeca_result = compute_lpeca_active_set(
                     c_ineq=state.ineq_val,
                     c_eq=state.eq_val,
                     grad=state.grad,
@@ -2031,16 +2143,21 @@ class SLSQP(optx.AbstractMinimiser):
                     mu_eq=state.multipliers_eq,
                     sigma=self.lpeca_sigma,
                     beta=self.lpeca_beta,
+                    trust_threshold=self.lpeca_trust_threshold,
                     use_lp=self.lpeca_use_lp,
                 )
+                in_warmup = state.step_count < self.lpeca_warmup_steps
+                # Bypass = warm-up firing OR trust gate vetoing.
+                bypassed = in_warmup | ~lpeca_result.valid
+                full_predicted = jnp.where(
+                    bypassed,
+                    jnp.zeros_like(lpeca_result.predicted),
+                    lpeca_result.predicted,
+                )
+                lpeca_bypassed = bypassed
+                lpeca_capped = lpeca_result.capped & ~bypassed
                 if m_ineq_general > 0:
-                    general_predicted = full_predicted[:m_ineq_general]
-                    n_free_dof = max(g.shape[0] - self.n_eq_constraints, 1)
-                    predicted_count = jnp.sum(general_predicted.astype(jnp.int32))
-                    oversize = predicted_count > n_free_dof
-                    predicted_active_set = jnp.where(
-                        oversize, jnp.zeros_like(general_predicted), general_predicted
-                    )
+                    predicted_active_set = full_predicted[:m_ineq_general]
                 else:
                     predicted_active_set = None
 
@@ -2111,6 +2228,8 @@ class SLSQP(optx.AbstractMinimiser):
             active_set_method=self.active_set_method,
             use_constraint_preconditioner=self.use_exact_hvp_in_qp,
             inner_solver=inner_solver,
+            mult_drop_floor=self.mult_drop_floor,
+            ping_pong_threshold=self.qp_ping_pong_threshold,
         )
 
         direction = qp_result.d
@@ -2314,4 +2433,8 @@ class SLSQP(optx.AbstractMinimiser):
             iterations=qp_result.iterations,
             bound_fix_solves=bound_fix_solves,
             n_bound_fixed=n_bound_fixed,
+            ping_ponged=qp_result.ping_ponged,
+            reached_max_iter=qp_result.reached_max_iter,
+            lpeca_bypassed=lpeca_bypassed,
+            lpeca_capped=lpeca_capped,
         )

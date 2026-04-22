@@ -305,20 +305,26 @@ solver = SLSQP(
 
 The QP subproblem is solved by a primal active-set method that adds or removes inequality constraints one at a time. When the problem is **degenerate** — multiple constraints pass through the same vertex or have tied violation/multiplier values — the active-set loop can *cycle*: iteration $i$ activates a constraint, iteration $i+1$ drops it, iteration $i+2$ re-activates it, and so on. The QP then exhausts its iteration budget without converging, producing a poor search direction.
 
-This implementation uses the **EXPAND** procedure (Gill, Murray, Saunders & Wright, *Mathematical Programming* 45, 1989) to break such cycles. The idea is simple: instead of a fixed feasibility tolerance, the active-set loop maintains a *working tolerance* that grows monotonically:
+This implementation uses the **EXPAND** procedure (Gill, Murray, Saunders & Wright, *Mathematical Programming* 45, 1989) to break such cycles. The idea is simple: instead of a fixed feasibility tolerance, the active-set loop maintains a *working tolerance* that grows monotonically. Following the SNOPT recipe in §3.2 of the original paper, the working tolerance ramps from $\tfrac{1}{2}\texttt{tol}$ to $\texttt{tol}$ over the full iteration budget:
 
 $$
-\delta_k = \texttt{tol} + k \cdot \tau, \qquad \tau = \frac{\texttt{tol} \cdot \texttt{expand\_factor}}{\texttt{max\_iter}}
+\delta_k = \delta_0 + k \cdot \tau, \qquad \delta_0 = \tfrac{1}{2}\,\texttt{tol}\cdot\texttt{expand\_factor}, \qquad \tau = \frac{\delta_0}{\texttt{max\_iter}}
 $$
+
+This ramp grows by a full $\texttt{tol}$ across the iteration budget — large enough to break floating-point ties at degenerate vertices. The earlier formulation $\tau = \texttt{tol}\cdot\texttt{expand\_factor}/\texttt{max\_iter}$ only widened the tolerance by *one ULP* over the budget, which was insufficient to dislodge any real tie and explained the "QP iteration budget exhausted" failures observed on degenerate problems.
 
 At each active-set iteration $k$:
 
 - A constraint is considered *violated* only if its residual is below $-\delta_k$ (progressively stricter threshold for activation).
-- A multiplier is considered *negative* only if it is below $-\delta_k$ (progressively stricter threshold for deactivation).
+- A multiplier is considered *negative* only if it is below $-\max(\delta_k, \texttt{mult\_drop\_floor})$.
 
-Because $\delta_k$ increases at every step, marginally active or marginally infeasible constraints that cause cycling are gradually excluded, breaking the degeneracy. With the default settings (`expand_factor=1.0`, `tol=1e-8`, `max_iter=100`), the tolerance doubles from `tol` to `2·tol` over the full iteration budget — conservative enough to preserve solution quality while reliably eliminating cycles.
+Because $\delta_k$ increases at every step, marginally active or marginally infeasible constraints that cause cycling are gradually excluded, breaking the degeneracy.
 
 EXPAND is the standard anti-cycling technique used in production solvers (MINOS, SNOPT, SQOPT) and is backed by a convergence guarantee: strict objective decrease within each expanding sequence. The `expand_factor` parameter on `solve_qp` controls the growth rate; set it to `0.0` to disable expansion entirely.
+
+**Noise-aware multiplier drop.** Multipliers recovered from the projected-CG inner solver carry numerical noise (typically $O(\epsilon \cdot \kappa(AA^T))$, e.g. $10^{-5}$ for moderately conditioned problems). Combined with the EXPAND working tolerance ($O(10^{-8})$), a constraint that was just added with a true multiplier near zero can be misclassified as "negative" and dropped, only to be re-added on the next iteration. The `mult_drop_floor` parameter on `solve_qp` (default `1e-6`) sets a noise-aware lower bound on the drop test: a constraint is only dropped when its multiplier is below $-\max(\delta_k, \texttt{mult\_drop\_floor})$. The default conservatively matches typical CG multiplier-recovery error.
+
+**Ping-pong detector.** Even with EXPAND and the noise-aware drop test, pathological degeneracies can still cause add-then-drop oscillations on the same constraint. The active-set loop now tracks the most recent add and drop indices: if the *same* constraint is added immediately after being dropped (or vice versa), an internal counter increments. When the counter reaches `qp_ping_pong_threshold` (default `3` repeated cycles) the QP loop short-circuits with `converged=True` and `ping_ponged=True`. The current iterate satisfies the QP optimality conditions modulo the ambiguous constraint and the outer SLSQP loop is no worse off than if the QP had truly converged. The detector trips much earlier than `max_iter` exhaustion, freeing the iteration budget for productive work. The diagnostic counter `n_qp_ping_pong` records how often this fires across the SQP run; `qp_cyc` in the verbose output flags it on a per-step basis.
 
 ### LPEC-A active set identification
 
@@ -334,12 +340,20 @@ The `active_set_method` parameter on `SLSQP` controls how LPEC-A interacts with 
 
 The threshold parameters `lpeca_sigma` (default 0.9) and `lpeca_beta` (default $1/(m_{\text{ineq}} + n + m_{\text{eq}})$) control the sensitivity of the prediction.
 
+**Trust gate.** Oberlin & Wright's Theorem 5 only guarantees correctness asymptotically — the prediction is reliable when the iterate is close enough to the solution that $\bar{\rho}$ is small. Far from the solution, $\bar{\rho}$ can be very large and the raw threshold $(\beta\bar{\rho})^{\bar{\sigma}}$ becomes wide enough to flag every inequality as active, producing a rank-deficient working set. The implementation gates this with `lpeca_trust_threshold` (default `1.0`): when $\bar{\rho} > \texttt{lpeca\_trust\_threshold}$ the prediction is deemed untrustworthy and is replaced with an empty set, letting the QP fall back to its warm-start active set. The diagnostic `n_lpeca_bypassed` records the number of SQP steps where this gate (or the warm-up, below) fired. The earlier implementation used a `min(threshold, max|c_ineq|)` clamp instead, which is mathematically vacuous (every $c_i$ is bounded by $\max|c_j|$ by construction), so it left the over-prediction problem unaddressed.
+
+**Rank-aware size cap.** Even when the trust gate passes, the predicted active set is truncated so that at most $n - m_{\text{eq}} - 1$ inequalities are predicted active. This ensures the working-set Jacobian $[A_{\text{eq}}; A_{\text{active}}]$ retains a rank margin (at most $n$ rows in $n$ columns of slack), preventing the LICQ-violating "everything active" prediction from poisoning the QP equality solve. When the cap fires, the most-violated constraints (smallest $c_{\text{ineq},i}$) are kept; the diagnostic `n_lpeca_capped` counts these events. The `lpeca_capped` field on `QPResult` flags it per step.
+
+**SQP warm-up gate.** LPEC-A's asymptotic guarantees assume the multiplier estimates fed into $\bar{\rho}$ are themselves reasonable. During the first few SQP iterations the multipliers are still transient (especially when the initial guess is far from the solution), so the LPEC-A prediction is bypassed entirely for the first `lpeca_warmup_steps` outer iterations (default `3`). After warm-up the trust gate above takes over.
+
 **Optional LP refinement.** By default, LPEC-A uses the multiplier estimates from the previous QP solve. Setting `lpeca_use_lp=True` solves a small LP (via `mpax.r2HPDHG`) to obtain tighter multiplier estimates, producing a more accurate prediction. This requires the `mpax` package (`pip install slsqp-jax[extras]`).
 
 ```python
 solver = SLSQP(
     active_set_method="lpeca_init",  # or "lpeca"
     lpeca_sigma=0.9,
+    lpeca_trust_threshold=1.0,
+    lpeca_warmup_steps=3,
     lpeca_use_lp=False,  # True requires mpax
     ...
 )
