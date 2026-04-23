@@ -507,6 +507,206 @@ class TestParseNonlinearConstraint:
 
 
 # ===================================================================
+# Tests for non-standard NonlinearConstraint.hessp extension
+# ===================================================================
+
+
+class TestParseNonlinearConstraintHessp:
+    """Covers the non-standard ``NonlinearConstraint.hessp`` attribute.
+
+    SciPy does not ship ``hessp`` on ``NonlinearConstraint``.  The compat
+    layer treats a user-attached ``hessp`` attribute, if present and
+    callable, as the per-component constraint HVP with precedence over
+    ``hess``.  See the module docstring of ``slsqp_jax.compat`` for the
+    full contract.
+    """
+
+    def test_hessp_takes_precedence_over_hess(self):
+        """Both attributes set: ``hess`` must never be called."""
+        hess_call_count = 0
+        hessp_call_count = 0
+
+        def my_hess(x, v):
+            nonlocal hess_call_count
+            hess_call_count += 1
+            return v[0] * np.diag([2.0, 2.0])
+
+        def my_hessp(x, p):
+            nonlocal hessp_call_count
+            hessp_call_count += 1
+            # c(x) = x0^2 + x1^2, Hessian = diag(2, 2), so HVP is 2 * p.
+            return np.array([[2.0 * p[0], 2.0 * p[1]]])
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            1.0,
+            1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+            hess=my_hess,
+        )
+        nlc.hessp = my_hessp  # non-standard
+
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.eq_hvp_fn is not None
+
+        p = jnp.array([3.0, 4.0])
+        hvp = pc.eq_hvp_fn(x0, p, None)
+        np.testing.assert_allclose(hvp, [[6.0, 8.0]])
+        assert hessp_call_count == 1
+        assert hess_call_count == 0
+
+    def test_hessp_only_no_hess(self):
+        """hessp alone is enough to produce eq_hvp_fn."""
+
+        def my_hessp(x, p):
+            return np.array([[2.0 * p[0], 2.0 * p[1]]])
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            1.0,
+            1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+        )
+        nlc.hessp = my_hessp
+
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.eq_hvp_fn is not None
+        p = jnp.array([1.0, 0.0])
+        np.testing.assert_allclose(pc.eq_hvp_fn(x0, p, None), [[2.0, 0.0]])
+
+    def test_hessp_mixed_eq_ineq_shapes_and_caching(self):
+        """Mixed eq+ineq: hessp is called once, rows are split and sign-flipped."""
+        hessp_call_count = 0
+
+        def my_fun(x):
+            return np.array([x[0] ** 2 + x[1] ** 2, x[0] - x[1]])
+
+        # Row 0: (d^2 c_0 / dx^2) @ p = diag(2,2) @ p = 2*p
+        # Row 1: (d^2 c_1 / dx^2) @ p = 0
+        def my_hessp(x, p):
+            nonlocal hessp_call_count
+            hessp_call_count += 1
+            return np.array(
+                [[2.0 * p[0], 2.0 * p[1]], [0.0, 0.0]],
+            )
+
+        nlc = NonlinearConstraint(
+            my_fun,
+            [1.0, 0.0],
+            [1.0, np.inf],
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]], [1.0, -1.0]]),
+        )
+        nlc.hessp = my_hessp
+
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.n_eq_constraints == 1
+        assert pc.n_ineq_constraints == 1
+        assert pc.eq_hvp_fn is not None
+        assert pc.ineq_hvp_fn is not None
+
+        hessp_call_count = 0
+        x = jnp.array([0.6, 0.4])
+        p = jnp.array([1.0, 0.0])
+        eq_hvp = pc.eq_hvp_fn(x, p, None)
+        ineq_hvp = pc.ineq_hvp_fn(x, p, None)
+
+        # hessp called once; second accessor hits the cache.
+        assert hessp_call_count == 1
+        np.testing.assert_allclose(eq_hvp, [[2.0, 0.0]])
+        np.testing.assert_allclose(ineq_hvp, [[0.0, 0.0]])
+
+    def test_hessp_upper_bound_sign_flip(self):
+        """Upper-bounded ineq row is negated (ub - f(x) >= 0 convention)."""
+
+        def my_hessp(x, p):
+            return np.array([[2.0 * p[0], 2.0 * p[1]]])
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            -np.inf,
+            10.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+        )
+        nlc.hessp = my_hessp
+
+        x0 = jnp.array([1.0, 1.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.n_eq_constraints == 0
+        assert pc.n_ineq_constraints == 1
+        assert pc.ineq_hvp_fn is not None
+        p = jnp.array([1.0, 0.0])
+        np.testing.assert_allclose(pc.ineq_hvp_fn(x0, p, None), [[-2.0, 0.0]])
+
+    def test_hessp_non_callable_falls_back_to_hess(self):
+        """A non-callable hessp (e.g. a sentinel string) is ignored."""
+        hess_call_count = 0
+
+        def my_hess(x, v):
+            nonlocal hess_call_count
+            hess_call_count += 1
+            return v[0] * np.diag([2.0, 2.0])
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            1.0,
+            1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+            hess=my_hess,
+        )
+        nlc.hessp = "2-point"  # non-callable sentinel
+
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.eq_hvp_fn is not None
+        p = jnp.array([1.0, 0.0])
+        np.testing.assert_allclose(pc.eq_hvp_fn(x0, p, None), [[2.0, 0.0]])
+        assert hess_call_count >= 1
+
+    def test_hessp_wrong_arity_raises(self):
+        """Arity != 2 (and no *args) must raise at parse time."""
+        base_kwargs = dict(
+            fun=lambda x: x[0] ** 2 + x[1] ** 2,
+            lb=1.0,
+            ub=1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+        )
+        x0 = jnp.array([1.0, 0.0])
+
+        nlc1 = NonlinearConstraint(**base_kwargs)
+        nlc1.hessp = lambda x: x  # arity 1
+        with pytest.raises(TypeError, match="hessp must accept exactly two"):
+            parse_constraints(nlc1, x0)
+
+        nlc3 = NonlinearConstraint(**base_kwargs)
+        nlc3.hessp = lambda x, p, extra: x  # arity 3
+        with pytest.raises(TypeError, match="hessp must accept exactly two"):
+            parse_constraints(nlc3, x0)
+
+    def test_hessp_accepts_varargs(self):
+        """A *args callable is accepted without arity enforcement."""
+
+        def my_hessp(*args, **kwargs):
+            p = args[1]
+            return np.array([[2.0 * p[0], 2.0 * p[1]]])
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            1.0,
+            1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+        )
+        nlc.hessp = my_hessp
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.eq_hvp_fn is not None
+        p = jnp.array([1.0, 0.0])
+        np.testing.assert_allclose(pc.eq_hvp_fn(x0, p, None), [[2.0, 0.0]])
+
+
+# ===================================================================
 # Tests for mixed constraint lists
 # ===================================================================
 

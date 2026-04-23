@@ -4,10 +4,51 @@ Provides utilities to convert SciPy-style constraint specifications
 (dicts, LinearConstraint, NonlinearConstraint) into the function/Jacobian/HVP
 signatures expected by the SLSQP solver, and a convenience
 ``minimize_like_scipy`` entry point.
+
+Non-standard ``NonlinearConstraint.hessp`` extension
+----------------------------------------------------
+
+``scipy.optimize.NonlinearConstraint`` does **not** ship a ``hessp``
+attribute, does **not** accept one in ``__init__``, and SciPy's own
+solvers never read one.  SLSQP-JAX's compat layer nevertheless honours
+a user-attached ``hessp`` attribute on a ``NonlinearConstraint``: if
+the attribute is present and callable, it is used as the per-component
+constraint Hessian-vector product with **precedence over** ``hess``.
+
+This is a deliberate, unorthodox extension.  It exists so that users
+can avoid forming a dense ``(n, n)`` constraint Hessian (which SciPy's
+``hess(x, v)`` convention forces) when all SLSQP-JAX actually needs is
+the HVP stack.
+
+Expected signature::
+
+    hessp(x, p) -> Array of shape (m, n)
+
+where ``x`` is the current iterate (shape ``(n,)``), ``p`` is the
+direction vector (shape ``(n,)``), ``m`` is the number of components
+of the constraint, and row ``i`` of the returned array equals
+``(d^2 c_i / dx^2)(x) @ p``.
+
+Usage pattern::
+
+    nlc = NonlinearConstraint(fun, lb, ub, jac=jac_fn)
+    nlc.hessp = my_hessp  # non-standard; ignored by SciPy, consumed here
+
+Precedence rules:
+
+1. If ``hessp`` is present and callable, it wins over ``hess``.
+2. If ``hessp`` is present but not callable (e.g. a sentinel string
+   like ``"2-point"``), it is ignored and ``hess`` is used if
+   callable -- identical to the existing behaviour for ``hess``.
+3. Validation is limited to positional-parameter arity via
+   ``inspect.signature``; shape/dtype mismatches surface as JAX errors
+   on first use.  Callables whose signature cannot be introspected
+   (e.g. some C-level builtins) are accepted silently.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -72,6 +113,53 @@ class _CachedEvaluator2:
             self._cache_val = self._fn(x, v, args)
             self._cache_key = key
         return self._cache_val
+
+
+# ---------------------------------------------------------------------------
+# Non-standard `NonlinearConstraint.hessp` validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_hessp_signature(fn: Callable) -> None:
+    """Arity check for a user-attached ``NonlinearConstraint.hessp``.
+
+    ``scipy.optimize.NonlinearConstraint`` does not ship a ``hessp``
+    attribute; this project treats one, if present and callable, as a
+    per-component constraint HVP with signature ``hessp(x, p) -> (m, n)``.
+
+    Only the positional-parameter arity is verified.  Callables whose
+    signature cannot be introspected (e.g. C-level builtins, some
+    ``functools.partial`` wrappers on exotic targets) are accepted
+    silently and any shape/dtype errors surface on first use.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return
+
+    positional = [
+        p
+        for p in sig.parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        and p.default is inspect.Parameter.empty
+    ]
+    has_varargs = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+    if has_varargs:
+        return
+    if len(positional) != 2:
+        raise TypeError(
+            "NonlinearConstraint.hessp must accept exactly two positional "
+            "arguments (x, p); got a callable with "
+            f"{len(positional)} required positional parameters. "
+            "Expected signature: hessp(x, p) -> Array of shape (m, n) whose "
+            "i-th row is (d^2 c_i / dx^2)(x) @ p."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +320,14 @@ def _parse_linear_constraint(con: LinearConstraint) -> _ConstraintParts:
 
 
 def _parse_nonlinear_constraint(con: NonlinearConstraint) -> _ConstraintParts:
-    """Parse a ``scipy.optimize.NonlinearConstraint``."""
+    """Parse a ``scipy.optimize.NonlinearConstraint``.
+
+    In addition to the standard ``fun``, ``jac``, and ``hess``
+    attributes, this honours a non-standard ``hessp`` attribute (see
+    the module-level docstring for the full contract and rationale):
+    if ``con.hessp`` is callable it is used as the per-component
+    constraint HVP with precedence over ``con.hess``.
+    """
     raw_fun = con.fun
     lb = np.atleast_1d(np.asarray(con.lb, dtype=float))
     ub = np.atleast_1d(np.asarray(con.ub, dtype=float))
@@ -270,6 +365,15 @@ def _parse_nonlinear_constraint(con: NonlinearConstraint) -> _ConstraintParts:
     raw_hess = getattr(con, "hess", None)
     has_hess = callable(raw_hess)
 
+    # Non-standard `hessp` extension: if the user has attached a callable
+    # `hessp` attribute to the NonlinearConstraint, it takes precedence over
+    # `hess`.  See the module-level docstring for the full contract and
+    # rationale.  Arity is validated up front; shape errors surface later.
+    _raw_hessp_attr = getattr(con, "hessp", None)
+    hessp_fn: Callable | None = _raw_hessp_attr if callable(_raw_hessp_attr) else None
+    if hessp_fn is not None:
+        _validate_hessp_signature(hessp_fn)
+
     # Cached Jacobian evaluator (if callable)
     if raw_jac is not None and has_jac and needs_eq and needs_ineq:
 
@@ -282,7 +386,18 @@ def _parse_nonlinear_constraint(con: NonlinearConstraint) -> _ConstraintParts:
 
     # Cached HVP evaluator: compute all m per-component HVPs once,
     # then let eq_hvp_fn / ineq_hvp_fn select their rows.
-    if raw_hess is not None and has_hess and needs_eq and needs_ineq:
+    #
+    # When `hessp` is supplied it already returns the (m, n) per-component
+    # stack in a single call, short-circuiting the m unit-vector loop that
+    # SciPy's `hess(x, v)` convention forces.
+    if hessp_fn is not None and needs_eq and needs_ineq:
+        hessp_call = hessp_fn
+
+        def _all_component_hvps(x: Any, v: Any, args: Any) -> Float[Array, "m n"]:
+            return jnp.atleast_2d(jnp.asarray(hessp_call(x, v)))
+
+        cached_hvp = _CachedEvaluator2(_all_component_hvps)
+    elif raw_hess is not None and has_hess and needs_eq and needs_ineq:
 
         def _all_component_hvps(x: Any, v: Any, args: Any) -> Float[Array, "m n"]:
             rows = []
@@ -330,7 +445,17 @@ def _parse_nonlinear_constraint(con: NonlinearConstraint) -> _ConstraintParts:
 
         # HVP
         eq_hvp_fn: ConstraintHVPFn | None = None
-        if raw_hess is not None and has_hess:
+        if hessp_fn is not None:
+            hessp_call_eq = hessp_fn
+            if cached_hvp is not None:
+
+                def eq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
+                    return cached_hvp(x, v, args)[eq_indices]
+            else:
+
+                def eq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
+                    return jnp.atleast_2d(jnp.asarray(hessp_call_eq(x, v)))[eq_indices]
+        elif raw_hess is not None and has_hess:
             if cached_hvp is not None:
 
                 def eq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
@@ -420,7 +545,39 @@ def _parse_nonlinear_constraint(con: NonlinearConstraint) -> _ConstraintParts:
 
         # HVP
         ineq_hvp_fn: ConstraintHVPFn | None = None
-        if raw_hess is not None and has_hess:
+        if hessp_fn is not None:
+            hessp_call_ineq = hessp_fn
+            if cached_hvp is not None:
+
+                def ineq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
+                    all_hvps = cached_hvp(x, v, args)
+                    lower_rows = (
+                        all_hvps[lower_indices]
+                        if n_lower > 0
+                        else jnp.zeros((0, x.shape[0]))
+                    )
+                    upper_rows = (
+                        -all_hvps[upper_indices]
+                        if n_upper > 0
+                        else jnp.zeros((0, x.shape[0]))
+                    )
+                    return jnp.concatenate([lower_rows, upper_rows])
+            else:
+
+                def ineq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
+                    all_hvps = jnp.atleast_2d(jnp.asarray(hessp_call_ineq(x, v)))
+                    lower_rows = (
+                        all_hvps[lower_indices]
+                        if n_lower > 0
+                        else jnp.zeros((0, x.shape[0]))
+                    )
+                    upper_rows = (
+                        -all_hvps[upper_indices]
+                        if n_upper > 0
+                        else jnp.zeros((0, x.shape[0]))
+                    )
+                    return jnp.concatenate([lower_rows, upper_rows])
+        elif raw_hess is not None and has_hess:
             if cached_hvp is not None:
 
                 def ineq_hvp_fn(x: Any, v: Any, args: Any) -> Float[Array, "k n"]:
@@ -694,7 +851,12 @@ def minimize_like_scipy(
         ``(min, max)`` pairs.
     constraints
         SciPy-style constraints (dict / list-of-dicts /
-        ``LinearConstraint`` / ``NonlinearConstraint``).
+        ``LinearConstraint`` / ``NonlinearConstraint``).  A
+        ``NonlinearConstraint`` may carry a user-attached ``hessp``
+        attribute (non-standard; not part of SciPy's API) that, if
+        callable, is used as the per-component constraint HVP with
+        precedence over ``hess``.  See the module-level docstring for
+        the full contract.
     options
         Solver options dict.  The following keys are popped with
         the listed defaults (which match the ``SLSQP`` constructor
