@@ -705,6 +705,38 @@ class TestParseNonlinearConstraintHessp:
         p = jnp.array([1.0, 0.0])
         np.testing.assert_allclose(pc.eq_hvp_fn(x0, p, None), [[2.0, 0.0]])
 
+    def test_hessp_non_introspectable_callable_accepted(self):
+        """Callables whose signature cannot be inspected bypass arity check.
+
+        Mirrors the C-level / exotic-wrapper case noted in the docstring:
+        ``inspect.signature`` raises ``ValueError`` and the validator must
+        silently accept the callable so parsing does not abort.  We force
+        the branch with a synthetic callable whose ``__signature__``
+        descriptor itself raises ``ValueError``.
+        """
+
+        class _NoSignatureHessp:
+            def __call__(self, x, p):
+                return np.array([[2.0 * p[0], 2.0 * p[1]]])
+
+            @property
+            def __signature__(self):
+                raise ValueError("synthetic: no signature available")
+
+        nlc = NonlinearConstraint(
+            lambda x: x[0] ** 2 + x[1] ** 2,
+            1.0,
+            1.0,
+            jac=lambda x: np.array([[2 * x[0], 2 * x[1]]]),
+        )
+        nlc.hessp = _NoSignatureHessp()
+
+        x0 = jnp.array([1.0, 0.0])
+        pc = parse_constraints(nlc, x0)
+        assert pc.eq_hvp_fn is not None
+        p = jnp.array([1.0, 0.0])
+        np.testing.assert_allclose(pc.eq_hvp_fn(x0, p, None), [[2.0, 0.0]])
+
 
 # ===================================================================
 # Tests for mixed constraint lists
