@@ -55,9 +55,10 @@ def objective(x, args):
 def eq_constraint(x, args):
     return jnp.array([x[0] + x[1] - 1.0])
 
-# Inequality constraint: x >= 0.2
+# Inequality constraint: x[0] <= 0.2
+# (recall the convention c_ineq(x) >= 0, so we encode it as 0.2 - x[0] >= 0)
 def ineq_constraint(x, args):
-    return jnp.array([x[0] - 0.2])
+    return jnp.array([0.2 - x[0]])
 
 solver = SLSQP(
     eq_constraint_fn=eq_constraint,
