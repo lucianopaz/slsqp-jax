@@ -220,11 +220,14 @@ Three strategies are provided:
 
 **`MinresQLPSolver`**. Solves the full $(n + m) \times (n + m)$ saddle-point KKT system directly using MINRES-QLP:
 
+<!-- GitHub's GFM pre-processor collapses `\\` to `\` inside $$…$$; four
+     backslashes survive as the `\\` row separator KaTeX expects.  The
+     Sphinx mirror in docs/source/index.md keeps the single `\\` form. -->
 $$
-\begin{bmatrix} B & A^T \\ A & 0 \end{bmatrix}
-\begin{bmatrix} d \\ \lambda \end{bmatrix}
+\begin{bmatrix} B & A^T \\\\ A & 0 \end{bmatrix}
+\begin{bmatrix} d \\\\ \lambda \end{bmatrix}
 =
-\begin{bmatrix} -g \\ b \end{bmatrix}
+\begin{bmatrix} -g \\\\ b \end{bmatrix}
 $$
 
 This eliminates the need for null-space projection, particular solution computation, and separate multiplier recovery — the direction $d$ and multipliers $\lambda$ are obtained simultaneously. The implementation follows the full Preconditioned MINRES-QLP (PMINRES-QLP) algorithm from Table 3.5 of Choi (2006), including both left (QR) and right (QLP) orthogonalizations. The QLP extension yields minimum-length solutions for singular/near-singular systems and improved numerical stability over plain MINRES. All iterations use QLP mode (equivalent to `TranCond=1` in the reference implementation). Givens rotations use the numerically stable SymOrtho procedure (Table 2.9).
@@ -309,21 +312,21 @@ The QP subproblem is solved by a primal active-set method that adds or removes i
 This implementation uses the **EXPAND** procedure (Gill, Murray, Saunders & Wright, *Mathematical Programming* 45, 1989) to break such cycles. The idea is simple: instead of a fixed feasibility tolerance, the active-set loop maintains a *working tolerance* that grows monotonically:
 
 $$
-\delta_k = \texttt{tol} + k \cdot \tau, \qquad \tau = \frac{\texttt{tol}\cdot\texttt{expand\_factor}}{\texttt{max\_iter}}
+\delta_k = \epsilon + k \tau, \qquad \tau = \frac{\epsilon \cdot c}{K}
 $$
 
-With the default `expand_factor=1.0` the working tolerance grows from `tol` at $k=0$ to `2·tol` at $k=\texttt{max\_iter}$ — enough to dislodge floating-point ties at degenerate vertices while staying tight enough that converged working sets remain consistent with the outer SLSQP stationarity tolerance.
+where $\epsilon$ is the `tol` parameter, $c$ is `expand_factor`, and $K$ is `max_iter`. With the default `expand_factor=1.0` the working tolerance grows from $\epsilon$ at $k=0$ to $2\epsilon$ at $k=K$ — enough to dislodge floating-point ties at degenerate vertices while staying tight enough that converged working sets remain consistent with the outer SLSQP stationarity tolerance.
 
 At each active-set iteration $k$:
 
 - A constraint is considered *violated* only if its residual is below $-\delta_k$ (progressively stricter threshold for activation).
-- A multiplier is considered *negative* only if it is below $-\max(\delta_k, \texttt{mult\_drop\_floor})$.
+- A multiplier is considered *negative* only if it is below $-\max(\delta_k, \mu_{\text{drop}})$, where $\mu_{\text{drop}}$ is the `mult_drop_floor` parameter.
 
 Because $\delta_k$ increases at every step, marginally active or marginally infeasible constraints that cause cycling are gradually excluded, breaking the degeneracy.
 
 EXPAND is the standard anti-cycling technique used in production solvers (MINOS, SNOPT, SQOPT) and is backed by a convergence guarantee: strict objective decrease within each expanding sequence. The `expand_factor` parameter on `solve_qp` controls the growth rate; set it to `0.0` to disable expansion entirely.
 
-**Noise-aware multiplier drop.** Multipliers recovered from the projected-CG inner solver carry numerical noise (typically $O(\epsilon \cdot \kappa(AA^T))$, e.g. $10^{-5}$ for moderately conditioned problems). Combined with the EXPAND working tolerance ($O(10^{-8})$), a constraint that was just added with a true multiplier near zero can be misclassified as "negative" and dropped, only to be re-added on the next iteration. The `mult_drop_floor` parameter on `solve_qp` (default `1e-6`) sets a noise-aware lower bound on the drop test: a constraint is only dropped when its multiplier is below $-\max(\delta_k, \texttt{mult\_drop\_floor})$. The default conservatively matches typical CG multiplier-recovery error.
+**Noise-aware multiplier drop.** Multipliers recovered from the projected-CG inner solver carry numerical noise (typically $O(\epsilon \cdot \kappa(AA^T))$, e.g. $10^{-5}$ for moderately conditioned problems). Combined with the EXPAND working tolerance ($O(10^{-8})$), a constraint that was just added with a true multiplier near zero can be misclassified as "negative" and dropped, only to be re-added on the next iteration. The `mult_drop_floor` parameter on `solve_qp` (default `1e-6`) sets a noise-aware lower bound on the drop test: a constraint is only dropped when its multiplier is below $-\max(\delta_k, \mu_{\text{drop}})$, where $\mu_{\text{drop}}$ is the `mult_drop_floor` parameter. The default conservatively matches typical CG multiplier-recovery error.
 
 **Ping-pong detector (opt-in).** Even with EXPAND and the noise-aware drop test, pathological degeneracies can still cause add-then-drop oscillations on the same constraint. The active-set loop tracks the most recent add and drop indices: if the *same* constraint is added immediately after being dropped (or vice versa), an internal counter increments. When the counter reaches `qp_ping_pong_threshold` the QP loop short-circuits with `converged=True` and `ping_ponged=True`. The detector is **disabled by default** (`qp_ping_pong_threshold = 2**31 - 1`); production paths rely on the classical behaviour where an oscillating pair keeps iterating until `qp_max_iter` is reached, which keeps the outer SQP loop in sync with the multiplier stream produced by that working set. Setting `qp_ping_pong_threshold` to a small value (e.g. `3`–`8`) opts in to the short-circuit for problems with confirmed degenerate vertices where `qp_max_iter` was being exhausted regularly. The diagnostic counter `n_qp_ping_pong` records how often the counter reached the threshold across the SQP run; `qp_cyc` in the verbose output flags it on a per-step basis. Note that when `MinresQLPSolver` is used, the coupled multipliers returned by the solver on a degenerate working set can be ill-conditioned — the short-circuit is particularly unsafe in that configuration and should stay disabled unless each step's merit penalty is verified to remain bounded.
 
@@ -341,7 +344,7 @@ The `active_set_method` parameter on `SLSQP` controls how LPEC-A interacts with 
 
 The threshold parameters `lpeca_sigma` (default 0.9) and `lpeca_beta` (default $1/(m_{\text{ineq}} + n + m_{\text{eq}})$) control the sensitivity of the prediction.
 
-**Trust gate.** Oberlin & Wright's Theorem 5 only guarantees correctness asymptotically — the prediction is reliable when the iterate is close enough to the solution that $\bar{\rho}$ is small. Far from the solution, $\bar{\rho}$ can be very large and the raw threshold $(\beta\bar{\rho})^{\bar{\sigma}}$ becomes wide enough to flag every inequality as active, producing a rank-deficient working set. The implementation gates this with `lpeca_trust_threshold` (default `1.0`): when $\bar{\rho} > \texttt{lpeca\_trust\_threshold}$ the prediction is deemed untrustworthy and is replaced with an empty set, letting the QP fall back to its warm-start active set. The diagnostic `n_lpeca_bypassed` records the number of SQP steps where this gate (or the warm-up, below) fired. The earlier implementation used a `min(threshold, max|c_ineq|)` clamp instead, which is mathematically vacuous (every $c_i$ is bounded by $\max|c_j|$ by construction), so it left the over-prediction problem unaddressed.
+**Trust gate.** Oberlin & Wright's Theorem 5 only guarantees correctness asymptotically — the prediction is reliable when the iterate is close enough to the solution that $\bar{\rho}$ is small. Far from the solution, $\bar{\rho}$ can be very large and the raw threshold $(\beta\bar{\rho})^{\bar{\sigma}}$ becomes wide enough to flag every inequality as active, producing a rank-deficient working set. The implementation gates this with `lpeca_trust_threshold` (default `1.0`): when $\bar{\rho}$ exceeds `lpeca_trust_threshold` the prediction is deemed untrustworthy and is replaced with an empty set, letting the QP fall back to its warm-start active set. The diagnostic `n_lpeca_bypassed` records the number of SQP steps where this gate (or the warm-up, below) fired. The earlier implementation used a `min(threshold, max|c_ineq|)` clamp instead, which is mathematically vacuous (every $c_i$ is bounded by $\max|c_j|$ by construction), so it left the over-prediction problem unaddressed.
 
 **Rank-aware size cap.** Even when the trust gate passes, the predicted active set is truncated so that at most $n - m_{\text{eq}} - 1$ inequalities are predicted active. This ensures the working-set Jacobian $[A_{\text{eq}}; A_{\text{active}}]$ retains a rank margin (at most $n$ rows in $n$ columns of slack), preventing the LICQ-violating "everything active" prediction from poisoning the QP equality solve. When the cap fires, the most-violated constraints (smallest $c_{\text{ineq},i}$) are kept; the diagnostic `n_lpeca_capped` counts these events. The `lpeca_capped` field on `QPResult` flags it per step.
 
@@ -411,7 +414,7 @@ Inequality constraints remain as hard constraints in the active-set method — t
 Proximal stabilization is **active by default** for equality-constrained problems (when `proximal_tau > 0`). The proximal parameter $\mu$ is computed adaptively at each iteration following Wright (2002, eq 6.6):
 
 $$
-\mu_k = \operatorname{clip}\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min},\;\mu_{\max}\bigr)
+\mu_k = \mathrm{clip}\!\bigl(\lVert \nabla_x L_k \rVert^{\tau},\;\mu_{\min},\;\mu_{\max}\bigr)
 $$
 
 where $\tau \in (0, 1)$ is the exponent (default 0.5), $\mu_{\min}$ is a floor (default `atol` — the feasibility tolerance, typically $10^{-6}$), and $\mu_{\max}$ is a ceiling (default 0.1). Wright's local convergence theory assumes the KKT residual is below 1; the ceiling handles the regime where the residual is large (far from the solution) by ensuring the proximal weight $1/\mu \geq 1/\mu_{\max}$ — preventing weak equality enforcement that would sabotage the L1 merit function descent. As the solver converges, $\mu$ shrinks below the ceiling, tightening equality enforcement while the floor prevents $1/\mu$ from exploding. Wright's Theorem 6.1 guarantees superlinear convergence when $\tau < 1$.
@@ -532,10 +535,10 @@ Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress
 At each step, the solver computes the L1 merit value $\varphi = f + \rho \cdot (\lVert c_\text{eq} \rVert_1 + \lVert \max(0, -c_\text{ineq}) \rVert_1)$ and checks whether:
 
 $$
-\varphi_\text{new} < \varphi_\text{best} - \texttt{stagnation\_tol} \cdot \max(|\varphi_\text{best}|, 1)
+\varphi_\text{new} < \varphi_\text{best} - \eta \cdot \max(|\varphi_\text{best}|, 1)
 $$
 
-If yes, $\varphi_\text{best}$ is updated and the patience counter resets. Otherwise, `steps_without_improvement` increments. Stagnation fires when `steps_without_improvement >= W` (where $W = \lfloor \texttt{max\_steps} / 10 \rfloor$) and at least $W$ steps have elapsed, terminating early with a `nonlinear_divergence` result code. This is O(1) state (vs O(Wn) for an x-history ring buffer) and directly measures optimization progress.
+where $\eta$ is the `stagnation_tol` parameter. If yes, $\varphi_\text{best}$ is updated and the patience counter resets. Otherwise, `steps_without_improvement` increments. Stagnation fires when `steps_without_improvement >= W` (where $W = \lfloor N / 10 \rfloor$ with $N$ = `max_steps`) and at least $W$ steps have elapsed, terminating early with a `nonlinear_divergence` result code. This is O(1) state (vs O(Wn) for an x-history ring buffer) and directly measures optimization progress.
 
 ```python
 solver = SLSQP(
