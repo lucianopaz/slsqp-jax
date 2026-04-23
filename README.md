@@ -220,15 +220,7 @@ Three strategies are provided:
 
 **`MinresQLPSolver`**. Solves the full $(n + m) \times (n + m)$ saddle-point KKT system directly using MINRES-QLP:
 
-<!-- GitHub's GFM pre-processor collapses `\\` to `\` inside $$…$$; four
-     backslashes survive as the `\\` row separator KaTeX expects.  The
-     Sphinx mirror in docs/source/index.md keeps the single `\\` form. -->
-$$
-\begin{bmatrix} B & A^T \\\\ A & 0 \end{bmatrix}
-\begin{bmatrix} d \\\\ \lambda \end{bmatrix}
-=
-\begin{bmatrix} -g \\\\ b \end{bmatrix}
-$$
+$$\begin{bmatrix} B & A^T \\\\ A & 0 \end{bmatrix} \begin{bmatrix} d \\\\ \lambda \end{bmatrix} = \begin{bmatrix} -g \\\\ b \end{bmatrix}$$
 
 This eliminates the need for null-space projection, particular solution computation, and separate multiplier recovery — the direction $d$ and multipliers $\lambda$ are obtained simultaneously. The implementation follows the full Preconditioned MINRES-QLP (PMINRES-QLP) algorithm from Table 3.5 of Choi (2006), including both left (QR) and right (QLP) orthogonalizations. The QLP extension yields minimum-length solutions for singular/near-singular systems and improved numerical stability over plain MINRES. All iterations use QLP mode (equivalent to `TranCond=1` in the reference implementation). Givens rotations use the numerically stable SymOrtho procedure (Table 2.9).
 
