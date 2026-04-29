@@ -59,7 +59,7 @@ from slsqp_jax.types import (
     Scalar,
     Vector,
 )
-from slsqp_jax.utils import args_closure
+from slsqp_jax.utils import args_closure, to_scalar
 
 STAGNATION_MESSAGE = (
     "The solver stagnated: the L1 merit function did not improve over "
@@ -1363,8 +1363,12 @@ class SLSQP(optx.AbstractMinimiser):
         m_bounds = self._n_lower_bounds + self._n_upper_bounds
         m_ineq_total = m_ineq_general + m_bounds
 
-        # Evaluate objective
+        # Evaluate objective.  Coerce to a true 0-d scalar in case the user
+        # function returns e.g. shape (1,); otherwise the non-scalar shape
+        # propagates into ``terminate`` and trips the ``jax.lax.cond``
+        # scalar-predicate check there.
         f_val, _aux = fn(y, args)
+        f_val = to_scalar(f_val)
 
         # Compute gradient (precomputed callable)
         grad = self._grad_impl(fn, y, args)
@@ -2017,6 +2021,20 @@ class SLSQP(optx.AbstractMinimiser):
         # is now a diagnostic flag only.
         has_min_steps = state.step_count >= self.min_steps
         converged = stationarity & primal_feasible & has_min_steps
+
+        # Defensive scalarization: ``stationarity`` inherits its shape from
+        # ``lagrangian_val`` which in turn inherits from ``state.f_val`` and
+        # the constraint values.  A user function that returns shape ``(1,)``
+        # instead of a true 0-d scalar would otherwise produce a shape-(1,)
+        # boolean here and trip the scalar-predicate check in
+        # ``jax.lax.cond`` deep inside JAX with a cryptic error.  The source
+        # is also scalarized in ``init`` / ``evaluate_at_alpha``; this is a
+        # belt-and-braces guarantee so future leaks from constraint shapes
+        # surface as a clear shape error at this call site.
+        converged = jnp.reshape(converged, ())
+        max_iters_reached = jnp.reshape(max_iters_reached, ())
+        stagnation_detected = jnp.reshape(stagnation_detected, ())
+        ls_stagnation = jnp.reshape(ls_stagnation, ())
 
         # Determine result code
         done = converged | max_iters_reached | stagnation_detected | ls_stagnation
