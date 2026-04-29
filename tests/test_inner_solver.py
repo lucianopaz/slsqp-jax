@@ -315,3 +315,46 @@ class TestCholeskySolveDirect:
         np.testing.assert_allclose(result.d, d_exp, atol=1e-8)
         np.testing.assert_allclose(result.multipliers, mult_exp, atol=1e-6)
         assert result.converged
+
+
+class TestNonScalarAdaptiveTol:
+    """Regression: a (1,)-shaped tolerance must not crash the inner solvers.
+
+    Optimistix's ``ImplicitAdjoint.apply`` re-traces the primal step
+    function during the adjoint computation (and on the forward pass with
+    the default adjoint).  If ``state.prev_grad_lagrangian`` ever carries
+    an unexpected leading axis, the Eisenstat-Walker tolerance computed
+    in ``solver.py`` becomes shape ``(1,)``.  That used to broadcast every
+    ``r0_norm_sq < cg_tol ** 2`` comparison to ``(1,)`` and trigger
+    ``TypeError: Pred must be a scalar`` deep inside ``jax.lax.cond``
+    in ``cg_step``.  The inner solvers must coerce the tolerance to a
+    true 0-d scalar at entry; this test simulates the leak directly.
+    """
+
+    @pytest.mark.parametrize(
+        "make_solver",
+        [
+            lambda tol: ProjectedCGCholesky(max_cg_iter=50, cg_tol=tol),
+            lambda tol: ProjectedCGCraig(
+                max_cg_iter=50, cg_tol=tol, craig_tol=1e-12, craig_max_iter=200
+            ),
+        ],
+        ids=["cholesky", "craig"],
+    )
+    def test_size_one_adaptive_tol(self, make_solver):
+        hvp_fn, g, A, b, active_mask, d_exp, mult_exp = _make_qp()
+        solver = make_solver(1e-10)
+        leaked_tol = jnp.array([1e-10])
+        result = solver.solve(
+            hvp_fn,
+            g,
+            A,
+            b,
+            active_mask,
+            precond_fn=None,
+            adaptive_tol=leaked_tol,
+        )
+        np.testing.assert_allclose(result.d, d_exp, atol=1e-8)
+        np.testing.assert_allclose(result.multipliers, mult_exp, atol=1e-6)
+        assert result.converged.shape == ()
+        assert bool(result.converged)
