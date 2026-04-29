@@ -32,6 +32,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from slsqp_jax.types import Scalar, Vector
+from slsqp_jax.utils import to_scalar
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -92,6 +93,16 @@ def build_cg_step(
         def project(v: Vector) -> Vector:
             return v
 
+    # Coerce ``cg_tol`` to a true 0-d scalar.  Otherwise a ``(1,)``-shaped
+    # tolerance (which can leak in via the adaptive Eisenstat-Walker path
+    # if ``state.prev_grad_lagrangian`` ever carries an unexpected leading
+    # axis) would broadcast every ``r_new_norm_sq < cg_tol ** 2`` comparison
+    # below to shape ``(1,)``.  The boolean ``state.converged`` would then
+    # latch onto that shape and the predicate fed to ``jax.lax.cond`` at
+    # the bottom of this function would no longer be a scalar, raising
+    # ``TypeError: Pred must be a scalar`` from deep inside JAX.
+    cg_tol = to_scalar(cg_tol)
+
     def cg_step(i, state):
         def do_step(state: _CGState) -> _CGState:
             Bp = hvp_fn(state.p)
@@ -148,7 +159,12 @@ def build_cg_step(
                 ),
             )
 
-        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
+        # Defensive scalarisation of the predicate.  The CG state stores
+        # ``converged: Bool[Array, ""]`` but a stale (1,)-shaped boolean
+        # could otherwise propagate through ``fori_loop`` and trip the
+        # scalar-predicate check inside ``cond``.
+        converged_pred = jnp.reshape(state.converged, ())
+        return jax.lax.cond(converged_pred, lambda s: s, do_step, state)
 
     return cg_step
 
@@ -193,6 +209,7 @@ def solve_unconstrained_cg(
     # quantities are identical to the textbook. See the summary table in
     # cg_sign_convention_analysis for the full derivation.
     n = g.shape[0]
+    cg_tol = to_scalar(cg_tol)
     r0 = -g
     r0_norm_sq = jnp.dot(r0, r0)
 
@@ -212,7 +229,7 @@ def solve_unconstrained_cg(
         p=p0,
         rz=rz0,
         iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
+        converged=jnp.reshape(r0_norm_sq < cg_tol**2, ()),
     )
 
     cg_step = build_cg_step(
@@ -430,6 +447,7 @@ def _solve_projected_cg_cholesky(
     """
     m = A.shape[0]
     has_fixed = free_mask is not None and d_fixed is not None
+    cg_tol = to_scalar(cg_tol)
 
     A_masked = jnp.where(active_mask[:, None], A, 0.0)
     b_masked = jnp.where(active_mask, b, 0.0)
@@ -508,7 +526,7 @@ def _solve_projected_cg_cholesky(
         p=p0,
         rz=rz0,
         iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
+        converged=jnp.reshape(r0_norm_sq < cg_tol**2, ()),
     )
 
     cg_step = build_cg_step(
@@ -565,7 +583,7 @@ _CRAIG_BREAKDOWN_TOL = 1e-14
 def craig_solve(
     A: Float[Array, "m n"],
     rhs: Float[Array, " m"],
-    tol: float = 1e-10,
+    tol: float | Scalar = 1e-10,
     max_iter: int = 100,
 ) -> tuple[Vector, Bool[Array, ""]]:
     """Solve ``min ||x||  s.t.  A x = rhs`` via CRAIG's method.
@@ -707,7 +725,9 @@ def craig_solve(
                 iteration=state.iteration + 1,
             )
 
-        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
+        return jax.lax.cond(
+            jnp.reshape(state.converged, ()), lambda s: s, do_step, state
+        )
 
     final = jax.lax.fori_loop(0, max_iter, craig_step, init_state)
     # A "true" success requires the residual to be below tolerance at
@@ -815,6 +835,7 @@ def _solve_projected_cg_craig(
     (m-dim) solution.
     """
     has_fixed = free_mask is not None and d_fixed is not None
+    cg_tol = to_scalar(cg_tol)
 
     A_masked = jnp.where(active_mask[:, None], A, 0.0)
     b_masked = jnp.where(active_mask, b, 0.0)
@@ -922,7 +943,7 @@ def _solve_projected_cg_craig(
         p=p0,
         rz=rz0,
         iteration=jnp.array(0),
-        converged=r0_norm_sq < cg_tol**2,
+        converged=jnp.reshape(r0_norm_sq < cg_tol**2, ()),
     )
 
     cg_step = build_cg_step(
@@ -1076,7 +1097,7 @@ class _PMinresQLPState(NamedTuple):
 def pminres_qlp_solve(
     matvec: Callable[[Vector], Vector],
     rhs: Vector,
-    tol: float = 1e-10,
+    tol: float | Scalar = 1e-10,
     max_iter: int = 200,
     precond: Callable[[Vector], Vector] | None = None,
 ) -> tuple[Vector, Bool[Array, ""]]:
@@ -1359,7 +1380,9 @@ def pminres_qlp_solve(
                 converged=stop_now,
             )
 
-        return jax.lax.cond(state.converged, lambda s: s, do_step, state)
+        return jax.lax.cond(
+            jnp.reshape(state.converged, ()), lambda s: s, do_step, state
+        )
 
     final = jax.lax.fori_loop(0, max_iter, step_fn, init_state)
     # Report genuine success only when the last residual dropped below
@@ -1438,7 +1461,7 @@ def _solve_kkt_minres_qlp(
     b: Float[Array, " m"],
     active_mask: Bool[Array, " m"],
     max_iter: int,
-    tol: float,
+    tol: float | Scalar,
     precond_fn: Callable[[Vector], Vector] | None = None,
     free_mask: Bool[Array, " n"] | None = None,
     d_fixed: Vector | None = None,
@@ -1462,6 +1485,7 @@ def _solve_kkt_minres_qlp(
     n = g.shape[0]
     m = A.shape[0]
     has_fixed = free_mask is not None and d_fixed is not None
+    tol = to_scalar(tol)
 
     A_masked = jnp.where(active_mask[:, None], A, 0.0)
     b_masked = jnp.where(active_mask, b, 0.0)

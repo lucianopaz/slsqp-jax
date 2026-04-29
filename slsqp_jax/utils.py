@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TypeVar, Union
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +16,7 @@ def args_closure(
     return wrapped
 
 
-def to_scalar(x: jax.Array) -> jax.Array:
+def to_scalar(x: Union[jax.Array, int, float, bool]) -> jax.Array:
     """Coerce a (possibly non-0-d, size-1) array to a true 0-d scalar.
 
     This guards the SLSQP internals against user objective functions that
