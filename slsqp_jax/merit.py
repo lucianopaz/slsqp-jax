@@ -19,6 +19,7 @@ from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int, jaxtyped
 
 from slsqp_jax.types import Scalar, Vector
+from slsqp_jax.utils import to_scalar
 
 
 class LineSearchResult(NamedTuple):
@@ -223,6 +224,7 @@ def backtracking_line_search(
         if bounds is not None:
             x_new = jnp.clip(x_new, bounds[:, 0], bounds[:, 1])
         f_new, _ = fn(x_new, args)
+        f_new = to_scalar(f_new)
 
         if eq_constraint_fn is not None and m_eq > 0:
             eq_new = eq_constraint_fn(x_new, args)
