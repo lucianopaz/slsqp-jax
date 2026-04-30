@@ -1541,10 +1541,25 @@ class SLSQP(optx.AbstractMinimiser):
         # should still be logged as a diagnostic failure.
         direction_nonfinite = ~jnp.isfinite(qp_result.direction).all()
 
+        # Defensively pin ``direction`` to its declared shape (n,).  If a
+        # rank-mismatch leak slipped past the QP / bound-fix machinery
+        # (e.g. broadcasting from a (1,)-shaped predicate into
+        # ``jnp.where(use_new, d_new, direction)``), ``direction`` could
+        # arrive here with a phantom leading axis, which would propagate
+        # into ``d_norm``, ``is_zero_step``, the line-search call (where
+        # ``x + alpha * direction`` would explode the user's objective
+        # with a (1, n) input), and ultimately into the
+        # ``consecutive_zero_steps`` / ``qp_optimal`` state fields,
+        # causing the next while_loop iteration to fail the tree-shape
+        # check.  Reshaping here surfaces any such leak as a clear
+        # shape error at this call site instead.
+        n_vars = state.grad.shape[0]
+        direction = jnp.reshape(direction, (n_vars,))
+
         # Zero-step convergence detection (pre–line-search):
         # catches inner solvers like CG that return d ≈ 0.
-        d_norm = jnp.linalg.norm(direction)
-        is_zero_step_pre = (d_norm < self.atol) & qp_result.converged
+        d_norm = jnp.reshape(jnp.linalg.norm(direction), ())
+        is_zero_step_pre = jnp.reshape((d_norm < self.atol) & qp_result.converged, ())
 
         # Step 3: Update penalty parameter — only trust multipliers
         # from a converged QP to avoid permanently inflating rho.
@@ -1720,14 +1735,18 @@ class SLSQP(optx.AbstractMinimiser):
         # Armijo / merit-descent condition also returns a tiny alpha,
         # but that is a *failure* rather than the KKT-optimal d ≈ 0
         # signal we want to accept as convergence.
-        is_zero_step_post = (
-            (alpha * d_norm < self.atol) & qp_result.converged & ls_result.success
+        is_zero_step_post = jnp.reshape(
+            (alpha * d_norm < self.atol) & qp_result.converged & ls_result.success,
+            (),
         )
-        is_zero_step = is_zero_step_pre | is_zero_step_post
-        new_consecutive_zero_steps = jnp.where(
-            is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)
+        is_zero_step = jnp.reshape(is_zero_step_pre | is_zero_step_post, ())
+        new_consecutive_zero_steps = jnp.reshape(
+            jnp.where(is_zero_step, state.consecutive_zero_steps + 1, jnp.array(0)),
+            (),
         )
-        new_qp_optimal = new_consecutive_zero_steps >= self.zero_step_patience
+        new_qp_optimal = jnp.reshape(
+            new_consecutive_zero_steps >= self.zero_step_patience, ()
+        )
 
         # Fatal line-search failure: even the identity-reset escalation
         # (triggered at ls_failure_patience) could not produce a descent
@@ -2285,10 +2304,25 @@ class SLSQP(optx.AbstractMinimiser):
             # ensuring adequate equality enforcement even far from the solution.
             # Wright's local convergence analysis assumes eta < 1; when the
             # KKT residual is large the cap keeps the penalty tight.
-            mu = jnp.clip(
-                kkt_residual**self.proximal_tau,
-                self._proximal_mu_min,
-                self._proximal_mu_max,
+            #
+            # ``mu`` is reshaped to a true 0-d scalar.  ``solve_qp`` /
+            # ``build_lagrangian_hvp`` declare ``proximal_mu: Scalar | float``
+            # which jaxtyping enforces as ``Float[Array, '']``.  If any of the
+            # clip operands carries a phantom leading axis (e.g.
+            # ``self._proximal_mu_min = self.atol`` when the user passed
+            # ``atol=jnp.array([1e-6])``, or ``proximal_tau`` arriving as a
+            # (1,)-shape array), ``mu`` would inherit that shape and trip
+            # the type check at ``solve_qp`` with a confusing
+            # ``Actual value: f64[1] | Expected: Float[Array, ''] | float``.
+            # Reshape here so any such leak surfaces as a clear shape error
+            # at this call site instead.
+            mu = jnp.reshape(
+                jnp.clip(
+                    kkt_residual**self.proximal_tau,
+                    self._proximal_mu_min,
+                    self._proximal_mu_max,
+                ),
+                (),
             )
         else:
             mu = 0.0
