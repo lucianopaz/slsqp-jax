@@ -1523,10 +1523,16 @@ def _solve_kkt_minres_qlp(
     # RHS: [-g_eff; b_work]
     kkt_rhs = jnp.concatenate([-g_eff, b_work])
 
+    # Inactive constraint rows are zeroed in A_work / b_work; the
+    # range-space and Schur factorisations need a "1" on those diagonal
+    # positions to stay invertible without coupling into the active
+    # block.  Hoisted out of the preconditioner branch so the no-precond
+    # path can also reuse it for the posterior projection.
+    reg_diag = jnp.where(active_mask, 0.0, 1.0)
+
     # Block-diagonal SPD preconditioner (Section 3.4 of Choi 2006)
     if precond_fn is not None:
         _raw_precond = precond_fn
-        reg_diag = jnp.where(active_mask, 0.0, 1.0)
 
         # When free_mask is active, the KKT system has zero rows/columns
         # at fixed-variable positions.  The L-BFGS inverse Hessian has
@@ -1561,12 +1567,44 @@ def _solve_kkt_minres_qlp(
         solution, converged = pminres_qlp_solve(
             kkt_matvec, kkt_rhs, tol=tol, max_iter=max_iter, precond=kkt_precond
         )
+
+        # M-metric range-space projection: minimise ||δd||_{M^{-1}} s.t.
+        # A_work (d - δd) = b_work.  The optimality conditions give
+        #   δd = M A_work^T (A_work M A_work^T)^{-1} (A_work d - b_work),
+        # which reuses A_M_AT_chol for free.  See Orban & Arioli, SIMAX
+        # 36(3) 2014, Lemma 3.1; Benzi-Golub-Liesen, Acta Numerica 2005,
+        # §5 (range-space methods).  Required because PMINRES-QLP only
+        # minimises the Euclidean residual of the full KKT system; when
+        # the Lanczos recurrence is truncated by max_iter or stalled by
+        # the SPD preconditioner's free/fixed coupling, the dual block
+        # A_work d - b_work stays non-zero and the SLSQP step leaves
+        # the linearised feasible region.
+        def _project_d(d_in: Vector) -> Vector:
+            r_dual = jnp.where(active_mask, A_work @ d_in - b_work, 0.0)
+            delta_lambda = _solve_schur(r_dual)
+            delta_d = _primal_precond(A_work.T @ delta_lambda)
+            return d_in - delta_d
     else:
         solution, converged = pminres_qlp_solve(
             kkt_matvec, kkt_rhs, tol=tol, max_iter=max_iter
         )
 
-    d = solution[:n]
+        # No SPD preconditioner is available, so build a small dedicated
+        # m x m Cholesky of A_work A_work^T just for the posterior
+        # 2-norm projection.  This is cheap (m << n) and guarantees the
+        # same feasibility-restoration property as the preconditioned
+        # branch.  Using ``A_work`` (which already incorporates
+        # ``free_mask``) keeps the projection consistent with the
+        # bound-fixed subspace.
+        A_AT = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+        A_AT_chol = jnp.linalg.cholesky(A_AT)
+
+        def _project_d(d_in: Vector) -> Vector:
+            r_dual = jnp.where(active_mask, A_work @ d_in - b_work, 0.0)
+            delta_lambda = jax.scipy.linalg.cho_solve((A_AT_chol, True), r_dual)
+            return d_in - A_work.T @ delta_lambda
+
+    d = _project_d(solution[:n])
     if has_fixed:
         # Force the direction to respect the fixed mask.  The KKT matvec
         # and preconditioner branches already keep fixed positions at
@@ -1576,6 +1614,10 @@ def _solve_kkt_minres_qlp(
         d = _free * d + _dfixed
     # KKT system uses L = ... + λ^T(Ad - b), but the active-set QP
     # solver uses L = ... - μ^T(Ad - b) with μ >= 0, so μ = -λ.
+    # Multipliers are left as PMINRES-QLP returned them; the projection
+    # nudges d by O(||r_dual||), so the resulting KKT-stationarity
+    # inconsistency is O(||B|| * ||δd||) and is absorbed by the outer
+    # L1 merit / L-BFGS secant blending.
     multipliers = -solution[n:]
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 

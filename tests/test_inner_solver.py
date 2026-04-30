@@ -317,6 +317,217 @@ class TestCholeskySolveDirect:
         assert result.converged
 
 
+class TestMinresQLPFeasibilityProjection:
+    """Posterior M-metric projection inside ``_solve_kkt_minres_qlp``.
+
+    PMINRES-QLP minimises the Euclidean residual of the full KKT
+    system, with no separate guarantee on the constraint subvector
+    ``A d - b``.  When the Lanczos recurrence is truncated by
+    ``max_iter``, the SLSQP step would otherwise leave the linearised
+    feasible region.  The posterior projection restores
+    ``A_work d = b_work`` to working precision in one back-solve;
+    these tests exercise both code paths (with and without an SPD
+    preconditioner) and the bound-fixed subspace branch.
+    """
+
+    @staticmethod
+    def _make_truncation_qp(n: int = 20, m: int = 3, seed: int = 0):
+        """A medium QP whose KKT system needs more than 5 Lanczos
+        iterations to converge.  Returns matvec / data that the inner
+        solver expects, plus the dense KKT matrix for sanity checks.
+        """
+        rng = np.random.RandomState(seed)
+        eigvals = jnp.asarray(np.logspace(-1.0, 2.0, n), dtype=jnp.float64)
+        Q, _ = jnp.linalg.qr(jnp.asarray(rng.randn(n, n), dtype=jnp.float64))
+        B = (Q * eigvals) @ Q.T
+        B = 0.5 * (B + B.T)
+        A = jnp.asarray(rng.randn(m, n), dtype=jnp.float64)
+        g = jnp.asarray(rng.randn(n), dtype=jnp.float64)
+        b = jnp.asarray(rng.randn(m), dtype=jnp.float64)
+
+        def hvp_fn(v):
+            return B @ v
+
+        active_mask = jnp.ones(m, dtype=bool)
+        return hvp_fn, g, A, b, active_mask, B
+
+    @staticmethod
+    def _unprojected_minres_d(hvp_fn, g, A, b, max_iter, precond_fn=None):
+        """Reference: pure PMINRES-QLP on the KKT system, no projection.
+
+        Used to confirm that truncation actually leaves the unprojected
+        direction infeasible, so the projection-pass tests are exercising
+        a real failure mode and not a vacuously-feasible iterate.
+        """
+        from slsqp_jax.inner_solver import pminres_qlp_solve
+
+        n = g.shape[0]
+        m = A.shape[0]
+
+        def kkt_matvec(z):
+            return jnp.concatenate([hvp_fn(z[:n]) + A.T @ z[n:], A @ z[:n]])
+
+        rhs = jnp.concatenate([-g, b])
+
+        if precond_fn is not None:
+            B_diag_arr = jnp.diag(jnp.eye(n))  # unused, just keeps mypy happy
+            del B_diag_arr
+            M_AT = jax.vmap(precond_fn)(A).T
+            S = A @ M_AT + 1e-8 * jnp.eye(m)
+            S_chol = jnp.linalg.cholesky(S)
+
+            def kkt_pre(z):
+                return jnp.concatenate(
+                    [
+                        precond_fn(z[:n]),
+                        jax.scipy.linalg.cho_solve((S_chol, True), z[n:]),
+                    ]
+                )
+
+            sol, _ = pminres_qlp_solve(
+                kkt_matvec, rhs, tol=1e-12, max_iter=max_iter, precond=kkt_pre
+            )
+        else:
+            sol, _ = pminres_qlp_solve(kkt_matvec, rhs, tol=1e-12, max_iter=max_iter)
+        return sol[:n]
+
+    def test_truncated_minres_with_preconditioner_is_feasible(self):
+        """5-iteration MINRES on a 20-variable problem cannot solve the
+        KKT system, but the posterior projection must drive ``||A d - b||``
+        down by many orders of magnitude.
+
+        The achievable feasibility floor is ``O(eps * cond(A M A^T) *
+        ||r_dual||)`` because the Schur Cholesky carries a ``1e-8 * I``
+        regularisation; we check both the absolute floor and the
+        improvement over the un-projected baseline.
+        """
+        hvp_fn, g, A, b, active_mask, B = self._make_truncation_qp()
+
+        B_diag = jnp.diag(B)
+
+        def precond_fn(v):
+            return v / B_diag
+
+        solver = MinresQLPSolver(max_iter=5, tol=1e-12, max_cg_iter=50)
+        result = solver.solve(hvp_fn, g, A, b, active_mask, precond_fn=precond_fn)
+
+        d_raw = self._unprojected_minres_d(
+            hvp_fn, g, A, b, max_iter=5, precond_fn=precond_fn
+        )
+        feasibility_raw = float(jnp.max(jnp.abs(A @ d_raw - b)))
+        feasibility = float(jnp.max(jnp.abs(A @ result.d - b)))
+
+        assert feasibility_raw > 1e-3, (
+            "test setup is degenerate: un-projected MINRES is already feasible "
+            f"(||A d - b||_inf = {feasibility_raw:.2e}); pick a harder problem"
+        )
+        assert feasibility < 1e-7, (
+            f"posterior projection failed: ||A d - b||_inf = {feasibility:.2e} "
+            f"(raw {feasibility_raw:.2e})"
+        )
+        # Projection should improve feasibility by at least 4 orders of magnitude.
+        assert feasibility < feasibility_raw * 1e-4, (
+            f"projection insufficient: raw {feasibility_raw:.2e} vs "
+            f"projected {feasibility:.2e}"
+        )
+        assert jnp.all(jnp.isfinite(result.d))
+
+    def test_truncated_minres_without_preconditioner_is_feasible(self):
+        """No-preconditioner branch must build its own ``A A^T`` Cholesky
+        and produce a near-feasible direction even after truncation.
+        """
+        hvp_fn, g, A, b, active_mask, _ = self._make_truncation_qp(seed=1)
+
+        solver = MinresQLPSolver(max_iter=5, tol=1e-12, max_cg_iter=50)
+        result = solver.solve(hvp_fn, g, A, b, active_mask, precond_fn=None)
+
+        d_raw = self._unprojected_minres_d(hvp_fn, g, A, b, max_iter=5)
+        feasibility_raw = float(jnp.max(jnp.abs(A @ d_raw - b)))
+        feasibility = float(jnp.max(jnp.abs(A @ result.d - b)))
+
+        assert feasibility_raw > 1e-3, (
+            "test setup is degenerate: un-projected MINRES is already feasible "
+            f"(||A d - b||_inf = {feasibility_raw:.2e}); pick a harder problem"
+        )
+        assert feasibility < 1e-7, (
+            f"posterior projection failed (no-precond): "
+            f"||A d - b||_inf = {feasibility:.2e} (raw {feasibility_raw:.2e})"
+        )
+        assert feasibility < feasibility_raw * 1e-4, (
+            f"projection insufficient (no-precond): raw {feasibility_raw:.2e} "
+            f"vs projected {feasibility:.2e}"
+        )
+        assert jnp.all(jnp.isfinite(result.d))
+
+    def test_projection_does_not_break_full_convergence(self):
+        """When MINRES does converge, the projection must be a near-no-op:
+        the iterate already satisfies ``A d = b`` to MINRES tolerance, so
+        the M-metric correction should leave the unconstrained KKT
+        solution intact (multipliers and direction).
+        """
+        hvp_fn, g, A, b, active_mask, d_exp, mult_exp = _make_qp()
+
+        solver = MinresQLPSolver(max_iter=200, tol=1e-12, max_cg_iter=50)
+        result = solver.solve(hvp_fn, g, A, b, active_mask, precond_fn=None)
+        np.testing.assert_allclose(result.d, d_exp, atol=1e-8)
+        np.testing.assert_allclose(result.multipliers, mult_exp, atol=1e-6)
+        assert bool(result.converged)
+
+    def test_projection_respects_bound_fixed_subspace(self):
+        """With ``free_mask`` / ``d_fixed`` supplied, the projected
+        direction must (a) leave the fixed entries equal to ``d_fixed``
+        and (b) restore ``A_work d - b_work = 0`` on the active rows,
+        where ``A_work = A * free_mask[None, :]`` and
+        ``b_work = b - A @ d_fixed``.
+        """
+        n, m = 30, 4
+        hvp_fn, g, A, b, active_mask, B = self._make_truncation_qp(n=n, m=m, seed=2)
+
+        rng = np.random.RandomState(7)
+        free_mask = jnp.asarray(rng.rand(n) > 0.5, dtype=bool)
+        # Make sure at least n - m + 1 variables stay free so the reduced
+        # KKT system is still consistent.
+        if int(jnp.sum(free_mask)) < n - m + 1:
+            free_mask = free_mask.at[: n - m + 1].set(True)
+        d_fixed = jnp.asarray(rng.randn(n) * 0.1, dtype=jnp.float64)
+        d_fixed = jnp.where(free_mask, 0.0, d_fixed)
+
+        B_diag = jnp.diag(B)
+
+        def precond_fn(v):
+            return v / B_diag
+
+        solver = MinresQLPSolver(max_iter=4, tol=1e-12, max_cg_iter=50)
+        result = solver.solve(
+            hvp_fn,
+            g,
+            A,
+            b,
+            active_mask,
+            precond_fn=precond_fn,
+            free_mask=free_mask,
+            d_fixed=d_fixed,
+        )
+
+        # (a) Fixed entries are pinned exactly.
+        fixed_err = float(
+            jnp.max(jnp.abs(jnp.where(free_mask, 0.0, result.d - d_fixed)))
+        )
+        assert fixed_err == 0.0, (
+            f"fixed entries drifted: max|d - d_fixed| over !free = {fixed_err:.2e}"
+        )
+
+        # (b) Reduced-space dual residual is at the projection floor
+        #     (~1e-7, bounded by the 1e-8 Schur regularisation).
+        A_work = A * free_mask[None, :]
+        b_work = b - A @ d_fixed
+        red_feas = float(jnp.max(jnp.abs(A_work @ result.d - b_work)))
+        assert red_feas < 1e-7, (
+            f"reduced-space feasibility broken: "
+            f"||A_work d - b_work||_inf = {red_feas:.2e}"
+        )
+
+
 class TestNonScalarAdaptiveTol:
     """Regression: a (1,)-shaped tolerance must not crash the inner solvers.
 

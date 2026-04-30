@@ -2002,3 +2002,166 @@ class TestRelativeStationarity:
         )
         y, state = _run_solver(solver, objective, jnp.array([0.5, 0.5]))
         np.testing.assert_allclose(y[0] + y[1], 1.0, atol=1e-5)
+
+
+class TestStateShapeConsistency:
+    """Regression: ``init`` and ``step`` must produce identically-shaped state.
+
+    Optimistix's ``while_loop`` checks that the body output's pytree shape
+    matches the carry's pytree shape on every iteration.  Any rank
+    mismatch — even a phantom leading axis on a single state field — causes
+    the loop to fail with a tree-shape error before our defensive checks
+    in ``terminate`` get to run.
+
+    A historical bug saw ``consecutive_zero_steps`` and ``qp_optimal``
+    drift from ``i64[]`` / ``bool[]`` (init) to ``i64[1]`` / ``bool[1]``
+    (step) because ``is_zero_step`` inherited a (1,)-shape from a
+    contaminated ``direction`` / ``d_norm`` chain.  This test pins the
+    shapes of every leaf of ``SLSQPState`` so future shape leaks surface
+    here instead of as cryptic optimistix tree-shape errors.
+    """
+
+    def _check_shapes_match(self, init_state, step_state, label=""):
+        init_leaves = jax.tree_util.tree_leaves(init_state)
+        step_leaves = jax.tree_util.tree_leaves(step_state)
+        assert len(init_leaves) == len(step_leaves), (
+            f"{label}: leaf count differs init={len(init_leaves)} "
+            f"step={len(step_leaves)}"
+        )
+        for i, (a, b) in enumerate(zip(init_leaves, step_leaves)):
+            assert jnp.asarray(a).shape == jnp.asarray(b).shape, (
+                f"{label}: leaf {i} shape mismatch "
+                f"init={jnp.asarray(a).shape} step={jnp.asarray(b).shape}"
+            )
+
+    def test_equality_constrained(self):
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 1.0])
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=50,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+        )
+        x0 = jnp.array([0.5, 0.5])
+        init_state = solver.init(objective, x0, None, {}, None, None, frozenset())
+        _, step_state, _ = solver.step(objective, x0, None, {}, init_state, frozenset())
+        self._check_shapes_match(init_state, step_state, label="eq")
+
+    def test_box_bounded(self):
+        """Repro for the original (1,)-leak: bounds + LPEC-A active set."""
+
+        n = 8
+        rng = np.random.RandomState(0)
+        Q_mat, _ = np.linalg.qr(rng.randn(n, n))
+        eigvals = np.logspace(-2, 4, n)
+        H = jnp.array(Q_mat @ np.diag(eigvals) @ Q_mat.T)
+
+        def objective(x, args):
+            return 0.5 * x @ H @ x, None
+
+        def eq_constraint(x, args):
+            return jnp.array([jnp.sum(x) - 1.0])
+
+        bounds = jnp.column_stack([jnp.zeros(n), jnp.ones(n)])
+        x0 = jnp.ones(n) / n
+
+        for active_set_method in ("expand", "lpeca_init", "lpeca"):
+            solver = SLSQP(
+                atol=1e-6,
+                max_steps=50,
+                eq_constraint_fn=eq_constraint,
+                n_eq_constraints=1,
+                bounds=bounds,
+                active_set_method=active_set_method,
+                proximal_tau=0.0,
+            )
+            init_state = solver.init(objective, x0, None, {}, None, None, frozenset())
+            y, step_state, _ = solver.step(
+                objective, x0, None, {}, init_state, frozenset()
+            )
+            self._check_shapes_match(
+                init_state, step_state, label=f"box+{active_set_method}"
+            )
+            # Also verify a second step from the new iterate.
+            _, step2_state, _ = solver.step(
+                objective, y, None, {}, step_state, frozenset()
+            )
+            self._check_shapes_match(
+                step_state, step2_state, label=f"box+{active_set_method} step2"
+            )
+
+    def test_full_minimise_does_not_raise_shape_error(self):
+        """End-to-end: optimistix ``minimise`` reproducing the user setup."""
+
+        n = 8
+        rng = np.random.RandomState(0)
+        Q_mat, _ = np.linalg.qr(rng.randn(n, n))
+        eigvals = np.logspace(-2, 4, n)
+        H = jnp.array(Q_mat @ np.diag(eigvals) @ Q_mat.T)
+
+        def objective(x, args):
+            return 0.5 * x @ H @ x, None
+
+        def eq_constraint(x, args):
+            return jnp.array([jnp.sum(x) - 1.0])
+
+        bounds = jnp.column_stack([jnp.zeros(n), jnp.ones(n)])
+        x0 = jnp.ones(n) / n
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=100,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            bounds=bounds,
+            active_set_method="lpeca",
+            proximal_tau=0.0,
+        )
+        sol = optx.minimise(
+            objective, solver, x0, has_aux=True, throw=False, max_steps=100
+        )
+        assert sol.value.shape == (n,)
+
+    def test_size_one_atol_does_not_leak_to_proximal_mu(self):
+        """User passes ``atol`` as a (1,)-shape array (a common mistake when
+        wrapping the solver inside a vmap or pulling the tolerance out of a
+        config object).
+
+        ``__check_init__`` aliases ``_proximal_mu_min = self.atol`` when the
+        user does not override ``proximal_mu_min``.  Without scalarisation,
+        this fed a ``(1,)``-shape ``mu`` into ``solve_qp`` and beartype
+        rejected it with::
+
+            Type-check error whilst typechecking parameter 'proximal_mu'.
+            Actual value: f64[1]
+            Expected type: Float[Array, ''] | float.
+
+        The fix coerces ``mu`` to a true 0-d scalar before threading it
+        into ``solve_qp`` / ``_build_lagrangian_hvp``, so any size-1 leak
+        from any of the clip operands (``proximal_tau``, ``proximal_mu_min``,
+        ``proximal_mu_max``, ``kkt_residual``) is squashed at the source.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def eq_constraint(x, args):
+            return jnp.array([jnp.sum(x) - 1.0])
+
+        solver = SLSQP(
+            atol=jnp.array([1e-6]),  # the leak source
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            max_steps=10,
+        )
+        x0 = jnp.array([0.5, 0.5])
+        # Should run without a beartype shape error.
+        sol = optx.minimise(
+            objective, solver, x0, has_aux=True, throw=False, max_steps=10
+        )
+        assert sol.value.shape == (2,)
