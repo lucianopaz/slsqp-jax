@@ -569,3 +569,128 @@ class TestNonScalarAdaptiveTol:
         np.testing.assert_allclose(result.multipliers, mult_exp, atol=1e-6)
         assert result.converged.shape == ()
         assert bool(result.converged)
+
+
+class TestMinresQLPProjectionRefinement:
+    """Iterative refinement of the M-metric range-space projection.
+
+    The single-shot projection inside ``_solve_kkt_minres_qlp`` floors
+    out at ``O(eps * cond(A M A^T) * ||r_dual||)`` because of the
+    ``1e-8 * I`` Schur regularisation.  On ill-conditioned KKT
+    systems this floor can still leave enough infeasibility for the
+    outer SQP to drift.  Running a handful of refinement rounds drives
+    ``||A d - b||`` down by squaring the relative error per round
+    (HR 2014, Algorithm 4.18 step 1(a)).  These tests confirm that
+    behaviour, both with and without an SPD preconditioner.
+    """
+
+    @staticmethod
+    def _make_illcond_kkt(n: int = 30, m: int = 4, seed: int = 11):
+        """Moderately ill-conditioned KKT.  ``B`` carries six orders of
+        magnitude in its spectrum (so the Schur block ``A M A^T``
+        inherits non-trivial conditioning); ``A`` is well-conditioned.
+        With this setup the single-shot projection floors out at the
+        ``1e-8 * I`` Schur regularisation (residual ``O(1e-9)``) and
+        iterative refinement drives it down to machine precision.
+        Going more aggressive on cond(``B``) makes the projection
+        itself ineffective (``(A M A^T + 1e-8 I)^{-1} r_0`` blows up
+        before the rank-1 update can kill ``r_0``), at which point the
+        test stops measuring the refinement loop.
+        """
+        rng = np.random.RandomState(seed)
+        eigvals = jnp.asarray(np.logspace(-3.0, 3.0, n), dtype=jnp.float64)
+        Q, _ = jnp.linalg.qr(jnp.asarray(rng.randn(n, n), dtype=jnp.float64))
+        B = (Q * eigvals) @ Q.T
+        B = 0.5 * (B + B.T)
+        A_full = jnp.asarray(rng.randn(m, n), dtype=jnp.float64)
+        g = jnp.asarray(rng.randn(n), dtype=jnp.float64)
+        b = jnp.asarray(rng.randn(m), dtype=jnp.float64)
+
+        def hvp_fn(v):
+            return B @ v
+
+        return hvp_fn, g, A_full, b, jnp.ones(m, dtype=bool), B
+
+    def _feasibility(self, A, d, b):
+        return float(jnp.linalg.norm(A @ d - b))
+
+    @pytest.mark.parametrize("with_preconditioner", [True, False])
+    def test_refinement_drops_residual(self, with_preconditioner):
+        hvp_fn, g, A, b, active_mask, B = self._make_illcond_kkt()
+
+        if with_preconditioner:
+            B_diag = jnp.diag(B)
+
+            def precond_fn(v):
+                return v / B_diag
+        else:
+            precond_fn = None
+
+        # ``proj_refine_max_iter=0`` keeps the legacy single-shot
+        # projection behaviour.  Truncating MINRES at 8 Lanczos
+        # iterations on a (30+4)-dim KKT system intentionally leaves
+        # a noticeable raw infeasibility, so the projection is doing
+        # real work (not just polishing a near-zero residual).
+        max_iter = 8
+        solver_no_refine = MinresQLPSolver(
+            max_iter=max_iter,
+            tol=1e-12,
+            proj_refine_max_iter=0,
+        )
+        solver_refine = MinresQLPSolver(
+            max_iter=max_iter,
+            tol=1e-12,
+            proj_refine_max_iter=3,
+            proj_refine_rtol=1e-14,
+            proj_refine_atol=1e-16,
+        )
+
+        res_no_refine = solver_no_refine.solve(
+            hvp_fn, g, A, b, active_mask, precond_fn=precond_fn
+        )
+        res_refine = solver_refine.solve(
+            hvp_fn, g, A, b, active_mask, precond_fn=precond_fn
+        )
+
+        feas_no_refine = self._feasibility(A, res_no_refine.d, b)
+        feas_refine = self._feasibility(A, res_refine.d, b)
+
+        assert jnp.all(jnp.isfinite(res_refine.d))
+
+        # The legacy floor must be high enough that this test is
+        # meaningful — if it's already at machine precision, refinement
+        # cannot make it three orders of magnitude smaller.
+        assert feas_no_refine > 1e-12, (
+            "test setup is too benign: legacy single-shot projection "
+            f"already feasible to {feas_no_refine:.2e}; tighten the "
+            "ill-conditioning"
+        )
+
+        # Refined version must be at least 3 OoM smaller.  In practice
+        # we usually see ~7 OoM (single-shot ~1e-9, refined ~1e-16).
+        assert feas_refine < feas_no_refine * 1e-3, (
+            f"refinement did not reduce ||A d - b|| by >= 3 OoM: "
+            f"single-shot {feas_no_refine:.2e}, refined {feas_refine:.2e}"
+        )
+
+        assert int(res_no_refine.n_proj_refinements) == 0
+        assert int(res_refine.n_proj_refinements) >= 1
+
+    def test_refinement_no_op_on_well_conditioned_kkt(self):
+        """When MINRES converges in full, the refinement must not
+        perturb the answer by more than working precision.
+        """
+        hvp_fn, g, A, b, active_mask, d_exp, mult_exp = _make_qp()
+
+        solver_no_refine = MinresQLPSolver(
+            max_iter=200, tol=1e-12, proj_refine_max_iter=0
+        )
+        solver_refine = MinresQLPSolver(max_iter=200, tol=1e-12, proj_refine_max_iter=3)
+
+        res_no = solver_no_refine.solve(hvp_fn, g, A, b, active_mask)
+        res_yes = solver_refine.solve(hvp_fn, g, A, b, active_mask)
+
+        np.testing.assert_allclose(res_yes.d, d_exp, atol=1e-10)
+        np.testing.assert_allclose(res_yes.multipliers, mult_exp, atol=1e-10)
+        # Direction unchanged up to floating-point reproducibility.
+        np.testing.assert_allclose(res_yes.d, res_no.d, atol=1e-12, rtol=1e-12)

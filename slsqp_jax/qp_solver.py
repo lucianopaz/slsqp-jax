@@ -82,6 +82,13 @@ class QPState(eqx.Module):
     last_drop_idx: Int[Array, ""]
     ping_pong_count: Int[Array, ""]
     ping_ponged: Bool[Array, ""]
+    # Latest M-metric projection feasibility residual from the inner
+    # solver (relevant for ``MinresQLPSolver``; always 0 for null-space
+    # CG / CRAIG solvers where feasibility is enforced structurally).
+    proj_residual: Scalar
+    # Cumulative number of M-metric projection refinement rounds across
+    # all inner solves performed inside this active-set loop.
+    n_proj_refinements: Int[Array, ""]
 
 
 def _inner_ok(result) -> Bool[Array, ""]:
@@ -119,6 +126,15 @@ class QPResult(NamedTuple):
     ping_ponged: Bool[Array, ""]
     reached_max_iter: Bool[Array, ""]
     final_working_tol: Scalar
+    # M-metric projection feasibility residual from the inner solver
+    # producing the *final* QP direction.  Always 0 for null-space
+    # solvers; surfaces the post-refinement residual of
+    # ``MinresQLPSolver`` so the outer SQP can flag QP solves whose
+    # feasibility floor is dangerously high.
+    proj_residual: Scalar
+    # Cumulative number of M-metric projection refinement rounds taken
+    # across all inner solves performed inside the active-set loop.
+    n_proj_refinements: Int[Array, ""]
 
 
 def _solve_qp_proximal(
@@ -198,6 +214,8 @@ def _solve_qp_proximal(
             ping_ponged=jnp.array(False),
             reached_max_iter=jnp.array(False),
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
+            proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
+            n_proj_refinements=jnp.asarray(0),
         )
 
     # Sub-case: inequalities present — active-set loop on A_ineq only
@@ -238,6 +256,11 @@ def _solve_qp_proximal(
         last_drop_idx=jnp.array(-1),
         ping_pong_count=jnp.array(0),
         ping_ponged=jnp.array(False),
+        # ``solve_unconstrained_cg`` does not produce projection
+        # diagnostics; start at zero and let body_fn populate from the
+        # first inner_solver.solve.
+        proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
+        n_proj_refinements=jnp.asarray(0),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -279,6 +302,12 @@ def _solve_qp_proximal(
         mult_ineq_new = result.multipliers
         inner_failed = ~_inner_ok(result)
         new_any_inner_failure = state.any_inner_failure | inner_failed
+
+        # Surface projection diagnostics from the inner solver: the
+        # latest residual (whichever active set produced ``d_new``)
+        # and the cumulative refinement count across all inner solves.
+        proj_residual_new = result.proj_residual.astype(jnp.float64)
+        n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
 
         mult_eq_new = _recover_mult_eq(d_new)
 
@@ -332,6 +361,8 @@ def _solve_qp_proximal(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def drop_constraint():
@@ -361,6 +392,8 @@ def _solve_qp_proximal(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def mark_converged():
@@ -376,6 +409,8 @@ def _solve_qp_proximal(
                 last_drop_idx=state.last_drop_idx,
                 ping_pong_count=state.ping_pong_count,
                 ping_ponged=state.ping_ponged,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         return jax.lax.cond(
@@ -409,6 +444,8 @@ def _solve_qp_proximal(
         ping_ponged=final_state.ping_ponged,
         reached_max_iter=reached_max_iter,
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
+        proj_residual=final_state.proj_residual,
+        n_proj_refinements=final_state.n_proj_refinements,
     )
 
 
@@ -478,6 +515,8 @@ def _solve_qp_direct(
             ping_ponged=jnp.array(False),
             reached_max_iter=jnp.array(False),
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
+            proj_residual=result.proj_residual.astype(jnp.float64),
+            n_proj_refinements=result.n_proj_refinements,
         )
 
     # Equality + inequality: active-set loop on the inequality portion.
@@ -519,6 +558,12 @@ def _solve_qp_direct(
         last_drop_idx=jnp.array(-1),
         ping_pong_count=jnp.array(0),
         ping_ponged=jnp.array(False),
+        # Surface the projection diagnostics from the warm-up solve so
+        # that even an active-set loop that converges immediately (no
+        # body_fn iterations) carries a meaningful residual through to
+        # the outer diagnostics.
+        proj_residual=init_result.proj_residual.astype(jnp.float64),
+        n_proj_refinements=init_result.n_proj_refinements,
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -546,6 +591,10 @@ def _solve_qp_direct(
         mult_all = result.multipliers
         inner_failed = ~_inner_ok(result)
         new_any_inner_failure = state.any_inner_failure | inner_failed
+
+        # Track latest projection residual + cumulative refinement count.
+        proj_residual_new = result.proj_residual.astype(jnp.float64)
+        n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
 
         mult_eq_new = mult_all[:m_eq]
         mult_ineq_new = mult_all[m_eq:]
@@ -591,6 +640,8 @@ def _solve_qp_direct(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def drop_constraint():
@@ -620,6 +671,8 @@ def _solve_qp_direct(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def mark_converged():
@@ -635,6 +688,8 @@ def _solve_qp_direct(
                 last_drop_idx=state.last_drop_idx,
                 ping_pong_count=state.ping_pong_count,
                 ping_ponged=state.ping_ponged,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         return jax.lax.cond(
@@ -659,6 +714,8 @@ def _solve_qp_direct(
         ping_ponged=final_state.ping_ponged,
         reached_max_iter=reached_max_iter,
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
+        proj_residual=final_state.proj_residual,
+        n_proj_refinements=final_state.n_proj_refinements,
     )
 
 
@@ -880,6 +937,8 @@ def solve_qp(
             ping_ponged=jnp.array(False),
             reached_max_iter=jnp.array(False),
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
+            proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
+            n_proj_refinements=jnp.asarray(0),
         )
 
     # ---- Proximal stabilized path (sSQP) ----
@@ -977,6 +1036,11 @@ def solve_qp(
         last_drop_idx=jnp.array(-1),
         ping_pong_count=jnp.array(0),
         ping_ponged=jnp.array(False),
+        # ``solve_unconstrained_cg`` does not produce projection
+        # diagnostics; start at zero and let body_fn populate from the
+        # first inner_solver.solve.
+        proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
+        n_proj_refinements=jnp.asarray(0),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -1004,6 +1068,10 @@ def solve_qp(
         mult_ineq_new = result.multipliers
         inner_failed = ~_inner_ok(result)
         new_any_inner_failure = state.any_inner_failure | inner_failed
+
+        # Track latest projection residual + cumulative refinement count.
+        proj_residual_new = result.proj_residual.astype(jnp.float64)
+        n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
 
         # Check feasibility with expanding tolerance (stricter activation)
         residuals = A_ineq @ d_new - b_ineq
@@ -1053,6 +1121,8 @@ def solve_qp(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def drop_constraint():
@@ -1082,6 +1152,8 @@ def solve_qp(
                     triggered, state.ping_pong_count, new_pp_count
                 ),
                 ping_ponged=state.ping_ponged | triggered,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         def mark_converged():
@@ -1097,6 +1169,8 @@ def solve_qp(
                 last_drop_idx=state.last_drop_idx,
                 ping_pong_count=state.ping_pong_count,
                 ping_ponged=state.ping_ponged,
+                proj_residual=proj_residual_new,
+                n_proj_refinements=n_proj_refinements_new,
             )
 
         return jax.lax.cond(
@@ -1121,4 +1195,6 @@ def solve_qp(
         ping_ponged=final_state.ping_ponged,
         reached_max_iter=reached_max_iter,
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
+        proj_residual=final_state.proj_residual,
+        n_proj_refinements=final_state.n_proj_refinements,
     )
