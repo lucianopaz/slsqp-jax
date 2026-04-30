@@ -167,6 +167,31 @@ class SLSQPDiagnostics(eqx.Module):
             ``free_mask`` for the bound-fixing loop).  Always 0 when
             ``active_set_method == "expand"`` or when
             ``lpeca_predict_bounds=False``.
+        n_proj_refinements: Cumulative number of M-metric projection
+            refinement rounds taken across all inner solves performed
+            by ``MinresQLPSolver`` over the run.  Always 0 for
+            null-space CG / CRAIG.  Useful as an indicator of how
+            often the inner self-correction had to step in.
+        max_proj_residual: High-water mark of the post-refinement
+            constraint residual ``||A d - b||`` reported by
+            ``MinresQLPSolver`` on the *accepted* QP direction across
+            all SQP steps.  A persistent non-zero value (relative to
+            ``atol``) flags ill-conditioned QPs whose feasibility
+            floor is being limited by the Schur regularisation rather
+            than the Krylov tolerance.  Always 0 for null-space
+            solvers.
+        n_divergence_blowups: Total number of merit blowup events
+            observed across the run, whether or not the patience
+            threshold was eventually reached.  This is the *raw*
+            blowup count (sum of every step where the merit exceeded
+            ``best_merit + divergence_factor * max(|best_merit|, 1)``
+            or returned NaN/Inf), not just the trigger events.
+        divergence_triggered: True when the best-iterate divergence
+            rollback fired at least once during the run.  When the
+            optimistix result code is ``RESULTS.nonlinear_divergence``
+            and this flag is set, the returned iterate is the
+            best-merit iterate seen so far rather than the most
+            recent (divergent) one.
     """
 
     n_qp_inner_failures: Int[Array, ""]
@@ -190,6 +215,10 @@ class SLSQPDiagnostics(eqx.Module):
     n_lpeca_bypassed: Int[Array, ""]
     n_lpeca_capped: Int[Array, ""]
     n_lpeca_bounds_prefixed: Int[Array, ""]
+    n_proj_refinements: Int[Array, ""]
+    max_proj_residual: Scalar
+    n_divergence_blowups: Int[Array, ""]
+    divergence_triggered: Bool[Array, ""]
 
 
 def _init_diagnostics() -> SLSQPDiagnostics:
@@ -216,6 +245,10 @@ def _init_diagnostics() -> SLSQPDiagnostics:
         n_lpeca_bypassed=jnp.array(0),
         n_lpeca_capped=jnp.array(0),
         n_lpeca_bounds_prefixed=jnp.array(0),
+        n_proj_refinements=jnp.array(0),
+        max_proj_residual=jnp.array(0.0),
+        n_divergence_blowups=jnp.array(0),
+        divergence_triggered=jnp.array(False),
     )
 
 
@@ -333,6 +366,16 @@ class SLSQPState(eqx.Module):
     # ``RESULTS.nonlinear_divergence`` to surface chronic LS failure.
     ls_fatal: Bool[Array, ""]
 
+    # Best-iterate divergence rollback (see :attr:`SLSQP.divergence_factor`).
+    # ``best_x`` is the iterate that achieved ``best_merit``.  When the
+    # merit blows up by ``divergence_factor`` or returns NaN/Inf for
+    # ``divergence_patience`` consecutive steps, ``step()`` overwrites
+    # the returned iterate with ``best_x`` and sets ``diverging=True``,
+    # which routes ``terminate()`` to ``RESULTS.nonlinear_divergence``.
+    best_x: Vector
+    blowup_count: Int[Array, ""]
+    diverging: Bool[Array, ""]
+
     # Diagnostic accumulators (see :class:`SLSQPDiagnostics`).
     diagnostics: SLSQPDiagnostics
 
@@ -368,6 +411,17 @@ class QPResult(eqx.Module):
             loop.  Always 0 when ``active_set_method == "expand"``,
             when ``lpeca_predict_bounds=False``, or when LPEC-A was
             bypassed by the warm-up / trust gates.
+        proj_residual: Post-refinement constraint residual ``||A d -
+            b||`` from the inner solver producing the final QP
+            direction (after bound-fixing).  Always 0 for null-space
+            CG / CRAIG; relevant for ``MinresQLPSolver`` where it
+            reflects the M-metric range-space projection floor and
+            feeds the outer divergence detector via
+            ``SLSQPDiagnostics.max_proj_residual``.
+        n_proj_refinements: Cumulative number of M-metric projection
+            refinement rounds across all inner solves performed for
+            this QP step (active-set loop + bound-fixing loop).  Always
+            0 for null-space solvers.
     """
 
     direction: Vector
@@ -383,6 +437,8 @@ class QPResult(eqx.Module):
     lpeca_bypassed: Bool[Array, ""]
     lpeca_capped: Bool[Array, ""]
     n_lpeca_bounds_prefixed: Int[Array, ""]
+    proj_residual: Scalar
+    n_proj_refinements: Int[Array, ""]
 
 
 class SLSQP(optx.AbstractMinimiser):
@@ -753,6 +809,21 @@ class SLSQP(optx.AbstractMinimiser):
 
     # Stagnation patience (computed in __check_init__)
     _stagnation_window: int = eqx.field(static=True, default=10)
+
+    # Best-iterate divergence rollback.  After ``divergence_patience``
+    # consecutive steps where the L1 merit exceeds the best-seen merit
+    # by more than ``divergence_factor * max(|best_merit|, 1)`` (or any
+    # NaN/Inf merit at all), the solver rolls back to ``best_x`` and
+    # terminates with ``RESULTS.nonlinear_divergence``.  This is a
+    # belt-and-braces guardrail for cases where the inner self-correction
+    # in ``MinresQLPSolver`` is not enough — typically badly
+    # ill-conditioned QPs that occasionally let the SQP iterate drift
+    # off the linearised feasible region.  The default ``divergence_factor =
+    # 10`` is generous enough to ride out moderate penalty inflation
+    # (which can scale the merit by O(rho)) and only fires on genuine
+    # runaway growth.
+    divergence_factor: float = 10.0
+    divergence_patience: int = 3
 
     # LPEC-A active set identification (Oberlin & Wright, 2005).
     # Controls how the QP active set is initialized and whether the
@@ -1457,6 +1528,9 @@ class SLSQP(optx.AbstractMinimiser):
             last_alpha=jnp.array(1.0),
             ls_success=jnp.array(True),
             ls_fatal=jnp.array(False),
+            best_x=y,
+            blowup_count=jnp.array(0),
+            diverging=jnp.array(False),
             diagnostics=_init_diagnostics(),
         )
 
@@ -1764,6 +1838,7 @@ class SLSQP(optx.AbstractMinimiser):
         )
         improved = merit_new < state.best_merit - merit_threshold
         new_best_merit = jnp.where(improved, merit_new, state.best_merit)
+        new_best_x = jnp.where(improved, y_new, state.best_x)
         new_steps_without = jnp.where(
             improved, jnp.array(0), state.steps_without_improvement + 1
         )
@@ -1771,6 +1846,31 @@ class SLSQP(optx.AbstractMinimiser):
         merit_stagnation = (state.step_count >= patience) & (
             new_steps_without >= patience
         )
+
+        # Best-iterate divergence rollback (HR-style outer guardrail).
+        # Trigger when the merit grows by more than ``divergence_factor``
+        # times the best-seen merit (or returns NaN/Inf) for
+        # ``divergence_patience`` steps in a row.  We use the *new* best
+        # merit as the comparison baseline so the trigger does not fire
+        # on the same step that just set a new best.  The
+        # ``~jnp.isfinite`` clause folds NaN/Inf merit (which would
+        # otherwise pass through ``jnp.where`` silently) into the
+        # blowup count.  When the patience runs out, the returned
+        # iterate is replaced with ``best_x`` and ``diverging`` is
+        # latched so ``terminate()`` routes to ``nonlinear_divergence``.
+        blowup_threshold = self.divergence_factor * jnp.maximum(
+            jnp.abs(new_best_merit), 1.0
+        )
+        merit_finite = jnp.isfinite(merit_new)
+        blowup_now = ((merit_new - new_best_merit) > blowup_threshold) | ~merit_finite
+        new_blowup_count = jnp.where(blowup_now, state.blowup_count + 1, jnp.array(0))
+        diverging_now = jnp.reshape(new_blowup_count >= self.divergence_patience, ())
+        # Roll back to the best iterate when divergence trips.  The
+        # remainder of ``new_state`` still reflects the *attempted* step
+        # (L-BFGS history, multipliers, gradients), which is fine
+        # because the driver loop terminates immediately after; nothing
+        # else consumes that state.
+        y_returned = jnp.where(diverging_now, new_best_x, y_new)
 
         # Update diagnostic accumulators.  All updates are branch-free so
         # the tracing inside jit/while_loop stays constant-shape.
@@ -1853,6 +1953,15 @@ class SLSQP(optx.AbstractMinimiser):
             + jnp.where(qp_result.lpeca_capped, 1, 0),
             n_lpeca_bounds_prefixed=prev_diag.n_lpeca_bounds_prefixed
             + qp_result.n_lpeca_bounds_prefixed,
+            n_proj_refinements=prev_diag.n_proj_refinements
+            + qp_result.n_proj_refinements,
+            max_proj_residual=jnp.maximum(
+                prev_diag.max_proj_residual,
+                qp_result.proj_residual.astype(prev_diag.max_proj_residual.dtype),
+            ),
+            n_divergence_blowups=prev_diag.n_divergence_blowups
+            + jnp.where(blowup_now, 1, 0),
+            divergence_triggered=prev_diag.divergence_triggered | diverging_now,
         )
 
         new_state = SLSQPState(
@@ -1883,6 +1992,9 @@ class SLSQP(optx.AbstractMinimiser):
             last_alpha=alpha,
             ls_success=ls_result.success,
             ls_fatal=ls_fatal,
+            best_x=new_best_x,
+            blowup_count=new_blowup_count,
+            diverging=diverging_now,
             diagnostics=new_diagnostics,
         )
 
@@ -1948,9 +2060,10 @@ class SLSQP(optx.AbstractMinimiser):
             ls_steps=("LS it", ls_result.n_evals),
             ls_success=("LS ok", ls_result.success),
             ls_tail=("LS tail", new_consecutive_ls_failures),
+            blowup_count=("blowup#", new_blowup_count),
         )
 
-        return y_new, new_state, aux  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
+        return y_returned, new_state, aux  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
 
     def terminate(
         self,
@@ -2027,6 +2140,11 @@ class SLSQP(optx.AbstractMinimiser):
         # Check chronic line-search failure (see step()).
         ls_stagnation = state.ls_fatal
 
+        # Best-iterate divergence rollback (see step()).  Latches once
+        # the merit-blowup patience runs out and the iterate has been
+        # rolled back to ``state.best_x``.
+        diverging = state.diverging
+
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
@@ -2054,15 +2172,22 @@ class SLSQP(optx.AbstractMinimiser):
         max_iters_reached = jnp.reshape(max_iters_reached, ())
         stagnation_detected = jnp.reshape(stagnation_detected, ())
         ls_stagnation = jnp.reshape(ls_stagnation, ())
+        diverging = jnp.reshape(diverging, ())
 
         # Determine result code
-        done = converged | max_iters_reached | stagnation_detected | ls_stagnation
+        done = (
+            converged
+            | max_iters_reached
+            | stagnation_detected
+            | ls_stagnation
+            | diverging
+        )
 
         result = jax.lax.cond(
             converged,
             lambda: optx.RESULTS.successful,
             lambda: jax.lax.cond(
-                stagnation_detected | ls_stagnation,
+                stagnation_detected | ls_stagnation | diverging,
                 lambda: optx.RESULTS.nonlinear_divergence,
                 lambda: jax.lax.cond(
                     max_iters_reached,
@@ -2441,6 +2566,16 @@ class SLSQP(optx.AbstractMinimiser):
             # active we were paying for ``5 * max_steps`` MINRES solves
             # whose results were masked out by ``use_new=False``.
             bound_fix_solves = jnp.array(0)
+            # Track projection diagnostics across the bound-fix loop.
+            # ``proj_residual_accum`` carries the residual of whichever
+            # inner solve ultimately produced ``direction``; we update
+            # it only when the new solve is accepted (``use_new``) so
+            # the final value matches the iterate exposed to the line
+            # search.  ``n_proj_refinements_accum`` is a strict sum
+            # across every inner solve performed (accepted or not),
+            # mirroring how ``bound_fix_solves`` itself is counted.
+            proj_residual_accum = qp_result.proj_residual
+            n_proj_refinements_accum = qp_result.n_proj_refinements
 
             bound_fix_tol = 1e-12
             for _bound_pass in range(5):
@@ -2514,10 +2649,18 @@ class SLSQP(optx.AbstractMinimiser):
                     )
 
                 def _skip_solve(_=None):
+                    # Branches of jax.lax.cond must produce identical
+                    # PyTree structure / shapes / dtypes; mirror the
+                    # InnerSolveResult fields populated by the inner
+                    # solver in ``_do_solve`` (especially the projection
+                    # diagnostics).  Skip-solves never refine, so they
+                    # contribute zero refinements and zero residual.
                     return InnerSolveResult(
                         d=direction,
                         multipliers=mult_combined,
                         converged=jnp.array(True),
+                        proj_residual=jnp.asarray(0.0, dtype=direction.dtype),
+                        n_proj_refinements=jnp.asarray(0),
                     )
 
                 bound_result = jax.lax.cond(
@@ -2531,6 +2674,22 @@ class SLSQP(optx.AbstractMinimiser):
                 use_new = needs_solve
                 direction = jnp.where(use_new, d_new, direction)
                 mult_combined = jnp.where(use_new, mult_new, mult_combined)
+
+                # Surface the projection diagnostics from the
+                # MinresQLPSolver result.  ``proj_residual_accum``
+                # tracks the residual on whichever direction we end
+                # up returning, so we update it only when the new
+                # solve is actually accepted.  ``n_proj_refinements_accum``
+                # sums every refinement round taken whether the solve
+                # was accepted or skipped.
+                proj_residual_accum = jnp.where(
+                    use_new,
+                    bound_result.proj_residual.astype(proj_residual_accum.dtype),
+                    proj_residual_accum,
+                )
+                n_proj_refinements_accum = (
+                    n_proj_refinements_accum + bound_result.n_proj_refinements
+                )
 
             # Final bound-active identification from the converged direction
             at_lower_full = (direction <= d_lower + bound_fix_tol) & finite_lower
@@ -2599,6 +2758,8 @@ class SLSQP(optx.AbstractMinimiser):
             active_set = qp_result.active_set
             bound_fix_solves = jnp.array(0)
             n_bound_fixed = jnp.array(0)
+            proj_residual_accum = qp_result.proj_residual
+            n_proj_refinements_accum = qp_result.n_proj_refinements
 
         return QPResult(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
             direction=direction,
@@ -2614,4 +2775,6 @@ class SLSQP(optx.AbstractMinimiser):
             lpeca_bypassed=lpeca_bypassed,
             lpeca_capped=lpeca_capped,
             n_lpeca_bounds_prefixed=lpeca_bounds_prefixed_count,
+            proj_residual=proj_residual_accum,
+            n_proj_refinements=n_proj_refinements_accum,
         )

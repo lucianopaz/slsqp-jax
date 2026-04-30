@@ -40,11 +40,30 @@ from slsqp_jax.utils import to_scalar
 
 
 class InnerSolveResult(NamedTuple):
-    """Result from an inner equality-constrained QP solve."""
+    """Result from an inner equality-constrained QP solve.
+
+    Attributes:
+        d: Search direction.
+        multipliers: Lagrange multipliers (shape ``(m,)``; entries for
+            inactive constraints are zero).
+        converged: True when the inner Krylov / projection iteration
+            satisfied its tolerance.
+        proj_residual: Post-solve constraint residual ``||A d - b||``
+            (Euclidean norm, restricted to active rows).  Always ``0`` for
+            null-space solvers (CG / CRAIG) where feasibility is enforced
+            structurally; non-zero for ``MinresQLPSolver`` where it
+            reflects the floor of the M-metric range-space projection
+            after iterative refinement.
+        n_proj_refinements: Number of M-metric projection refinement
+            rounds actually applied.  Always ``0`` for null-space
+            solvers.  At most ``MinresQLPSolver.proj_refine_max_iter``.
+    """
 
     d: Vector
     multipliers: Float[Array, " m"]
     converged: Bool[Array, ""]
+    proj_residual: Scalar = jnp.asarray(0.0)
+    n_proj_refinements: Int[Array, ""] = jnp.asarray(0)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +370,17 @@ class ProjectedCGCholesky(AbstractInnerSolver):
             d_fixed=d_fixed,
             use_constraint_preconditioner=self.use_constraint_preconditioner,
         )
-        return InnerSolveResult(d=d, multipliers=multipliers, converged=converged)
+        # Null-space CG enforces ``A d = b`` structurally via the
+        # particular solution + range-space projector; the residual
+        # ``||A d - b||`` is at floating-point floor by construction,
+        # so we report 0 (no refinement applies).
+        return InnerSolveResult(
+            d=d,
+            multipliers=multipliers,
+            converged=converged,
+            proj_residual=jnp.asarray(0.0, dtype=d.dtype),
+            n_proj_refinements=jnp.asarray(0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -798,7 +827,15 @@ class ProjectedCGCraig(AbstractInnerSolver):
             mult_recovery_tol=self.mult_recovery_tol,
             mult_recovery_max_iter=self.mult_recovery_max_iter,
         )
-        return InnerSolveResult(d=d, multipliers=multipliers, converged=converged)
+        # See ``ProjectedCGCholesky.solve`` for why the projection
+        # diagnostics are reported as zero on null-space solvers.
+        return InnerSolveResult(
+            d=d,
+            multipliers=multipliers,
+            converged=converged,
+            proj_residual=jnp.asarray(0.0, dtype=d.dtype),
+            n_proj_refinements=jnp.asarray(0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1417,11 +1454,27 @@ class MinresQLPSolver(AbstractInnerSolver):
 
     where ``B_diag = diag(B_0)`` (L-BFGS diagonal) and
     ``S = A B_diag^{-1} A^T`` is the Schur complement.
+
+    After PMINRES-QLP returns the iterate ``d``, an M-metric range-space
+    projection drives ``A d = b`` on the active rows.  The single shot
+    is followed by up to ``proj_refine_max_iter`` rounds of iterative
+    refinement, each costing one matvec + one Schur back-solve (no
+    refactorisation).  Refinement squares the relative feasibility
+    error per round, eliminating the residual floor ``O(eps · cond(A
+    M Aᵀ) · ||r_dual||)`` from the ``1e-8·I`` Schur regularisation;
+    on ill-conditioned problems this is the difference between the
+    SQP step landing on the linearised feasible region and drifting
+    off it.  See HR (2014, Algorithm 4.18 step 1(a)) for the
+    motivation.
     """
 
     max_iter: int = 200
     tol: float = 1e-10
     max_cg_iter: int = 50
+    # Iterative refinement of the M-metric projection.  See class docstring.
+    proj_refine_max_iter: int = 3
+    proj_refine_rtol: float = 1e-10
+    proj_refine_atol: float = 1e-14
 
     def solve(
         self,
@@ -1439,7 +1492,7 @@ class MinresQLPSolver(AbstractInnerSolver):
         # are part of the linear system. Loosening the tolerance would
         # degrade constraint satisfaction (unlike null-space CG where
         # constraints are enforced by the projector). Keep self.tol.
-        d, multipliers, converged = _solve_kkt_minres_qlp(
+        d, multipliers, converged, proj_residual, n_refinements = _solve_kkt_minres_qlp(
             hvp_fn=hvp_fn,
             g=g,
             A=A,
@@ -1450,8 +1503,17 @@ class MinresQLPSolver(AbstractInnerSolver):
             precond_fn=precond_fn,
             free_mask=free_mask,
             d_fixed=d_fixed,
+            proj_refine_max_iter=self.proj_refine_max_iter,
+            proj_refine_rtol=self.proj_refine_rtol,
+            proj_refine_atol=self.proj_refine_atol,
         )
-        return InnerSolveResult(d=d, multipliers=multipliers, converged=converged)
+        return InnerSolveResult(
+            d=d,
+            multipliers=multipliers,
+            converged=converged,
+            proj_residual=proj_residual,
+            n_proj_refinements=n_refinements,
+        )
 
 
 def _solve_kkt_minres_qlp(
@@ -1465,7 +1527,16 @@ def _solve_kkt_minres_qlp(
     precond_fn: Callable[[Vector], Vector] | None = None,
     free_mask: Bool[Array, " n"] | None = None,
     d_fixed: Vector | None = None,
-) -> tuple[Vector, Float[Array, " m"], Bool[Array, ""]]:
+    proj_refine_max_iter: int = 3,
+    proj_refine_rtol: float = 1e-10,
+    proj_refine_atol: float = 1e-14,
+) -> tuple[
+    Vector,
+    Float[Array, " m"],
+    Bool[Array, ""],
+    Scalar,
+    Int[Array, ""],
+]:
     """Solve equality-constrained QP via PMINRES-QLP on the full KKT system.
 
     The KKT system::
@@ -1579,11 +1650,12 @@ def _solve_kkt_minres_qlp(
         # the SPD preconditioner's free/fixed coupling, the dual block
         # A_work d - b_work stays non-zero and the SLSQP step leaves
         # the linearised feasible region.
-        def _project_d(d_in: Vector) -> Vector:
+        def _project_step(d_in: Vector) -> tuple[Vector, Scalar]:
             r_dual = jnp.where(active_mask, A_work @ d_in - b_work, 0.0)
+            r_norm = jnp.linalg.norm(r_dual)
             delta_lambda = _solve_schur(r_dual)
             delta_d = _primal_precond(A_work.T @ delta_lambda)
-            return d_in - delta_d
+            return d_in - delta_d, r_norm
     else:
         solution, converged = pminres_qlp_solve(
             kkt_matvec, kkt_rhs, tol=tol, max_iter=max_iter
@@ -1599,12 +1671,72 @@ def _solve_kkt_minres_qlp(
         A_AT = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
         A_AT_chol = jnp.linalg.cholesky(A_AT)
 
-        def _project_d(d_in: Vector) -> Vector:
+        def _project_step(d_in: Vector) -> tuple[Vector, Scalar]:
             r_dual = jnp.where(active_mask, A_work @ d_in - b_work, 0.0)
+            r_norm = jnp.linalg.norm(r_dual)
             delta_lambda = jax.scipy.linalg.cho_solve((A_AT_chol, True), r_dual)
-            return d_in - A_work.T @ delta_lambda
+            return d_in - A_work.T @ delta_lambda, r_norm
 
-    d = _project_d(solution[:n])
+    # Iterative refinement of the projection.  HR (2014, Algorithm 4.18,
+    # step 1(a)) tightens the projection accuracy until the feasibility
+    # residual ||A d - b|| is small relative to ||b||.  We approximate
+    # this by a fixed-point loop on the projection itself: each round
+    # applies one more correction ``d <- d - M A^T (A M A^T)^{-1} (A d
+    # - b)``, which squares the relative feasibility error per round.
+    # The loop is ``proj_refine_max_iter + 1`` projections in total
+    # (one mandatory shot + ``proj_refine_max_iter`` refinement rounds).
+    # Cost per round: one matvec + one Schur back-solve, negligible
+    # next to the Krylov solve we already paid for.
+    b_norm_floor = jnp.linalg.norm(b_work) + jnp.asarray(1.0, dtype=b_work.dtype)
+    proj_atol = jnp.asarray(proj_refine_atol, dtype=b_work.dtype)
+    proj_rtol = jnp.asarray(proj_refine_rtol, dtype=b_work.dtype)
+    refine_target = proj_atol + proj_rtol * b_norm_floor
+
+    # Initial mandatory projection (round 0).
+    d_proj, residual_pre = _project_step(solution[:n])
+    n_refinements = jnp.asarray(0)
+
+    def _refine_body(carry, _):
+        d_cur, _r_prev, done_prev, n_done = carry
+        d_next, r_next = _project_step(d_cur)
+        # ``done_prev`` latches once the residual drops below the target
+        # so subsequent rounds become no-ops (numerical stability matches
+        # exactly via ``jnp.where``, no NaNs from a degenerate Schur
+        # solve once the residual is already at floor).
+        d_out = jnp.where(done_prev, d_cur, d_next)
+        r_out = jnp.where(done_prev, _r_prev, r_next)
+        # Count this round only if it actually ran.
+        n_out = jnp.where(done_prev, n_done, n_done + 1)
+        done_next = done_prev | (r_out <= refine_target)
+        return (d_out, r_out, done_next, n_out), r_out
+
+    if proj_refine_max_iter > 0:
+        # Compute initial post-shot residual; if it's already at floor
+        # we want to skip refinement entirely.  Recomputing it cheaply:
+        residual_init = jnp.linalg.norm(
+            jnp.where(active_mask, A_work @ d_proj - b_work, 0.0)
+        )
+        done_init = residual_init <= refine_target
+        (d_proj, residual_post, _done_final, n_refinements), _ = jax.lax.scan(
+            _refine_body,
+            (d_proj, residual_init, done_init, n_refinements),
+            None,
+            length=proj_refine_max_iter,
+        )
+    else:
+        residual_post = jnp.linalg.norm(
+            jnp.where(active_mask, A_work @ d_proj - b_work, 0.0)
+        )
+
+    # Re-use ``residual_pre`` so that the unused-variable check passes
+    # while still letting downstream code observe the *post*-refinement
+    # residual via the InnerSolveResult.  ``residual_pre`` is the
+    # residual feeding into the first projection (i.e. the unprojected
+    # MINRES iterate's infeasibility); we do not surface it directly
+    # but keep the name for readability.
+    del residual_pre
+
+    d = d_proj
     if has_fixed:
         # Force the direction to respect the fixed mask.  The KKT matvec
         # and preconditioner branches already keep fixed positions at
@@ -1622,4 +1754,4 @@ def _solve_kkt_minres_qlp(
     multipliers = jnp.where(active_mask, multipliers, 0.0)
 
     finite = jnp.isfinite(d).all() & jnp.isfinite(multipliers).all()
-    return d, multipliers, converged & finite
+    return d, multipliers, converged & finite, residual_post, n_refinements

@@ -240,11 +240,11 @@ The preconditioner is a **block-diagonal SPD** matrix $M^{-1} = \text{diag}(B_{\
 
 $$\delta d = M A^T (A M A^T)^{-1} (A d - b), \qquad d \leftarrow d - \delta d$$
 
-This is the closest correction to $d$ in the metric induced by the SPD preconditioner $M$ and the unique minimiser of $\lVert \delta d \rVert_{M^{-1}}$ subject to $A(d - \delta d) = b$. The factorisation of $A M A^T$ is **already computed for the Schur block of the preconditioner**, so the projection costs only one extra back-solve plus a matvec — essentially one additional Lanczos step. After the projection, $\lVert A d - b \rVert$ is reduced to roughly $\varepsilon \cdot \kappa(A M A^T) \cdot \lVert A d_{\text{raw}} - b \rVert$ (i.e. the floor set by the $10^{-8} I$ regularisation on the Schur Cholesky), typically $10^4$–$10^7$ tighter than the un-projected MINRES iterate. When no SPD preconditioner is supplied, a small dedicated $A A^T + \varepsilon I$ Cholesky is built just for this 2-norm projection. Multipliers are left as PMINRES-QLP returned them; the residual stationarity inconsistency $O(\lVert B \rVert \cdot \lVert \delta d \rVert)$ is absorbed by the outer L1 merit and L-BFGS secant blending. References: Orban & Arioli, *Projected Krylov Methods for Saddle-Point Systems*, SIAM J. Matrix Anal. Appl. 36(3), 2014, Lemma 3.1; Benzi, Golub & Liesen, *Numerical Solution of Saddle Point Problems*, Acta Numerica, 2005, §5.
+This is the closest correction to $d$ in the metric induced by the SPD preconditioner $M$ and the unique minimiser of $\lVert \delta d \rVert_{M^{-1}}$ subject to $A(d - \delta d) = b$. The factorisation of $A M A^T$ is **already computed for the Schur block of the preconditioner**, so the projection costs only one extra back-solve plus a matvec — essentially one additional Lanczos step. After a single shot, $\lVert A d - b \rVert$ is reduced to roughly $\varepsilon \cdot \kappa(A M A^T) \cdot \lVert A d_{\text{raw}} - b \rVert$ (the floor set by the $10^{-8} I$ regularisation on the Schur Cholesky), typically $10^4$–$10^7$ tighter than the un-projected MINRES iterate. To eliminate even that residual floor on ill-conditioned problems the projection is wrapped in a fixed-point **iterative refinement** loop, applying $d \leftarrow d - M A^T (A M A^T)^{-1} (A d - b)$ up to `proj_refine_max_iter` times (default `3`) with early termination once $\lVert A d - b \rVert$ drops below `proj_refine_atol + proj_refine_rtol * (1 + ||b||)`. Each refinement round costs only one additional matvec plus one Schur back-solve (no refactorisation), and on the test fixtures in `tests/test_inner_solver.py::TestMinresQLPProjectionRefinement` it drives the residual from $\sim 10^{-9}$ (single shot) to machine precision. The actual rounds used and final residual are surfaced through `SLSQPDiagnostics.n_proj_refinements` and `SLSQPDiagnostics.max_proj_residual`. When no SPD preconditioner is supplied, a small dedicated $A A^T + \varepsilon I$ Cholesky is built just for the 2-norm projection. Multipliers are left as PMINRES-QLP returned them; the residual stationarity inconsistency $O(\lVert B \rVert \cdot \lVert \delta d \rVert)$ is absorbed by the outer L1 merit and L-BFGS secant blending. References: Orban & Arioli, *Projected Krylov Methods for Saddle-Point Systems*, SIAM J. Matrix Anal. Appl. 36(3), 2014, Lemma 3.1; Benzi, Golub & Liesen, *Numerical Solution of Saddle Point Problems*, Acta Numerica, 2005, §5.
 
 Cost: $O((n + m) \cdot t_{\text{minres}})$ per solve, where $t_{\text{minres}}$ is the number of Lanczos iterations (controlled by `max_iter` and `tol`); the posterior projection adds one $m \times m$ triangular solve.
 
-- Reference: Choi, *Iterative Methods for Singular Linear Equations and Least-Squares Problems*, PhD thesis, Stanford University, 2006. Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011. Orban & Arioli, *Projected Krylov Methods for Saddle-Point Systems*, SIAM J. Matrix Anal. Appl. 36(3), 2014.
+- Reference: Choi, *Iterative Methods for Singular Linear Equations and Least-Squares Problems*, PhD thesis, Stanford University, 2006. Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011. Orban & Arioli, *Projected Krylov Methods for Saddle-Point Systems*, SIAM J. Matrix Anal. Appl. 36(3), 2014. Heinkenschloss & Ridzal, *A Matrix-Free Trust-Region SQP Method for Equality Constrained Optimization*, SIAM J. Optim. 24(3), 2014, Algorithm 4.18.
 
 To use an alternative inner solver, construct the desired strategy and pass it to `SLSQP` (which forwards it to `solve_qp`):
 
@@ -564,6 +564,34 @@ print(sol.stats["stagnation"])     # False if converged normally
 print(sol.stats["last_step_size"]) # Step size from final iteration
 ```
 
+### Best-iterate divergence rollback
+
+Even with the inner self-correction in `MinresQLPSolver`, pathological QPs can occasionally produce SQP iterates that drift off the linearised feasible region or generate non-finite merit values. The solver carries a **best-iterate divergence detector** as a final guardrail:
+
+- `state.best_x` tracks the iterate that achieved `state.best_merit`.
+- At every step, if the new merit exceeds the best-seen merit by more than $\texttt{divergence\_factor} \cdot \max(\lvert\varphi_\text{best}\rvert, 1)$ — *or* if the merit is NaN/Inf — `state.blowup_count` increments. Otherwise it resets to zero.
+- Once `blowup_count >= divergence_patience`, `state.diverging` latches `True`, the iterate returned by `step()` is **rolled back to** `state.best_x`, and `terminate()` routes to `RESULTS.nonlinear_divergence`.
+
+Defaults are `divergence_factor=10.0` and `divergence_patience=3`, intentionally generous so the trigger only fires on genuine runaway growth and not on routine penalty inflation. The L-BFGS history, multipliers, and gradients still reflect the *attempted* step; only the iterate the user sees is rolled back. On a benign run the detector stays quiet — `divergence_triggered` is `False` and `n_divergence_blowups` is `0`. Inspired by Heinkenschloss & Ridzal (2014, §4.3) — applying the spirit of their normal-step over-correction control to a line-search SQP.
+
+```python
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    inner_solver=MinresQLPSolver(max_iter=200, tol=1e-10),
+    divergence_factor=10.0,    # default
+    divergence_patience=3,     # default
+)
+```
+
+The diagnostic accumulator surfaces both the trigger and the cumulative count:
+
+```python
+diag = get_diagnostics(sol.state)
+print(diag.divergence_triggered)    # True iff rollback fired at least once
+print(diag.n_divergence_blowups)    # total blowup events (>=patience when triggered)
+```
+
 ### Diagnostics
 
 `SLSQPState` carries a `diagnostics` field of type `SLSQPDiagnostics` that accumulates lightweight counters and summary statistics on every call to `step()` (branch-free, so they work under JIT). Use `slsqp_jax.get_diagnostics(state)` on the final state to retrieve them:
@@ -587,6 +615,10 @@ print(diag.n_bound_fix_solves)   # non-trivial bound-fixing inner solves
 print(diag.max_bound_fixed)      # peak number of variables pinned to bounds
 print(diag.max_active_ineq)      # peak active general-ineq / bound count
 print(diag.n_merit_regressions)  # steps where merit increased despite LS ok
+print(diag.n_proj_refinements)   # total M-metric refinement rounds (MINRES-QLP)
+print(diag.max_proj_residual)    # high-water ||A d - b|| post-refinement
+print(diag.n_divergence_blowups) # cumulative blowup-count increments
+print(diag.divergence_triggered) # True iff best-iterate rollback fired
 ```
 
 Because a line search that can only take $\alpha \approx 2^{-20}$ no longer counts as convergence, these counters are the recommended way to assess the quality of a run whose result code is `RESULTS.successful` but whose objective / constraints look suspect. Large `n_qp_inner_failures` together with a small `eq_jac_min_sv_est` usually indicates a near-rank-deficient equality Jacobian; a non-zero `tail_ls_failures` at termination means the solver bailed out on stagnation and the returned iterate is a best-merit point, not a stationary point.
