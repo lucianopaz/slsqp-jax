@@ -313,6 +313,82 @@ solver = SLSQP(
 )
 ```
 
+### NLP-level bound multiplier recovery
+
+When box constraints are present, the inequality multiplier vector
+$\mu_{\text{ineq}} \in \mathbb{R}^{m_{\text{ineq}}}$ stored in
+`state.multipliers_ineq` is laid out as
+`[general; lower_bound; upper_bound]`. The bound block of this vector
+appears in the Lagrangian gradient
+$\nabla_x L = \nabla f - J_{\text{eq}}^T \lambda - J_{\text{ineq}}^T \mu_{\text{ineq}}$
+and therefore directly affects the relative-stationarity convergence test
+$\lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(|L|, 1)$.
+
+For each accepted SLSQP step the bound multipliers are **recomputed from
+the partial Lagrangian gradient at $x_{k+1}$**, after the line search.
+Concretely, for each variable $i$ at a bound at $x_{k+1}$:
+
+$$
+\mu_i^{\text{lower}} = \max\!\Bigl(0,\; \bigl[\nabla f(x_{k+1}) - J_{\text{eq}}^T \lambda - J_{\text{gen}}^T \mu_{\text{gen}}\bigr]_i\Bigr), \qquad
+\mu_j^{\text{upper}} = \max\!\Bigl(0,\; -\bigl[\nabla f(x_{k+1}) - J_{\text{eq}}^T \lambda - J_{\text{gen}}^T \mu_{\text{gen}}\bigr]_j\Bigr).
+$$
+
+By construction this zeros $\nabla_x L$ exactly on every active-bound
+component (only the residual on the equality / general-inequality
+multipliers remains), and the clamp to $\geq 0$ enforces dual
+feasibility. The active-bound test uses an absolute floor of $10^{-12}$
+plus a relative safety term $\epsilon \cdot (1 + |y_{\text{new}}|)$;
+variables clipped to a bound by `_clip_to_bounds` satisfy the test by
+exact equality, the relative term only matters for variables the line
+search drove to within floating-point precision of a bound without
+explicit clipping.
+
+**Why post-line-search.** The previous bound-multiplier recovery
+happened *inside the QP* at $x_k$ via $B d + g - A^T \lambda$, which
+inherits three sources of noise:
+
+1. The L-BFGS HVP $B d \neq H d$ unless the L-BFGS approximation is
+   exact (it isn't, for any $k > 0$ on a non-quadratic objective).
+2. The recovery is at $x_k$, not at the iterate where the convergence
+   test runs ($x_{k+1}$).
+3. The active-bound mask is derived from the *QP direction* and not
+   from $x_{k+1}$, so an $\alpha < 1$ line search can leave the recovered
+   multiplier "for the wrong point".
+
+On bound-heavy problems (e.g. `Portfolio(n=5000)` with `MinresQLPSolver`,
+where the optimum has thousands of active bounds) this used to pin
+$\lVert \nabla_x L \rVert / |L|$ above `rtol` even when the constraints
+were satisfied and $\alpha = 1$. The post-line-search recovery removes
+all three error sources for the bound block.
+
+**Why the L-BFGS secant is unaffected.** The bound Jacobian
+`state.bound_jac` is constant (identity-style rows for lower bounds and
+their negatives for upper bounds), so the bound contribution to the
+secant pair
+
+$$
+y_k = \nabla_x L(x_{k+1}, \lambda) - \nabla_x L(x_k, \lambda)
+$$
+
+vanishes identically: $[J_{\text{bound}} - J_{\text{bound}}]^T \mu_{\text{bound}} \equiv 0$
+regardless of $\mu_{\text{bound}}$, as long as the same multiplier
+vector is applied at both endpoints — which is the case in this
+implementation. This matches the L-BFGS-B precedent (Byrd, Lu, Nocedal
+& Zhu, *SIAM J. Sci. Comput.* 16(5), 1995; Zhu, Byrd, Lu & Nocedal,
+*ACM TOMS* 23(4), 1997, Algorithm 778), which uses
+$y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$ (i.e. $\mu_{\text{bound}} = 0$ at
+both endpoints) for bound-constrained problems. The corrected bound
+multipliers are also written back into `state.multipliers_ineq` so
+LPEC-A's predictor, the verbose diagnostics, and the next QP's
+warm-start all see the sharper values.
+
+There is no user-facing parameter for this behaviour: the recovery is
+always on whenever bounds are present, costs one extra
+$J_{\text{eq}}^T \lambda$ / $J_{\text{gen}}^T \mu_{\text{gen}}$ matvec
+that is amortised against the existing
+`compute_lagrangian_gradient` call, and silently degrades to a no-op
+when `bounds is None`.
+
 ### QP anti-cycling: the EXPAND procedure
 
 The QP subproblem is solved by a primal active-set method that adds or removes inequality constraints one at a time. When the problem is **degenerate** — multiple constraints pass through the same vertex or have tied violation/multiplier values — the active-set loop can *cycle*: iteration $i$ activates a constraint, iteration $i+1$ drops it, iteration $i+2$ re-activates it, and so on. The QP then exhausts its iteration budget without converging, producing a poor search direction.

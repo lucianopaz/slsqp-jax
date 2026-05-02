@@ -1203,23 +1203,21 @@ class TestLpecaBoundPrediction:
         """Predicted bound active set is consistent with optimum when
         the problem mixes a general inequality and box bounds.
 
-        Minimise (x - target)^2 + (y - target)^2 subject to
-            x + y >= 0.5,  0 <= x <= 1, 0 <= y <= 1.
-        With target = (-1, 2) the unconstrained optimum is outside the
-        box on both coordinates, so the optimum is x=0, y=1 and the
-        general inequality is inactive.
+        Uses the same 5-D ``_box_problem`` configuration as the other
+        bound-prefix tests, augmented with a strictly satisfied general
+        inequality ``sum(x) >= -1`` so the LPEC-A inequality vector
+        layout becomes ``[general; lower; upper]`` (the case the
+        bound-prefix machinery is meant to handle).  The 5-D problem
+        does not converge in a single step under quadratic L-BFGS
+        warm-up, which gives LPEC-A a chance to predict bounds; the 2-D
+        problem this test used to use converges in one step under the
+        sharper NLP-level bound-multiplier recovery and therefore never
+        exercises the bound-prefix path.
         """
-        target = jnp.array([-1.0, 2.0])
-
-        def objective(x, args):
-            return jnp.sum((x - target) ** 2), None
+        objective, bounds, x0, expected = self._box_problem()
 
         def ineq_constraint(x, args):
-            return jnp.array([x[0] + x[1] - 0.5])
-
-        bounds = jnp.stack([jnp.zeros(2), jnp.ones(2)], axis=1)
-        x0 = jnp.array([0.5, 0.5])
-        expected = jnp.array([0.0, 1.0])
+            return jnp.array([jnp.sum(x) - (-1.0)])
 
         solver = SLSQP(
             atol=1e-7,

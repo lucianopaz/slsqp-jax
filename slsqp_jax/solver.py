@@ -29,6 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
+    compute_partial_lagrangian_gradient,
     estimate_hessian_diagonal,
     lbfgs_append,
     lbfgs_hvp,
@@ -1193,6 +1194,119 @@ class SLSQP(optx.AbstractMinimiser):
 
         return jnp.concatenate([J_lower, J_upper], axis=0)
 
+    def _recover_bound_multipliers(
+        self,
+        y_new: Vector,
+        grad_new: Vector,
+        eq_jac_new: Float[Array, "m_eq n"],
+        ineq_jac_new: Float[Array, "m_ineq n"],
+        mult_eq: Float[Array, " m_eq"],
+        mult_ineq_general: Float[Array, " m_general"],
+    ) -> tuple[Float[Array, " n_lower"], Float[Array, " n_upper"]]:
+        """Recover bound multipliers from the NLP reduced gradient at x_{k+1}.
+
+        Reads off the bound multiplier as the residual of the *partial*
+        Lagrangian gradient (no bound contribution) at the post-line-search
+        iterate, restricted to the variables that are at a bound at
+        ``y_new``.  By construction, splicing these multipliers back into
+        the full Lagrangian gradient zeros the bound-active components of
+        ``∇L`` exactly.
+
+        See ``compute_partial_lagrangian_gradient`` for the partial
+        Lagrangian gradient definition.  The sign convention follows
+        ``_build_bound_jacobian`` (``+I`` rows for lower bounds, ``−I``
+        rows for upper bounds), so:
+
+            μ_lower[i] = +partial_grad_L[lower_idx[i]]
+            μ_upper[j] = −partial_grad_L[upper_idx[j]]
+
+        clamped to ``≥ 0`` to enforce dual feasibility.  A small negative
+        recovered value at an "active" bound means our active-set guess
+        at ``y_new`` is off by one variable; clamping folds the
+        discrepancy back into ``||∇L||`` instead of injecting a bogus
+        negative multiplier.
+
+        The active-bound test uses an absolute tolerance of ``1e-12``
+        plus a per-variable relative safety term ``eps · (1 + |y_new|)``.
+        Variables clipped to a bound by ``_clip_to_bounds`` satisfy the
+        test exactly; the relative term only matters for variables the
+        line search drove to within floating-point precision of a bound
+        without explicit clipping.
+
+        Args:
+            y_new: Post-line-search iterate (already clipped to bounds).
+            grad_new: Objective gradient at ``y_new``.
+            eq_jac_new: Equality-constraint Jacobian at ``y_new``.
+            ineq_jac_new: Full inequality Jacobian at ``y_new``,
+                with bound rows.  Only the general portion (first
+                ``self.n_ineq_constraints`` rows) is used.
+            mult_eq: Equality multipliers (typically the blended
+                multipliers from the current step).
+            mult_ineq_general: General-inequality multipliers (no
+                bound block); typically ``blended_mult_ineq[:m_general]``.
+
+        Returns:
+            ``(mu_lower_corr, mu_upper_corr)`` of shapes
+            ``(n_lower,)`` and ``(n_upper,)`` respectively.  Empty
+            arrays when the corresponding bound side has no finite
+            entries (or when ``self.bounds is None``).
+        """
+        n_lower = self._n_lower_bounds
+        n_upper = self._n_upper_bounds
+        m_general = self.n_ineq_constraints
+
+        if self.bounds is None or (n_lower == 0 and n_upper == 0):
+            return jnp.zeros((0,), dtype=y_new.dtype), jnp.zeros(
+                (0,), dtype=y_new.dtype
+            )
+
+        gen_jac_new = (
+            ineq_jac_new[:m_general]
+            if m_general > 0
+            else jnp.zeros((0, y_new.shape[0]), dtype=y_new.dtype)
+        )
+        partial_grad_L = compute_partial_lagrangian_gradient(
+            grad_new,
+            eq_jac_new,
+            mult_eq,
+            gen_jac_new,
+            mult_ineq_general,
+        )
+
+        # Per-variable active-bound tolerance: absolute floor of 1e-12
+        # (matches ``bound_fix_tol`` in the QP bound-fixing loop) plus a
+        # relative ``eps * (1 + |y_new|)`` safety term so the test still
+        # fires for variables whose magnitude pushes the absolute floor
+        # below the local floating-point spacing.  Variables clipped to
+        # a bound by ``_clip_to_bounds`` satisfy the test by exact
+        # equality and the relative term is irrelevant for them.
+        eps = jnp.asarray(jnp.finfo(y_new.dtype).eps, dtype=y_new.dtype)
+        bound_tol = jnp.asarray(1e-12, dtype=y_new.dtype) + eps * (1.0 + jnp.abs(y_new))
+
+        if n_lower > 0:
+            lower_idx = jnp.asarray(self._lower_indices, dtype=jnp.int32)
+            lb_at_idx = self.bounds[lower_idx, 0]
+            at_lower = (y_new[lower_idx] - lb_at_idx) <= bound_tol[lower_idx]
+            mu_lower_corr = jnp.maximum(
+                jnp.where(at_lower, partial_grad_L[lower_idx], 0.0),
+                0.0,
+            )
+        else:
+            mu_lower_corr = jnp.zeros((0,), dtype=y_new.dtype)
+
+        if n_upper > 0:
+            upper_idx = jnp.asarray(self._upper_indices, dtype=jnp.int32)
+            ub_at_idx = self.bounds[upper_idx, 1]
+            at_upper = (ub_at_idx - y_new[upper_idx]) <= bound_tol[upper_idx]
+            mu_upper_corr = jnp.maximum(
+                jnp.where(at_upper, -partial_grad_L[upper_idx], 0.0),
+                0.0,
+            )
+        else:
+            mu_upper_corr = jnp.zeros((0,), dtype=y_new.dtype)
+
+        return mu_lower_corr, mu_upper_corr
+
     def _build_lagrangian_hvp(
         self,
         fn: Callable,
@@ -1694,10 +1808,63 @@ class SLSQP(optx.AbstractMinimiser):
             qp_result.multipliers_ineq - state.multipliers_ineq
         )
 
+        # NLP-level bound multiplier recovery at x_{k+1}.  The QP-level
+        # bound multipliers in ``blended_mult_ineq[m_general:]`` were
+        # recovered from ``B d + g − A^T λ`` at ``x_k`` using the L-BFGS
+        # HVP and the bound-fixing loop's ``direction``-based active set;
+        # they inherit the L-BFGS / iterate / regularised-projection
+        # error budget which can pin ``||∇L|| / |L|`` above ``rtol`` on
+        # bound-heavy problems.  Recompute them from the *partial*
+        # Lagrangian gradient at ``x_{k+1}`` (computed with the same
+        # blended ``μ_eq`` / ``μ_gen`` we are about to use) and splice
+        # back into ``blended_mult_ineq`` in place.  By construction
+        # ``∇L`` at the active bound indices then cancels exactly.
+        #
+        # The bound block of the L-BFGS secant pair
+        #     y_k = ∇L(x_{k+1}, λ) − ∇L(x_k, λ)
+        # is invariant under this splice because the bound Jacobian
+        # ``state.bound_jac`` is constant: ``[J_b − J_b]^T μ_b ≡ 0``
+        # regardless of ``μ_b``, as long as the same multiplier vector
+        # is applied at both endpoints — which it is below (a single
+        # ``blended_mult_ineq`` feeds both ``grad_lagrangian_new`` and
+        # ``grad_lagrangian_old``).  This is consistent with L-BFGS-B's
+        # use of ``y_k = ∇f(x_{k+1}) − ∇f(x_k)`` (i.e. ``μ_b = 0`` at
+        # both endpoints; Byrd, Lu, Nocedal, Zhu, SIAM J. Sci. Comput.
+        # 16(5), 1995).
+        m_ineq_general_static = self.n_ineq_constraints
+        m_bounds_static = self._n_lower_bounds + self._n_upper_bounds
+        n_lower_static = self._n_lower_bounds
+        if m_bounds_static > 0:
+            mult_ineq_general_blended = (
+                blended_mult_ineq[:m_ineq_general_static]
+                if m_ineq_general_static > 0
+                else jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
+            )
+            mu_lower_corr, mu_upper_corr = self._recover_bound_multipliers(
+                y_new=y_new,
+                grad_new=grad_new,
+                eq_jac_new=eq_jac_new,
+                ineq_jac_new=ineq_jac_new,
+                mult_eq=blended_mult_eq,
+                mult_ineq_general=mult_ineq_general_blended,
+            )
+            if n_lower_static > 0:
+                blended_mult_ineq = blended_mult_ineq.at[
+                    m_ineq_general_static : m_ineq_general_static + n_lower_static
+                ].set(mu_lower_corr)
+            if self._n_upper_bounds > 0:
+                blended_mult_ineq = blended_mult_ineq.at[
+                    m_ineq_general_static + n_lower_static :
+                ].set(mu_upper_corr)
+        else:
+            mu_lower_corr = jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
+            mu_upper_corr = jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
+
         # Step 6: Update L-BFGS history
         s = y_new - y  # Step taken
 
         # Compute gradient of Lagrangian at new point using blended multipliers
+        # (with the NLP-recovered bound block spliced in above).
         grad_lagrangian_new = compute_lagrangian_gradient(
             grad_new,
             eq_jac_new,
@@ -1964,6 +2131,31 @@ class SLSQP(optx.AbstractMinimiser):
             divergence_triggered=prev_diag.divergence_triggered | diverging_now,
         )
 
+        # Propagate the NLP-recovered bound multipliers into the next
+        # state so that LPEC-A's active-set predictor, the verbose
+        # diagnostics, and any consumer of ``state.multipliers_ineq``
+        # see the corrected (sharper) bound block.  The general portion
+        # is taken from ``qp_result.multipliers_ineq`` (raw QP output,
+        # unblended) for symmetry with ``multipliers_eq=`` below.  The
+        # mild blended-vs-unblended inconsistency in the recovery (the
+        # corrected bound mults were derived from blended ``μ_eq`` /
+        # ``μ_gen``) is acceptable: ``μ_b`` for warm-start only needs
+        # to be a non-negative dual estimate that approximately zeros
+        # the partial Lagrangian gradient on active bounds at
+        # ``x_{k+1}``.
+        if m_bounds_static > 0:
+            multipliers_ineq_for_state = qp_result.multipliers_ineq
+            if n_lower_static > 0:
+                multipliers_ineq_for_state = multipliers_ineq_for_state.at[
+                    m_ineq_general_static : m_ineq_general_static + n_lower_static
+                ].set(mu_lower_corr)
+            if self._n_upper_bounds > 0:
+                multipliers_ineq_for_state = multipliers_ineq_for_state.at[
+                    m_ineq_general_static + n_lower_static :
+                ].set(mu_upper_corr)
+        else:
+            multipliers_ineq_for_state = qp_result.multipliers_ineq
+
         new_state = SLSQPState(
             step_count=state.step_count + 1,
             f_val=f_val_new,
@@ -1974,7 +2166,7 @@ class SLSQP(optx.AbstractMinimiser):
             ineq_jac=ineq_jac_new,
             lbfgs_history=new_lbfgs_history,
             multipliers_eq=qp_result.multipliers_eq,
-            multipliers_ineq=qp_result.multipliers_ineq,
+            multipliers_ineq=multipliers_ineq_for_state,
             prev_grad_lagrangian=grad_lagrangian_new,
             grad_lagrangian=grad_lagrangian_new,
             merit_penalty=merit_penalty,
