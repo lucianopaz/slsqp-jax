@@ -676,6 +676,51 @@ def lbfgs_identity_reset(
 
 
 @jaxtyped(typechecker=beartype)
+def compute_partial_lagrangian_gradient(
+    grad_f: Vector,
+    eq_jac: Float[Array, "m_eq n"],
+    multipliers_eq: Float[Array, " m_eq"],
+    gen_jac: Float[Array, "m_gen n"],
+    multipliers_gen: Float[Array, " m_gen"],
+) -> Vector:
+    """Compute the partial Lagrangian gradient (without the bound block).
+
+    Returns ``nabla f(x) - J_eq(x)^T lambda - J_gen(x)^T mu_gen``, where
+    ``J_gen`` is the Jacobian of the *general* (nonlinear) inequality
+    constraints — i.e. the inequality block excluding the constant
+    identity-style rows that come from box bounds.
+
+    This is the core helper used by both ``compute_lagrangian_gradient``
+    (which adds the bound contribution on top) and the post-line-search
+    NLP-level bound-multiplier recovery in ``solver.py``: by reading off
+    the partial Lagrangian gradient at indices that are at a bound at
+    ``x_{k+1}``, the recovery picks the bound multiplier that exactly
+    zeros the corresponding component of the full Lagrangian gradient.
+
+    Args:
+        grad_f: Gradient of the objective function ``nabla f(x)``.
+        eq_jac: Jacobian of equality constraints (m_eq x n).
+        multipliers_eq: Lagrange multipliers for equality constraints.
+        gen_jac: Jacobian of *general* inequality constraints
+            (m_gen x n).  Must exclude bound rows.
+        multipliers_gen: Lagrange multipliers for general inequality
+            constraints.
+
+    Returns:
+        Partial Lagrangian gradient with no bound contribution.
+    """
+    grad_L = grad_f
+
+    if eq_jac.shape[0] > 0:
+        grad_L = grad_L - eq_jac.T @ multipliers_eq
+
+    if gen_jac.shape[0] > 0:
+        grad_L = grad_L - gen_jac.T @ multipliers_gen
+
+    return grad_L
+
+
+@jaxtyped(typechecker=beartype)
 def compute_lagrangian_gradient(
     grad_f: Vector,
     eq_jac: Float[Array, "m_eq n"],
@@ -691,25 +736,31 @@ def compute_lagrangian_gradient(
     Its gradient with respect to x is:
         nabla_x L = nabla f(x) - J_eq^T lambda - J_ineq^T mu
 
+    ``ineq_jac`` and ``multipliers_ineq`` must include the bound block
+    when bounds are present (the ineq layout used by ``solver.py`` is
+    ``[general; lower_bound; upper_bound]``).  Internally this is built
+    on top of :func:`compute_partial_lagrangian_gradient` so the
+    bound-multiplier recovery in the outer solver shares the same code
+    path for the non-bound contribution.
+
     Args:
         grad_f: Gradient of objective function nabla f(x).
         eq_jac: Jacobian of equality constraints (m_eq x n).
-        ineq_jac: Jacobian of inequality constraints (m_ineq x n).
+        ineq_jac: Jacobian of inequality constraints (m_ineq x n),
+            including bound rows.
         multipliers_eq: Lagrange multipliers for equality constraints.
-        multipliers_ineq: Lagrange multipliers for inequality constraints.
+        multipliers_ineq: Lagrange multipliers for inequality
+            constraints, including bound multipliers.
 
     Returns:
         Gradient of Lagrangian nabla_x L.
     """
     grad_L = grad_f
 
-    m_eq = eq_jac.shape[0]
-    m_ineq = ineq_jac.shape[0]
-
-    if m_eq > 0:
+    if eq_jac.shape[0] > 0:
         grad_L = grad_L - eq_jac.T @ multipliers_eq
 
-    if m_ineq > 0:
+    if ineq_jac.shape[0] > 0:
         grad_L = grad_L - ineq_jac.T @ multipliers_ineq
 
     return grad_L

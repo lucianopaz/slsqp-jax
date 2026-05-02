@@ -14,6 +14,7 @@ from slsqp_jax.compat import (
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
+    compute_partial_lagrangian_gradient,
     estimate_hessian_diagonal,
     lbfgs_append,
     lbfgs_compute_diagonal,
@@ -108,6 +109,7 @@ __all__ = [
     "update_penalty_parameter",
     # Hessian utilities
     "compute_lagrangian_gradient",
+    "compute_partial_lagrangian_gradient",
     # LPEC-A active set identification
     "compute_rho_bar",
     "identify_active_set_lpeca",
