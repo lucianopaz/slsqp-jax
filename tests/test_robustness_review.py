@@ -62,6 +62,7 @@ class TestChronicLineSearchNoLongerSuccess:
     disjunct.
     """
 
+    @pytest.mark.slow
     def test_degenerate_linear_program_flags_ls_fatal(self):
         n = 5
         weights = jnp.linspace(1.0, 10.0, n)
@@ -247,6 +248,7 @@ class TestMinresFreeMaskWithPrecond:
     even when a (non-identity) preconditioner is supplied.
     """
 
+    @pytest.mark.slow
     def test_bounds_fixed_stay_at_bound(self):
         def objective(x, args):
             return 0.5 * jnp.sum((x - 2.0) ** 2), None
@@ -320,6 +322,7 @@ class TestLBFGSClipParameters:
 
 
 class TestProjectedCGCraigIntegration:
+    @pytest.mark.slow
     def test_equality_constrained_quadratic(self):
         def objective(x, args):
             return jnp.sum((x - jnp.array([1.0, 2.0, 3.0])) ** 2), None
@@ -371,6 +374,7 @@ class TestLBFGSSkipCounter:
         y_ok = jnp.asarray(rng.randn(4))
         assert bool(lbfgs_should_skip(s_tiny, y_ok))
 
+    @pytest.mark.slow
     def test_counter_does_not_saturate_past_memory(self):
         """Run many more iterations than ``lbfgs_memory`` on an easy
         problem where almost every pair should be accepted; the fixed

@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
+import pytest
 
 from slsqp_jax import SLSQP, MinresQLPSolver, get_diagnostics
 
@@ -99,6 +100,7 @@ class TestNanMeritRollsBackToBest:
 
         return objective
 
+    @pytest.mark.slow
     def test_rollback_to_best_x(self):
         objective = self._make_problem(nan_radius=5.0)
         solver = SLSQP(
@@ -160,6 +162,7 @@ class TestBenignProblemDoesNotDiverge:
         assert result == optx.RESULTS.successful
         np.testing.assert_allclose(np.asarray(y), [1.0, 1.0, 1.0], atol=1e-5)
 
+    @pytest.mark.slow
     def test_constrained_problem_does_not_trigger_divergence(self):
         def objective(x, args):
             return jnp.sum(x**2), None

@@ -247,7 +247,7 @@ class TestBenchmarkNoProximal:
 class TestRosenbrock:
     """Test the Rosenbrock function at large scale."""
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_rosenbrock_100k_dimensions(self):
         """Test SLSQP on 100,000 dimensional Rosenbrock function.
 

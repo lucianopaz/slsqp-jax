@@ -338,7 +338,7 @@ class TestSLSQPUserSuppliedDerivatives:
         # Solution: x = y = z = 1 on the sphere
         np.testing.assert_allclose(jnp.sum(y**2), 3.0, rtol=1e-4)
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_user_hvp_ad_fallback_for_ineq_constraints(self):
         """Test with user-supplied objective HVP but AD fallback for ineq constraints.
 
@@ -744,7 +744,6 @@ class TestOptimistixMinimise:
 class TestSLSQPComparisonWithSciPy:
     """Compare SLSQP-JAX results with SciPy's SLSQP."""
 
-    @pytest.mark.slow
     def test_vs_scipy_unconstrained(self):
         """Compare unconstrained optimization with SciPy."""
 
@@ -819,7 +818,7 @@ class TestSLSQPBoxConstraints:
 
         np.testing.assert_allclose(y, [2.0], rtol=1e-4)
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_simple_upper_bound(self):
         """Minimize -x subject to x <= 3  =>  x = 3"""
 
@@ -894,6 +893,7 @@ class TestSLSQPBoxConstraints:
         np.testing.assert_allclose(y, [2.0, 2.0], rtol=1e-3)
         np.testing.assert_allclose(y[0] + y[1], 4.0, atol=1e-5)
 
+    @pytest.mark.slow
     def test_bounds_with_inequality_constraint(self):
         """Minimize (x-5)^2 + (y-5)^2 subject to x + y >= 3, 0 <= x,y <= 2
 
@@ -930,7 +930,7 @@ class TestSLSQPBoxConstraints:
         assert jnp.all(y >= 0.0 - 1e-5)
         assert jnp.all(y <= 2.0 + 1e-5)
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_bounds_inactive(self):
         """Test when bounds exist but are not active at the solution.
 
@@ -958,6 +958,7 @@ class TestSLSQPBoxConstraints:
 
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-4)
 
+    @pytest.mark.slow
     def test_partial_bounds(self):
         """Test with some variables bounded and some unbounded.
 
@@ -1151,7 +1152,7 @@ class TestSLSQPBoundsComparisonWithSciPy:
 
         np.testing.assert_allclose(y, result_scipy.x, rtol=1e-3)
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_bounds_match_scipy_partial(self):
         """Compare partially bounded optimization with SciPy."""
 
@@ -1403,6 +1404,7 @@ class TestEarlyTerminationFix:
         np.testing.assert_allclose(eq_constraint(y, None), 0.0, atol=1e-5)
         assert state.step_count > 0, "Solver should have taken at least one step"
 
+    @pytest.mark.slow
     def test_small_gradient_on_constraint(self):
         """Pathological case with small objective gradient on constraint surface.
 
@@ -1701,7 +1703,7 @@ class TestStagnationDetection:
             y, state, _ = solver.step(objective, y, args, {}, state, frozenset())
         return y, state, result
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_stagnation_on_infeasible_problem(self):
         """Infeasible constraints should cause merit stagnation.
 
@@ -2052,6 +2054,7 @@ class TestStateShapeConsistency:
         _, step_state, _ = solver.step(objective, x0, None, {}, init_state, frozenset())
         self._check_shapes_match(init_state, step_state, label="eq")
 
+    @pytest.mark.slow
     def test_box_bounded(self):
         """Repro for the original (1,)-leak: bounds + LPEC-A active set."""
 
