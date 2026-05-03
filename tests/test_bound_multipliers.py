@@ -104,6 +104,7 @@ class TestPartialLagrangianGradient:
 class TestNLPBoundMultiplierRecovery:
     """End-to-end checks of the post-line-search bound-multiplier splice."""
 
+    @pytest.mark.slow
     def test_diagonal_qp_lower_bound_multipliers_match_analytic(self):
         """Closed-form ``min ½ x^T diag(d) x − c^T x  s.t.  x ≥ 0``.
 
@@ -201,6 +202,7 @@ class TestNLPBoundMultiplierRecovery:
         np.testing.assert_allclose(bound_mult_upper, mu_star_upper, atol=1e-7)
         assert jnp.all(bound_mult_upper >= -1e-12)
 
+    @pytest.mark.slow
     def test_bound_mult_with_equality_constraint(self):
         """Mix bound + equality so the recovery exercises the partial gradient.
 
@@ -254,6 +256,7 @@ class TestNLPBoundMultiplierRecovery:
         # ∇L ≈ 0 from the QP.
         assert jnp.linalg.norm(state.grad_lagrangian) < 1e-6
 
+    @pytest.mark.slow
     def test_bound_mult_only_active_bounds_get_nonzero(self):
         """Only variables actually at a bound at ``x_{k+1}`` get a non-zero μ.
 
@@ -420,6 +423,7 @@ class TestNLPBoundMultiplierStagnationRegression:
             f"||∇L||/|L| = {float(rel_stationarity):.3e} exceeds {rtol_target:.0e}"
         )
 
+    @pytest.mark.slow
     def test_portfolio_small_minres_qlp_iterate_is_stationary(self):
         """``Portfolio(n=100) + MinresQLPSolver``: iterate satisfies KKT.
 
@@ -460,7 +464,7 @@ class TestNLPBoundMultiplierStagnationRegression:
             rtol_target=1e-3,
         )
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_portfolio_n500_minres_qlp_iterate_is_stationary(self):
         """``Portfolio(n=500) + MinresQLPSolver``: iterate satisfies KKT.
 
@@ -561,3 +565,109 @@ class TestNLPBoundMultiplierStagnationRegression:
         # regresses.
         diag = get_diagnostics(sol.state)
         assert jnp.isfinite(diag.max_proj_residual), f"diagnostics: {diag}"
+
+
+class TestCoveragePaths:
+    """Small targeted tests that exercise otherwise-uncovered code paths.
+
+    These hit defensive guards and rarely-used user toggles that the
+    end-to-end SLSQP tests do not naturally reach.  Each test is
+    intentionally small so it stays in the fast suite.
+    """
+
+    def test_recover_bound_multipliers_returns_empty_when_no_bounds(self):
+        """Direct call exercises the ``bounds is None`` early-return guard.
+
+        ``_recover_bound_multipliers`` is gated by ``m_bounds_static > 0``
+        in ``step()``, so the early-return inside the helper is dead
+        code at runtime.  Calling it directly with ``bounds=None``
+        keeps the safety guard test-covered.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        solver = SLSQP(atol=1e-6, max_steps=5, bounds=None)
+        x0 = jnp.array([1.0, 2.0])
+        n = x0.shape[0]
+        grad_new = 2 * x0
+        eq_jac_new = jnp.zeros((0, n))
+        ineq_jac_new = jnp.zeros((0, n))
+
+        mu_lower, mu_upper = solver._recover_bound_multipliers(
+            y_new=x0,
+            grad_new=grad_new,
+            eq_jac_new=eq_jac_new,
+            ineq_jac_new=ineq_jac_new,
+            mult_eq=jnp.zeros((0,)),
+            mult_ineq_general=jnp.zeros((0,)),
+        )
+        assert mu_lower.shape == (0,)
+        assert mu_upper.shape == (0,)
+        assert mu_lower.dtype == x0.dtype
+        assert mu_upper.dtype == x0.dtype
+
+    def test_use_preconditioner_false(self):
+        """``use_preconditioner=False`` covers the early-return path
+        in ``_build_preconditioner``.
+
+        Default is ``True``; turning it off forces the inner CG to run
+        unpreconditioned and is the only way to hit the ``return None``
+        branch.  The problem is intentionally trivial so the test stays
+        in the fast suite.
+        """
+
+        def objective(x, args):
+            return (x[0] - 1.0) ** 2 + (x[1] - 2.0) ** 2, None
+
+        def eq_constraint(x, args):
+            return jnp.array([x[0] + x[1] - 3.0])
+
+        solver = SLSQP(
+            atol=1e-8,
+            max_steps=30,
+            eq_constraint_fn=eq_constraint,
+            n_eq_constraints=1,
+            use_preconditioner=False,
+        )
+        x0 = jnp.array([0.0, 0.0])
+        y, _ = _run_solver(solver, objective, x0)
+        # Equality-projected optimum: x = y = 1.5 by symmetry of the
+        # objective around the constraint plane.  Wait — actually
+        # ``min (x-1)^2 + (y-2)^2`` projected on ``x+y=3`` gives the
+        # closest point: solve d/dx[(x-1)^2 + (3-x-2)^2] = 0
+        # ⇒ 2(x-1) - 2(1-x) = 0 ⇒ x = 1, y = 2.
+        np.testing.assert_allclose(y, [1.0, 2.0], atol=1e-5)
+
+    def test_ineq_hvp_via_jvp_path(self):
+        """Cover the ``ineq_hvp_contrib`` AD path in ``__check_init__``.
+
+        Triggered when ``ineq_constraint_fn`` is provided without an
+        explicit ``ineq_hvp_fn`` and an exact Lagrangian HVP is
+        actually evaluated (here via ``use_exact_hvp_in_qp=True``).
+        Without this exercise, the closure body
+        ``def weighted(x): return jnp.dot(multipliers, ineq_con_fn(x, args))``
+        and the ``jax.jvp(jax.grad(weighted), ...)`` call inside it
+        are defined but never executed.
+        """
+
+        def objective(x, args):
+            return jnp.sum(x**2), None
+
+        def ineq_constraint(x, args):
+            # Nonlinear so the HVP is non-trivial.
+            return jnp.array([1.0 - jnp.sum(x**2)])
+
+        solver = SLSQP(
+            atol=1e-6,
+            max_steps=30,
+            ineq_constraint_fn=ineq_constraint,
+            n_ineq_constraints=1,
+            use_exact_hvp_in_qp=True,
+        )
+        x0 = jnp.array([0.5, 0.5])
+        y, _ = _run_solver(solver, objective, x0)
+        # The unconstrained minimum is at the origin, which satisfies
+        # ``1 - ||x||^2 >= 0``, so the constraint is inactive at the
+        # optimum and the solver should return ``y ≈ 0``.
+        np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)

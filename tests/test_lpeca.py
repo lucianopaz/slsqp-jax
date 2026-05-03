@@ -183,6 +183,33 @@ class TestIdentifyActiveSet:
         assert result_low.predicted.shape == (1,)
         assert result_high.predicted.shape == (1,)
 
+    def test_empty_inequality_set_short_circuits(self):
+        """When ``m_ineq == 0`` the function takes the early-return path.
+
+        The rank-aware size cap below the early return divides by
+        ``m_ineq`` (via ``argsort``), so the function must short-circuit
+        with an empty prediction *before* the cap is computed.  Covers
+        the early-return branch in ``identify_active_set_lpeca``.
+        """
+        c_ineq = jnp.zeros(0)
+        c_eq = jnp.array([0.5])
+        grad = jnp.array([1.0, -2.0])
+        A_ineq = jnp.zeros((0, 2))
+        A_eq = jnp.array([[1.0, 1.0]])
+        lambda_ineq = jnp.zeros(0)
+        mu_eq = jnp.array([0.25])
+
+        result = identify_active_set_lpeca(
+            c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq
+        )
+
+        assert result.predicted.shape == (0,)
+        assert not bool(result.capped)
+        # ``valid`` reflects the trust-gate decision; either truth value
+        # is fine for an empty problem, we only care that the call did
+        # not crash on the size-cap path.
+        assert result.predicted.dtype == bool
+
 
 class TestSolveLpecaLp:
     """Tests for the LPEC-A LP solve via mpax.r2HPDHG."""
@@ -1073,6 +1100,7 @@ class TestLpecaBoundPrediction:
         expected = jnp.clip(target, 0.0, 1.0)
         return objective, bounds, x0, expected
 
+    @pytest.mark.slow
     def test_bound_extension_matches_expand(self):
         """Solution is unchanged regardless of the bound-extension flag."""
         objective, bounds, x0, expected = self._box_problem()
@@ -1100,6 +1128,7 @@ class TestLpecaBoundPrediction:
         np.testing.assert_allclose(y_off, expected, atol=1e-5)
         np.testing.assert_allclose(y_on, expected, atol=1e-5)
 
+    @pytest.mark.slow
     def test_bound_prefix_counter_accumulates(self):
         """When the prediction is trusted and non-empty, the counter is > 0."""
         objective, bounds, x0, _ = self._box_problem()
@@ -1123,6 +1152,7 @@ class TestLpecaBoundPrediction:
             f"got n_lpeca_bounds_prefixed={int(state.diagnostics.n_lpeca_bounds_prefixed)}"
         )
 
+    @pytest.mark.slow
     def test_bound_prefix_zero_when_flag_off(self):
         """With ``lpeca_predict_bounds=False`` no bounds are pre-fixed."""
         objective, bounds, x0, _ = self._box_problem()
@@ -1142,6 +1172,7 @@ class TestLpecaBoundPrediction:
             "Bound pre-fix counter must stay at 0 when the flag is off"
         )
 
+    @pytest.mark.slow
     def test_bound_prefix_zero_when_trust_gate_vetoes(self):
         """With a very tight trust threshold, no prefix is ever applied."""
         objective, bounds, x0, _ = self._box_problem()
@@ -1165,6 +1196,7 @@ class TestLpecaBoundPrediction:
             "Trust gate must have fired on at least one step"
         )
 
+    @pytest.mark.slow
     def test_bound_prefix_skipped_during_warmup(self):
         """During the LPEC-A warm-up window, no bound prefix is applied."""
         objective, bounds, x0, _ = self._box_problem()
@@ -1185,6 +1217,7 @@ class TestLpecaBoundPrediction:
             "Warm-up must suppress LPEC-A bound pre-fix"
         )
 
+    @pytest.mark.slow
     def test_expand_method_has_zero_bound_prefix(self):
         """When ``active_set_method='expand'`` the counter stays at 0."""
         objective, bounds, x0, _ = self._box_problem()
@@ -1199,6 +1232,7 @@ class TestLpecaBoundPrediction:
 
         assert int(state.diagnostics.n_lpeca_bounds_prefixed) == 0
 
+    @pytest.mark.slow
     def test_bound_prefix_handles_mixed_general_and_bounds(self):
         """Predicted bound active set is consistent with optimum when
         the problem mixes a general inequality and box bounds.

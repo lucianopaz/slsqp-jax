@@ -109,7 +109,7 @@ class TestIllConditionedHessian:
         # (variables with smaller weights should be larger to satisfy constraint)
         assert y[0] > y[-1], "Lower-weighted variable should be larger"
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_extreme_scaling_disparity(self):
         """Problem with different variable scales.
 
@@ -257,7 +257,6 @@ class TestNearInfeasibleConstraints:
 class TestComparisonWithSciPy:
     """Compare slsqp-jax and SciPy on ill-conditioned problems."""
 
-    @pytest.mark.slow
     def test_ill_conditioned_vs_scipy(self):
         """Compare both solvers on ill-conditioned quadratic.
 
@@ -409,7 +408,7 @@ class TestProcessOptimizationBenchmarks:
         assert jnp.all(y >= 50 - 1), "Temperatures should be >= 50"
         assert jnp.all(y <= 200 + 1), "Temperatures should be <= 200"
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_heat_exchanger_network(self):
         """Simplified heat exchanger network optimization.
 
@@ -465,6 +464,7 @@ class TestProcessOptimizationBenchmarks:
             f"Constraint violation too large: {constraint_violation}"
         )
 
+    @pytest.mark.slow
     def test_distillation_column_simplified(self):
         """Simplified distillation column optimization.
 
@@ -579,6 +579,7 @@ class TestNumericalStability:
         # Should still converge to origin
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-2)
 
+    @pytest.mark.slow
     def test_mixed_large_small_values(self):
         """Problem with variables of different magnitudes.
 
@@ -649,7 +650,7 @@ class TestIllConditionedBenchmark:
             "H_np": H_np,
         }
 
-    @pytest.mark.slow
+    @pytest.mark.very_slow
     def test_ill_conditioned_100_lbfgs_improves(self):
         """L-BFGS mode should significantly reduce the objective.
 
