@@ -78,12 +78,44 @@ print(sol.result)  # RESULTS.successful
 The returned `optimistix.Solution` object contains:
 
 - `sol.value` — the optimal point.
-- `sol.result` — a status code (`RESULTS.successful` or an error).
+- `sol.result` — the coarse `optimistix.RESULTS` status code (`successful`, `nonlinear_max_steps_reached`, `nonlinear_divergence`, `nonfinite`).
+- `sol.stats["slsqp_result"]` — the **granular** `slsqp_jax.RESULTS` classification (see [Termination Codes](#termination-codes)).
 - `sol.aux` — any auxiliary data returned by the objective.
-- `sol.stats` — solver statistics (e.g. number of steps taken).
+- `sol.stats` — solver statistics (number of steps, line-search/QP failure counters, the granular result code, etc.).
 - `sol.state` — the final internal solver state.
 
 Since `SLSQP` is a standard Optimistix minimiser, it composes with all Optimistix features: `throw=False` for non-raising error handling, custom `adjoint` methods for differentiating through the solve, and so on. See the [Optimistix documentation](https://docs.kidger.site/optimistix/) for details.
+
+### Termination Codes
+
+`slsqp_jax.RESULTS` is a subclass of `optimistix.RESULTS` that adds finer-grained failure classifications. The granular code is exposed via `Solution.stats["slsqp_result"]`; `Solution.result` itself carries only the coarse code accepted by optimistix's iterative driver.
+
+| `slsqp_jax.RESULTS` member | Meaning | Recommended remediation |
+|---|---|---|
+| `successful` | Either classical `stationarity & primal_feasibility` or the guarded QP-KKT disjunct fired. | None — converged. |
+| `nonlinear_max_steps_reached` | Iteration budget exhausted at a primally feasible iterate. | Increase `max_steps`, or loosen `rtol`. |
+| `merit_stagnation` | The L1 merit did not improve over `max_steps // 10` consecutive steps. The iterate is feasible but stationarity could not be driven below `rtol`. | Loosen `rtol`, switch to `use_exact_hvp_in_qp=True`, or check constraint LICQ. |
+| `line_search_failure` | `2 * ls_failure_patience` consecutive line searches failed to produce a descent direction even after escalating L-BFGS resets. | Try `MinresQLPSolver`, exact HVPs, or a larger initial penalty parameter. |
+| `iterate_blowup` | The L1 merit grew by more than `divergence_factor * max(|best_merit|, 1)` (or returned NaN/Inf) for `divergence_patience` steps. The returned iterate is the best-merit iterate; the solver's later iterates were diverging. | Check problem scaling; consider supplying exact HVPs. |
+| `qp_subproblem_failure` | `2 * qp_failure_patience` consecutive QP subproblem failures. The inner QP solver could not produce a usable descent direction even after L-BFGS escalations. | Check the equality Jacobian for rank deficiency; try a different `inner_solver`. |
+| `infeasible` | Override applied on top of any algorithmic failure when the final iterate violates `atol` feasibility. The constraints are likely infeasible or the active-set machinery could not satisfy them. | Inspect `c_eq` / `c_ineq` at `sol.value`; consider a feasible warm-start. |
+| `nonfinite` | NaN/Inf in the iterate or its objective value. | Check the objective for numerical breakdown near `sol.value`; clip / regularise as needed. |
+
+```python
+from slsqp_jax import RESULTS, is_successful
+
+sol = optx.minimise(objective, solver, x0, has_aux=True, throw=False)
+
+# Check broad success regardless of which enum the result came from:
+if is_successful(sol.result):
+    ...
+elif sol.stats["slsqp_result"] == RESULTS.merit_stagnation:
+    # L-BFGS multiplier noise blocks the strict rtol; loosen rtol
+    # or supply exact HVPs.
+    ...
+```
+
+> **Migration note.** Equality between `optimistix.RESULTS` and `slsqp_jax.RESULTS` members raises `ValueError` (each item carries an `_enumeration` reference and equinox enforces strict same-class equality). If you previously wrote `sol.result == optx.RESULTS.successful`, switch to `slsqp_jax.is_successful(sol.result)` or compare via `slsqp_jax.RESULTS.promote(sol.result)`.
 
 ### Supplying gradients and Jacobians
 
@@ -588,13 +620,21 @@ Combined with the L-BFGS soft reset (above), these mechanisms allow the solver t
 
 When the QP converges but the resulting direction is not a descent direction for the L1 merit function, the backtracking line search exhausts its iteration budget and returns a tiny step size ($\alpha \approx 0.5^{20}$). The solver tracks consecutive line search failures and applies the same escalating L-BFGS reset strategy as for QP failures: soft reset on each failure, escalating to identity reset after `ls_failure_patience` (default 3) consecutive failures. The counter resets to zero on any successful line search.
 
-If `consecutive_ls_failures` reaches `2 * ls_failure_patience`, the solver flags the run as fatally stagnant (`state.ls_fatal = True`) and `terminate()` returns `RESULTS.nonlinear_divergence`. Previously, `terminate()` declared **success** as soon as the QP reported optimality *and* the current iterate was primally feasible, regardless of stationarity. That path masked chronic line-search failure because `qp_optimal` latches after `zero_step_patience` consecutive zero-norm steps, which is exactly what a collapsed line search produces. The `qp_optimal & primal_feasible` disjunct has been removed; convergence now strictly requires both the relative-stationarity condition $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(\lvert L \rvert, 1)$ *and* primal feasibility $\max \lvert c_{\text{eq}} \rvert \leq \texttt{atol}$ and $\max(0, -c_{\text{ineq}}) \leq \texttt{atol}$.
+If `consecutive_ls_failures` reaches `2 * ls_failure_patience`, the solver flags the run as fatally stagnant (`state.ls_fatal = True`) and `terminate()` returns `optx.RESULTS.nonlinear_divergence` (with the granular code `slsqp_jax.RESULTS.line_search_failure` exposed via `Solution.stats["slsqp_result"]`; see [Termination Codes](#termination-codes)).
 
-### Zero-step convergence detection
+Convergence requires either (a) the strict pair `stationarity & primal_feasibility`, or (b) the **guarded QP-KKT disjunct** described below.
 
-When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations, the solver declares **successful** convergence rather than waiting for the merit-based stagnation counter (which would report `nonlinear_divergence`).
+### Zero-step convergence detection (guarded QP-KKT success)
 
-The zero-step check has two stages: a **pre-line-search** check ($\lVert d \rVert < \texttt{atol}$) that catches null-space CG solvers returning $d = 0$ exactly, and a **post-line-search** check ($\alpha \lVert d \rVert < \texttt{atol}$) that catches full-KKT solvers like `MinresQLPSolver`. MINRES-QLP always returns $\lVert d \rVert > 0$ even when the projected gradient is negligible, because the coupled $(d, \lambda)$ KKT system always has a non-trivial solution. The line search then accepts only a tiny $\alpha$, making the effective step negligible. The post-line-search check detects this and correctly triggers zero-step convergence.
+When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations the `state.qp_optimal` flag latches, and the convergence test is augmented with the disjunct
+
+$$
+\text{qp\_kkt\_success} = \text{qp\_optimal} \land \text{primal\_feasible} \land \text{ls\_success} \land \bigl( \alpha \geq 1 - 10^{-6} \bigr) \land \text{has\_min\_steps}.
+$$
+
+The `ls_success` and `last_alpha == 1` guards are critical: without them, a line search that exhausts its budget without satisfying the Armijo / merit-descent condition (chronic line-search collapse) also produces consecutive zero-norm steps, which an unguarded `qp_optimal & primal_feasible` disjunct would silently classify as success. Requiring a *full* step rules that out: when $d \approx 0$ and the iterate is feasible, $x + 1.0 \cdot 0 = x$ is trivially accepted by the line search at $\alpha = 1$, so any $\alpha < 1$ signals that $d \neq 0$ and the LS had to backtrack — exactly the chronic-collapse symptom we want to keep classified as a failure.
+
+The zero-step check has two stages: a **pre-line-search** check ($\lVert d \rVert < \texttt{atol}$) that catches null-space CG solvers returning $d = 0$ exactly, and a **post-line-search** check ($\alpha \lVert d \rVert < \texttt{atol}$, gated on `ls_success`) that catches full-KKT solvers like `MinresQLPSolver`. MINRES-QLP always returns $\lVert d \rVert > 0$ even when the projected gradient is negligible, because the coupled $(d, \lambda)$ KKT system always has a non-trivial solution. The line search then accepts only a tiny $\alpha$, making the effective step negligible. The post-line-search check detects this and correctly triggers zero-step convergence.
 
 ```python
 solver = SLSQP(

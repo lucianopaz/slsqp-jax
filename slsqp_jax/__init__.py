@@ -47,6 +47,7 @@ from slsqp_jax.merit import (
     update_penalty_parameter,
 )
 from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.results import RESULTS, is_successful
 from slsqp_jax.solver import (
     SLSQP,
     STAGNATION_MESSAGE,
@@ -71,6 +72,9 @@ __all__ = [
     "SLSQPDiagnostics",
     "get_diagnostics",
     "QPResult",
+    # Termination codes
+    "RESULTS",
+    "is_successful",
     # Types
     "ConstraintFn",
     "GradFn",
