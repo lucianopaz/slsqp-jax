@@ -51,6 +51,7 @@ from slsqp_jax.merit import (
     update_penalty_parameter,
 )
 from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.results import RESULTS
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -189,7 +190,7 @@ class SLSQPDiagnostics(eqx.Module):
             or returned NaN/Inf), not just the trigger events.
         divergence_triggered: True when the best-iterate divergence
             rollback fired at least once during the run.  When the
-            optimistix result code is ``RESULTS.nonlinear_divergence``
+            ``slsqp_jax.RESULTS`` result code is ``iterate_blowup``
             and this flag is set, the returned iterate is the
             best-merit iterate seen so far rather than the most
             recent (divergent) one.
@@ -293,6 +294,13 @@ class SLSQPState(eqx.Module):
         qp_converged: Whether the most recent QP solve converged.
         prev_active_set: Active inequality constraint set from the previous QP solve,
             used for warm-starting the next QP subproblem.
+        termination_code: Granular ``slsqp_jax.RESULTS`` classification
+            (``successful`` / ``merit_stagnation`` / ``line_search_failure``
+            / ``iterate_blowup`` / ``infeasible`` / ``qp_subproblem_failure``
+            / ``nonlinear_max_steps_reached`` / ``nonfinite``). Surfaced
+            via ``Solution.stats["slsqp_result"]``; ``Solution.result``
+            itself remains the coarse ``optx.RESULTS`` code accepted by
+            optimistix's driver.
     """
 
     # Iteration tracking
@@ -364,18 +372,37 @@ class SLSQPState(eqx.Module):
     # Whether the most recent line search failed AND the escalated
     # identity reset also failed (``consecutive_ls_failures`` exceeded
     # ``2 * ls_failure_patience``).  Triggers early termination with
-    # ``RESULTS.nonlinear_divergence`` to surface chronic LS failure.
+    # ``RESULTS.line_search_failure`` to surface chronic LS failure.
     ls_fatal: Bool[Array, ""]
+
+    # Whether the QP subproblem has failed for ``2 * qp_failure_patience``
+    # consecutive iterations.  Mirrors ``ls_fatal``: the L-BFGS soft- /
+    # identity-reset escalation could not produce a usable QP direction,
+    # and we should terminate with ``RESULTS.qp_subproblem_failure``.
+    qp_fatal: Bool[Array, ""]
 
     # Best-iterate divergence rollback (see :attr:`SLSQP.divergence_factor`).
     # ``best_x`` is the iterate that achieved ``best_merit``.  When the
     # merit blows up by ``divergence_factor`` or returns NaN/Inf for
     # ``divergence_patience`` consecutive steps, ``step()`` overwrites
     # the returned iterate with ``best_x`` and sets ``diverging=True``,
-    # which routes ``terminate()`` to ``RESULTS.nonlinear_divergence``.
+    # which routes ``terminate()`` to ``RESULTS.iterate_blowup``.
     best_x: Vector
     blowup_count: Int[Array, ""]
     diverging: Bool[Array, ""]
+
+    # Granular termination classification using ``slsqp_jax.RESULTS``
+    # (see :mod:`slsqp_jax.results`).  Optimistix's ``iterative_solve``
+    # driver only accepts members of ``optx.RESULTS`` from
+    # ``terminate()``, so the public ``Solution.result`` is the coarse
+    # base-class code.  This field carries the finer
+    # ``slsqp_jax.RESULTS`` classification (e.g. ``merit_stagnation``,
+    # ``line_search_failure``, ``iterate_blowup``,
+    # ``qp_subproblem_failure``, ``infeasible``) and is surfaced via
+    # ``Solution.stats["slsqp_result"]`` in :meth:`SLSQP.postprocess`.
+    # Pre-termination its value is ``RESULTS.successful`` (i.e. the
+    # loop is still running, no failure latched).
+    termination_code: Any
 
     # Diagnostic accumulators (see :class:`SLSQPDiagnostics`).
     diagnostics: SLSQPDiagnostics
@@ -815,7 +842,7 @@ class SLSQP(optx.AbstractMinimiser):
     # consecutive steps where the L1 merit exceeds the best-seen merit
     # by more than ``divergence_factor * max(|best_merit|, 1)`` (or any
     # NaN/Inf merit at all), the solver rolls back to ``best_x`` and
-    # terminates with ``RESULTS.nonlinear_divergence``.  This is a
+    # terminates with ``RESULTS.iterate_blowup``.  This is a
     # belt-and-braces guardrail for cases where the inner self-correction
     # in ``MinresQLPSolver`` is not enough — typically badly
     # ill-conditioned QPs that occasionally let the SQP iterate drift
@@ -1642,6 +1669,8 @@ class SLSQP(optx.AbstractMinimiser):
             last_alpha=jnp.array(1.0),
             ls_success=jnp.array(True),
             ls_fatal=jnp.array(False),
+            qp_fatal=jnp.array(False),
+            termination_code=RESULTS.successful,
             best_x=y,
             blowup_count=jnp.array(0),
             diverging=jnp.array(False),
@@ -1994,8 +2023,16 @@ class SLSQP(optx.AbstractMinimiser):
         # direction.  After 2 * ls_failure_patience consecutive LS
         # failures we conclude that the problem is either infeasible or
         # catastrophically ill-conditioned and terminate with
-        # ``nonlinear_divergence`` rather than silently converging.
+        # ``RESULTS.line_search_failure`` rather than silently converging.
         ls_fatal = new_consecutive_ls_failures >= 2 * self.ls_failure_patience
+
+        # Fatal QP-subproblem failure: mirror of ``ls_fatal`` for the
+        # QP solver.  The first ``qp_failure_patience`` failures soft-
+        # then-identity-reset the L-BFGS history; if the QP still
+        # cannot produce a usable direction after a further
+        # ``qp_failure_patience`` failures, terminate with
+        # ``RESULTS.qp_subproblem_failure``.
+        qp_fatal = new_consecutive_qp_failures >= 2 * self.qp_failure_patience
 
         # Merit-based stagnation detection: track consecutive steps
         # without sufficient improvement in the L1 merit function.
@@ -2156,6 +2193,127 @@ class SLSQP(optx.AbstractMinimiser):
         else:
             multipliers_ineq_for_state = qp_result.multipliers_ineq
 
+        # ------------------------------------------------------------------
+        # Granular termination-code classification.
+        #
+        # ``terminate()`` only returns coarse ``optx.RESULTS`` codes
+        # because optimistix's ``iterative_solve`` driver post-processes
+        # our return value with ``optx.RESULTS.where(...)``, which
+        # rejects subclass instances.  We therefore mirror the same
+        # classification logic here using the ``slsqp_jax.RESULTS``
+        # subclass and stash it on the state so ``postprocess()`` can
+        # surface it via ``Solution.stats["slsqp_result"]``.
+        #
+        # The flags below match those checked in ``terminate()``: they
+        # share the same semantics but are computed at the *new* iterate
+        # (after the line search and bound-multiplier recovery), so the
+        # resulting code is consistent with the value optimistix
+        # eventually settles on.
+        # ------------------------------------------------------------------
+        m_eq_static = self.n_eq_constraints
+        m_ineq_total_static = (
+            self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
+        )
+        eq_feasible_new = (
+            jnp.max(jnp.abs(eq_val_new)) <= self.atol
+            if m_eq_static > 0
+            else jnp.array(True)
+        )
+        ineq_feasible_new = (
+            jnp.max(jnp.maximum(0.0, -ineq_val_new)) <= self.atol
+            if m_ineq_total_static > 0
+            else jnp.array(True)
+        )
+        primal_feasible_new = jnp.reshape(eq_feasible_new & ineq_feasible_new, ())
+        lagrangian_val_new = f_val_new
+        if m_eq_static > 0:
+            lagrangian_val_new = lagrangian_val_new - jnp.dot(
+                qp_result.multipliers_eq, eq_val_new
+            )
+        if m_ineq_total_static > 0:
+            lagrangian_val_new = lagrangian_val_new - jnp.dot(
+                multipliers_ineq_for_state, ineq_val_new
+            )
+        grad_norm_new = jnp.linalg.norm(grad_lagrangian_new)
+        stationarity_new = grad_norm_new <= self.rtol * jnp.maximum(
+            jnp.abs(lagrangian_val_new), 1.0
+        )
+        new_step_count = state.step_count + 1
+        has_min_steps_new = new_step_count >= self.min_steps
+        max_iters_reached_new = new_step_count >= self.max_steps
+        classical_converged_new = (
+            stationarity_new & primal_feasible_new & has_min_steps_new
+        )
+        qp_kkt_success_new = (
+            new_qp_optimal
+            & primal_feasible_new
+            & ls_result.success
+            & (alpha >= 1.0 - 1e-6)
+            & has_min_steps_new
+        )
+        converged_new = jnp.reshape(classical_converged_new | qp_kkt_success_new, ())
+        # See the matching comment in ``terminate()``: the best-iterate
+        # rollback intentionally leaves ``f_val_new`` non-finite while
+        # restoring ``y_returned`` to ``best_x``.  Checking the
+        # objective here would re-route legitimate ``iterate_blowup``
+        # cases to ``nonfinite``.
+        nonfinite_new = ~jnp.all(jnp.isfinite(y_returned))
+        non_success_done_new = (
+            max_iters_reached_new
+            | merit_stagnation
+            | qp_fatal
+            | ls_fatal
+            | diverging_now
+        )
+        # Layered classification using ``slsqp_jax.RESULTS.where``.
+        # Mirrors the priority order documented in ``terminate()``.
+        termination_code = RESULTS.successful
+        termination_code = RESULTS.where(
+            jnp.reshape(max_iters_reached_new, ()),
+            RESULTS.nonlinear_max_steps_reached,
+            termination_code,
+        )
+        termination_code = RESULTS.where(
+            jnp.reshape(merit_stagnation, ()),
+            RESULTS.merit_stagnation,
+            termination_code,
+        )
+        termination_code = RESULTS.where(
+            jnp.reshape(qp_fatal, ()),
+            RESULTS.qp_subproblem_failure,
+            termination_code,
+        )
+        termination_code = RESULTS.where(
+            jnp.reshape(ls_fatal, ()),
+            RESULTS.line_search_failure,
+            termination_code,
+        )
+        termination_code = RESULTS.where(
+            jnp.reshape(diverging_now, ()),
+            RESULTS.iterate_blowup,
+            termination_code,
+        )
+        # Infeasibility override: any non-success termination at an
+        # infeasible iterate is reclassified as ``infeasible`` so the
+        # user immediately knows to inspect the constraints rather
+        # than tune ``max_steps`` / ``rtol``.
+        termination_code = RESULTS.where(
+            jnp.reshape(non_success_done_new & ~primal_feasible_new, ()),
+            RESULTS.infeasible,
+            termination_code,
+        )
+        # Nonfinite supersedes algorithmic classifications: a NaN
+        # iterate is the *cause* of every other latched failure flag.
+        termination_code = RESULTS.where(
+            jnp.reshape(nonfinite_new, ()),
+            RESULTS.nonfinite,
+            termination_code,
+        )
+        # Success wins over every failure classification above.
+        termination_code = RESULTS.where(
+            converged_new, RESULTS.successful, termination_code
+        )
+
         new_state = SLSQPState(
             step_count=state.step_count + 1,
             f_val=f_val_new,
@@ -2184,6 +2342,8 @@ class SLSQP(optx.AbstractMinimiser):
             last_alpha=alpha,
             ls_success=ls_result.success,
             ls_fatal=ls_fatal,
+            qp_fatal=qp_fatal,
+            termination_code=termination_code,
             best_x=new_best_x,
             blowup_count=new_blowup_count,
             diverging=diverging_now,
@@ -2332,24 +2492,70 @@ class SLSQP(optx.AbstractMinimiser):
         # Check chronic line-search failure (see step()).
         ls_stagnation = state.ls_fatal
 
+        # Check chronic QP-subproblem failure (see step()).
+        qp_stagnation = state.qp_fatal
+
         # Best-iterate divergence rollback (see step()).  Latches once
         # the merit-blowup patience runs out and the iterate has been
         # rolled back to ``state.best_x``.
         diverging = state.diverging
 
+        # NaN/Inf in the iterate.  Routed to ``RESULTS.nonfinite``.
+        # We deliberately *do not* check ``state.f_val`` here: the
+        # best-iterate divergence rollback (see ``step()``) leaves
+        # ``state.f_val`` reflecting the *attempted* step (which can
+        # legitimately be NaN -- that is what tripped the rollback in
+        # the first place) while ``y`` is restored to ``state.best_x``
+        # which is finite by construction.  Including ``state.f_val``
+        # in the nonfinite check would steal the routing away from
+        # ``iterate_blowup`` for the exact pathology the rollback is
+        # designed to handle.  ``state.grad`` is excluded for the same
+        # reason -- the actual stationarity signal goes through
+        # ``grad_lagrangian`` above.
+        nonfinite_iter = ~jnp.all(jnp.isfinite(y))
+
         # Converged if stationary, feasible, and past minimum iterations.
         # The min_steps guard prevents false convergence when multipliers
         # are zero-initialized and haven't been updated by a QP solve yet.
         #
-        # The old code also declared success via
+        # An older revision declared success via the unguarded form
         #     state.qp_optimal & primal_feasible
-        # without any stationarity check.  That disjunct let repeated
-        # tiny-alpha line searches masquerade as convergence because
-        # ``qp_optimal`` is latched once ``zero_step_patience``
-        # consecutive "zero steps" are seen.  We drop it; ``qp_optimal``
-        # is now a diagnostic flag only.
+        # without any stationarity check.  That let repeated tiny-alpha
+        # line searches masquerade as convergence because ``qp_optimal``
+        # is latched once ``zero_step_patience`` consecutive "zero
+        # steps" (pre- *or* post-line-search) are seen, and a collapsing
+        # line search produces exactly that pattern.
+        #
+        # We re-introduce the disjunct here in a *guarded* form:
+        #
+        #     qp_kkt_success = qp_optimal & primal_feasible
+        #                      & ls_success & (last_alpha >= 1 - eps)
+        #
+        # The ``ls_success`` flag rules out a line search that exhausted
+        # its budget without satisfying the Armijo / merit-descent
+        # condition.  The ``last_alpha >= 1 - eps`` guard rules out the
+        # tiny-alpha collapse that motivated the original removal: when
+        # ``d`` truly vanishes (the QP is at its KKT point and the
+        # current iterate is feasible), the line search trivially
+        # accepts ``alpha = 1`` because ``x + 1.0 * 0 = x``.  Any
+        # ``alpha < 1`` therefore signals that ``d != 0`` and the LS
+        # had to backtrack -- exactly the chronic-collapse symptom we
+        # want to keep classified as a failure.
+        #
+        # This catches the legitimate case where the L-BFGS multiplier-
+        # recovery noise leaves ``||grad L|| / |L|`` just above ``rtol``
+        # but the QP is already at its model-KKT point and no further
+        # progress is mathematically possible.
         has_min_steps = state.step_count >= self.min_steps
-        converged = stationarity & primal_feasible & has_min_steps
+        classical_converged = stationarity & primal_feasible & has_min_steps
+        qp_kkt_success = (
+            state.qp_optimal
+            & primal_feasible
+            & state.ls_success
+            & (state.last_alpha >= 1.0 - 1e-6)
+            & has_min_steps
+        )
+        converged = classical_converged | qp_kkt_success
 
         # Defensive scalarization: ``stationarity`` inherits its shape from
         # ``lagrangian_val`` which in turn inherits from ``state.f_val`` and
@@ -2364,27 +2570,53 @@ class SLSQP(optx.AbstractMinimiser):
         max_iters_reached = jnp.reshape(max_iters_reached, ())
         stagnation_detected = jnp.reshape(stagnation_detected, ())
         ls_stagnation = jnp.reshape(ls_stagnation, ())
+        qp_stagnation = jnp.reshape(qp_stagnation, ())
         diverging = jnp.reshape(diverging, ())
+        nonfinite_iter = jnp.reshape(nonfinite_iter, ())
 
-        # Determine result code
         done = (
             converged
             | max_iters_reached
             | stagnation_detected
             | ls_stagnation
+            | qp_stagnation
             | diverging
+            | nonfinite_iter
         )
 
+        # ``terminate`` must return a member of ``optx.RESULTS``: the
+        # optimistix ``_iterate`` driver post-processes our return
+        # value with ``optx.RESULTS.where(tree_allfinite(_y), ...,
+        # optx.RESULTS.nonfinite)`` and uses ``result == optx.RESULTS.
+        # successful`` as the loop predicate.  Equinox's enumeration
+        # ``where`` requires both branches to share the *exact* same
+        # ``_enumeration`` class, so a subclass instance would crash
+        # the driver.  We therefore use the coarse ``optx.RESULTS``
+        # codes here and surface the granular ``slsqp_jax.RESULTS``
+        # classification through ``state.termination_code`` (set in
+        # ``step()``) and ``Solution.stats["slsqp_result"]`` (set in
+        # ``postprocess()``).
+        non_success_done = (
+            max_iters_reached
+            | stagnation_detected
+            | ls_stagnation
+            | qp_stagnation
+            | diverging
+        )
         result = jax.lax.cond(
             converged,
             lambda: optx.RESULTS.successful,
             lambda: jax.lax.cond(
-                stagnation_detected | ls_stagnation | diverging,
-                lambda: optx.RESULTS.nonlinear_divergence,
+                nonfinite_iter,
+                lambda: optx.RESULTS.nonfinite,
                 lambda: jax.lax.cond(
-                    max_iters_reached,
-                    lambda: optx.RESULTS.max_steps_reached,
-                    lambda: optx.RESULTS.successful,  # Still running
+                    non_success_done,
+                    lambda: optx.RESULTS.nonlinear_divergence,
+                    lambda: jax.lax.cond(
+                        max_iters_reached,
+                        lambda: optx.RESULTS.nonlinear_max_steps_reached,
+                        lambda: optx.RESULTS.successful,  # Still running
+                    ),
                 ),
             ),
         )
@@ -2430,8 +2662,19 @@ class SLSQP(optx.AbstractMinimiser):
             "multipliers_eq": state.multipliers_eq,
             "multipliers_ineq": state.multipliers_ineq,
             "stagnation": state.stagnation,
+            "ls_fatal": state.ls_fatal,
+            "qp_fatal": state.qp_fatal,
+            "diverging": state.diverging,
             "last_step_size": state.last_alpha,
             "consecutive_ls_failures": state.consecutive_ls_failures,
+            "consecutive_qp_failures": state.consecutive_qp_failures,
+            # Granular ``slsqp_jax.RESULTS`` classification of why the
+            # run terminated.  ``Solution.result`` is the coarse
+            # ``optx.RESULTS`` code (forced on us by optimistix's
+            # ``iterative_solve``); this surfaces the finer code so
+            # users can do
+            # ``sol.stats["slsqp_result"] == slsqp_jax.RESULTS.merit_stagnation``.
+            "slsqp_result": state.termination_code,
         }
 
         return y, aux, stats
