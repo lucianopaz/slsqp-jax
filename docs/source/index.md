@@ -246,7 +246,7 @@ Total cost per QP solve: $O(n \cdot k \cdot t)$, where $t$ is the number of CG i
 
 The equality-constrained subproblem solved at each active-set iteration — minimise a quadratic subject to $A d = b$ for the currently active constraints — is delegated to a pluggable **inner solver**. All inner solvers implement the `AbstractInnerSolver` interface (an `equinox.Module`) and return an `InnerSolveResult` containing the search direction $d$, the Lagrange multipliers for the active constraints, and a convergence flag.
 
-Three strategies are provided:
+Four strategies are provided:
 
 **`ProjectedCGCholesky`** (default). Null-space projected CG with Cholesky-based projection — the approach described in the previous section. Computes the Cholesky factorization of the regularised $A A^T + \varepsilon I$ once, then reuses it for all CG iterations and for multiplier recovery via iterative refinement. Cost: $O(m^3)$ factorization amortised over $t$ CG iterations, each costing $O(kn + m^2)$. Best when the number of active constraints $m$ is small relative to $n$.
 
@@ -277,6 +277,15 @@ Cost: $O((n + m) \cdot t_{\text{minres}})$ per solve, where $t_{\text{minres}}$ 
 
 - Reference: Choi, *Iterative Methods for Singular Linear Equations and Least-Squares Problems*, PhD thesis, Stanford University, 2006. Choi, Paige & Saunders, *MINRES-QLP: A Krylov Subspace Method for Indefinite or Singular Symmetric Systems*, SIAM J. Sci. Comput. 33(4), 2011. Orban & Arioli, *Projected Krylov Methods for Saddle-Point Systems*, SIAM J. Matrix Anal. Appl. 36(3), 2014. Heinkenschloss & Ridzal, *A Matrix-Free Trust-Region SQP Method for Equality Constrained Optimization*, SIAM J. Optim. 24(3), 2014, Algorithm 4.18.
 
+**`HRInexactSTCG`** (composite). Heinkenschloss-Ridzal (2014) Algorithm 4.5 — a Steihaug-Toint conjugate gradient iteration designed to be robust to *inexact* null-space projectors. The class is a thin wrapper that **composes** another inner solver to obtain its projector, particular solution, and multiplier-recovery closure (packaged into an internal `ProjectionContext`), so the same Cholesky / CRAIG projection machinery is reused without code duplication. Two technical moves make the iteration noise-tolerant:
+
+1. **Modified residual recurrence** ($r_{i+1} = r_i - \alpha_i H p_i$, *not* re-projected at each step — HR Remark 4.6.i). Re-projecting the residual at every CG iteration would re-inject projector noise on every step; the modified recurrence absorbs the projector exactly once, at initialisation, so under inexact $\widetilde{W}_k$ the iterates are the unique CG sequence for *some* fixed linear operator (HR Lemma 4.10).
+2. **Full H-conjugacy reorthogonalisation** of every search direction $p_i$ against all stored $p_j$. The static-shape buffers are $(\texttt{max\_cg\_iter}, n)$; reorthogonalisation cost is $O(\texttt{max\_cg\_iter}^2 \cdot n)$ across the whole inner solve. This rebuilds the H-conjugacy that floating-point arithmetic erodes when the projector is not exact.
+
+The convergence test uses the *projected* residual, $\lVert \widetilde{W}_k r_i \rVert \le \texttt{cg\_tol} \cdot \lVert \widetilde{W}_k r_0 \rVert$, with both numerator and denominator carrying the same projector noise; the ratio reaches the inner solver's precision floor cleanly instead of grinding against it. The initial value $\lVert \widetilde{W}_k r_0 \rVert$ is the *projected gradient norm* and is surfaced as `InnerSolveResult.projected_grad_norm`. This is the noise-aware stationarity proxy: $\widetilde{W}_k(g_k + B d_p)$ is independent of multiplier-recovery accuracy (the projector annihilates the multiplier-direction component of the gradient by construction), so it stays clean even when classical $\lVert \nabla_x L \rVert$ stagnates at the multiplier-recovery floor. The QP layer threads `projected_grad_norm` through `QPResult` and `_solve_qp_subproblem`'s bound-fixing loop with **latest-not-accumulated** semantics — only the most recent inner solve's value is forwarded — so the outer loop sees the projected gradient at the actually-used active set. The curvature guard `pHp ≤ max(cg_regularization·||p||², cg_regularization·||r₀||²)` combines a relative threshold (SNOPT-style scale-invariance) with an absolute floor anchored to the initial projected gradient: without the absolute floor, when both `||p||` and `pHp` decay together near convergence the relative test never fires, and a numerically-noise-dominated `pHp` in the denominator produces an `O(1/eps²)` step that contaminates the iterate. The composed inner solver must implement `build_projection_context` — `ProjectedCGCholesky` and `ProjectedCGCraig` do; `MinresQLPSolver` does not (the saddle-point KKT system has no separate null-space projector to reuse), and composing it raises `NotImplementedError`. The `precond_fn` argument is accepted for interface compatibility but silently ignored: HR Algorithm 4.5 has no inner preconditioner. Cost per solve: identical to the composed projector's per-iteration cost plus an additive $O(\texttt{max\_cg\_iter}^2 \cdot n)$ from full reorthogonalisation.
+
+- Reference: Heinkenschloss & Ridzal, *A Matrix-Free Trust-Region SQP Method for Equality Constrained Optimization*, SIAM J. Optim. 24(3), 2014, Algorithm 4.5 and Lemma 4.10.
+
 To use an alternative inner solver, construct the desired strategy and pass it to `SLSQP` (which forwards it to `solve_qp`):
 
 ```python
@@ -299,6 +308,26 @@ solver = SLSQP(
     eq_constraint_fn=eq_constraint,
     n_eq_constraints=1,
     inner_solver=MinresQLPSolver(max_iter=200, tol=1e-10),
+)
+
+# HR-STCG composing a CRAIG projector — noise-aware, matrix-free.
+# Pair with ``use_inexact_stationarity=True`` so the outer loop can
+# terminate on the projected-gradient floor when the classical
+# stationarity test stalls on multiplier-recovery noise.
+from slsqp_jax import HRInexactSTCG
+
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    inner_solver=HRInexactSTCG(
+        inner=ProjectedCGCraig(
+            max_cg_iter=50, cg_tol=1e-8,
+            craig_tol=1e-10, craig_max_iter=200,
+        ),
+        max_cg_iter=80,
+        cg_tol=1e-8,
+    ),
+    use_inexact_stationarity=True,
 )
 ```
 
@@ -648,6 +677,24 @@ The zero-step check has two stages: a **pre-line-search** check ($\lVert d \rVer
 ```python
 solver = SLSQP(
     zero_step_patience=3,   # Default; declare convergence after 3 consecutive d≈0 steps
+)
+```
+
+### Inexact stationarity (HR-STCG outer disjunct)
+
+For runs that use `HRInexactSTCG` as the inner solver, the classical Lagrangian-gradient stationarity test $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ can stagnate at a multiplier-recovery noise floor — the iterate is genuinely at a KKT point but $\lVert \nabla_x L \rVert$ never drops below the floor because the recovered $\lambda$ carries $O(\varepsilon \cdot \kappa(A A^T))$ noise that contaminates $\nabla_x L = \nabla f - A^T \lambda$. The Heinkenschloss-Ridzal *projected* gradient $\lVert \widetilde{W}_k (g + B d_p) \rVert$ does **not** suffer this floor: the null-space projector annihilates the multiplier-direction component of the gradient by construction, so it stays clean even when $\lambda$ does not. The latest projected gradient norm from each QP solve is forwarded into the outer state as `state.last_projected_grad_norm`, and the diagnostics block accumulates a low-water mark `min_projected_grad_norm`.
+
+The opt-in flag `use_inexact_stationarity` (default `False`) augments the stationarity branch of `terminate()` with a disjunct on `state.last_projected_grad_norm`:
+
+$$\text{stationarity} = \bigl( \lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(|L|, 1) \bigr) \;\lor\; \bigl( \texttt{use\_inexact\_stationarity} \land \lVert \widetilde{W}_k g \rVert \le \texttt{rtol} \cdot \max(|L|, 1) \bigr).$$
+
+The same disjunction is mirrored in `step()`'s convergence latch so both call sites agree. Primal feasibility (`max|c_eq| ≤ atol` and `max(0, -c_ineq) ≤ atol`) is still required regardless of which stationarity branch fires; the disjunct only relaxes the *gradient* test, not the constraint test. The toggle is independent of the inner solver — supplying `HRInexactSTCG` without setting the flag leaves the run on the classical test (the projected-gradient field is populated but ignored), while setting the flag with a non-HR inner solver leaves `last_projected_grad_norm = inf` so the disjunct cannot fire. Use this when a profile run shows `|∇L|/|L|` stalling above `rtol` while feasibility is reached and `min_projected_grad_norm / |L|` (visible in `get_diagnostics(state)`) is well below it; if the projected gradient is also stuck, the iterate is genuinely not stationary and the toggle will not change the outcome.
+
+```python
+solver = SLSQP(
+    inner_solver=HRInexactSTCG(inner=ProjectedCGCraig(...), max_cg_iter=80, cg_tol=1e-8),
+    use_inexact_stationarity=True,  # opt-in
+    rtol=1e-6,
 )
 ```
 

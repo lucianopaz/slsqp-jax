@@ -29,10 +29,12 @@ from slsqp_jax.hessian import (
 )
 from slsqp_jax.inner_solver import (
     AbstractInnerSolver,
+    HRInexactSTCG,
     InnerSolveResult,
     MinresQLPSolver,
     ProjectedCGCholesky,
     ProjectedCGCraig,
+    ProjectionContext,
 )
 from slsqp_jax.lpeca import (
     LPECAResult,
@@ -87,10 +89,12 @@ __all__ = [
     "minimize_like_scipy",
     # Inner solver strategies
     "AbstractInnerSolver",
+    "HRInexactSTCG",
     "InnerSolveResult",
     "MinresQLPSolver",
     "ProjectedCGCholesky",
     "ProjectedCGCraig",
+    "ProjectionContext",
     # QP solver
     "solve_qp",
     # L-BFGS

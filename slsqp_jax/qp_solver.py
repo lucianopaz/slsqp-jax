@@ -89,6 +89,14 @@ class QPState(eqx.Module):
     # Cumulative number of M-metric projection refinement rounds across
     # all inner solves performed inside this active-set loop.
     n_proj_refinements: Int[Array, ""]
+    # Latest projected-gradient norm ``||W̃_k g_k||`` from the inner
+    # solver (``HRInexactSTCG`` only; defaults to ``inf`` for every
+    # other inner solver).  Surfaced through ``QPResult`` for the
+    # opt-in ``use_inexact_stationarity`` outer-loop convergence test
+    # in ``solver.py``.  Stores the *latest* inner-solver value rather
+    # than accumulating; the active-set loop's final inner solve
+    # produces the value that matters.
+    projected_grad_norm: Scalar
 
 
 def _inner_ok(result) -> Bool[Array, ""]:
@@ -135,6 +143,11 @@ class QPResult(NamedTuple):
     # Cumulative number of M-metric projection refinement rounds taken
     # across all inner solves performed inside the active-set loop.
     n_proj_refinements: Int[Array, ""]
+    # Latest projected-gradient norm from the final inner solve (HR
+    # Inexact STCG only; ``inf`` for every other inner solver).
+    # Surfaces the noise-aware stationarity proxy used by the opt-in
+    # ``use_inexact_stationarity`` outer-loop convergence test.
+    projected_grad_norm: Scalar
 
 
 def _solve_qp_proximal(
@@ -216,6 +229,7 @@ def _solve_qp_proximal(
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
             proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
             n_proj_refinements=jnp.asarray(0),
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype=jnp.float64),
         )
 
     # Sub-case: inequalities present — active-set loop on A_ineq only
@@ -261,6 +275,7 @@ def _solve_qp_proximal(
         # first inner_solver.solve.
         proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
         n_proj_refinements=jnp.asarray(0),
+        projected_grad_norm=jnp.asarray(jnp.inf, dtype=jnp.float64),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -308,6 +323,7 @@ def _solve_qp_proximal(
         # and the cumulative refinement count across all inner solves.
         proj_residual_new = result.proj_residual.astype(jnp.float64)
         n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
+        projected_grad_norm_new = result.projected_grad_norm.astype(jnp.float64)
 
         mult_eq_new = _recover_mult_eq(d_new)
 
@@ -363,6 +379,7 @@ def _solve_qp_proximal(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def drop_constraint():
@@ -394,6 +411,7 @@ def _solve_qp_proximal(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def mark_converged():
@@ -411,6 +429,7 @@ def _solve_qp_proximal(
                 ping_ponged=state.ping_ponged,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         return jax.lax.cond(
@@ -446,6 +465,7 @@ def _solve_qp_proximal(
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
         proj_residual=final_state.proj_residual,
         n_proj_refinements=final_state.n_proj_refinements,
+        projected_grad_norm=final_state.projected_grad_norm,
     )
 
 
@@ -517,6 +537,7 @@ def _solve_qp_direct(
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
             proj_residual=result.proj_residual.astype(jnp.float64),
             n_proj_refinements=result.n_proj_refinements,
+            projected_grad_norm=result.projected_grad_norm.astype(jnp.float64),
         )
 
     # Equality + inequality: active-set loop on the inequality portion.
@@ -564,6 +585,7 @@ def _solve_qp_direct(
         # the outer diagnostics.
         proj_residual=init_result.proj_residual.astype(jnp.float64),
         n_proj_refinements=init_result.n_proj_refinements,
+        projected_grad_norm=init_result.projected_grad_norm.astype(jnp.float64),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -595,6 +617,7 @@ def _solve_qp_direct(
         # Track latest projection residual + cumulative refinement count.
         proj_residual_new = result.proj_residual.astype(jnp.float64)
         n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
+        projected_grad_norm_new = result.projected_grad_norm.astype(jnp.float64)
 
         mult_eq_new = mult_all[:m_eq]
         mult_ineq_new = mult_all[m_eq:]
@@ -642,6 +665,7 @@ def _solve_qp_direct(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def drop_constraint():
@@ -673,6 +697,7 @@ def _solve_qp_direct(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def mark_converged():
@@ -690,6 +715,7 @@ def _solve_qp_direct(
                 ping_ponged=state.ping_ponged,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         return jax.lax.cond(
@@ -716,6 +742,7 @@ def _solve_qp_direct(
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
         proj_residual=final_state.proj_residual,
         n_proj_refinements=final_state.n_proj_refinements,
+        projected_grad_norm=final_state.projected_grad_norm,
     )
 
 
@@ -939,6 +966,7 @@ def solve_qp(
             final_working_tol=jnp.asarray(0.0, dtype=jnp.float64),
             proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
             n_proj_refinements=jnp.asarray(0),
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype=jnp.float64),
         )
 
     # ---- Proximal stabilized path (sSQP) ----
@@ -1041,6 +1069,7 @@ def solve_qp(
         # first inner_solver.solve.
         proj_residual=jnp.asarray(0.0, dtype=jnp.float64),
         n_proj_refinements=jnp.asarray(0),
+        projected_grad_norm=jnp.asarray(jnp.inf, dtype=jnp.float64),
     )
 
     def cond_fn(state: QPState) -> Bool[Array, ""]:
@@ -1072,6 +1101,7 @@ def solve_qp(
         # Track latest projection residual + cumulative refinement count.
         proj_residual_new = result.proj_residual.astype(jnp.float64)
         n_proj_refinements_new = state.n_proj_refinements + result.n_proj_refinements
+        projected_grad_norm_new = result.projected_grad_norm.astype(jnp.float64)
 
         # Check feasibility with expanding tolerance (stricter activation)
         residuals = A_ineq @ d_new - b_ineq
@@ -1123,6 +1153,7 @@ def solve_qp(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def drop_constraint():
@@ -1154,6 +1185,7 @@ def solve_qp(
                 ping_ponged=state.ping_ponged | triggered,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         def mark_converged():
@@ -1171,6 +1203,7 @@ def solve_qp(
                 ping_ponged=state.ping_ponged,
                 proj_residual=proj_residual_new,
                 n_proj_refinements=n_proj_refinements_new,
+                projected_grad_norm=projected_grad_norm_new,
             )
 
         return jax.lax.cond(
@@ -1197,4 +1230,5 @@ def solve_qp(
         final_working_tol=jnp.asarray(final_working_tol, dtype=jnp.float64),
         proj_residual=final_state.proj_residual,
         n_proj_refinements=final_state.n_proj_refinements,
+        projected_grad_norm=final_state.projected_grad_norm,
     )
