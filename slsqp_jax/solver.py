@@ -221,6 +221,15 @@ class SLSQPDiagnostics(eqx.Module):
     max_proj_residual: Scalar
     n_divergence_blowups: Int[Array, ""]
     divergence_triggered: Bool[Array, ""]
+    # Low-water mark of the inner solver's projected-gradient norm
+    # ``||W̃_k g_k||`` across the run.  Always ``inf`` for inner
+    # solvers other than ``HRInexactSTCG`` (the default value
+    # populated through ``InnerSolveResult.projected_grad_norm`` when
+    # the solver does not produce this quantity).  Surfaced for
+    # post-hoc inspection of how close the run actually got to KKT in
+    # the inexact-projection sense, regardless of whether
+    # ``use_inexact_stationarity`` was on.
+    min_projected_grad_norm: Scalar
 
 
 def _init_diagnostics() -> SLSQPDiagnostics:
@@ -251,6 +260,7 @@ def _init_diagnostics() -> SLSQPDiagnostics:
         max_proj_residual=jnp.array(0.0),
         n_divergence_blowups=jnp.array(0),
         divergence_triggered=jnp.array(False),
+        min_projected_grad_norm=jnp.asarray(jnp.inf),
     )
 
 
@@ -364,6 +374,15 @@ class SLSQPState(eqx.Module):
     stagnation: Bool[Array, ""]
     last_alpha: Scalar
 
+    # Norm of the projected gradient ``||W̃_k g_k||`` from the most
+    # recent inner solve, surfaced through ``QPResult.projected_grad_norm``.
+    # Always ``inf`` for inner solvers that do not produce this value
+    # (everything other than ``HRInexactSTCG``).  Used by
+    # ``terminate()`` when ``use_inexact_stationarity=True`` so that
+    # the run can declare convergence at the inner solver's noise
+    # floor instead of waiting for the exact Lagrangian gradient.
+    last_projected_grad_norm: Scalar
+
     # Whether the most recent line search reported success (Armijo satisfied
     # or at least a strictly decreasing merit).  Used by ``terminate`` to
     # distinguish genuine convergence from tiny-alpha stagnation.
@@ -467,6 +486,7 @@ class QPResult(eqx.Module):
     n_lpeca_bounds_prefixed: Int[Array, ""]
     proj_residual: Scalar
     n_proj_refinements: Int[Array, ""]
+    projected_grad_norm: Scalar
 
 
 class SLSQP(optx.AbstractMinimiser):
@@ -803,6 +823,25 @@ class SLSQP(optx.AbstractMinimiser):
     # False preserves baseline behavior; enable for large-scale problems
     # where early QP over-solving is wasteful.
     adaptive_cg_tol: bool = eqx.field(static=True, default=False)
+
+    # Use the inner solver's projected-gradient norm
+    # ``||W̃_k g_k||`` as an additional stationarity criterion in
+    # ``terminate()``.  When True, the run can declare convergence
+    # once ``state.last_projected_grad_norm <= rtol * max(|L|, 1)``,
+    # which is the right test on ill-conditioned problems where the
+    # null-space projector hits its noise floor and the exact
+    # Lagrangian gradient cannot be driven below ``rtol``
+    # (Heinkenschloss & Ridzal, 2014, Theorem 3.5).  The classical
+    # ``||∇_x L||`` criterion is still checked in parallel; the
+    # inexact path is purely *additive* (logical OR), so a run that
+    # satisfies the classical test still converges classically
+    # regardless of this flag.  Only meaningful when paired with the
+    # ``HRInexactSTCG`` inner solver, which is the only solver that
+    # populates ``InnerSolveResult.projected_grad_norm`` with
+    # something other than ``inf``; with any other inner solver the
+    # criterion silently degrades to "never converges this way".
+    # Default False to preserve baseline semantics.
+    use_inexact_stationarity: bool = eqx.field(static=True, default=False)
 
     # CG regularization: minimum eigenvalue threshold for the CG curvature
     # guard.  CG stops when the effective eigenvalue p^T B p / ||p||^2
@@ -1667,6 +1706,7 @@ class SLSQP(optx.AbstractMinimiser):
             steps_without_improvement=jnp.array(0),
             stagnation=jnp.array(False),
             last_alpha=jnp.array(1.0),
+            last_projected_grad_norm=jnp.asarray(jnp.inf),
             ls_success=jnp.array(True),
             ls_fatal=jnp.array(False),
             qp_fatal=jnp.array(False),
@@ -2166,6 +2206,12 @@ class SLSQP(optx.AbstractMinimiser):
             n_divergence_blowups=prev_diag.n_divergence_blowups
             + jnp.where(blowup_now, 1, 0),
             divergence_triggered=prev_diag.divergence_triggered | diverging_now,
+            min_projected_grad_norm=jnp.minimum(
+                prev_diag.min_projected_grad_norm,
+                qp_result.projected_grad_norm.astype(
+                    prev_diag.min_projected_grad_norm.dtype
+                ),
+            ),
         )
 
         # Propagate the NLP-recovered bound multipliers into the next
@@ -2235,8 +2281,14 @@ class SLSQP(optx.AbstractMinimiser):
                 multipliers_ineq_for_state, ineq_val_new
             )
         grad_norm_new = jnp.linalg.norm(grad_lagrangian_new)
-        stationarity_new = grad_norm_new <= self.rtol * jnp.maximum(
-            jnp.abs(lagrangian_val_new), 1.0
+        rtol_target_new = self.rtol * jnp.maximum(jnp.abs(lagrangian_val_new), 1.0)
+        classical_stationarity_new = grad_norm_new <= rtol_target_new
+        # Mirror of ``terminate()``: inexact-stationarity disjunct
+        # using the *just-computed* QP projected-gradient norm so the
+        # early-exit path agrees with ``terminate()`` on the same step.
+        inexact_stationarity_new = qp_result.projected_grad_norm <= rtol_target_new
+        stationarity_new = classical_stationarity_new | (
+            jnp.asarray(self.use_inexact_stationarity) & inexact_stationarity_new
         )
         new_step_count = state.step_count + 1
         has_min_steps_new = new_step_count >= self.min_steps
@@ -2340,6 +2392,7 @@ class SLSQP(optx.AbstractMinimiser):
             steps_without_improvement=new_steps_without,
             stagnation=merit_stagnation,
             last_alpha=alpha,
+            last_projected_grad_norm=qp_result.projected_grad_norm,
             ls_success=ls_result.success,
             ls_fatal=ls_fatal,
             qp_fatal=qp_fatal,
@@ -2466,8 +2519,17 @@ class SLSQP(optx.AbstractMinimiser):
 
         # Relative stationarity: ||nabla L|| <= rtol * max(|L|, 1)
         grad_norm = jnp.linalg.norm(grad_lagrangian)
-        stationarity = grad_norm <= self.rtol * jnp.maximum(
-            jnp.abs(lagrangian_val), 1.0
+        rtol_target = self.rtol * jnp.maximum(jnp.abs(lagrangian_val), 1.0)
+        classical_stationarity = grad_norm <= rtol_target
+        # Inexact-stationarity disjunct (HR 2014, Theorem 3.5): the
+        # inner solver's projected-gradient norm ``||W̃_k g_k||`` is
+        # the noise-aware stationarity proxy.  Active only when
+        # ``use_inexact_stationarity=True``; otherwise the default
+        # ``inf`` value of ``last_projected_grad_norm`` ensures this
+        # branch never fires.
+        inexact_stationarity = state.last_projected_grad_norm <= rtol_target
+        stationarity = classical_stationarity | (
+            jnp.asarray(self.use_inexact_stationarity) & inexact_stationarity
         )
 
         # Check primal feasibility
@@ -3011,6 +3073,11 @@ class SLSQP(optx.AbstractMinimiser):
             # mirroring how ``bound_fix_solves`` itself is counted.
             proj_residual_accum = qp_result.proj_residual
             n_proj_refinements_accum = qp_result.n_proj_refinements
+            # Latest-not-accumulated semantics: track the projected-
+            # gradient norm of whichever inner solve ultimately produced
+            # ``direction``.  Updated only when ``use_new`` is true so
+            # the value matches the iterate exposed to the line search.
+            projected_grad_norm_accum = qp_result.projected_grad_norm
 
             bound_fix_tol = 1e-12
             for _bound_pass in range(5):
@@ -3096,6 +3163,14 @@ class SLSQP(optx.AbstractMinimiser):
                         converged=jnp.array(True),
                         proj_residual=jnp.asarray(0.0, dtype=direction.dtype),
                         n_proj_refinements=jnp.asarray(0),
+                        # Skip-solve preserves the previous direction
+                        # without producing a fresh projected-gradient
+                        # norm.  Returning ``inf`` is the right default
+                        # because anything other than ``HRInexactSTCG``
+                        # also returns ``inf``; the active-set loop's
+                        # last *real* solve still feeds the
+                        # ``projected_grad_norm_accum`` we surface.
+                        projected_grad_norm=jnp.asarray(jnp.inf, dtype=direction.dtype),
                     )
 
                 bound_result = jax.lax.cond(
@@ -3124,6 +3199,13 @@ class SLSQP(optx.AbstractMinimiser):
                 )
                 n_proj_refinements_accum = (
                     n_proj_refinements_accum + bound_result.n_proj_refinements
+                )
+                projected_grad_norm_accum = jnp.where(
+                    use_new,
+                    bound_result.projected_grad_norm.astype(
+                        projected_grad_norm_accum.dtype
+                    ),
+                    projected_grad_norm_accum,
                 )
 
             # Final bound-active identification from the converged direction
@@ -3195,6 +3277,7 @@ class SLSQP(optx.AbstractMinimiser):
             n_bound_fixed = jnp.array(0)
             proj_residual_accum = qp_result.proj_residual
             n_proj_refinements_accum = qp_result.n_proj_refinements
+            projected_grad_norm_accum = qp_result.projected_grad_norm
 
         return QPResult(  # ty: ignore[invalid-return-type]  # equinox @dataclass_transform
             direction=direction,
@@ -3212,4 +3295,5 @@ class SLSQP(optx.AbstractMinimiser):
             n_lpeca_bounds_prefixed=lpeca_bounds_prefixed_count,
             proj_residual=proj_residual_accum,
             n_proj_refinements=n_proj_refinements_accum,
+            projected_grad_norm=projected_grad_norm_accum,
         )

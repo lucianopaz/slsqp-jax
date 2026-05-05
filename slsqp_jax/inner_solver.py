@@ -64,6 +64,81 @@ class InnerSolveResult(NamedTuple):
     converged: Bool[Array, ""]
     proj_residual: Scalar = jnp.asarray(0.0)
     n_proj_refinements: Int[Array, ""] = jnp.asarray(0)
+    # Norm of the *projected* initial gradient ``W̃_k g`` that the inner
+    # solver actually iterated against (HR 2014, Theorem 3.5).  This is
+    # the noise-aware stationarity proxy: when the outer SQP enables
+    # ``use_inexact_stationarity``, the run is allowed to converge once
+    # this value drops below ``rtol * max(|L|, 1)``.  Defaults to ``inf``
+    # so that solvers which do not produce this quantity (i.e. anything
+    # other than ``HRInexactSTCG``) cannot accidentally satisfy a
+    # ``< rtol`` test even if the user toggles the flag — the inexact
+    # path silently degrades to "never converges this way".
+    projected_grad_norm: Scalar = jnp.asarray(jnp.inf)
+
+
+# ---------------------------------------------------------------------------
+# Projection context (shared infrastructure for projector-based solvers)
+# ---------------------------------------------------------------------------
+
+
+class ProjectionContext(NamedTuple):
+    """Reusable bundle of projector + particular-solution + multiplier-recovery
+    closures for an active equality system ``A_active d = b_active``.
+
+    Existing strategies (``ProjectedCGCholesky``, ``ProjectedCGCraig``) build
+    these inline inside their ``solve`` methods.  Composed strategies (e.g.
+    ``HRInexactSTCG``) call ``inner.build_projection_context(...)`` to reuse
+    the projector and multiplier-recovery infrastructure of an underlying
+    null-space solver while running their own CG loop on top.
+
+    Attributes:
+        project: Inexact null-space projector ``W̃_k(v)``.  Maps a vector
+            in the (free) ambient space to its projection onto
+            ``null(A_work)`` using whatever inner approximation the
+            underlying strategy provides (Cholesky for
+            ``ProjectedCGCholesky``, CRAIG for ``ProjectedCGCraig``).
+        d_p: Particular solution.  ``A_work @ d_p == b_work`` to inner
+            solver precision; ``d_p`` already incorporates ``d_fixed`` on
+            the bound-fixed coordinates, so it lives in the full ``n``-
+            dimensional space.
+        recover_multipliers: Closure mapping ``(B d + g)`` to a length-``m``
+            multiplier vector with zeros on inactive rows.  Encapsulates
+            both the inversion of ``A_work A_workᵀ`` *and* the active-mask
+            zeroing.  HR Algorithm 4.5 calls this once per outer step
+            (after the modified-residual CG iteration converges).
+        hvp_work: Working-subspace HVP.  Equal to ``hvp_fn`` when no bound
+            fixing is in effect; otherwise ``v -> _free * hvp_fn(_free * v)``
+            so the iteration only sees the free coordinates.
+        g_eff: Effective gradient ``g + B @ d_p`` evaluated against
+            ``hvp_work``.  HR's notation calls this ``g_k``; it is the
+            input to the projected-residual recurrence.
+        A_work: Already-masked working constraint matrix (active rows,
+            free columns).  Surfaced primarily so callers can sanity-check
+            the residual ``||A_work @ d - b_work||``; ``project`` and
+            ``recover_multipliers`` already incorporate it.
+        free_mask: Boolean mask of free variables (always present;
+            equals ``ones(n)`` when no bound-fixing is in effect).
+        d_fixed: Fixed-variable values on bound-active coordinates
+            (zeros elsewhere; zeros everywhere when no bound-fixing).
+        has_fixed: ``True`` iff any coordinate is bound-fixed.  Cheap
+            indicator so consumers do not have to redo the mask check.
+        converged: Convergence flag of the inner projector solve that
+            built the context (always ``True`` for Cholesky; carries the
+            CRAIG breakdown / convergence flag for the iterative
+            projector).  Composed strategies AND this with their own
+            convergence to surface inner-projector failures upstream.
+    """
+
+    project: Callable[[Vector], Vector]
+    d_p: Vector
+    recover_multipliers: Callable[[Vector], Float[Array, " m"]]
+    hvp_work: Callable[[Vector], Vector]
+    g_eff: Vector
+    A_work: Float[Array, "m n"]
+    free_mask: Bool[Array, " n"]
+    d_fixed: Vector
+    has_fixed: bool
+    converged: Bool[Array, ""]
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +393,34 @@ class AbstractInnerSolver(eqx.Module):
         """
         ...  # pragma: no cover
 
+    def build_projection_context(
+        self,
+        hvp_fn: Callable[[Vector], Vector],
+        g: Vector,
+        A: Float[Array, "m n"],
+        b: Float[Array, " m"],
+        active_mask: Bool[Array, " m"],
+        precond_fn: Callable[[Vector], Vector] | None = None,
+        free_mask: Bool[Array, " n"] | None = None,
+        d_fixed: Vector | None = None,
+    ) -> ProjectionContext:
+        """Build a reusable projector + multiplier-recovery context.
+
+        Composed strategies (e.g. ``HRInexactSTCG``) call this on the
+        underlying inner solver to obtain its null-space projector,
+        particular solution and multiplier-recovery closure without
+        running the projector's own CG loop.
+
+        The default implementation raises ``NotImplementedError`` so
+        full-KKT solvers (``MinresQLPSolver``) cleanly opt out — they
+        have no separate projection step and therefore cannot supply
+        the inexact-projector ``W̃_k`` that HR Algorithm 4.5 needs.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a projection context; "
+            "it cannot be used as the inner projector for HRInexactSTCG."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Strategy 1: Projected CG with Cholesky-based null-space projection
@@ -380,12 +483,122 @@ class ProjectedCGCholesky(AbstractInnerSolver):
             converged=converged,
             proj_residual=jnp.asarray(0.0, dtype=d.dtype),
             n_proj_refinements=jnp.asarray(0),
+            # ``inf`` so the opt-in inexact-stationarity test can never
+            # be tripped accidentally on a non-HR inner solver.
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype=d.dtype),
+        )
+
+    def build_projection_context(
+        self,
+        hvp_fn: Callable[[Vector], Vector],
+        g: Vector,
+        A: Float[Array, "m n"],
+        b: Float[Array, " m"],
+        active_mask: Bool[Array, " m"],
+        precond_fn: Callable[[Vector], Vector] | None = None,
+        free_mask: Bool[Array, " n"] | None = None,
+        d_fixed: Vector | None = None,
+    ) -> ProjectionContext:
+        return _make_cholesky_projection_ctx(
+            hvp_fn=hvp_fn,
+            g=g,
+            A=A,
+            b=b,
+            active_mask=active_mask,
+            free_mask=free_mask,
+            d_fixed=d_fixed,
         )
 
 
 # ---------------------------------------------------------------------------
 # Implementation: projected CG with Cholesky projection
 # ---------------------------------------------------------------------------
+
+
+def _make_cholesky_projection_ctx(
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
+    A: Float[Array, "m n"],
+    b: Float[Array, " m"],
+    active_mask: Bool[Array, " m"],
+    free_mask: Bool[Array, " n"] | None = None,
+    d_fixed: Vector | None = None,
+) -> ProjectionContext:
+    """Build a ``ProjectionContext`` backed by a regularised Cholesky
+    factorisation of ``A_work A_workᵀ``.
+
+    Mirrors the projector-construction prefix of
+    ``_solve_projected_cg_cholesky``: masks ``A`` and ``b`` to the
+    active rows, applies bound-fixing, factorises ``AAᵀ + 1e-8·I``,
+    and packages the resulting projector, particular solution and
+    multiplier-recovery closure (with one round of iterative
+    refinement) into a ``ProjectionContext`` for reuse.
+    """
+    m = A.shape[0]
+    has_fixed = free_mask is not None and d_fixed is not None
+
+    A_masked = jnp.where(active_mask[:, None], A, 0.0)
+    b_masked = jnp.where(active_mask, b, 0.0)
+
+    if has_fixed and free_mask is not None and d_fixed is not None:
+        A_work = A_masked * free_mask[None, :]
+        b_work = b_masked - A_masked @ d_fixed
+    else:
+        A_work = A_masked
+        b_work = b_masked
+
+    reg_diag = jnp.where(active_mask, 0.0, 1.0)
+    AAt = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
+    AAt_chol = jnp.linalg.cholesky(AAt)
+
+    def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
+        return jax.scipy.linalg.cho_solve((AAt_chol, True), rhs)
+
+    _free: Bool[Array, " n"] = (
+        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
+    )
+    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
+    d_p_free = A_work.T @ solve_AAt(b_work)
+    d_p = d_p_free + _dfixed if has_fixed else d_p_free
+
+    def project(v: Vector) -> Vector:
+        v_work = _free * v if has_fixed else v
+        return v_work - A_work.T @ solve_AAt(A_work @ v_work)
+
+    if has_fixed:
+
+        def hvp_work(v: Vector) -> Vector:
+            return _free * hvp_fn(_free * v)
+
+        g_eff = _free * (g + hvp_fn(_dfixed))
+    else:
+        hvp_work = hvp_fn
+        g_eff = g
+
+    def recover_multipliers(Bd_plus_g: Vector) -> Float[Array, " m"]:
+        # KKT recovery with one step of iterative refinement to absorb
+        # the O(eps · cond(AAt)) error introduced by the 1e-8 ridge.
+        kkt_rhs = A_work @ Bd_plus_g
+        mult = solve_AAt(kkt_rhs)
+        mult = jnp.where(active_mask, mult, 0.0)
+        grad_L_qp = Bd_plus_g - A_work.T @ mult
+        delta = solve_AAt(A_work @ grad_L_qp)
+        mult = mult + delta
+        mult = jnp.where(active_mask, mult, 0.0)
+        return mult
+
+    return ProjectionContext(
+        project=project,
+        d_p=d_p,
+        recover_multipliers=recover_multipliers,
+        hvp_work=hvp_work,
+        g_eff=g_eff,
+        A_work=A_work,
+        free_mask=_free,
+        d_fixed=_dfixed,
+        has_fixed=bool(has_fixed),
+        converged=jnp.asarray(True),
+    )
 
 
 def _solve_projected_cg_cholesky(
@@ -475,40 +688,27 @@ def _solve_projected_cg_cholesky(
         budget.
     """
     m = A.shape[0]
-    has_fixed = free_mask is not None and d_fixed is not None
     cg_tol = to_scalar(cg_tol)
 
-    A_masked = jnp.where(active_mask[:, None], A, 0.0)
-    b_masked = jnp.where(active_mask, b, 0.0)
-
-    if has_fixed and free_mask is not None and d_fixed is not None:
-        A_work = A_masked * free_mask[None, :]
-        b_work = b_masked - A_masked @ d_fixed
-    else:
-        A_work = A_masked
-        b_work = b_masked
-
-    reg_diag = jnp.where(active_mask, 0.0, 1.0)
-    AAt = A_work @ A_work.T + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
-    AAt_chol = jnp.linalg.cholesky(AAt)
-
-    def solve_AAt(rhs: Float[Array, " m"]) -> Float[Array, " m"]:
-        return jax.scipy.linalg.cho_solve((AAt_chol, True), rhs)
-
-    _free: Bool[Array, " n"] = (
-        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
+    ctx = _make_cholesky_projection_ctx(
+        hvp_fn=hvp_fn,
+        g=g,
+        A=A,
+        b=b,
+        active_mask=active_mask,
+        free_mask=free_mask,
+        d_fixed=d_fixed,
     )
-    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
-    d_p_free = A_work.T @ solve_AAt(b_work)
-    d_p = d_p_free + _dfixed if has_fixed else d_p_free
-
-    def project(v: Vector) -> Vector:
-        v_work = _free * v if has_fixed else v
-        return v_work - A_work.T @ solve_AAt(A_work @ v_work)
+    A_work = ctx.A_work
+    project = ctx.project
+    hvp_work = ctx.hvp_work
+    g_eff = ctx.g_eff
+    d_p = ctx.d_p
 
     # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
     if precond_fn is not None and use_constraint_preconditioner:
         _raw_precond = precond_fn
+        reg_diag = jnp.where(active_mask, 0.0, 1.0)
         M_AT = jax.vmap(_raw_precond)(A_work).T  # (n, m)
         A_M_AT = A_work @ M_AT + jnp.diag(reg_diag) + 1e-8 * jnp.eye(m)
         A_M_AT_chol = jnp.linalg.cholesky(A_M_AT)
@@ -524,16 +724,6 @@ def _solve_projected_cg_cholesky(
         effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
     else:
         effective_precond = precond_fn
-
-    if has_fixed:
-
-        def hvp_work(v: Vector) -> Vector:
-            return _free * hvp_fn(_free * v)
-
-        g_eff = _free * (g + hvp_fn(_dfixed))
-    else:
-        hvp_work = hvp_fn
-        g_eff = g
 
     Bd_p = hvp_work(d_p)
     r0 = project(-(g_eff + Bd_p))
@@ -570,18 +760,7 @@ def _solve_projected_cg_cholesky(
 
     # Multiplier recovery using the full (unmasked) HVP
     Bd = hvp_fn(final_cg.d)
-    kkt_residual = A_work @ (Bd + g)
-    multipliers = solve_AAt(kkt_residual)
-    multipliers = jnp.where(active_mask, multipliers, 0.0)
-
-    # Iterative refinement: the regularized Cholesky (AAt + eps*I) introduces
-    # O(eps * cond(AAt)) error in the multipliers.  One refinement step squares
-    # the relative error, e.g. from ~1e-5 to ~1e-10 for cond ~ 1e3.
-    grad_L_qp = Bd + g - A_work.T @ multipliers
-    refinement_rhs = A_work @ grad_L_qp
-    delta_mult = solve_AAt(refinement_rhs)
-    multipliers = multipliers + delta_mult
-    multipliers = jnp.where(active_mask, multipliers, 0.0)
+    multipliers = ctx.recover_multipliers(Bd + g)
 
     return final_cg.d, multipliers, final_cg.converged
 
@@ -835,12 +1014,132 @@ class ProjectedCGCraig(AbstractInnerSolver):
             converged=converged,
             proj_residual=jnp.asarray(0.0, dtype=d.dtype),
             n_proj_refinements=jnp.asarray(0),
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype=d.dtype),
+        )
+
+    def build_projection_context(
+        self,
+        hvp_fn: Callable[[Vector], Vector],
+        g: Vector,
+        A: Float[Array, "m n"],
+        b: Float[Array, " m"],
+        active_mask: Bool[Array, " m"],
+        precond_fn: Callable[[Vector], Vector] | None = None,
+        free_mask: Bool[Array, " n"] | None = None,
+        d_fixed: Vector | None = None,
+    ) -> ProjectionContext:
+        return _make_craig_projection_ctx(
+            hvp_fn=hvp_fn,
+            g=g,
+            A=A,
+            b=b,
+            active_mask=active_mask,
+            free_mask=free_mask,
+            d_fixed=d_fixed,
+            craig_tol=self.craig_tol,
+            craig_max_iter=self.craig_max_iter,
+            mult_recovery_tol=self.mult_recovery_tol,
+            mult_recovery_max_iter=self.mult_recovery_max_iter,
         )
 
 
 # ---------------------------------------------------------------------------
 # Implementation: projected CG with CRAIG projection
 # ---------------------------------------------------------------------------
+
+
+def _make_craig_projection_ctx(
+    hvp_fn: Callable[[Vector], Vector],
+    g: Vector,
+    A: Float[Array, "m n"],
+    b: Float[Array, " m"],
+    active_mask: Bool[Array, " m"],
+    free_mask: Bool[Array, " n"] | None = None,
+    d_fixed: Vector | None = None,
+    craig_tol: float = 1e-10,
+    craig_max_iter: int = 200,
+    mult_recovery_tol: float = 1e-12,
+    mult_recovery_max_iter: int = 200,
+) -> ProjectionContext:
+    """Build a ``ProjectionContext`` backed by CRAIG (Golub-Kahan
+    bidiagonalisation) for the null-space projection.
+
+    Mirrors the projector-construction prefix of
+    ``_solve_projected_cg_craig``.  The ``converged`` flag carries the
+    CRAIG breakdown / convergence status of the *particular solution*
+    solve (``A_work d_p = b_work``); per-projector-call CRAIG
+    convergence flags inside the CG loop are not threaded through.
+    The multiplier-recovery closure runs CG on the normal equations
+    ``A A^T λ = -A (B d + g)`` (matching ``_solve_projected_cg_craig``
+    sign convention).
+    """
+    has_fixed = free_mask is not None and d_fixed is not None
+
+    A_masked = jnp.where(active_mask[:, None], A, 0.0)
+    b_masked = jnp.where(active_mask, b, 0.0)
+
+    if has_fixed and free_mask is not None and d_fixed is not None:
+        A_work = A_masked * free_mask[None, :]
+        b_work = b_masked - A_masked @ d_fixed
+    else:
+        A_work = A_masked
+        b_work = b_masked
+
+    _free: Bool[Array, " n"] = (
+        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
+    )
+    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
+
+    d_p_free, d_p_craig_conv = craig_solve(
+        A_work, b_work, tol=craig_tol, max_iter=craig_max_iter
+    )
+    d_p_free_finite = jnp.isfinite(d_p_free).all()
+    d_p_free = jnp.where(d_p_free_finite, d_p_free, jnp.zeros_like(d_p_free))
+    d_p = d_p_free + _dfixed if has_fixed else d_p_free
+
+    def project(v: Vector) -> Vector:
+        v_work = _free * v if has_fixed else v
+        x_proj, _ = craig_solve(
+            A_work, A_work @ v_work, tol=craig_tol, max_iter=craig_max_iter
+        )
+        x_proj = jnp.where(jnp.isfinite(x_proj).all(), x_proj, jnp.zeros_like(x_proj))
+        return v_work - x_proj
+
+    if has_fixed:
+
+        def hvp_work(v: Vector) -> Vector:
+            return _free * hvp_fn(_free * v)
+
+        g_eff = _free * (g + hvp_fn(_dfixed))
+    else:
+        hvp_work = hvp_fn
+        g_eff = g
+
+    reg_diag = jnp.where(active_mask, 0.0, 1.0)
+
+    def normal_hvp(v: Float[Array, " m"]) -> Float[Array, " m"]:
+        return A_work @ (A_work.T @ v) + reg_diag * v
+
+    def recover_multipliers(Bd_plus_g: Vector) -> Float[Array, " m"]:
+        kkt_rhs = A_work @ Bd_plus_g
+        mult, _ = solve_unconstrained_cg(
+            normal_hvp, -kkt_rhs, mult_recovery_max_iter, mult_recovery_tol
+        )
+        mult = jnp.where(active_mask, mult, 0.0)
+        return mult
+
+    return ProjectionContext(
+        project=project,
+        d_p=d_p,
+        recover_multipliers=recover_multipliers,
+        hvp_work=hvp_work,
+        g_eff=g_eff,
+        A_work=A_work,
+        free_mask=_free,
+        d_fixed=_dfixed,
+        has_fixed=bool(has_fixed),
+        converged=d_p_craig_conv,
+    )
 
 
 def _solve_projected_cg_craig(
@@ -871,53 +1170,27 @@ def _solve_projected_cg_craig(
     CRAIG naturally returns the primal (n-dim) rather than the dual
     (m-dim) solution.
     """
-    has_fixed = free_mask is not None and d_fixed is not None
     cg_tol = to_scalar(cg_tol)
 
-    A_masked = jnp.where(active_mask[:, None], A, 0.0)
-    b_masked = jnp.where(active_mask, b, 0.0)
-
-    if has_fixed and free_mask is not None and d_fixed is not None:
-        A_work = A_masked * free_mask[None, :]
-        b_work = b_masked - A_masked @ d_fixed
-    else:
-        A_work = A_masked
-        b_work = b_masked
-
-    _free: Bool[Array, " n"] = (
-        free_mask if free_mask is not None else jnp.ones(A.shape[1], dtype=bool)
+    ctx = _make_craig_projection_ctx(
+        hvp_fn=hvp_fn,
+        g=g,
+        A=A,
+        b=b,
+        active_mask=active_mask,
+        free_mask=free_mask,
+        d_fixed=d_fixed,
+        craig_tol=craig_tol,
+        craig_max_iter=craig_max_iter,
+        mult_recovery_tol=mult_recovery_tol,
+        mult_recovery_max_iter=mult_recovery_max_iter,
     )
-    _dfixed: Vector = d_fixed if d_fixed is not None else jnp.zeros(A.shape[1])
-
-    # Particular solution: d_p = A^T (A A^T)^{-1} b = craig_solve(A, b).
-    # Guard against a non-finite result (e.g. the rhs is non-zero but
-    # the active Jacobian is numerically rank-deficient and CRAIG
-    # breakdown-guarded back to ``x = 0``, or extreme magnitudes escaped
-    # the breakdown detector): fall back to ``d_p = 0`` so the CG loop
-    # at least starts from a finite iterate.
-    d_p_free, d_p_craig_conv = craig_solve(
-        A_work, b_work, tol=craig_tol, max_iter=craig_max_iter
-    )
-    d_p_free_finite = jnp.isfinite(d_p_free).all()
-    d_p_free = jnp.where(d_p_free_finite, d_p_free, jnp.zeros_like(d_p_free))
-    d_p = d_p_free + _dfixed if has_fixed else d_p_free
-
-    # Projection: P(v) = v - A^T (A A^T)^{-1} A v = v - craig_solve(A, Av).
-    # We deliberately do not propagate per-call CRAIG convergence from
-    # inside the CG iteration (would require threading state into
-    # ``_CGState``).  If CRAIG breaks down on the projection solve we
-    # fall back to the identity on that component, which degrades the
-    # projector to "no projection" for the problematic input but keeps
-    # the CG iterates finite.  Without this guard, a breakdown-induced
-    # non-finite ``x_proj`` would be subtracted from ``v_work`` and
-    # poison every subsequent HVP/projection call.
-    def project(v: Vector) -> Vector:
-        v_work = _free * v if has_fixed else v
-        x_proj, _ = craig_solve(
-            A_work, A_work @ v_work, tol=craig_tol, max_iter=craig_max_iter
-        )
-        x_proj = jnp.where(jnp.isfinite(x_proj).all(), x_proj, jnp.zeros_like(x_proj))
-        return v_work - x_proj
+    A_work = ctx.A_work
+    project = ctx.project
+    hvp_work = ctx.hvp_work
+    g_eff = ctx.g_eff
+    d_p = ctx.d_p
+    d_p_craig_conv = ctx.converged
 
     # Constraint preconditioner (Gould, Hribar & Nocedal, 2001).
     # With CRAIG, the A M A^T system is also solved iteratively.
@@ -949,16 +1222,6 @@ def _solve_projected_cg_craig(
         effective_precond: Callable[[Vector], Vector] | None = _constraint_precond
     else:
         effective_precond = precond_fn
-
-    if has_fixed:
-
-        def hvp_work(v: Vector) -> Vector:
-            return _free * hvp_fn(_free * v)
-
-        g_eff = _free * (g + hvp_fn(_dfixed))
-    else:
-        hvp_work = hvp_fn
-        g_eff = g
 
     Bd_p = hvp_work(d_p)
     r0 = project(-(g_eff + Bd_p))
@@ -993,27 +1256,249 @@ def _solve_projected_cg_craig(
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
 
-    # Multiplier recovery via CG on normal equations A A^T λ = A(Bd+g).
-    # This avoids forming A A^T; each CG step uses A @ (A^T @ v).
     Bd = hvp_fn(final_cg.d)
-    kkt_rhs = A_work @ (Bd + g)
-    reg_diag = jnp.where(active_mask, 0.0, 1.0)
-
-    def normal_hvp(v: Float[Array, " m"]) -> Float[Array, " m"]:
-        return A_work @ (A_work.T @ v) + reg_diag * v
-
-    multipliers, mult_cg_converged = solve_unconstrained_cg(
-        normal_hvp, -kkt_rhs, mult_recovery_max_iter, mult_recovery_tol
-    )
-    multipliers = jnp.where(active_mask, multipliers, 0.0)
+    multipliers = ctx.recover_multipliers(Bd + g)
 
     finite_d = jnp.isfinite(final_cg.d).all()
     finite_mult = jnp.isfinite(multipliers).all()
-    converged = (
-        final_cg.converged & d_p_craig_conv & mult_cg_converged & finite_d & finite_mult
-    )
+    converged = final_cg.converged & d_p_craig_conv & finite_d & finite_mult
 
     return final_cg.d, multipliers, converged
+
+
+# ---------------------------------------------------------------------------
+# Heinkenschloss-Ridzal (2014) Algorithm 4.5: Steihaug-Toint CG with
+# inexact null-space projections (no trust radius / no normal-tangent
+# split — the line-search SQP wrapper handles globalization).
+# ---------------------------------------------------------------------------
+
+
+class _HRSTCGState(NamedTuple):
+    """Internal state for the HR-inexact-STCG iteration.
+
+    Layout:
+
+    - ``t``: current iterate, in the (free) ambient space.
+    - ``r``: HR's "modified" residual ``r̃_i``.  At ``i=0`` this is
+      ``-W̃ g_eff`` (descent-residual sign convention so the standard
+      descent CG step direction ``+α p`` minimises the model).  At
+      subsequent iterations ``r̃_{i+1} = r̃_i − α̃_i H p̃_i`` — the HR
+      "modified" recurrence (Remark 4.6.i) which avoids re-projecting
+      the residual at every step and is the technical move that gives
+      the iteration a fixed-linear-operator interpretation under
+      inexact ``W̃``.
+    - ``z``: ``z̃_i = W̃(r̃_i)``.  At ``i=0`` equal to ``r`` (no
+      inner preconditioner); HR projects only when computing ``z`` —
+      not when updating ``r``.
+    - ``p``: current search direction.
+    - ``rz``: ``⟨r̃_i, z̃_i⟩`` (= ``⟨r̃_i, r̃_i⟩`` without preconditioner).
+    - ``proj_grad_norm``: ``‖r̃_0‖`` cached for the relative
+      convergence test ``‖z̃_i‖ ≤ tol · ‖r̃_0‖`` and surfaced as the
+      noise-aware stationarity proxy.
+    - ``P``, ``HP``, ``pHp_diag``: history buffers for full
+      H-conjugacy reorthogonalisation.  ``P[j] = p̃_j``,
+      ``HP[j] = H p̃_j``, ``pHp_diag[j] = ⟨p̃_j, H p̃_j⟩``.  Static
+      shape ``(max_cg_iter, n)`` / ``(max_cg_iter,)``.
+    - ``iteration``, ``converged``: standard CG bookkeeping.
+    """
+
+    t: Vector
+    r: Vector
+    z: Vector
+    p: Vector
+    rz: Scalar
+    proj_grad_norm: Scalar
+    P: Float[Array, "imax n"]
+    HP: Float[Array, "imax n"]
+    pHp_diag: Float[Array, " imax"]
+    iteration: Int[Array, ""]
+    converged: Bool[Array, ""]
+
+
+def _hr_stcg(
+    hvp_work: Callable[[Vector], Vector],
+    g_eff: Vector,
+    project: Callable[[Vector], Vector],
+    cg_tol: Scalar | float,
+    cg_regularization: float,
+    max_cg_iter: int,
+) -> tuple[Vector, Scalar, Bool[Array, ""]]:
+    """Run HR (2014) Algorithm 4.5 — STCG with inexact null-space projections.
+
+    Solves the equality-constrained reduced QP
+
+        minimize  q(t̃) = g_eff^T t̃ + 1/2 t̃^T H t̃   over null(A_work)
+
+    using projected conjugate gradient where the projector ``W̃_k`` is
+    applied only when computing ``z̃_i = W̃(r̃_i)``.  The residual
+    itself follows the modified recurrence ``r̃_{i+1} = r̃_i − α_i H p̃_i``
+    (HR Remark 4.6.i), which absorbs the projector exactly once at
+    initialisation and avoids the noise re-injection that the
+    re-projected three-term recurrence in the textbook STCG induces
+    under inexact ``W̃``.  Combined with full H-conjugacy
+    reorthogonalisation of every ``p̃_i`` against all stored
+    ``p̃_j``, the iteration becomes the unique CG sequence for
+    *some* fixed linear operator ``W̃_k`` (HR Lemma 4.10), even though
+    no such operator is ever formed.
+
+    Sign convention.  We use the descent-residual convention
+    ``r̃ = -∇q`` (so ``r̃_0 = -W̃ g_eff``); the resulting standard
+    CG step ``t̃_{i+1} = t̃_i + α_i p̃_i`` with ``α_i =
+    ⟨r̃_i, z̃_i⟩ / ⟨p̃_i, H p̃_i⟩`` minimises the model.  This is
+    algebraically equivalent to HR's max-residual presentation in
+    their Algorithm 4.5; the change keeps the descent-direction
+    semantics of ``t̃_k`` consistent with how the outer SQP composes
+    ``d = d_p + t̃_k``.
+
+    Convergence test.  Step 1(a) uses ``‖z̃_i‖ ≤ tol_CG · ‖r̃_0‖`` —
+    a relative test against the initial *projected* gradient.  This
+    is exactly the noise-aware stationarity proxy: both numerator
+    and denominator carry the same projector noise, so the test
+    reaches the inner solver's precision floor and stops cleanly
+    instead of grinding against it.
+
+    Curvature / stagnation guard.  We preserve the SNOPT-style
+    scale-invariant guard ``⟨p̃, H p̃⟩ ≤ ε ‖p̃‖²`` for negative /
+    near-zero curvature and a stagnation guard
+    ``|⟨r̃_i, p̃_i⟩| < 1e-30``; either short-circuits the iteration
+    with the last good iterate.
+
+    Memory.  The full-reorth buffers ``P, HP`` are static-shape
+    ``(max_cg_iter, n)``; total ``2 · imax · n · 8 B``
+    (e.g. ``imax=50, n=50_000`` → 40 MB).  Reorth cost across all
+    iterations is ``O(imax^2 · n)``.
+
+    Args:
+        hvp_work: Working-subspace HVP ``v -> H @ v`` (already masked
+            to the free subspace when bound-fixing is in effect).
+        g_eff: Effective gradient ``g + B d_p`` (HR's ``g_k``).
+        project: Inexact null-space projector ``W̃_k`` (typically
+            from ``ProjectionContext.project``).
+        cg_tol: Relative convergence tolerance on ``‖z̃_i‖`` (Step 1(a)).
+        cg_regularization: Curvature-guard threshold (``δ²``).  Set to
+            zero to disable the guard.
+        max_cg_iter: Static upper bound on the number of CG iterations.
+            Determines the size of the reorth buffers.
+
+    Returns:
+        ``(t̃_k, ‖r̃_0‖, converged)`` — the descent step (in the free
+        subspace), the initial *projected* gradient norm (which is
+        the noise-aware stationarity proxy), and the convergence flag.
+    """
+    n = g_eff.shape[0]
+    cg_tol = to_scalar(cg_tol)
+
+    Wg = project(g_eff)
+    r0 = -Wg
+    z0 = r0
+    proj_grad_norm = jnp.sqrt(jnp.maximum(jnp.dot(r0, r0), 0.0))
+    rz0 = jnp.dot(r0, z0)
+    p0 = z0
+
+    P = jnp.zeros((max_cg_iter, n), dtype=g_eff.dtype)
+    HP = jnp.zeros((max_cg_iter, n), dtype=g_eff.dtype)
+    pHp_diag = jnp.zeros(max_cg_iter, dtype=g_eff.dtype)
+
+    init_state = _HRSTCGState(
+        t=jnp.zeros(n, dtype=g_eff.dtype),
+        r=r0,
+        z=z0,
+        p=p0,
+        rz=rz0,
+        proj_grad_norm=proj_grad_norm,
+        P=P,
+        HP=HP,
+        pHp_diag=pHp_diag,
+        iteration=jnp.array(0),
+        # Pre-converge if the projected gradient is already at floor.
+        converged=jnp.reshape(
+            proj_grad_norm <= cg_tol * jnp.maximum(proj_grad_norm, 1e-30), ()
+        ),
+    )
+
+    indices = jnp.arange(max_cg_iter)
+
+    def step_fn(_i: int, state: _HRSTCGState) -> _HRSTCGState:
+        def do_step(state: _HRSTCGState) -> _HRSTCGState:
+            i = state.iteration
+            Hp = hvp_work(state.p)
+            pHp = jnp.dot(state.p, Hp)
+            pp = jnp.dot(state.p, state.p)
+
+            # Step 1(c)/(d): SNOPT-style scale-invariant curvature
+            # guard plus an absolute floor anchored to the initial
+            # projected gradient.  Without the absolute floor, when
+            # ``p`` shrinks toward machine precision near convergence
+            # both ``pHp`` and ``cg_regularization * pp`` decay
+            # together; ``pHp`` can drop to ``O(eps²)`` while still
+            # exceeding the relative threshold, leaving
+            # ``alpha = rz / pHp`` to amplify the noisy direction by
+            # ``O(1/eps²)`` and contaminate ``t``.  The absolute floor
+            # ``cg_regularization · ‖r̃_0‖²`` cuts that noise
+            # amplification — it is dimensionally consistent with
+            # ``pHp`` (curvature × length²) and reflects the smallest
+            # curvature the iteration could meaningfully resolve.
+            # HR's stagnation check ``⟨r̃_i, p̃_i⟩ ≈ 0`` triggers a
+            # separate exit.
+            abs_floor = cg_regularization * state.proj_grad_norm * state.proj_grad_norm
+            bad_curvature = pHp <= jnp.maximum(cg_regularization * pp, abs_floor)
+            rp = jnp.dot(state.r, state.p)
+            stagnation = jnp.abs(rp) < 1e-30
+            short_circuit = bad_curvature | stagnation
+
+            pHp_safe = jnp.maximum(pHp, 1e-30)
+            alpha = jnp.where(short_circuit, jnp.array(0.0), state.rz / pHp_safe)
+
+            t_new = state.t + alpha * state.p
+            # HR Remark 4.6.i — modified residual recurrence.  Note: NOT
+            # ``project(... )``; the projector is applied only when
+            # computing ``z̃`` below.
+            r_new = state.r - alpha * Hp
+            z_new = project(r_new)
+
+            # Update buffers with current p_i / Hp_i / pHp_i so the
+            # full-reorth uses every direction including the freshly
+            # consumed one.
+            P_buf = state.P.at[i].set(state.p)
+            HP_buf = state.HP.at[i].set(Hp)
+            pHp_buf = state.pHp_diag.at[i].set(pHp)
+
+            # Full reorthogonalisation: the new search direction p_{i+1}
+            # is built from z_{i+1} so as to be H-conjugate to every
+            # stored p_j.  Coeffs ``β_l = -⟨z_{i+1}, H p_l⟩/⟨p_l,
+            # H p_l⟩`` enforce ``⟨p_{i+1}, H p_l⟩ = 0`` for l ≤ i.
+            mask_j = indices <= i  # include the just-stored p_i
+            Hz_dots = HP_buf @ z_new  # (max_cg_iter,)
+            pHp_diag_safe = jnp.where(jnp.abs(pHp_buf) > 1e-30, pHp_buf, 1e-30)
+            coeffs = jnp.where(mask_j, Hz_dots / pHp_diag_safe, 0.0)
+            p_new = z_new - coeffs @ P_buf
+
+            rz_new = jnp.dot(r_new, z_new)
+            z_norm = jnp.sqrt(jnp.maximum(jnp.dot(z_new, z_new), 0.0))
+            tol_target = cg_tol * jnp.maximum(state.proj_grad_norm, 1e-30)
+            converged_new = (z_norm <= tol_target) | short_circuit
+
+            return _HRSTCGState(
+                t=jnp.where(short_circuit, state.t, t_new),
+                r=jnp.where(short_circuit, state.r, r_new),
+                z=jnp.where(short_circuit, state.z, z_new),
+                p=jnp.where(short_circuit, state.p, p_new),
+                rz=jnp.where(short_circuit, state.rz, rz_new),
+                proj_grad_norm=state.proj_grad_norm,
+                P=P_buf,
+                HP=HP_buf,
+                pHp_diag=pHp_buf,
+                iteration=state.iteration + 1,
+                converged=converged_new,
+            )
+
+        # Defensive scalarisation of the predicate, mirroring
+        # ``build_cg_step``.
+        converged_pred = jnp.reshape(state.converged, ())
+        return jax.lax.cond(converged_pred, lambda s: s, do_step, state)
+
+    final = jax.lax.fori_loop(0, max_cg_iter, step_fn, init_state)
+    return final.t, final.proj_grad_norm, final.converged
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1998,7 @@ class MinresQLPSolver(AbstractInnerSolver):
             converged=converged,
             proj_residual=proj_residual,
             n_proj_refinements=n_refinements,
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype=d.dtype),
         )
 
 
@@ -1755,3 +2241,173 @@ def _solve_kkt_minres_qlp(
 
     finite = jnp.isfinite(d).all() & jnp.isfinite(multipliers).all()
     return d, multipliers, converged & finite, residual_post, n_refinements
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: HR (2014) Algorithm 4.5 — STCG with inexact projections
+# ---------------------------------------------------------------------------
+
+
+class HRInexactSTCG(AbstractInnerSolver):
+    """Heinkenschloss-Ridzal (2014) Algorithm 4.5 — Steihaug-Toint CG with
+    inexact null-space projections.
+
+    Composes an existing null-space inner solver
+    (``ProjectedCGCholesky`` or ``ProjectedCGCraig``) to obtain its
+    projector ``W̃_k``, particular solution ``d_p`` and
+    multiplier-recovery closure, then runs a *separate* CG iteration
+    on top whose three textbook three-term-recurrence cancellations are
+    replaced by full H-conjugacy reorthogonalisation against every
+    previous search direction.  The residual update follows the
+    "modified" recurrence ``r̃_{i+1} = r̃_i − α_i H p̃_i`` (HR Remark
+    4.6.i) — the projector is applied only when computing
+    ``z̃_{i+1} = W̃(r̃_{i+1})``.
+
+    Together, these two changes give the iteration a fixed-linear-
+    operator interpretation under inexact ``W̃`` (HR Lemma 4.10,
+    Theorem 4.11): even when each ``W̃(v)`` carries projection
+    noise, the iteration is the unique CG sequence for *some* fixed
+    operator ``W̃_k``.  This is the technical move that makes the
+    iteration converge cleanly to the noise floor instead of grinding
+    against it.
+
+    Recommended pairing.  ``ProjectedCGCraig`` exposes the actual
+    tightenable knob (``craig_tol``); composing
+    ``HRInexactSTCG(inner=ProjectedCGCraig(...))`` lets the user
+    trade projector accuracy against runtime explicitly.  The
+    Cholesky variant has a fixed ``1e-8`` regularisation so its
+    projection floor is not user-controllable.
+
+    ``MinresQLPSolver`` is *not* a valid composition target:
+    full-KKT solvers do not expose a separate projection step.  An
+    attempted composition raises ``NotImplementedError`` from the
+    inherited ``AbstractInnerSolver.build_projection_context``
+    default at the first call to ``solve``.
+
+    Cost.  Per HR Algorithm 4.5 step: one HVP, one projector
+    application (provided by ``inner``), and an ``O(imax · n)``
+    Gram-Schmidt back-substitution against the stored search-direction
+    history.  Total reorth cost across all iterations:
+    ``O(imax^2 · n)``.  Memory: ``2 · imax · n`` floats for the
+    static-shape ``(P, HP)`` buffers.
+
+    Attributes:
+        inner: Composed null-space inner solver supplying the
+            projector and multiplier-recovery infrastructure.  Must
+            implement ``build_projection_context``; the saddle-point
+            ``MinresQLPSolver`` does not and will raise on the first
+            ``solve`` call.
+        max_cg_iter: Static upper bound on the number of inner CG
+            iterations.  Determines the size of the reorth buffers.
+        cg_tol: Relative convergence tolerance for the projected
+            residual ``‖z̃_i‖ ≤ tol · ‖r̃_0‖``.
+        cg_regularization: Curvature-guard threshold ``δ²`` used by
+            the SNOPT-style scale-invariant short-circuit
+            ``⟨p̃, H p̃⟩ ≤ δ² ‖p̃‖²``.  Defaults to ``1e-6``; set to
+            ``0.0`` to disable.
+    """
+
+    inner: AbstractInnerSolver
+    max_cg_iter: int
+    cg_tol: Scalar | float
+    cg_regularization: float = 1e-6
+
+    def build_projection_context(
+        self,
+        hvp_fn: Callable[[Vector], Vector],
+        g: Vector,
+        A: Float[Array, "m n"],
+        b: Float[Array, " m"],
+        active_mask: Bool[Array, " m"],
+        precond_fn: Callable[[Vector], Vector] | None = None,
+        free_mask: Bool[Array, " n"] | None = None,
+        d_fixed: Vector | None = None,
+    ) -> ProjectionContext:
+        # Delegate to the composed projector; HRInexactSTCG itself does
+        # not provide an additional projector layer.
+        return self.inner.build_projection_context(
+            hvp_fn=hvp_fn,
+            g=g,
+            A=A,
+            b=b,
+            active_mask=active_mask,
+            precond_fn=precond_fn,
+            free_mask=free_mask,
+            d_fixed=d_fixed,
+        )
+
+    def solve(
+        self,
+        hvp_fn: Callable[[Vector], Vector],
+        g: Vector,
+        A: Float[Array, "m n"],
+        b: Float[Array, " m"],
+        active_mask: Bool[Array, " m"],
+        precond_fn: Callable[[Vector], Vector] | None = None,
+        free_mask: Bool[Array, " n"] | None = None,
+        d_fixed: Vector | None = None,
+        adaptive_tol: Scalar | float | None = None,
+    ) -> InnerSolveResult:
+        # ``precond_fn`` is accepted for interface compatibility but
+        # silently dropped: HR Algorithm 4.5 uses no inner
+        # preconditioner.  The composed projector may still consume it
+        # internally (e.g. for its constraint-preconditioner path) when
+        # ``build_projection_context`` chooses to use it.
+        ctx = self.inner.build_projection_context(
+            hvp_fn=hvp_fn,
+            g=g,
+            A=A,
+            b=b,
+            active_mask=active_mask,
+            precond_fn=precond_fn,
+            free_mask=free_mask,
+            d_fixed=d_fixed,
+        )
+        effective_tol = adaptive_tol if adaptive_tol is not None else self.cg_tol
+
+        # HR-STCG iterates a null-space step ``t̃`` starting from
+        # ``d_p`` (the particular solution that satisfies
+        # ``A_work d_p = b_work``).  The "effective gradient" handed
+        # to the CG iteration is therefore the gradient of the
+        # quadratic at ``d_p``: ``g_k = g_eff + B d_p``.  Without
+        # the ``B d_p`` shift the iteration would compute the wrong
+        # search direction (the residual would not be projected onto
+        # the right vector), and the final ``d = d_p + t̃`` would
+        # silently diverge from the true QP optimum.  This mirrors
+        # the ``r0 = project(-(g_eff + B d_p))`` initialisation in
+        # ``_solve_projected_cg_cholesky``.
+        Bd_p = ctx.hvp_work(ctx.d_p)
+        g_at_dp = ctx.g_eff + Bd_p
+
+        t_tilde, proj_grad_norm, cg_converged = _hr_stcg(
+            hvp_work=ctx.hvp_work,
+            g_eff=g_at_dp,
+            project=ctx.project,
+            cg_tol=effective_tol,
+            cg_regularization=self.cg_regularization,
+            max_cg_iter=self.max_cg_iter,
+        )
+
+        # The HR step lives in the (free) ambient space.  Combine it
+        # with the particular solution (which already incorporates
+        # ``d_fixed``).
+        d = ctx.d_p + t_tilde
+
+        # Multiplier recovery uses the full (unmasked) HVP — same
+        # convention as the underlying solver.
+        Bd = hvp_fn(d)
+        multipliers = ctx.recover_multipliers(Bd + g)
+
+        finite_d = jnp.isfinite(d).all()
+        finite_mult = jnp.isfinite(multipliers).all()
+        converged = cg_converged & ctx.converged & finite_d & finite_mult
+
+        return InnerSolveResult(
+            d=d,
+            multipliers=multipliers,
+            converged=converged,
+            # Null-space projector enforces ``A d = b`` structurally.
+            proj_residual=jnp.asarray(0.0, dtype=d.dtype),
+            n_proj_refinements=jnp.asarray(0),
+            projected_grad_norm=proj_grad_norm.astype(d.dtype),
+        )
