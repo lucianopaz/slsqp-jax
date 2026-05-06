@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.qp import solve_qp
 
 # Enable 64-bit precision for numerical accuracy
 jax.config.update("jax_enable_x64", True)

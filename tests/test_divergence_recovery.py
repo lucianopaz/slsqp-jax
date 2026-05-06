@@ -24,7 +24,8 @@ import numpy as np
 import optimistix as optx
 import pytest
 
-from slsqp_jax import SLSQP, MinresQLPSolver, get_diagnostics
+from slsqp_jax import MinresQLPSolver, get_diagnostics
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -58,7 +59,7 @@ class TestTerminateRoutesDiverging:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(atol=1e-8, max_steps=10)
+        solver = _make_slsqp(atol=1e-8, max_steps=10)
         x0 = jnp.array([1.0, -2.0])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
 
@@ -103,7 +104,7 @@ class TestNanMeritRollsBackToBest:
     @pytest.mark.slow
     def test_rollback_to_best_x(self):
         objective = self._make_problem(nan_radius=5.0)
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=30,
             divergence_factor=10.0,
@@ -150,7 +151,7 @@ class TestBenignProblemDoesNotDiverge:
         def objective(x, args):
             return jnp.sum((x - 1.0) ** 2), None
 
-        solver = SLSQP(atol=1e-8, max_steps=50)
+        solver = _make_slsqp(atol=1e-8, max_steps=50)
         x0 = jnp.array([3.0, -2.0, 0.5])
         y, state, result = _run_loop(solver, objective, x0)
 
@@ -170,7 +171,7 @@ class TestBenignProblemDoesNotDiverge:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -197,7 +198,7 @@ class TestBenignProblemDoesNotDiverge:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,

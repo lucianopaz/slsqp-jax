@@ -11,6 +11,17 @@ from slsqp_jax.compat import (
     minimize_like_scipy,
     parse_constraints,
 )
+from slsqp_jax.config import (
+    AdaptiveCGConfig,
+    LBFGSConfig,
+    LineSearchConfig,
+    LPECAConfig,
+    PreconditionerConfig,
+    ProximalConfig,
+    QPConfig,
+    SLSQPConfig,
+    ToleranceConfig,
+)
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
@@ -28,7 +39,7 @@ from slsqp_jax.hessian import (
     lbfgs_should_skip,
     lbfgs_soft_reset,
 )
-from slsqp_jax.inner_solver import (
+from slsqp_jax.inner import (
     AbstractInnerSolver,
     HRInexactSTCG,
     InnerSolveResult,
@@ -49,11 +60,11 @@ from slsqp_jax.merit import (
     compute_merit,
     update_penalty_parameter,
 )
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.qp import solve_qp
 from slsqp_jax.results import RESULTS, is_successful
-from slsqp_jax.solver import (
-    SLSQP,
-    STAGNATION_MESSAGE,
+from slsqp_jax.slsqp import SLSQP
+from slsqp_jax.slsqp.solver import STAGNATION_MESSAGE
+from slsqp_jax.state import (
     QPResult,
     SLSQPDiagnostics,
     SLSQPState,
@@ -75,6 +86,16 @@ __all__ = [
     "SLSQPDiagnostics",
     "get_diagnostics",
     "QPResult",
+    # Configuration
+    "SLSQPConfig",
+    "ToleranceConfig",
+    "LBFGSConfig",
+    "LineSearchConfig",
+    "QPConfig",
+    "ProximalConfig",
+    "PreconditionerConfig",
+    "LPECAConfig",
+    "AdaptiveCGConfig",
     # Termination codes
     "RESULTS",
     "is_successful",

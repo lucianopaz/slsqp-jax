@@ -20,7 +20,7 @@ import optimistix as optx
 import pytest
 from scipy.optimize import minimize as scipy_minimize
 
-from slsqp_jax import SLSQP
+from tests.conftest import _make_slsqp
 
 # Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)
@@ -50,7 +50,7 @@ def make_benchmark_problem(n, proximal_tau=0.5):
     def ineq_constraint(x, args):
         return x[:n_ineq]
 
-    solver = SLSQP(
+    solver = _make_slsqp(
         atol=1e-6,
         max_steps=200,
         eq_constraint_fn=eq_constraint,
@@ -271,7 +271,7 @@ class TestRosenbrock:
             return jnp.sum(term1 + term2), None
 
         # Unconstrained SLSQP solver
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=500,
             eq_constraint_fn=None,

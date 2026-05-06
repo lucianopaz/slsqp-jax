@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax import SLSQP
 from slsqp_jax.hessian import (
     LBFGSHistory,
     lbfgs_append,
@@ -25,7 +24,8 @@ from slsqp_jax.hessian import (
     lbfgs_inverse_hvp,
     lbfgs_reset,
 )
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.qp import solve_qp
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -237,7 +237,7 @@ class TestProximalPreconditioner:
 
         n = 4
         mu = 0.1
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             use_preconditioner=True,
@@ -267,7 +267,7 @@ class TestProximalPreconditioner:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             use_preconditioner=True,
             atol=1e-8,
         )
@@ -299,7 +299,7 @@ class TestPenaltyGating:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             qp_max_iter=1,  # force QP failure
@@ -340,7 +340,7 @@ class TestSteepestDescentFallback:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             qp_max_iter=1,
             qp_max_cg_iter=1,
             atol=1e-4,
@@ -369,7 +369,7 @@ class TestStagnationRecovery:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             use_preconditioner=True,
@@ -392,7 +392,7 @@ class TestStagnationRecovery:
             return jnp.array([jnp.sum(x) - 3.0])
 
         bounds = jnp.array([[0.0, 5.0], [0.0, 5.0], [0.0, 5.0]])
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             bounds=bounds,
@@ -426,7 +426,7 @@ class TestStagnationRecovery:
         bounds = jnp.array([[0.0, 10.0]] * n)
         x0 = jnp.array([2.0, 1.0, 1.5, 0.5])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             bounds=bounds,
@@ -551,26 +551,40 @@ class TestEscalatingLBFGSRecovery:
     def test_consecutive_failures_trigger_identity_reset(self):
         """After qp_failure_patience consecutive QP failures, L-BFGS resets to identity.
 
-        Uses inequality constraints so the active-set loop always enters the
-        body (warm-start doesn't immediately satisfy KKT), forcing genuine QP
-        failures with qp_max_iter=1.
+        ``qp_real_failure`` is gated on ``~qp_result.converged &
+        ~qp_result.reached_max_iter`` so that a QP that simply hits its
+        iteration budget — which still returns a finite Newton direction
+        the line search can vet — does not poison the L-BFGS history.
+        The only deterministic way to drive a "real" QP failure is to
+        force a non-finite direction out of the inner CG.  We do this by
+        plugging in a custom ``obj_hvp_fn`` that returns NaN: with
+        ``qp.use_exact_hvp=True`` and an unconstrained problem the QP
+        layer routes straight to ``solve_unconstrained_cg``, which then
+        propagates the NaN through ``finite_d`` so that ``converged=False``
+        and ``reached_max_iter=False`` simultaneously.
+
+        The objective is a heavily anisotropic quadratic so the
+        steepest-descent fallback (which the outer step takes whenever
+        the QP returns ``converged=False``) cannot accidentally solve
+        the problem in one shot — the failure counter must be allowed
+        to climb to ``qp_failure_patience`` instead of being reset by
+        an immediate ``y == y*`` line search.
         """
+        scales = jnp.array([1e-6, 1.0, 1e6])
 
         def objective(x, args):
-            return jnp.sum(x**2), None
+            return 0.5 * jnp.sum(scales * x**2), None
 
-        def ineq_constraint(x, args):
-            return jnp.array([x[0] + x[1] - 1.0, x[0] - x[1]])
+        def nan_hvp(x, v, args):
+            return jnp.full_like(v, jnp.nan)
 
         patience = 3
-        solver = SLSQP(
-            ineq_constraint_fn=ineq_constraint,
-            n_ineq_constraints=2,
-            qp_max_iter=1,
-            qp_max_cg_iter=1,
+        solver = _make_slsqp(
+            obj_hvp_fn=nan_hvp,
+            use_exact_hvp_in_qp=True,
             qp_failure_patience=patience,
             atol=1e-8,
-            max_steps=patience + 5,
+            max_steps=2 * patience + 5,
         )
         x0 = jnp.array([2.0, -1.0, 0.5])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
@@ -598,7 +612,7 @@ class TestEscalatingLBFGSRecovery:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             qp_failure_patience=3,
             atol=1e-6,
             max_steps=5,
@@ -630,7 +644,7 @@ class TestAlphaScaledMultipliers:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             atol=1e-8,
@@ -658,7 +672,7 @@ class TestAlphaScaledMultipliers:
             return (x[0] - 5) ** 2 + (x[1] - 5) ** 2, None
 
         bounds = jnp.array([[0.0, 2.0], [0.0, 2.0]])
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             bounds=bounds,
             max_steps=50,
@@ -679,13 +693,13 @@ class TestMeritStagnation:
 
     def test_stagnation_window_calculation(self):
         """_stagnation_window = max(1, max_steps // 10)."""
-        solver = SLSQP(max_steps=100)
+        solver = _make_slsqp(max_steps=100)
         assert solver._stagnation_window == 10
 
-        solver2 = SLSQP(max_steps=7)
+        solver2 = _make_slsqp(max_steps=7)
         assert solver2._stagnation_window == 1
 
-        solver3 = SLSQP(max_steps=200)
+        solver3 = _make_slsqp(max_steps=200)
         assert solver3._stagnation_window == 20
 
     def test_best_merit_init(self):
@@ -694,7 +708,7 @@ class TestMeritStagnation:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(max_steps=100)
+        solver = _make_slsqp(max_steps=100)
         x0 = jnp.array([1.0, 2.0, 3.0])
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
         assert jnp.isfinite(state.best_merit)
@@ -707,7 +721,7 @@ class TestMeritStagnation:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             stagnation_tol=1e-12,
@@ -722,7 +736,7 @@ class TestMeritStagnation:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-15,
             max_steps=100,
             stagnation_tol=1e-3,
@@ -748,21 +762,38 @@ class TestAdaptiveProximalMu:
 
     def test_proximal_tau_validation(self):
         """proximal_tau must be in [0, 1)."""
-        SLSQP(proximal_tau=0.0)  # 0 is valid (disables proximal)
-        with pytest.raises(ValueError, match="proximal_tau"):
-            SLSQP(proximal_tau=1.0)
-        with pytest.raises(ValueError, match="proximal_tau"):
-            SLSQP(proximal_tau=-0.5)
+        _make_slsqp(proximal_tau=0.0)  # 0 is valid (disables proximal)
+        with pytest.raises(ValueError, match="proximal.tau"):
+            _make_slsqp(proximal_tau=1.0)
+        with pytest.raises(ValueError, match="proximal.tau"):
+            _make_slsqp(proximal_tau=-0.5)
 
     def test_proximal_mu_min_default_from_atol(self):
         """proximal_mu_min=None should resolve to atol."""
-        solver = SLSQP(atol=1e-7)
+        solver = _make_slsqp(atol=1e-7)
         assert solver._proximal_mu_min == 1e-7
 
     def test_proximal_mu_min_explicit(self):
         """Explicit proximal_mu_min should be used."""
-        solver = SLSQP(proximal_mu_min=1e-5)
+        solver = _make_slsqp(proximal_mu_min=1e-5)
         assert solver._proximal_mu_min == 1e-5
+
+    def test_proximal_mu_property_accessors(self):
+        """Public ``proximal_mu_min`` / ``proximal_mu_max`` properties read the config.
+
+        The legacy public surface is preserved as ``@property`` shims on
+        :class:`SLSQP` that read the new nested ``ProximalConfig``;
+        exercising them keeps the read-paths covered alongside
+        ``__check_init__``.
+        """
+        solver = _make_slsqp(proximal_mu_min=1e-5, proximal_mu_max=0.25)
+        assert solver.proximal_mu_min == 1e-5
+        assert solver.proximal_mu_max == 0.25
+        # The default ``proximal_mu_min=None`` reads back as ``None``
+        # before ``__check_init__`` aliases it to ``atol`` on the
+        # private slot.
+        defaults = _make_slsqp()
+        assert defaults.proximal_mu_min is None
 
     @pytest.mark.slow
     def test_adaptive_mu_converges_equality_constrained(self):
@@ -774,7 +805,7 @@ class TestAdaptiveProximalMu:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             atol=1e-6,
@@ -797,7 +828,7 @@ class TestAdaptiveProximalMu:
             return jnp.array([x[0] + x[1] - 1.0])
 
         for tau in [0.0, 0.1, 0.5, 0.9]:
-            solver = SLSQP(
+            solver = _make_slsqp(
                 eq_constraint_fn=eq_constraint,
                 n_eq_constraints=1,
                 proximal_tau=tau,
@@ -817,7 +848,7 @@ class TestAdaptiveProximalMu:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             proximal_tau=0,
@@ -842,7 +873,7 @@ class TestAdaptiveProximalMu:
         def ineq_constraint(x, args):
             return jnp.array([x[0], x[1]])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=1,
             ineq_constraint_fn=ineq_constraint,

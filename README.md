@@ -12,6 +12,8 @@ A pure-JAX implementation of the **SLSQP** (Sequential Least Squares Quadratic P
 
 The `SLSQP` solver is built on top of [Optimistix](https://github.com/patrick-kidger/optimistix), a JAX library for nonlinear solvers. It implements the `optimistix.AbstractMinimiser` interface, so you run it through the standard [`optimistix.minimise`](https://docs.kidger.site/optimistix/api/minimise/) entry point — no manual iteration loop required.
 
+> **Breaking API change.** The previous flat `SLSQP(rtol=…, atol=…, max_steps=…, …)` constructor has been replaced with a single nested `SLSQPConfig` argument. All examples below use the new layout; users on `slsqp_jax.compat.minimize_like_scipy` need no changes. See [`REFACTOR_NOTES.md`](REFACTOR_NOTES.md) for the migration mapping (every removed flat kwarg is listed alongside its new sub-config home) and a side-by-side migration example.
+
 ## Installation
 
 You can install the package from PyPI using any standard method:
@@ -45,7 +47,7 @@ Then create an `SLSQP` solver and pass it to `optimistix.minimise`:
 ```python
 import jax.numpy as jnp
 import optimistix as optx
-from slsqp_jax import SLSQP
+from slsqp_jax import SLSQP, SLSQPConfig, ToleranceConfig
 
 # Objective: minimize x^2 + y^2
 def objective(x, args):
@@ -65,7 +67,7 @@ solver = SLSQP(
     n_eq_constraints=1,
     ineq_constraint_fn=ineq_constraint,
     n_ineq_constraints=1,
-    rtol=1e-8,
+    config=SLSQPConfig(tolerance=ToleranceConfig(rtol=1e-8)),
 )
 
 x0 = jnp.array([0.5, 0.5])
@@ -85,6 +87,47 @@ The returned `optimistix.Solution` object contains:
 - `sol.state` — the final internal solver state.
 
 Since `SLSQP` is a standard Optimistix minimiser, it composes with all Optimistix features: `throw=False` for non-raising error handling, custom `adjoint` methods for differentiating through the solve, and so on. See the [Optimistix documentation](https://docs.kidger.site/optimistix/) for details.
+
+### Configuration
+
+`SLSQP` takes a single `config: SLSQPConfig` argument that aggregates all the algorithmic knobs into eight semantically-grouped sub-configs. Pass only the sub-configs you want to override; the rest fall back to their defaults.
+
+| Sub-config | Imported as | Controls |
+| --- | --- | --- |
+| `tolerance` | `ToleranceConfig` | `rtol`, `atol`, `max_steps`, `min_steps`, `stagnation_tol`, `divergence_factor`, `divergence_patience` |
+| `lbfgs` | `LBFGSConfig` | L-BFGS `memory`, `damping_threshold`, per-variable diagonal `diag_floor` / `diag_ceil` |
+| `line_search` | `LineSearchConfig` | Backtracking `max_steps`, `armijo_c1`, `failure_patience` |
+| `qp` | `QPConfig` | QP active-set `max_iter`, inner `max_cg_iter`, `failure_patience`, `zero_step_patience`, `ping_pong_threshold`, `mult_drop_floor`, `cg_regularization`, Newton-CG `use_exact_hvp` |
+| `proximal` | `ProximalConfig` | sSQP `tau`, `mu_min`, `mu_max` |
+| `preconditioner` | `PreconditionerConfig` | `enabled`, `type` (`"lbfgs"` / `"diagonal"`), `diagonal_n_probes` |
+| `lpeca` | `LPECAConfig` | LPEC-A `method`, `sigma`, `beta`, `use_lp`, `trust_threshold`, `warmup_steps`, `predict_bounds` |
+| `adaptive_cg` | `AdaptiveCGConfig` | Eisenstat-Walker `enabled`, HR-STCG `use_inexact_stationarity` |
+
+Constraint information (`eq_constraint_fn`, `ineq_constraint_fn`, `n_eq_constraints`, `n_ineq_constraints`, `bounds`), optional derivative overrides (`obj_grad_fn`, `eq_jac_fn`, `ineq_jac_fn`, `obj_hvp_fn`, `eq_hvp_fn`, `ineq_hvp_fn`), the optional pluggable `inner_solver`, and the `verbose` printer remain top-level keyword arguments on `SLSQP` itself; only the algorithmic numerical knobs moved into `SLSQPConfig`.
+
+```python
+from slsqp_jax import (
+    SLSQP,
+    SLSQPConfig,
+    ToleranceConfig,
+    LBFGSConfig,
+    QPConfig,
+    LPECAConfig,
+)
+
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=1,
+    config=SLSQPConfig(
+        tolerance=ToleranceConfig(rtol=1e-8, max_steps=200),
+        lbfgs=LBFGSConfig(memory=20),
+        qp=QPConfig(max_iter=200, max_cg_iter=120),
+        lpeca=LPECAConfig(method="lpeca_init", warmup_steps=2),
+    ),
+)
+```
+
+The full migration table from the legacy flat keyword arguments is in [`REFACTOR_NOTES.md`](REFACTOR_NOTES.md). Other examples below in this README still occasionally use the legacy flat-kwarg style for brevity; the same parameters live in the sub-configs listed above.
 
 ### Termination Codes
 

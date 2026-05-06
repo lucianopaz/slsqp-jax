@@ -59,7 +59,7 @@ import optimistix as optx
 from jaxtyping import Array, Float
 from scipy.optimize import Bounds, LinearConstraint, NonlinearConstraint
 
-from slsqp_jax.solver import SLSQP
+from slsqp_jax.slsqp import SLSQP
 from slsqp_jax.types import (
     ConstraintFn,
     ConstraintHVPFn,
@@ -955,12 +955,137 @@ def minimize_like_scipy(
             return jnp.asarray(user_hessp(x, v, *packed_args))
 
     # --- Build solver ---
+    # Translate the SciPy-style flat options dictionary into the new
+    # nested :class:`SLSQPConfig`.  This is the only documented
+    # migration path for downstream users that still want the
+    # SciPy-flavoured ``options=`` dict — direct construction of
+    # :class:`SLSQP` requires the nested config explicitly.
+    from slsqp_jax.config import (
+        AdaptiveCGConfig,
+        LBFGSConfig,
+        LineSearchConfig,
+        LPECAConfig,
+        PreconditionerConfig,
+        ProximalConfig,
+        QPConfig,
+        SLSQPConfig,
+        ToleranceConfig,
+    )
+
     max_steps = opts.pop("max_steps", opts.pop("maxiter", 100))
-    solver = SLSQP(
-        rtol=opts.pop("rtol", 1e-6),
-        atol=opts.pop("atol", 1e-6),
+
+    def _pop_section(section_cls, mapping):
+        kw = {}
+        for src_key, dst_key in mapping.items():
+            if src_key in opts:
+                kw[dst_key] = opts.pop(src_key)
+        return section_cls(**kw)
+
+    tolerance = _pop_section(
+        ToleranceConfig,
+        {
+            "rtol": "rtol",
+            "atol": "atol",
+            "min_steps": "min_steps",
+            "stagnation_tol": "stagnation_tol",
+            "divergence_factor": "divergence_factor",
+            "divergence_patience": "divergence_patience",
+        },
+    )
+    tolerance = ToleranceConfig(
+        rtol=tolerance.rtol,
+        atol=tolerance.atol,
         max_steps=max_steps,
-        min_steps=opts.pop("min_steps", 1),
+        min_steps=tolerance.min_steps,
+        stagnation_tol=tolerance.stagnation_tol,
+        divergence_factor=tolerance.divergence_factor,
+        divergence_patience=tolerance.divergence_patience,
+    )
+    lbfgs = _pop_section(
+        LBFGSConfig,
+        {
+            "lbfgs_memory": "memory",
+            "damping_threshold": "damping_threshold",
+            "lbfgs_diag_floor": "diag_floor",
+            "lbfgs_diag_ceil": "diag_ceil",
+        },
+    )
+    line_search = _pop_section(
+        LineSearchConfig,
+        {
+            "line_search_max_steps": "max_steps",
+            "armijo_c1": "armijo_c1",
+            "ls_failure_patience": "failure_patience",
+        },
+    )
+    qp = _pop_section(
+        QPConfig,
+        {
+            "qp_max_iter": "max_iter",
+            "qp_max_cg_iter": "max_cg_iter",
+            "qp_failure_patience": "failure_patience",
+            "zero_step_patience": "zero_step_patience",
+            "qp_ping_pong_threshold": "ping_pong_threshold",
+            "mult_drop_floor": "mult_drop_floor",
+            "cg_regularization": "cg_regularization",
+            "use_exact_hvp_in_qp": "use_exact_hvp",
+        },
+    )
+    proximal = _pop_section(
+        ProximalConfig,
+        {
+            "proximal_tau": "tau",
+            "proximal_mu_min": "mu_min",
+            "proximal_mu_max": "mu_max",
+        },
+    )
+    preconditioner = _pop_section(
+        PreconditionerConfig,
+        {
+            "use_preconditioner": "enabled",
+            "preconditioner_type": "type",
+            "diagonal_n_probes": "diagonal_n_probes",
+        },
+    )
+    lpeca = _pop_section(
+        LPECAConfig,
+        {
+            "active_set_method": "method",
+            "lpeca_sigma": "sigma",
+            "lpeca_beta": "beta",
+            "lpeca_use_lp": "use_lp",
+            "lpeca_trust_threshold": "trust_threshold",
+            "lpeca_warmup_steps": "warmup_steps",
+            "lpeca_predict_bounds": "predict_bounds",
+        },
+    )
+    adaptive_cg = _pop_section(
+        AdaptiveCGConfig,
+        {
+            "adaptive_cg_tol": "enabled",
+            "use_inexact_stationarity": "use_inexact_stationarity",
+        },
+    )
+
+    config = SLSQPConfig(
+        tolerance=tolerance,
+        lbfgs=lbfgs,
+        line_search=line_search,
+        qp=qp,
+        proximal=proximal,
+        preconditioner=preconditioner,
+        lpeca=lpeca,
+        adaptive_cg=adaptive_cg,
+    )
+
+    inner_solver = opts.pop("inner_solver", None)
+    if opts:
+        raise TypeError(
+            f"minimize_like_scipy: unrecognized option(s): {sorted(opts.keys())!r}"
+        )
+
+    solver = SLSQP(
+        config=config,
         eq_constraint_fn=parsed.eq_constraint_fn,
         ineq_constraint_fn=parsed.ineq_constraint_fn,
         n_eq_constraints=parsed.n_eq_constraints,
@@ -972,13 +1097,8 @@ def minimize_like_scipy(
         obj_hvp_fn=obj_hvp_fn,
         eq_hvp_fn=parsed.eq_hvp_fn,
         ineq_hvp_fn=parsed.ineq_hvp_fn,
-        lbfgs_memory=opts.pop("lbfgs_memory", 10),
-        line_search_max_steps=opts.pop("line_search_max_steps", 20),
-        armijo_c1=opts.pop("armijo_c1", 1e-4),
-        qp_max_iter=opts.pop("qp_max_iter", 100),
-        qp_max_cg_iter=opts.pop("qp_max_cg_iter", 50),
-        verbose=verbose,  # type: ignore[arg-type]  # verbose is resolved in __check_init__
-        **opts,
+        inner_solver=inner_solver,
+        verbose=verbose,  # type: ignore[arg-type]
     )
 
     sol = optx.minimise(

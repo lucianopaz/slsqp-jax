@@ -33,11 +33,11 @@ import optimistix as optx
 import pytest
 
 from slsqp_jax import (
-    SLSQP,
     MinresQLPSolver,
     compute_partial_lagrangian_gradient,
     get_diagnostics,
 )
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -128,7 +128,7 @@ class TestNLPBoundMultiplierRecovery:
         x_star = jnp.maximum(c / d, 0.0)
         mu_star_lower = jnp.maximum(-c, 0.0)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-10,
             rtol=1e-10,
             max_steps=50,
@@ -186,7 +186,7 @@ class TestNLPBoundMultiplierRecovery:
         # μ_upper = −∂f/∂x_i = c − d * ub
         mu_star_upper = c - d * ub
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-10,
             rtol=1e-10,
             max_steps=50,
@@ -230,7 +230,7 @@ class TestNLPBoundMultiplierRecovery:
 
         bounds = jnp.column_stack([jnp.zeros(n), jnp.full(n, jnp.inf)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-10,
             rtol=1e-10,
             max_steps=80,
@@ -283,7 +283,7 @@ class TestNLPBoundMultiplierRecovery:
             ]
         )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-10,
             rtol=1e-10,
             max_steps=50,
@@ -314,7 +314,7 @@ class TestNLPBoundMultiplierRecovery:
         def ineq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -434,7 +434,7 @@ class TestNLPBoundMultiplierStagnationRegression:
         n = 100
         objective, eq_fn, ineq_fn, bounds, x0 = self._make_portfolio(n)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             rtol=1e-6,
             max_steps=300,
@@ -479,7 +479,7 @@ class TestNLPBoundMultiplierStagnationRegression:
         n = 500
         objective, eq_fn, ineq_fn, bounds, x0 = self._make_portfolio(n)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             rtol=1e-6,
             max_steps=400,
@@ -524,7 +524,7 @@ class TestNLPBoundMultiplierStagnationRegression:
         n = 5000
         objective, eq_fn, ineq_fn, bounds, x0 = self._make_portfolio(n)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             rtol=1e-6,
             max_steps=500,
@@ -587,7 +587,7 @@ class TestCoveragePaths:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(atol=1e-6, max_steps=5, bounds=None)
+        solver = _make_slsqp(atol=1e-6, max_steps=5, bounds=None)
         x0 = jnp.array([1.0, 2.0])
         n = x0.shape[0]
         grad_new = 2 * x0
@@ -623,7 +623,7 @@ class TestCoveragePaths:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=30,
             eq_constraint_fn=eq_constraint,
@@ -658,7 +658,7 @@ class TestCoveragePaths:
             # Nonlinear so the HVP is non-trivial.
             return jnp.array([1.0 - jnp.sum(x**2)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=30,
             ineq_constraint_fn=ineq_constraint,

@@ -27,9 +27,10 @@ import jax
 import jax.numpy as jnp
 import optimistix as optx
 
-from slsqp_jax import SLSQP, MinresQLPSolver, ProjectedCGCraig
-from slsqp_jax.inner_solver import craig_solve
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax import MinresQLPSolver, ProjectedCGCraig
+from slsqp_jax.inner.krylov import craig_solve
+from slsqp_jax.qp import solve_qp
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -75,7 +76,12 @@ class TestLPECABoundScatterX32:
             import jax.numpy as jnp
             import numpy as np
             import optimistix as optx
-            from slsqp_jax import SLSQP
+            from slsqp_jax import (
+                SLSQP,
+                LPECAConfig,
+                SLSQPConfig,
+                ToleranceConfig,
+            )
 
             def objective(x, args):
                 return jnp.sum(x ** 2), None
@@ -85,13 +91,17 @@ class TestLPECABoundScatterX32:
             bounds = np.stack([np.full(n, -0.5), np.full(n, 0.5)], axis=1)
 
             solver = SLSQP(
-                atol=1e-6,
-                rtol=1e-6,
-                max_steps=20,
                 bounds=bounds,
-                active_set_method="lpeca_init",
-                lpeca_predict_bounds=True,
-                lpeca_warmup_steps=0,
+                config=SLSQPConfig(
+                    tolerance=ToleranceConfig(
+                        atol=1e-6, rtol=1e-6, max_steps=20
+                    ),
+                    lpeca=LPECAConfig(
+                        method="lpeca_init",
+                        predict_bounds=True,
+                        warmup_steps=0,
+                    ),
+                ),
             )
             sol = optx.minimise(
                 objective, solver, x0, has_aux=True, throw=False
@@ -125,7 +135,7 @@ class TestMinresQLPPingPongDisabled:
     """
 
     def test_default_threshold_is_effectively_off(self):
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             rtol=1e-6,
             max_steps=5,
@@ -155,7 +165,7 @@ class TestMinresQLPPingPongDisabled:
         def ineq_constraint(x, args):
             return x  # x_i >= 0
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             rtol=1e-6,
             max_steps=15,
