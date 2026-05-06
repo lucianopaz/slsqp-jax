@@ -32,11 +32,11 @@ from slsqp_jax.hessian import (
     compute_partial_lagrangian_gradient,
     estimate_hessian_diagonal,
     lbfgs_append,
+    lbfgs_curvature_diagnostics,
     lbfgs_hvp,
     lbfgs_identity_reset,
     lbfgs_init,
     lbfgs_inverse_hvp,
-    lbfgs_should_skip,
     lbfgs_soft_reset,
 )
 from slsqp_jax.inner_solver import (
@@ -230,6 +230,17 @@ class SLSQPDiagnostics(eqx.Module):
     # the inexact-projection sense, regardless of whether
     # ``use_inexact_stationarity`` was on.
     min_projected_grad_norm: Scalar
+    # Number of iterations where the inner solver's projected-gradient
+    # norm ``||W̃_k g_k||`` was strictly smaller than the classical
+    # Lagrangian gradient norm ``||\u2207L||``.  A high count is the
+    # post-hoc indicator that multiplier-recovery noise is the limiting
+    # factor (i.e. the inexact-stationarity disjunct could rescue the
+    # run from a stationarity stall) and the user might benefit from
+    # ``use_inexact_stationarity=True`` paired with ``HRInexactSTCG``.
+    # Always ``0`` for inner solvers that do not populate
+    # ``projected_grad_norm`` because the field is initialised to
+    # ``+inf`` and never compares less than the finite classical norm.
+    n_steps_inexact_below_classical: Int[Array, ""]
 
 
 def _init_diagnostics() -> SLSQPDiagnostics:
@@ -261,6 +272,7 @@ def _init_diagnostics() -> SLSQPDiagnostics:
         n_divergence_blowups=jnp.array(0),
         divergence_triggered=jnp.array(False),
         min_projected_grad_norm=jnp.asarray(jnp.inf),
+        n_steps_inexact_below_classical=jnp.array(0),
     )
 
 
@@ -1987,22 +1999,37 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
-        # On QP failure: soft reset (keep most recent pair) to preserve
-        # the newest curvature information while discarding stale pairs.
-        new_lbfgs_history = jax.lax.cond(
-            qp_result.converged,
-            lambda h: h,
-            lbfgs_soft_reset,
-            new_lbfgs_history,
-        )
-
-        # Escalating recovery: after qp_failure_patience consecutive
-        # QP failures, soft resets are re-using the same problematic
-        # pair. Hard-reset to identity to break the cycle.
+        # QP-failure recovery (5a + 5b).
+        #
+        # 5a: distinguish "real" QP failure (non-finite direction —
+        # ``qp_result.converged=False`` *not* caused by hitting
+        # ``qp_max_iter``) from a benign budget exhaustion (finite
+        # direction returned, but the active-set loop hit
+        # ``qp_max_iter``).  ``qp_solver._solve_qp_*`` forces
+        # ``converged=False`` whenever ``reached_max_iter`` is true so
+        # the outer driver does not silently trust the EXPAND-relaxed
+        # tolerance, but for the L-BFGS reset chain we want to treat
+        # budget exhaustion as a *successful* outcome: the inner solver
+        # spent its budget, returned a usable Newton direction, and the
+        # merit/line search has already vetted it.  Counting this as a
+        # failure burns through history we want to keep.
+        #
+        # 5b: even on a *real* failure, only soft-reset on the *first*
+        # failure of a streak.  The previous chain soft-reset on every
+        # increment of the counter and then identity-reset at the
+        # patience threshold, which double-discards the buffer (3x soft
+        # reset + 1x identity reset by the time the patience fires).
+        qp_real_failure = ~qp_result.converged & ~qp_result.reached_max_iter
         new_consecutive_qp_failures = jnp.where(
-            qp_result.converged,
-            jnp.array(0),
+            qp_real_failure,
             state.consecutive_qp_failures + 1,
+            jnp.array(0),
+        )
+        new_lbfgs_history = jax.lax.cond(
+            qp_real_failure & (new_consecutive_qp_failures == 1),
+            lbfgs_soft_reset,
+            lambda h: h,
+            new_lbfgs_history,
         )
         new_lbfgs_history = jax.lax.cond(
             new_consecutive_qp_failures >= self.qp_failure_patience,
@@ -2011,8 +2038,9 @@ class SLSQP(optx.AbstractMinimiser):
             new_lbfgs_history,
         )
 
-        # Line search failure recovery: soft reset on each failure,
-        # identity escalation after patience threshold.
+        # Line-search failure recovery (5b symmetric): soft reset only
+        # on the *first* failure of a streak; identity escalation at
+        # patience threshold.
         ls_failed = ~ls_result.success
         new_consecutive_ls_failures = jnp.where(
             ls_failed,
@@ -2020,7 +2048,7 @@ class SLSQP(optx.AbstractMinimiser):
             jnp.array(0),
         )
         new_lbfgs_history = jax.lax.cond(
-            ls_failed & (new_consecutive_ls_failures < self.ls_failure_patience),
+            ls_failed & (new_consecutive_ls_failures == 1),
             lbfgs_soft_reset,
             lambda h: h,
             new_lbfgs_history,
@@ -2127,7 +2155,13 @@ class SLSQP(optx.AbstractMinimiser):
         # report a "skip" on every iteration after memory is full and
         # saturate ``n_lbfgs_skips`` to (max_steps - memory).
         prev_diag = state.diagnostics
-        lbfgs_skipped = lbfgs_should_skip(s, y_for_lbfgs)
+        # Pull (s.y, |s.y|/(||s||*||y||), skipped) all at once so the
+        # verbose callback can surface the L-BFGS skip diagnostic.  The
+        # ``skipped`` flag is identical to ``lbfgs_should_skip(s, y)``
+        # so the diagnostic accumulator below is unchanged.
+        lbfgs_sty, lbfgs_relcurv, lbfgs_skipped = lbfgs_curvature_diagnostics(
+            s, y_for_lbfgs
+        )
         # Estimate of the smallest singular value of J_eq from the
         # Cholesky factor of J_eq J_eq^T (when equality constraints are
         # present).  This is ``sqrt(min_i diag(L)^2)`` which is a lower
@@ -2211,6 +2245,23 @@ class SLSQP(optx.AbstractMinimiser):
                 qp_result.projected_grad_norm.astype(
                     prev_diag.min_projected_grad_norm.dtype
                 ),
+            ),
+            # Branch-free counter: ``+1`` whenever the inner solver's
+            # projected-gradient norm is strictly smaller than the
+            # classical Lagrangian gradient norm at the new iterate.
+            # ``grad_lagrangian_new`` is finalised earlier in ``step()``
+            # (line ~1949) so it is safe to read here.  We cast both
+            # sides to the same dtype before comparing to avoid the
+            # ``ComplexWarning`` that ``jnp.where`` would otherwise emit
+            # on dtype mismatches between ``float64`` (counter target
+            # arithmetic) and ``float32`` (potential dtype of the QP
+            # quantities under JAX 32-bit mode).
+            n_steps_inexact_below_classical=prev_diag.n_steps_inexact_below_classical
+            + jnp.where(
+                qp_result.projected_grad_norm.astype(jnp.float64)
+                < jnp.linalg.norm(grad_lagrangian_new).astype(jnp.float64),
+                1,
+                0,
             ),
         )
 
@@ -2445,6 +2496,7 @@ class SLSQP(optx.AbstractMinimiser):
             constraint_violation=("|c|", c_viol, ".3e"),
             kkt_residual=("|∇L|", kkt, ".3e"),
             kkt_relative=("|∇L|/|L|", rel_kkt, ".3e"),
+            proj_grad_norm=("|W̃g|", qp_result.projected_grad_norm, ".3e"),
             grad_norm=("|∇f|", grad_norm, ".3e"),
             step_size=("α", alpha, ".3e"),
             direction_norm=("|d|", dir_norm, ".3e"),
@@ -2456,6 +2508,8 @@ class SLSQP(optx.AbstractMinimiser):
             lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
             lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
             lbfgs_skipped=("skip", lbfgs_skipped),
+            lbfgs_sty=("s·y", lbfgs_sty, ".3e"),
+            lbfgs_relcurv=("rel_curv", lbfgs_relcurv, ".3e"),
             qp_iters=("QPiter", qp_result.iterations),
             qp_cyc=("QPcyc", qp_cyc),
             qp_converged=("QP ok", qp_result.converged),
@@ -2658,12 +2712,20 @@ class SLSQP(optx.AbstractMinimiser):
         # classification through ``state.termination_code`` (set in
         # ``step()``) and ``Solution.stats["slsqp_result"]`` (set in
         # ``postprocess()``).
+        # ``max_iters_reached`` is intentionally *excluded* from the
+        # ``non_success_done`` disjunction.  The cond ladder below routes
+        # ``non_success_done -> nonlinear_divergence`` and only the
+        # remaining ``max_iters_reached`` branch maps to
+        # ``nonlinear_max_steps_reached``.  Including ``max_iters_reached``
+        # here would mis-classify a run that simply ran out of iterations
+        # (no genuine failure flags latched) as ``nonlinear_divergence``.
+        # This mirrors the priority order already implemented in
+        # ``step()`` via ``RESULTS.where`` (see lines 2320-2367), where
+        # ``nonlinear_max_steps_reached`` is the lowest-priority non-
+        # success classification and any genuine failure flag overrides
+        # it.
         non_success_done = (
-            max_iters_reached
-            | stagnation_detected
-            | ls_stagnation
-            | qp_stagnation
-            | diverging
+            stagnation_detected | ls_stagnation | qp_stagnation | diverging
         )
         result = jax.lax.cond(
             converged,

@@ -167,17 +167,27 @@ def build_cg_step(
     precond_fn: Callable[[Vector], Vector] | None = None,
     project: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
+    cg_atol: float | None = None,
 ):
     """Build a CG step function.
 
     Args:
         hvp_fn: Hessian-vector product function v -> B @ v.
-        cg_tol: Convergence tolerance on residual norm.
+        cg_tol: Convergence tolerance on residual norm (absolute when
+            ``cg_atol`` is ``None``; otherwise the squared per-step test
+            is ``r^T r < max(cg_atol**2, cg_tol**2)`` so the larger of
+            the two acts as the effective floor).
         precond_fn: Optional preconditioner v -> M @ v where M ~ B^{-1}.
         project: Optional projection function v -> P(v) where P is the
             projection onto the null space of A.
         cg_regularization: Minimum eigenvalue threshold for the curvature
             guard.
+        cg_atol: Optional absolute residual-norm floor.  When provided,
+            convergence is declared at ``r^T r < max(cg_atol**2,
+            cg_tol**2)``.  Used by the multiplier-recovery CG inside
+            ``ProjectedCGCraig`` so that a near-KKT iterate does not
+            chase a relative target below ``eps``.  Defaults to ``None``
+            (current behaviour: pure absolute test ``r^T r < cg_tol**2``).
 
     Returns:
         A CG step function.
@@ -196,6 +206,16 @@ def build_cg_step(
     # the bottom of this function would no longer be a scalar, raising
     # ``TypeError: Pred must be a scalar`` from deep inside JAX.
     cg_tol = to_scalar(cg_tol)
+    # ``tol_sq`` is the squared residual-norm threshold used by the
+    # convergence test below.  When ``cg_atol`` is provided we take
+    # the *larger* of ``cg_atol**2`` and ``cg_tol**2`` so that the
+    # absolute floor only kicks in when ``cg_tol`` is itself tighter
+    # than the floor (e.g. ``mult_recovery_tol = 1e-12`` chasing a
+    # near-KKT residual already at machine precision).
+    if cg_atol is not None:
+        tol_sq: Scalar | float = jnp.maximum(cg_atol**2, cg_tol**2)
+    else:
+        tol_sq = cg_tol**2
 
     def cg_step(i, state):
         def do_step(state: _CGState) -> _CGState:
@@ -231,7 +251,7 @@ def build_cg_step(
             beta = rz_new / jnp.maximum(state.rz, 1e-30)
             p_new = z_new + beta * state.p
 
-            converged = (r_new_norm_sq < cg_tol**2) | has_bad_curvature
+            converged = (r_new_norm_sq < tol_sq) | has_bad_curvature
 
             return jax.lax.cond(
                 has_bad_curvature,
@@ -270,6 +290,7 @@ def solve_unconstrained_cg(
     cg_tol: Scalar | float,
     precond_fn: Callable[[Vector], Vector] | None = None,
     cg_regularization: float = 1e-6,
+    cg_atol: float | None = None,
 ) -> tuple[Vector, Bool[Array, ""]]:
     """Solve the unconstrained QP: min (1/2) d^T B d + g^T d.
 
@@ -288,6 +309,15 @@ def solve_unconstrained_cg(
             guard.  CG declares "bad curvature" when the effective
             eigenvalue ``p^T B p / ||p||^2`` falls below this value.
             Based on SNOPT Section 4.5 (Gill, Murray & Saunders, 2005).
+        cg_atol: Optional absolute residual-norm floor.  When provided,
+            the per-step convergence test becomes
+            ``r^T r < max(cg_atol**2, cg_tol**2)`` so an absolute floor
+            kicks in whenever the user-supplied ``cg_tol`` would target
+            a residual below the floor.  Used by the multiplier-recovery
+            CG inside ``ProjectedCGCraig`` (where ``cg_tol`` is set to
+            ``mult_recovery_tol = 1e-12`` and the RHS can shrink to the
+            same scale near KKT).  Defaults to ``None`` (pure absolute
+            ``cg_tol`` test, current behaviour).
 
     Returns:
         Tuple of (d, converged) where d is the solution vector and
@@ -304,6 +334,13 @@ def solve_unconstrained_cg(
     # cg_sign_convention_analysis for the full derivation.
     n = g.shape[0]
     cg_tol = to_scalar(cg_tol)
+    # Mirror the hybrid convergence threshold logic from ``build_cg_step``
+    # so the *initial* convergence test (``r0`` already at floor) honors
+    # the same effective floor as subsequent CG iterations.
+    if cg_atol is not None:
+        init_tol_sq: Scalar | float = jnp.maximum(cg_atol**2, cg_tol**2)
+    else:
+        init_tol_sq = cg_tol**2
     r0 = -g
     r0_norm_sq = jnp.dot(r0, r0)
 
@@ -323,7 +360,7 @@ def solve_unconstrained_cg(
         p=p0,
         rz=rz0,
         iteration=jnp.array(0),
-        converged=jnp.reshape(r0_norm_sq < cg_tol**2, ()),
+        converged=jnp.reshape(r0_norm_sq < init_tol_sq, ()),
     )
 
     cg_step = build_cg_step(
@@ -331,6 +368,7 @@ def solve_unconstrained_cg(
         cg_tol=cg_tol,
         precond_fn=precond_fn,
         cg_regularization=cg_regularization,
+        cg_atol=cg_atol,
     )
 
     final_cg = jax.lax.fori_loop(0, max_cg_iter, cg_step, init_cg)
@@ -786,6 +824,13 @@ class _CraigState(NamedTuple):
 
 
 _CRAIG_BREAKDOWN_TOL = 1e-14
+# Hardcoded absolute residual floor for the CRAIG convergence test.  Together
+# with the user-tunable relative ``tol``, the test becomes
+# ``residual < max(_CRAIG_TOL_ABS, tol * ||rhs||)``.  Without this floor a
+# near-KKT iterate with ``||rhs|| ~ 1e-13`` would target ``tol * 1e-13``
+# (below ``eps``) and never converge, even though the actual residual is
+# already at machine precision.
+_CRAIG_TOL_ABS = 1e-12
 
 
 def craig_solve(
@@ -811,15 +856,25 @@ def craig_solve(
     - Particular solution: ``d_p = craig_solve(A, b)``
     - Projection: ``P(v) = v - craig_solve(A, A @ v)``
 
+    Convergence test is hybrid absolute+relative:
+    ``residual < max(_CRAIG_TOL_ABS=1e-12, tol * ||rhs||)``.  The
+    absolute floor protects against the pathology where ``||rhs||``
+    is itself near machine epsilon (e.g. when projecting at a near-KKT
+    iterate where ``A v`` shrinks at the rate the SQP is converging),
+    in which case the pure-relative target ``tol * ||rhs||`` would
+    drop below ``eps`` and convergence could never fire.
+
     Args:
         A: Matrix (m x n).
         rhs: Right-hand side (m,).
-        tol: Convergence tolerance on ``||A x - rhs|| / ||rhs||``.
+        tol: Relative tolerance on ``||A x - rhs|| / ||rhs||``.  The
+            effective convergence threshold also has a hardcoded
+            absolute floor of ``1e-12``.
         max_iter: Maximum bidiagonalization steps.
 
     Returns:
         Tuple ``(x, converged)``.  ``converged`` is ``True`` only when the
-        relative residual fell below ``tol``; it is ``False`` if CRAIG
+        residual fell below the hybrid threshold; it is ``False`` if CRAIG
         broke down (``alpha`` / ``beta`` below an absolute threshold,
         signalling rank deficiency or numerical collapse) or exhausted
         its iteration budget.  When ``converged`` is ``False`` the
@@ -859,7 +914,9 @@ def craig_solve(
     # If beta1 is already zero, rhs is zero and x=0 is exact.
     trivially_converged = beta1 < tol * jnp.maximum(beta1_safe, 1.0)
     residual_init = jnp.abs(beta2 * s1)
-    init_converged = trivially_converged | (residual_init < tol * beta1_safe)
+    # Hybrid convergence threshold: max(absolute floor, relative on ||rhs||).
+    init_threshold = jnp.maximum(_CRAIG_TOL_ABS, tol * beta1_safe)
+    init_converged = trivially_converged | (residual_init < init_threshold)
     # Breakdown: A^T rhs is (numerically) zero.  Only report a breakdown
     # when we would otherwise report non-convergence; a zero rhs is not
     # an error.
@@ -915,7 +972,9 @@ def craig_solve(
             u_new = u_hat / beta_safe
 
             residual_new = jnp.abs(beta_new * s_new)
-            converged = residual_new < tol * beta1_safe
+            # Hybrid: absolute floor plus relative on ``||rhs||``.
+            step_threshold = jnp.maximum(_CRAIG_TOL_ABS, tol * beta1_safe)
+            converged = residual_new < step_threshold
 
             broke = alpha_breakdown | beta_breakdown
             done = converged | broke
@@ -938,9 +997,10 @@ def craig_solve(
         )
 
     final = jax.lax.fori_loop(0, max_iter, craig_step, init_state)
-    # A "true" success requires the residual to be below tolerance at
-    # termination and not having flagged a breakdown.
-    success = (final.residual < tol * beta1_safe) & ~final.breakdown
+    # A "true" success requires the residual to be below the hybrid
+    # threshold at termination and not having flagged a breakdown.
+    final_threshold = jnp.maximum(_CRAIG_TOL_ABS, tol * beta1_safe)
+    success = (final.residual < final_threshold) & ~final.breakdown
     return final.x, success
 
 
@@ -1122,8 +1182,17 @@ def _make_craig_projection_ctx(
 
     def recover_multipliers(Bd_plus_g: Vector) -> Float[Array, " m"]:
         kkt_rhs = A_work @ Bd_plus_g
+        # Pass the absolute floor so a near-KKT iterate (where ``kkt_rhs``
+        # itself shrinks toward machine precision) does not chase a
+        # ``mult_recovery_tol`` target below ``eps`` and stall.  The CRAIG
+        # absolute floor _CRAIG_TOL_ABS is reused here so the projector
+        # and the multiplier recovery stop at the same noise floor.
         mult, _ = solve_unconstrained_cg(
-            normal_hvp, -kkt_rhs, mult_recovery_max_iter, mult_recovery_tol
+            normal_hvp,
+            -kkt_rhs,
+            mult_recovery_max_iter,
+            mult_recovery_tol,
+            cg_atol=_CRAIG_TOL_ABS,
         )
         mult = jnp.where(active_mask, mult, 0.0)
         return mult
@@ -1215,7 +1284,11 @@ def _solve_projected_cg_craig(
                 return amat_hvp(v) + reg_diag * v
 
             w, _ = solve_unconstrained_cg(
-                amat_hvp_reg, -AMr, mult_recovery_max_iter, mult_recovery_tol
+                amat_hvp_reg,
+                -AMr,
+                mult_recovery_max_iter,
+                mult_recovery_tol,
+                cg_atol=_CRAIG_TOL_ABS,
             )
             return Mr - _raw_precond(A_work.T @ w)
 
@@ -1271,6 +1344,17 @@ def _solve_projected_cg_craig(
 # inexact null-space projections (no trust radius / no normal-tangent
 # split — the line-search SQP wrapper handles globalization).
 # ---------------------------------------------------------------------------
+
+# Hardcoded absolute floor for the HR-STCG inner-convergence test.  The
+# Step 1(a) test ``||z̃|| <= cg_tol * ||r̃_0||`` becomes
+# ``||z̃|| <= max(_HRSTCG_TOL_ABS, cg_tol * ||r̃_0||)`` so that when
+# ``||r̃_0||`` itself is at or below machine epsilon the iteration does
+# not chase a target below ``eps`` and return a spurious
+# ``converged=False`` flag.  Set tighter than ``_CRAIG_TOL_ABS`` (1e-12)
+# because the HR test is on the *projected* residual ``z̃`` (already
+# noise-cleaned by the projector), whereas CRAIG's residual is the raw
+# ``A x - rhs`` which carries one extra noise level.
+_HRSTCG_TOL_ABS = 1e-14
 
 
 class _HRSTCGState(NamedTuple):
@@ -1350,12 +1434,18 @@ def _hr_stcg(
     semantics of ``t̃_k`` consistent with how the outer SQP composes
     ``d = d_p + t̃_k``.
 
-    Convergence test.  Step 1(a) uses ``‖z̃_i‖ ≤ tol_CG · ‖r̃_0‖`` —
-    a relative test against the initial *projected* gradient.  This
-    is exactly the noise-aware stationarity proxy: both numerator
-    and denominator carry the same projector noise, so the test
-    reaches the inner solver's precision floor and stops cleanly
-    instead of grinding against it.
+    Convergence test.  Step 1(a) uses
+    ``‖z̃_i‖ ≤ max(_HRSTCG_TOL_ABS, tol_CG · ‖r̃_0‖)`` — a hybrid
+    absolute+relative test against the initial *projected* gradient.
+    The relative target is HR's noise-aware stationarity proxy: both
+    numerator and denominator carry the same projector noise, so the
+    test reaches the inner solver's precision floor and stops cleanly
+    instead of grinding against it.  The absolute floor protects the
+    edge case where ``‖r̃_0‖`` is itself at or below machine epsilon
+    (e.g. the QP at a feasible KKT point with `g_eff` already in
+    ``range(A_work^T)``); without the floor the relative target
+    collapses below ``eps`` and the iteration would return a spurious
+    ``converged=False`` flag even though the QP is at its KKT point.
 
     Curvature / stagnation guard.  We preserve the SNOPT-style
     scale-invariant guard ``⟨p̃, H p̃⟩ ≤ ε ‖p̃‖²`` for negative /
@@ -1410,10 +1500,13 @@ def _hr_stcg(
         HP=HP,
         pHp_diag=pHp_diag,
         iteration=jnp.array(0),
-        # Pre-converge if the projected gradient is already at floor.
-        converged=jnp.reshape(
-            proj_grad_norm <= cg_tol * jnp.maximum(proj_grad_norm, 1e-30), ()
-        ),
+        # Pre-converge if the projected gradient is already at the
+        # absolute floor.  The previous form ``proj_grad_norm <= cg_tol *
+        # max(proj_grad_norm, 1e-30)`` collapsed to ``proj_grad_norm
+        # <= cg_tol * proj_grad_norm`` (i.e. essentially ``<= 0``) for
+        # any ``cg_tol < 1`` and so never fired.  The hybrid form below
+        # is the right pre-convergence check.
+        converged=jnp.reshape(proj_grad_norm <= _HRSTCG_TOL_ABS, ()),
     )
 
     indices = jnp.arange(max_cg_iter)
@@ -1475,7 +1568,12 @@ def _hr_stcg(
 
             rz_new = jnp.dot(r_new, z_new)
             z_norm = jnp.sqrt(jnp.maximum(jnp.dot(z_new, z_new), 0.0))
-            tol_target = cg_tol * jnp.maximum(state.proj_grad_norm, 1e-30)
+            # Hybrid abs+rel convergence threshold: the absolute floor
+            # ``_HRSTCG_TOL_ABS`` kicks in only when ``cg_tol *
+            # ||r̃_0||`` would itself be below the floor (i.e. on a QP
+            # whose initial projected gradient is already near machine
+            # epsilon).  Otherwise the relative HR test dominates.
+            tol_target = jnp.maximum(_HRSTCG_TOL_ABS, cg_tol * state.proj_grad_norm)
             converged_new = (z_norm <= tol_target) | short_circuit
 
             return _HRSTCGState(
