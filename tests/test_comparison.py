@@ -44,7 +44,7 @@ class TestUnconstrainedOptimization:
 
         # TODO: Test with JAX implementation once complete
         # x0_jax = jnp.array([-1.0, 1.0])
-        # solver = SLSQP(atol=1e-9, max_steps=100)
+        # solver = _make_slsqp(atol=1e-9, max_steps=100)
         # result_jax = optx.minimise(rosenbrock_jax, solver, x0_jax)
 
         # np.testing.assert_allclose(

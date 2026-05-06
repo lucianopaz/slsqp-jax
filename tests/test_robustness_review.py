@@ -22,7 +22,6 @@ import optimistix as optx
 import pytest
 
 from slsqp_jax import (
-    SLSQP,
     MinresQLPSolver,
     ProjectedCGCraig,
     get_diagnostics,
@@ -30,8 +29,9 @@ from slsqp_jax import (
     lbfgs_init,
     lbfgs_should_skip,
 )
-from slsqp_jax.inner_solver import craig_solve
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.inner.krylov import craig_solve
+from slsqp_jax.qp import solve_qp
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -77,7 +77,7 @@ class TestChronicLineSearchNoLongerSuccess:
         def ineq_constraint(x, args):
             return x[:4]
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-12,
             rtol=1e-12,
             max_steps=200,
@@ -112,7 +112,7 @@ class TestDiagnosticsAccumulator:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=20,
             eq_constraint_fn=eq_constraint,
@@ -136,7 +136,7 @@ class TestDiagnosticsAccumulator:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(atol=1e-8, max_steps=10)
+        solver = _make_slsqp(atol=1e-8, max_steps=10)
         x0 = jnp.array([2.0, -1.0])
         _, state, _ = _run_loop(solver, objective, x0)
 
@@ -253,7 +253,7 @@ class TestMinresFreeMaskWithPrecond:
         def objective(x, args):
             return 0.5 * jnp.sum((x - 2.0) ** 2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=30,
             bounds=jnp.array(
@@ -300,7 +300,7 @@ class TestLBFGSClipParameters:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=10,
             lbfgs_diag_floor=1e-2,
@@ -330,7 +330,7 @@ class TestProjectedCGCraigIntegration:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - 6.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -387,7 +387,7 @@ class TestLBFGSSkipCounter:
         def eq(x, args):
             return jnp.array([jnp.sum(x) - float(x.shape[0])])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-12,
             rtol=1e-12,
             max_steps=60,
@@ -428,7 +428,7 @@ class TestBoundFixShortCircuit:
         # outer step, typically zero.
         bounds = jnp.stack([-10.0 * jnp.ones(3), 10.0 * jnp.ones(3)], axis=1)
 
-        solver = SLSQP(atol=1e-8, max_steps=20, bounds=bounds)
+        solver = _make_slsqp(atol=1e-8, max_steps=20, bounds=bounds)
         x0 = jnp.zeros(3)
         _, state, _ = _run_loop(solver, objective, x0, max_steps=20)
 
@@ -445,7 +445,7 @@ class TestBoundFixShortCircuit:
 
         bounds = jnp.stack([jnp.zeros(3), jnp.array([0.5, 2.0, 2.0])], axis=1)
 
-        solver = SLSQP(atol=1e-8, max_steps=30, bounds=bounds)
+        solver = _make_slsqp(atol=1e-8, max_steps=30, bounds=bounds)
         x0 = jnp.zeros(3)
         y, state, _ = _run_loop(solver, objective, x0, max_steps=30)
 

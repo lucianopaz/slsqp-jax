@@ -27,13 +27,13 @@ import numpy as np
 import pytest
 
 from slsqp_jax import (
-    SLSQP,
     HRInexactSTCG,
     MinresQLPSolver,
     ProjectedCGCholesky,
     ProjectedCGCraig,
     get_diagnostics,
 )
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -295,7 +295,7 @@ class TestOuterIntegration:
         )
         hr = HRInexactSTCG(inner=craig, max_cg_iter=60, cg_tol=1e-8)
 
-        baseline = SLSQP(
+        baseline = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=m_eq,
             inner_solver=craig,
@@ -304,7 +304,7 @@ class TestOuterIntegration:
             atol=1e-6,
             proximal_tau=0.0,
         )
-        with_hr = SLSQP(
+        with_hr = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=m_eq,
             inner_solver=hr,
@@ -343,7 +343,7 @@ class TestOuterIntegration:
         )
         hr = HRInexactSTCG(inner=craig, max_cg_iter=60, cg_tol=1e-8)
 
-        with_hr = SLSQP(
+        with_hr = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=m_eq,
             inner_solver=hr,
@@ -385,7 +385,7 @@ class TestOuterIntegration:
         hr = HRInexactSTCG(inner=craig, max_cg_iter=60, cg_tol=1e-8)
 
         # Solver with toggle ON.
-        on = SLSQP(
+        on = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=m_eq,
             inner_solver=hr,
@@ -396,7 +396,7 @@ class TestOuterIntegration:
             proximal_tau=0.0,
         )
         # Same solver with toggle OFF.
-        off = SLSQP(
+        off = _make_slsqp(
             eq_constraint_fn=eq_constraint,
             n_eq_constraints=m_eq,
             inner_solver=hr,

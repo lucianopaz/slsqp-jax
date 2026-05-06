@@ -996,3 +996,48 @@ class TestMinimizeLikeScipy:
         x0 = np.array([100.0, 100.0])
         sol = minimize_like_scipy(fun, x0, throw=False, options={"max_steps": 1})
         assert sol.value is not None
+
+    def test_options_routed_into_subconfigs(self):
+        """Non-``max_steps`` options reach their nested ``*Config`` slot.
+
+        Exercises the per-section translation loop in
+        ``_pop_section`` (the branch that actually pops a key from the
+        options dict) by passing one option from every sub-config.
+        """
+
+        def fun(x):
+            return x[0] ** 2 + x[1] ** 2
+
+        x0 = np.array([3.0, -2.0])
+        sol = minimize_like_scipy(
+            fun,
+            x0,
+            options={
+                "max_steps": 20,
+                "min_steps": 1,
+                "lbfgs_memory": 5,
+                "line_search_max_steps": 8,
+                "qp_max_iter": 30,
+                "proximal_tau": 0.0,
+                "preconditioner_type": "lbfgs",
+                "active_set_method": "expand",
+                "adaptive_cg_tol": False,
+            },
+        )
+        assert sol.value is not None
+
+    def test_unrecognized_option_raises(self):
+        """Unknown keys in the SciPy-style ``options`` dict should error.
+
+        Covers the trailing ``if opts: raise TypeError(...)`` guard in
+        ``minimize_like_scipy`` after every section has been popped.
+        """
+
+        def fun(x):
+            return x[0] ** 2 + x[1] ** 2
+
+        x0 = np.array([3.0, -2.0])
+        with pytest.raises(TypeError, match="unrecognized option"):
+            minimize_like_scipy(
+                fun, x0, options={"max_steps": 5, "definitely_not_a_real_option": 42}
+            )

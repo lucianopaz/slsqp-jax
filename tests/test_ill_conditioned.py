@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from scipy.optimize import minimize as scipy_minimize
 
-from slsqp_jax import SLSQP
+from tests.conftest import _make_slsqp
 
 # Enable 64-bit precision for numerical accuracy
 jax.config.update("jax_enable_x64", True)
@@ -59,7 +59,7 @@ class TestIllConditionedHessian:
         def objective(x, args):
             return jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-4,
             max_steps=50,
             lbfgs_memory=10,
@@ -91,7 +91,7 @@ class TestIllConditionedHessian:
         def eq_constraint(x, args):
             return jnp.array([jnp.sum(x) - float(n)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-3,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -122,7 +122,7 @@ class TestIllConditionedHessian:
         def objective(x, args):
             return (100 * x[0]) ** 2 + x[1] ** 2, None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
         )
@@ -162,7 +162,7 @@ class TestNearInfeasibleConstraints:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -199,7 +199,7 @@ class TestNearInfeasibleConstraints:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             ineq_constraint_fn=ineq_constraint,
@@ -237,7 +237,7 @@ class TestNearInfeasibleConstraints:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-5,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -285,7 +285,7 @@ class TestComparisonWithSciPy:
         )
 
         # slsqp-jax
-        solver = SLSQP(atol=1e-6, max_steps=50, lbfgs_memory=10)
+        solver = _make_slsqp(atol=1e-6, max_steps=50, lbfgs_memory=10)
         y_jax, _ = _run_solver(solver, objective_jax, x0_jax)
 
         # Both should significantly reduce the objective
@@ -328,7 +328,7 @@ class TestComparisonWithSciPy:
         )
 
         # slsqp-jax
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-4,
             max_steps=50,
             eq_constraint_fn=constraint_jax,
@@ -389,7 +389,7 @@ class TestProcessOptimizationBenchmarks:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             ineq_constraint_fn=ineq_constraint,
@@ -439,7 +439,7 @@ class TestProcessOptimizationBenchmarks:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -509,7 +509,7 @@ class TestProcessOptimizationBenchmarks:
                 ]
             )
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-4,
             max_steps=100,
             eq_constraint_fn=eq_constraint,
@@ -551,7 +551,7 @@ class TestNumericalStability:
             # Flat region near optimum
             return jnp.sum(x**4), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=100,
         )
@@ -568,7 +568,7 @@ class TestNumericalStability:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-4,
             max_steps=100,
         )
@@ -591,7 +591,7 @@ class TestNumericalStability:
             # x[0] natural scale ~0.1, x[1] natural scale ~10
             return (x[0] * 10 - 1) ** 2 + (x[1] * 0.1 - 1) ** 2, None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
         )
@@ -664,7 +664,7 @@ class TestIllConditionedBenchmark:
         n = 100
         prob = self._make_problem(n)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-8,
             atol=1e-8,
             max_steps=500,
@@ -714,7 +714,7 @@ class TestIllConditionedBenchmark:
         )
         f_scipy = float(result_scipy.fun)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-8,
             atol=1e-8,
             max_steps=500,
@@ -758,7 +758,7 @@ class TestNewtonCGMode:
         def objective(x, args):
             return 0.5 * jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             use_exact_hvp_in_qp=True,
@@ -778,7 +778,7 @@ class TestNewtonCGMode:
         def eq_fn(x, args):
             return jnp.array([jnp.sum(x) - float(n)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             eq_constraint_fn=eq_fn,
@@ -799,7 +799,7 @@ class TestNewtonCGMode:
         def objective(x, args):
             return 0.5 * jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             use_exact_hvp_in_qp=True,
@@ -825,7 +825,7 @@ class TestNewtonCGMode:
         def obj_hvp(x, v, args):
             return weights * v
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             obj_hvp_fn=obj_hvp,
@@ -841,7 +841,7 @@ class TestNewtonCGMode:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=30,
             use_exact_hvp_in_qp=True,
@@ -862,7 +862,7 @@ class TestDampingThreshold:
         def objective(x, args):
             return 0.5 * jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             damping_threshold=0.0,
@@ -877,7 +877,7 @@ class TestDampingThreshold:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             damping_threshold=0.5,
@@ -888,7 +888,7 @@ class TestDampingThreshold:
 
     def test_default_damping_unchanged(self):
         """Default damping_threshold is 0.2 (Powell's standard value)."""
-        solver = SLSQP(max_steps=10)
+        solver = _make_slsqp(max_steps=10)
         assert solver.damping_threshold == 0.2
 
 
@@ -921,7 +921,7 @@ class TestPerVariableDiagonal:
         def objective(x, args):
             return 0.5 * jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
         )
@@ -1001,14 +1001,14 @@ class TestDiagonalPreconditioner:
     def test_validation_requires_hvp(self):
         """preconditioner_type='diagonal' without HVP should raise."""
         with pytest.raises(ValueError, match="requires an exact HVP"):
-            SLSQP(
+            _make_slsqp(
                 max_steps=10,
                 preconditioner_type="diagonal",
             )
 
     def test_validation_accepts_use_exact_hvp(self):
         """preconditioner_type='diagonal' with use_exact_hvp_in_qp is valid."""
-        solver = SLSQP(
+        solver = _make_slsqp(
             max_steps=10,
             preconditioner_type="diagonal",
             use_exact_hvp_in_qp=True,
@@ -1021,7 +1021,7 @@ class TestDiagonalPreconditioner:
         def obj_hvp(x, v, args):
             return v
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             max_steps=10,
             preconditioner_type="diagonal",
             obj_hvp_fn=obj_hvp,
@@ -1030,8 +1030,8 @@ class TestDiagonalPreconditioner:
 
     def test_invalid_preconditioner_type(self):
         """Invalid preconditioner_type should raise."""
-        with pytest.raises(ValueError, match="preconditioner_type must be"):
-            SLSQP(max_steps=10, preconditioner_type="invalid")
+        with pytest.raises(ValueError, match="preconditioner.type must be"):
+            _make_slsqp(max_steps=10, preconditioner_type="invalid")
 
     def test_diagonal_precond_unconstrained_quadratic(self):
         """Diagonal preconditioner converges on ill-conditioned quadratic."""
@@ -1041,7 +1041,7 @@ class TestDiagonalPreconditioner:
         def objective(x, args):
             return 0.5 * jnp.sum(weights * x**2), None
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=100,
             use_exact_hvp_in_qp=True,
@@ -1069,7 +1069,7 @@ class TestDiagonalPreconditioner:
         def eq_fn(x, args):
             return jnp.array([jnp.sum(x) - float(n)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=100,
             eq_constraint_fn=eq_fn,
@@ -1095,7 +1095,7 @@ class TestDiagonalPreconditioner:
         def eq_fn(x, args):
             return jnp.array([jnp.sum(x) - float(n)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=200,
             eq_constraint_fn=eq_fn,
@@ -1120,7 +1120,7 @@ class TestDiagonalPreconditioner:
 
         bounds = jnp.column_stack([jnp.zeros(n), jnp.ones(n)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=100,
             bounds=bounds,
@@ -1157,7 +1157,7 @@ class TestDiagonalPreconditioner:
         )
         f_scipy = float(result_scipy.fun)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-8,
             atol=1e-8,
             max_steps=500,

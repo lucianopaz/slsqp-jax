@@ -18,8 +18,9 @@ import numpy as np
 import optimistix as optx
 import pytest
 
-from slsqp_jax import RESULTS, SLSQP, is_successful
+from slsqp_jax import RESULTS, is_successful
 from slsqp_jax.results import RESULTS as RESULTS_DIRECT
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -113,9 +114,9 @@ class TestStateRoutingDirect:
 
         x0 = jnp.array([0.5, 0.5])
         if max_iters:
-            solver = SLSQP(rtol=1e-15, atol=1e-6, max_steps=2, min_steps=1)
+            solver = _make_slsqp(rtol=1e-15, atol=1e-6, max_steps=2, min_steps=1)
         else:
-            solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=20, min_steps=1)
+            solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=20, min_steps=1)
 
         state = solver.init(objective, x0, None, {}, None, None, frozenset())
         # Run one real step so the state has been initialized end-to-
@@ -169,7 +170,7 @@ class TestStateRoutingDirect:
             return jnp.sum((x - 1.0) ** 2), None
 
         x0 = jnp.array([0.5, 0.5])
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=20, min_steps=1)
+        solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=20, min_steps=1)
         done, result = solver.terminate(objective, x0, None, {}, state, frozenset())
         # ``result`` is an EnumerationItem; its ``_enumeration``
         # must point at the parent class.
@@ -188,7 +189,7 @@ class TestLiveProblemClassification:
             return jnp.sum((x - 1.0) ** 2), None
 
         x0 = jnp.array([0.0, 0.0])
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=50)
+        solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=50)
         sol = optx.minimise(
             objective, solver, x0, has_aux=True, throw=False, max_steps=50
         )
@@ -205,7 +206,7 @@ class TestLiveProblemClassification:
             return jnp.array([x[0] - 0.0, x[0] - 1.0])
 
         x0 = jnp.array([0.5])
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-6,
             atol=1e-6,
             eq_constraint_fn=eq,
@@ -232,7 +233,7 @@ class TestLiveProblemClassification:
         x0 = jnp.array([10.0, 10.0])
         # max_steps=1 with rtol/atol so tight that one step won't
         # converge -- the solver bails on the budget.
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-15,
             atol=1e-15,
             max_steps=1,
@@ -269,7 +270,7 @@ class TestLiveProblemClassification:
         # rtol=1e-15 is unreachable with L-BFGS multiplier noise;
         # max_steps=20 -> patience window = 2; disable the KKT
         # success disjunct by setting zero_step_patience high.
-        solver = SLSQP(
+        solver = _make_slsqp(
             rtol=1e-15,
             atol=1e-6,
             max_steps=20,
@@ -300,7 +301,7 @@ class TestStatsAccess:
             return jnp.sum((x - 1.0) ** 2), None
 
         x0 = jnp.array([0.5, 0.5])
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=10)
+        solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=10)
         sol = optx.minimise(
             objective, solver, x0, has_aux=True, throw=False, max_steps=10
         )
@@ -314,7 +315,7 @@ class TestStatsAccess:
             return jnp.sum((x - 1.0) ** 2), None
 
         x0 = jnp.array([0.5, 0.5])
-        solver = SLSQP(rtol=1e-6, atol=1e-6, max_steps=10)
+        solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=10)
         sol = optx.minimise(
             objective, solver, x0, has_aux=True, throw=False, max_steps=10
         )

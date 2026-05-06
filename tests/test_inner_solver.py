@@ -11,7 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax import SLSQP, MinresQLPSolver, ProjectedCGCholesky, ProjectedCGCraig
+from slsqp_jax import MinresQLPSolver, ProjectedCGCholesky, ProjectedCGCraig
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -52,7 +53,7 @@ class TestInnerSolverUnconstrained:
         def objective(x, args):
             return jnp.sum(x**2), None
 
-        solver = SLSQP(atol=1e-8, max_steps=50, inner_solver=inner_solver)
+        solver = _make_slsqp(atol=1e-8, max_steps=50, inner_solver=inner_solver)
         x0 = jnp.array([3.0, -2.0])
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
@@ -61,7 +62,7 @@ class TestInnerSolverUnconstrained:
         def objective(x, args):
             return (1 - x[0]) ** 2 + 100 * (x[1] - x[0] ** 2) ** 2, None
 
-        solver = SLSQP(atol=1e-8, max_steps=200, inner_solver=inner_solver)
+        solver = _make_slsqp(atol=1e-8, max_steps=200, inner_solver=inner_solver)
         x0 = jnp.array([-1.0, 1.0])
         y, _ = _run_solver(solver, objective, x0)
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-3)
@@ -79,7 +80,7 @@ class TestInnerSolverEquality:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] + x[2] - 3.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -100,7 +101,7 @@ class TestInnerSolverEquality:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 2.0, x[1] + x[2] - 2.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -125,7 +126,7 @@ class TestInnerSolverInequality:
         def ineq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 2.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -153,7 +154,7 @@ class TestInnerSolverMixed:
         def ineq_constraint(x, args):
             return x
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -179,7 +180,7 @@ class TestInnerSolverBoxConstraints:
             return (x[0] - 3) ** 2 + (x[1] - 3) ** 2, None
 
         bounds = jnp.array([[0.0, 2.0], [0.0, 2.0]])
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-8,
             max_steps=50,
             bounds=bounds,
@@ -200,7 +201,7 @@ class TestInnerSolverJIT:
         def eq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=10,
             eq_constraint_fn=eq_constraint,
@@ -359,7 +360,7 @@ class TestMinresQLPFeasibilityProjection:
         direction infeasible, so the projection-pass tests are exercising
         a real failure mode and not a vacuously-feasible iterate.
         """
-        from slsqp_jax.inner_solver import pminres_qlp_solve
+        from slsqp_jax.inner.krylov import pminres_qlp_solve
 
         n = g.shape[0]
         m = A.shape[0]

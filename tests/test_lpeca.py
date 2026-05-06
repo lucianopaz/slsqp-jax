@@ -12,13 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax import SLSQP
 from slsqp_jax.lpeca import (
     compute_lpeca_active_set,
     compute_rho_bar,
     identify_active_set_lpeca,
 )
-from slsqp_jax.qp_solver import solve_qp
+from slsqp_jax.qp import solve_qp
+from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -637,15 +637,15 @@ class TestSLSQPLpecaModes:
 
     def test_invalid_method_raises_on_construction(self):
         """Invalid active_set_method should raise ValueError at init."""
-        with pytest.raises(ValueError, match="active_set_method"):
-            SLSQP(active_set_method="invalid")
+        with pytest.raises(ValueError, match="lpeca.method"):
+            _make_slsqp(active_set_method="invalid")
 
     def test_invalid_sigma_raises(self):
         """Invalid lpeca_sigma should raise ValueError."""
-        with pytest.raises(ValueError, match="lpeca_sigma"):
-            SLSQP(active_set_method="lpeca_init", lpeca_sigma=0.0)
-        with pytest.raises(ValueError, match="lpeca_sigma"):
-            SLSQP(active_set_method="lpeca_init", lpeca_sigma=1.0)
+        with pytest.raises(ValueError, match="lpeca.sigma"):
+            _make_slsqp(active_set_method="lpeca_init", lpeca_sigma=0.0)
+        with pytest.raises(ValueError, match="lpeca.sigma"):
+            _make_slsqp(active_set_method="lpeca_init", lpeca_sigma=1.0)
 
     @pytest.mark.parametrize("method", ["expand", "lpeca_init", "lpeca"])
     def test_inequality_constrained_quadratic(self, method):
@@ -663,7 +663,7 @@ class TestSLSQPLpecaModes:
         def ineq_constraint(x, args):
             return jnp.array([x[0] + x[1] - 2.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -695,7 +695,7 @@ class TestSLSQPLpecaModes:
         def ineq_constraint(x, args):
             return x
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             eq_constraint_fn=eq_constraint,
@@ -725,7 +725,7 @@ class TestSLSQPLpecaModes:
         def ineq_constraint(x, args):
             return jnp.array([x[0] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -754,7 +754,7 @@ class TestSLSQPLpecaModes:
         n = 3
         bounds = jnp.stack([jnp.zeros(n), jnp.ones(n)], axis=1)
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             bounds=bounds,
@@ -782,7 +782,7 @@ class TestSLSQPLpecaModes:
         def ineq_constraint(x, args):
             return jnp.array([x[0], x[1], x[0] + x[1]])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -803,7 +803,7 @@ class TestSLSQPLpecaModes:
         def ineq_constraint(x, args):
             return jnp.array([x[0] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=50,
             ineq_constraint_fn=ineq_constraint,
@@ -1034,7 +1034,7 @@ class TestLpecaWarmupGate:
 
     def test_lpeca_warmup_steps_parameter_exists(self):
         """``SLSQP`` accepts ``lpeca_warmup_steps`` and stores it."""
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             active_set_method="lpeca",
             lpeca_warmup_steps=5,
@@ -1050,7 +1050,7 @@ class TestLpecaWarmupGate:
         def ineq_constraint(x, args):
             return jnp.array([x[0] - 1.0])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-6,
             max_steps=20,
             ineq_constraint_fn=ineq_constraint,
@@ -1106,14 +1106,14 @@ class TestLpecaBoundPrediction:
         objective, bounds, x0, expected = self._box_problem()
 
         common = dict(atol=1e-7, max_steps=80, bounds=bounds)
-        solver_expand = SLSQP(**common, active_set_method="expand")
-        solver_bounds_off = SLSQP(
+        solver_expand = _make_slsqp(**common, active_set_method="expand")
+        solver_bounds_off = _make_slsqp(
             **common,
             active_set_method="lpeca_init",
             lpeca_warmup_steps=0,
             lpeca_predict_bounds=False,
         )
-        solver_bounds_on = SLSQP(
+        solver_bounds_on = _make_slsqp(
             **common,
             active_set_method="lpeca_init",
             lpeca_warmup_steps=0,
@@ -1133,7 +1133,7 @@ class TestLpecaBoundPrediction:
         """When the prediction is trusted and non-empty, the counter is > 0."""
         objective, bounds, x0, _ = self._box_problem()
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             max_steps=80,
             bounds=bounds,
@@ -1157,7 +1157,7 @@ class TestLpecaBoundPrediction:
         """With ``lpeca_predict_bounds=False`` no bounds are pre-fixed."""
         objective, bounds, x0, _ = self._box_problem()
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             max_steps=80,
             bounds=bounds,
@@ -1177,7 +1177,7 @@ class TestLpecaBoundPrediction:
         """With a very tight trust threshold, no prefix is ever applied."""
         objective, bounds, x0, _ = self._box_problem()
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             max_steps=80,
             bounds=bounds,
@@ -1201,7 +1201,7 @@ class TestLpecaBoundPrediction:
         """During the LPEC-A warm-up window, no bound prefix is applied."""
         objective, bounds, x0, _ = self._box_problem()
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             # Cap max_steps at the warm-up window so LPEC-A never fires.
             max_steps=3,
@@ -1222,7 +1222,7 @@ class TestLpecaBoundPrediction:
         """When ``active_set_method='expand'`` the counter stays at 0."""
         objective, bounds, x0, _ = self._box_problem()
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             max_steps=80,
             bounds=bounds,
@@ -1253,7 +1253,7 @@ class TestLpecaBoundPrediction:
         def ineq_constraint(x, args):
             return jnp.array([jnp.sum(x) - (-1.0)])
 
-        solver = SLSQP(
+        solver = _make_slsqp(
             atol=1e-7,
             max_steps=80,
             bounds=bounds,
