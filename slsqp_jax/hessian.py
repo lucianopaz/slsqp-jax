@@ -288,7 +288,15 @@ def lbfgs_should_skip(
 
     sTy_raw = jnp.dot(s, y)
     relative_curvature = jnp.abs(sTy_raw) / jnp.maximum(s_norm * y_norm, 1e-30)
-    curvature_too_small = (relative_curvature < 1e-8) & (sTy_raw > 0)
+    # Floor lowered from ``1e-8`` to ``1e-12`` (machine-precision floor
+    # for ``float64``).  After an identity reset on a near-KKT iterate
+    # ``||s|| ~ rtol`` and ``||y|| = ||B s|| = ||s||`` (since ``B = I``),
+    # so ``s.y / (||s|| ||y||)`` is dominated by floating-point
+    # cancellation in the dot product and can dip below ``1e-8`` purely
+    # from rounding even when the pair carries genuine curvature
+    # information.  ``1e-12`` is the smallest threshold where the pair
+    # is truly *noise* rather than under-resolved curvature.
+    curvature_too_small = (relative_curvature < 1e-12) & (sTy_raw > 0)
 
     has_bad_values = ~(
         jnp.isfinite(s_norm) & jnp.isfinite(y_norm) & jnp.isfinite(sTy_raw)
@@ -301,6 +309,43 @@ def lbfgs_should_skip(
         | curvature_too_small
         | has_bad_values
     )
+
+
+@jaxtyped(typechecker=beartype)
+def lbfgs_curvature_diagnostics(
+    s: Vector,
+    y: Vector,
+    skip_threshold: float = 1e-8,
+) -> tuple[Scalar, Scalar, Bool[Array, ""]]:
+    """Return ``(s.y, relative_curvature, skipped)`` for the curvature pair.
+
+    Exposes the same intermediate quantities ``lbfgs_should_skip`` uses
+    so the verbose callback can surface them without re-implementing the
+    skip predicate.  ``relative_curvature = |s.y| / (||s|| * ||y||)`` is
+    the cosine of the angle between ``s`` and ``y`` and the dominant
+    contributor to the skip decision (a near-zero value indicates the
+    curvature pair is at the floating-point noise floor and gets
+    skipped by the ``relative_curvature < skip_threshold`` branch of
+    ``lbfgs_should_skip``).
+
+    Args:
+        s: Step vector ``x_{k+1} - x_k``.
+        y: Gradient difference ``\u2207L_{k+1} - \u2207L_k`` (Lagrangian gradient
+            difference for SLSQP).
+        skip_threshold: Threshold passed to ``lbfgs_should_skip``.
+
+    Returns:
+        ``(sty, relative_curvature, skipped)``, where ``sty = s.y`` is
+        the raw curvature inner product, ``relative_curvature`` is the
+        normalised version used in the skip predicate, and ``skipped``
+        is the same boolean ``lbfgs_should_skip`` returns.
+    """
+    s_norm = jnp.linalg.norm(s)
+    y_norm = jnp.linalg.norm(y)
+    sty = jnp.dot(s, y)
+    relative_curvature = jnp.abs(sty) / jnp.maximum(s_norm * y_norm, 1e-30)
+    skipped = lbfgs_should_skip(s, y, skip_threshold=skip_threshold)
+    return sty, relative_curvature, skipped
 
 
 @jaxtyped(typechecker=beartype)
