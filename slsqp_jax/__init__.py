@@ -22,6 +22,16 @@ from slsqp_jax.config import (
     SLSQPConfig,
     ToleranceConfig,
 )
+from slsqp_jax.diagnostics import (
+    DebugReport,
+    DebugRunResult,
+    Diagnosis,
+    Signal,
+    StepSummary,
+    capture_state_at_step,
+    debug_run,
+    diagnose,
+)
 from slsqp_jax.hessian import (
     LBFGSHistory,
     compute_lagrangian_gradient,
@@ -109,6 +119,15 @@ __all__ = [
     "ParsedConstraints",
     "parse_constraints",
     "minimize_like_scipy",
+    # Diagnostics
+    "DebugReport",
+    "DebugRunResult",
+    "Diagnosis",
+    "Signal",
+    "StepSummary",
+    "capture_state_at_step",
+    "debug_run",
+    "diagnose",
     # Inner solver strategies
     "AbstractInnerSolver",
     "HRInexactSTCG",

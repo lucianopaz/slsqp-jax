@@ -852,6 +852,92 @@ Together these let you distinguish "the solver is slow because of active-set chu
 
 The bound-handling loop after the QP direction used to run exactly `5` reduced-space inner solves per outer iteration, even when the free-variable mask was already stable. On problems such as `Portfolio(n=5000)` with `MinresQLPSolver` this meant `5 * 500 = 2500` full `(n + m)` MINRES-QLP solves per run, the vast majority of which had their results masked out by `use_new=False`. The loop now wraps each inner solve in `jax.lax.cond(any_change & any_fixed, ...)` and records the number of non-trivial solves in `QPResult.bound_fix_solves` (surfaced as `diag.n_bound_fix_solves`). On the portfolio benchmark this cut the average from 5 to well under 1 solve per outer step with no change in the accepted direction.
 
+## Diagnostics
+
+The `slsqp_jax.diagnostics` sub-package layers post-mortem diagnostics on top of the production `SLSQP` API. It is intended for the case where a run failed (early termination, slow progress, suspected bad direction) and the user wants to narrow the search before deciding what to change.
+
+> **Scope limitation.** The diagnostics layer reports *hypotheses with evidence*, not verdicts. It cannot solve the hard cases (wrong gradient, mis-formulated constraints, badly-scaled problem, ill-posed local geometry). What it does do is rule out solver-side causes faster than reading `AGENTS.md` by hand. Signal text reads "X looks suspicious because Y" and the report wording leans on "consistent with" / "candidate cause" rather than "your problem is X".
+
+### Quick start
+
+```python
+import jax.numpy as jnp
+from slsqp_jax import SLSQP, diagnose
+
+def f(x, args):
+    return jnp.sum((x - 1.0) ** 2)
+
+def c_eq(x, args):
+    return jnp.array([jnp.sum(x) - 5.0])
+
+solver = SLSQP(eq_constraint_fn=c_eq, n_eq_constraints=1)
+x0 = jnp.zeros(4)
+
+report = diagnose(solver, f, x0)
+report.print_summary()
+```
+
+The report includes:
+
+1. The granular `slsqp_jax.RESULTS` termination code (with the exact message string) and the coarse `optx.RESULTS` it maps to.
+2. Final-iterate metrics (`||grad_L||/max(|L|,1)`, primal feasibility, `rho`, L-BFGS condition number).
+3. Fired signals — partitioned into "in scope for this termination code" and "less likely given the termination mode" (per `SCOPE_BY_TERMINATION`); within each group sorted by `confidence` (`high` → `medium` → `low`). Each signal carries a one-line summary, the evidence numbers, the artifact keys it built (e.g. `J_eq`, `JJT`, `singular_values`), and concrete suggestions.
+4. Multi-signal diagnoses — pattern matches against fired-signal sets (e.g. `lbfgs_conditioning_extreme + line_search_collapse → stale_lbfgs_curvature`). Single-signal cases are surfaced directly without a rule.
+5. A prose-annotated dump of every `SLSQPDiagnostics` counter (counters' docstrings drive the prose).
+6. An ASCII trajectory chart of `(step, f, merit, rel_KKT, alpha, qp_iter, qp_ok, ls_ok)`.
+
+### Public API
+
+```python
+from slsqp_jax import (
+    diagnose,                # auto: run + classify + report
+    debug_run,               # manual: just produce a DebugRunResult
+    capture_state_at_step,   # ad-hoc: re-run to a specific step (with reproducibility check)
+    DebugReport,
+    DebugRunResult,
+    Signal,
+    Diagnosis,
+    StepSummary,
+)
+```
+
+`diagnose(...)` always emits a report, even on `RESULTS.successful`, because the user can request a diagnosis when "progress speed has degraded a lot, but not enough for an early exit to be fired". Confidence and the firing-signal set determine whether anything substantive prints; on a clean run the report is one paragraph plus the counter dump.
+
+`capture_state_at_step(...)` re-runs the solver to a specific step and returns the live `SLSQPState`. When passed `expected_summary=run.summaries[k-1]`, it asserts the recovered state's `StepSummary` digest matches the original; on mismatch it raises `RuntimeError("debug-run trajectory is not reproducible: …")` with a list of diverging fields. This is the load-bearing reproducibility guard — without it the tool can silently lie about which iterate it is showing.
+
+### Performance contract
+
+The runner is a *debug* tool, not a production loop. It deliberately trades the on-device `jax.lax.while_loop` of `optimistix.iterative_solve` for a host-driven Python `for` loop calling `jit(step)`, paying one device→host sync per iteration. On GPU this can turn a 3 s production run into a 30-60 s diagnose run. That cost is acceptable because the alternative is the user reading verbose output by eye for hours.
+
+To keep the cost bounded, every per-step evaluator splits into a cheap predicate (`cheap_predicate(summary) -> bool`, scalar-only, runs every step) and an expensive `build_artifacts(state) -> dict[str, np.ndarray]` (only invoked the first iteration the predicate fires; pulls the needed device arrays to host once and computes derived linalg). End-of-run evaluators only see the final state plus the trajectory of summaries and pay no per-step cost.
+
+### Confidence
+
+Each fired signal carries a single ranking field, `confidence ∈ {low, medium, high}`, derived from two underlying axes via the lookup table:
+
+| `specificity \ magnitude` | `marginal` | `moderate` | `extreme` |
+| ------------------------- | ---------- | ---------- | --------- |
+| `specific`                | medium     | high       | high      |
+| `ambiguous`               | low        | medium     | medium    |
+| `generic`                 | low        | low        | low       |
+
+`specificity` is a *static* editorial classification declared at evaluator registration (`specific` = pattern essentially diagnostic for one cause; `ambiguous` = consistent with two or three; `generic` = consistent with many). `magnitude` is *dynamic*, computed at fire time from the largest evidence-to-threshold ratio (`< 10×` → `marginal`; `< 100×` → `moderate`; otherwise → `extreme`). Use cases that need both axes can read `signal.specificity` / `signal.magnitude` directly.
+
+### Starter signal set
+
+| Signal | Flavour | Specificity | Threshold |
+| ------ | ------- | ----------- | --------- |
+| `eq_jacobian_rank_deficient` | per-step | specific | `eq_jac_min_sv_est < 1e-8` (cumulative low-water) |
+| `lbfgs_conditioning_extreme` | per-step | ambiguous | `max_diag/min_diag > 1e6` for ≥ 3 consecutive steps |
+| `multiplier_recovery_noise` | end-of-run | specific | textbook noise-floor signature (see `AGENTS.md`) |
+| `line_search_collapse` | end-of-run | ambiguous | `tail_ls_failures > 0` AND `ls_alpha_min < 1e-10` |
+| `qp_budget_or_pingpong` | end-of-run | generic | `n_qp_budget_exhausted > 0` OR `n_qp_ping_pong > 0` |
+| `merit_oscillation` | end-of-run | generic | `n_merit_regressions > step_count / 10` |
+| `lpeca_overpredicting` | end-of-run | ambiguous | `n_lpeca_capped / step_count > 0.5` OR `n_lpeca_bypassed == step_count` |
+| `infeasible_termination` | end-of-run | specific | termination code ∈ `{infeasible, nonfinite}` OR feasibility never satisfied |
+
+The set is append-only; adding a new signal requires (a) one function in `slsqp_jax/diagnostics/signals.py` with a docstring citing the relevant `AGENTS.md` section + the threshold inline, (b) a `register_evaluator(...)` call, and (c) matching `test_signal_<name>_synthetic` + `test_signal_<name>_integration` in `tests/diagnostics/`. The cap-policy enforcement test (`tests/diagnostics/test_registry.py`) fails CI if either test is missing.
+
 ## License
 
 MIT
