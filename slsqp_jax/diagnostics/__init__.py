@@ -27,6 +27,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
+from slsqp_jax.diagnostics.intercept import (
+    DiagnosticContext,
+    diagnose_minimize_like_scipy,
+    diagnostic_run,
+)
 from slsqp_jax.diagnostics.playbook import (
     SCOPE_BY_TERMINATION,
     Diagnosis,
@@ -91,6 +96,7 @@ __all__ = [
     "DebugReport",
     "DebugRunResult",
     "Diagnosis",
+    "DiagnosticContext",
     "END_OF_RUN_EVALUATORS",
     "EvalContext",
     "PER_STEP_EVALUATORS",
@@ -103,6 +109,8 @@ __all__ = [
     "confidence_for",
     "debug_run",
     "diagnose",
+    "diagnose_minimize_like_scipy",
+    "diagnostic_run",
     "evaluate_diagnoses",
     "magnitude_for",
     "register_evaluator",

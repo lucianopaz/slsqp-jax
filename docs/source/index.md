@@ -893,15 +893,47 @@ The report includes:
 5. A prose-annotated dump of every `SLSQPDiagnostics` counter (counters' docstrings drive the prose).
 6. An ASCII trajectory chart of `(step, f, merit, rel_KKT, alpha, qp_iter, qp_ok, ls_ok)`.
 
+### Quick start for `minimize_like_scipy` users
+
+If you do not construct `SLSQP` yourself but go through `minimize_like_scipy` (or your own wrapper around `optimistix.minimise`), the diagnostics layer offers two zero-refactor opt-ins so you do not have to lift the call site into the lower-level API:
+
+```python
+import slsqp_jax
+
+# (1) Context manager — wrap your existing wrapper code as-is.
+with slsqp_jax.diagnostic_run() as ctx:
+    sol = slsqp_jax.minimize_like_scipy(fun, x0, options={"maxiter": 100})
+    # `sol` is a real optimistix.Solution; downstream code is unaffected.
+
+# After the with-block, ctx.runs and ctx.reports hold one entry per
+# intercepted call.  By default the on-exit print is *quiet on clean
+# success* and only renders the report for any run that did NOT
+# converge, plus a one-line trailer telling you how to inspect more.
+print(ctx)  # DiagnosticContext(runs=1, failing=0, intercepted=1, ...)
+
+# (2) Drop-in helper — same signature as minimize_like_scipy.
+sol, report = slsqp_jax.diagnose_minimize_like_scipy(fun, x0, options={...})
+report.print_summary()
+```
+
+`diagnostic_run(...)` works by monkey-patching `optimistix.minimise` for the duration of the `with` block. Calls whose `solver` is an `SLSQP` instance are re-routed through `debug_run` (and the resulting `DebugReport` is stashed on `ctx.reports`). Calls with any other solver pass through unchanged. The context manager is **not re-entrant and not thread-safe**: a process-wide lock rejects nested or concurrent enters with `RuntimeError`.
+
+The `print_on_exit` argument controls the on-exit summary: `"auto"` (default) prints reports only for failing runs plus a trailer; `"always"` prints every report; `"never"` suppresses everything. Pass `output=` to redirect to a file-like sink instead of `sys.stdout`.
+
+**Import-binding caveat.** The patch replaces `optimistix.minimise`-the-module-attribute. If your code does `from optimistix import minimise` and then calls `minimise(...)`, the name was bound at import time and the patch will *not* apply. The context manager detects this case (zero intercepts and zero passthroughs on exit) and emits a `UserWarning` pointing at `diagnose_minimize_like_scipy(...)` as the non-magic alternative.
+
 ### Public API
 
 ```python
 from slsqp_jax import (
-    diagnose,                # auto: run + classify + report
+    diagnose,                # auto: run + classify + report (low-level: needs an SLSQP instance)
+    diagnostic_run,          # context manager: intercepts optx.minimise inside the `with` block
+    diagnose_minimize_like_scipy,  # drop-in replacement for minimize_like_scipy with diagnostics
     debug_run,               # manual: just produce a DebugRunResult
     capture_state_at_step,   # ad-hoc: re-run to a specific step (with reproducibility check)
     DebugReport,
     DebugRunResult,
+    DiagnosticContext,
     Signal,
     Diagnosis,
     StepSummary,
