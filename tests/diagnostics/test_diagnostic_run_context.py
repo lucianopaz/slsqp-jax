@@ -353,3 +353,123 @@ def test_top_level_exports_present():
     assert hasattr(slsqp_jax, "diagnostic_run")
     assert hasattr(slsqp_jax, "diagnose_minimize_like_scipy")
     assert hasattr(slsqp_jax, "DiagnosticContext")
+
+
+# ---------------------------------------------------------------------------
+# DiagnosticContext: print_summary + __repr__ surface
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostic_context_print_summary_all(quad_x0):
+    """``ctx.print_summary()`` (no ``idx``) prints every captured report."""
+    with diagnostic_run(print_on_exit="never") as ctx:
+        minimize_like_scipy(_quadratic, quad_x0, options={"maxiter": 50})
+        # Run a second call so we have two reports to render.
+        minimize_like_scipy(_quadratic, quad_x0, options={"maxiter": 50})
+
+    assert ctx.intercepted_calls == 2
+
+    out = io.StringIO()
+    ctx.print_summary(file=out)
+    rendered = out.getvalue()
+    # Both reports should be in the output, separated by a blank line.
+    assert rendered.count("SLSQP-JAX Debug Report") == 2
+
+
+def test_diagnostic_context_print_summary_by_idx(quad_x0):
+    """``ctx.print_summary(idx=...)`` prints only the requested report."""
+    with diagnostic_run(print_on_exit="never") as ctx:
+        minimize_like_scipy(_quadratic, quad_x0, options={"maxiter": 50})
+
+    out = io.StringIO()
+    ctx.print_summary(idx=0, file=out)
+    rendered = out.getvalue()
+    assert rendered.count("SLSQP-JAX Debug Report") == 1
+
+
+def test_diagnostic_context_repr_contains_counts(quad_x0):
+    """The ``__repr__`` surfaces the run / failing / intercept / passthrough counts."""
+    other_solver = optx.BFGS(rtol=1e-6, atol=1e-6)
+
+    def fn(x, args):
+        return _quadratic(x)
+
+    with diagnostic_run(print_on_exit="never") as ctx:
+        minimize_like_scipy(_quadratic, quad_x0, options={"maxiter": 50})
+        optx.minimise(fn, other_solver, quad_x0, max_steps=100, throw=False)
+
+    text = repr(ctx)
+    assert text.startswith("DiagnosticContext(")
+    assert "runs=1" in text
+    assert "failing=0" in text
+    assert "intercepted=1" in text
+    assert "passthrough=1" in text
+
+
+# ---------------------------------------------------------------------------
+# Passthrough: adjoint kwarg forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostic_run_passthrough_forwards_adjoint(quad_x0):
+    """When the caller passes ``adjoint=...`` to a non-SLSQP solver, the
+    patched ``optx.minimise`` must forward it instead of dropping it."""
+    other_solver = optx.BFGS(rtol=1e-6, atol=1e-6)
+    adjoint = optx.RecursiveCheckpointAdjoint()
+
+    def fn(x, args):
+        return _quadratic(x)
+
+    with diagnostic_run(print_on_exit="never") as ctx:
+        sol = optx.minimise(
+            fn,
+            other_solver,
+            quad_x0,
+            max_steps=100,
+            throw=False,
+            adjoint=adjoint,
+        )
+
+    assert ctx.passthrough_calls == 1
+    assert isinstance(sol, optx.Solution)
+    assert jnp.allclose(sol.value, jnp.array([1.0, 2.5]), atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# print_on_exit "auto": multiple failing reports get separator newline
+# ---------------------------------------------------------------------------
+
+
+def test_print_on_exit_auto_prints_no_run_trailer():
+    """``print_on_exit="auto"`` (or ``"always"``) on an empty context
+    prints the "no SLSQP calls were intercepted" trailer."""
+    out = io.StringIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with diagnostic_run(print_on_exit="auto", output=out):
+            pass
+    assert "no SLSQP calls were intercepted" in out.getvalue()
+
+
+def test_print_on_exit_auto_separates_multiple_failing_reports(rosenbrock_x0):
+    out = io.StringIO()
+    with diagnostic_run(print_on_exit="auto", output=out) as ctx:
+        minimize_like_scipy(
+            _rosenbrock,
+            rosenbrock_x0,
+            options={"maxiter": 2},
+            throw=False,
+        )
+        minimize_like_scipy(
+            _rosenbrock,
+            rosenbrock_x0,
+            options={"maxiter": 2},
+            throw=False,
+        )
+
+    assert ctx.intercepted_calls == 2
+    assert ctx.n_failing == 2
+    rendered = out.getvalue()
+    # Both reports printed (plus the trailer).
+    assert rendered.count("SLSQP-JAX Debug Report") == 2
+    assert "captured 2 run(s), 2 failing" in rendered

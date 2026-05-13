@@ -336,12 +336,15 @@ def diagnostic_run(
             active (re-entrant or concurrent enter).  The patch is a
             global mutation; serialising would mask bugs.
 
-    Examples:
-        >>> with slsqp_jax.diagnostic_run() as ctx:
-        ...     sol = slsqp_jax.minimize_like_scipy(fun, x0, ...)
-        >>> # On exit, any failing report has already been printed.
-        >>> # The Solution is the real optimistix.Solution.
-        >>> ctx.runs[0].diagnostics  # SLSQPDiagnostics counters
+    Example:
+
+    .. code-block:: python
+
+        with slsqp_jax.diagnostic_run() as ctx:
+            sol = slsqp_jax.minimize_like_scipy(fun, x0, ...)
+        # On exit, any failing report has already been printed.
+        # The Solution is the real optimistix.Solution.
+        ctx.runs[0].diagnostics  # SLSQPDiagnostics counters
     """
     ctx = DiagnosticContext()
 
@@ -496,7 +499,7 @@ def diagnose_minimize_like_scipy(
         )
 
     if not ctx.reports:
-        raise RuntimeError(
+        raise RuntimeError(  # pragma: no cover
             "diagnose_minimize_like_scipy: minimize_like_scipy did not call "
             "optimistix.minimise (this should not happen — please report a bug)."
         )
