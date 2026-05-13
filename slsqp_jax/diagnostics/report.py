@@ -364,7 +364,7 @@ class DebugReport:
             for n in related:
                 sig = sigs_by_name.get(n)
                 if sig is None:
-                    continue
+                    continue  # pragma: no cover
                 rank = _CONFIDENCE_RANK.get(getattr(sig, "confidence", ""), -1)
                 if rank > best:
                     best = rank
@@ -401,7 +401,7 @@ class DebugReport:
             value = getattr(diag, f.name)
             try:
                 py_val: Any = value.item()  # type: ignore[union-attr]
-            except (AttributeError, ValueError):
+            except (AttributeError, ValueError):  # pragma: no cover
                 py_val = value
             prose = _diag_prose(f.name)
             label = f"  {f.name}:".ljust(38)
@@ -584,7 +584,7 @@ def _result_message(result: Any) -> str:
             msg = index_to_message[target_value]
             if isinstance(msg, str):
                 return msg
-        except (IndexError, KeyError):
+        except (IndexError, KeyError):  # pragma: no cover
             pass
     for attr in ("value", "message"):
         msg = getattr(result, attr, None)
@@ -600,7 +600,7 @@ def _diagnostics_to_dict(diag: "SLSQPDiagnostics") -> dict[str, Any]:
         value = getattr(diag, f.name)
         try:
             out[f.name] = value.item()  # type: ignore[union-attr]
-        except (AttributeError, ValueError):
+        except (AttributeError, ValueError):  # pragma: no cover
             out[f.name] = value
     return out
 

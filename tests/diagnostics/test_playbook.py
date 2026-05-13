@@ -195,3 +195,42 @@ def test_diagnosis_dataclass_carries_related_signals():
     assert isinstance(stale, Diagnosis)
     assert "lbfgs_conditioning_extreme" in stale.related_signals
     assert "line_search_collapse" in stale.related_signals
+
+
+# ---------------------------------------------------------------------------
+# Defensive helpers
+# ---------------------------------------------------------------------------
+
+
+def test_enum_value_returns_none_on_non_enum_inputs():
+    """``_enum_value`` must degrade gracefully (no exceptions) when the
+    input has no ``_value`` attribute or carries a non-int value."""
+    from slsqp_jax.diagnostics.playbook import _enum_value
+
+    assert _enum_value(object()) is None
+    # ``_value`` exists but cannot be coerced to ``int``.
+
+    class _Bogus:
+        _value = "not-int"
+
+    assert _enum_value(_Bogus()) is None
+
+
+def test_scope_for_returns_none_on_non_enum():
+    """``_scope_for`` short-circuits via :func:`_enum_value` -> ``None``."""
+    from slsqp_jax.diagnostics.playbook import _scope_for
+
+    assert _scope_for(object()) is None
+
+
+def test_signals_in_scope_falls_back_to_everything_for_unknown_code():
+    """A non-enum termination code must land in the "everything in scope"
+    fallback so the renderer can still produce something useful."""
+    fired = {"a", "b", "c"}
+    assert signals_in_scope(object(), fired) == fired
+
+
+def test_magnitude_for_handles_non_numeric_input():
+    """Strings (or anything that fails ``float(...)`` coercion) must
+    fall back to ``"marginal"`` rather than raise."""
+    assert magnitude_for("not-a-number") == "marginal"  # type: ignore[arg-type]
