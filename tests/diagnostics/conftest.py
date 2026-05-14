@@ -149,7 +149,7 @@ def _synthetic_state(
         multipliers_ineq_qp=jnp.zeros(m_ineq),
         multipliers_eq_ls=jnp.zeros(m_eq),
         multipliers_ineq_ls=jnp.zeros(m_ineq),
-        prev_grad_lagrangian=jnp.zeros(n),
+        kkt_residual_grad=jnp.zeros(n),
         grad_lagrangian=jnp.zeros(n),
         merit_penalty=jnp.array(1.0),
         bound_jac=jnp.zeros((0, n)),

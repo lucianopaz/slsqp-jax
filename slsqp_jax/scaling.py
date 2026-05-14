@@ -728,11 +728,10 @@ def unscale_solution(sol: optx.Solution, factors: ScaleFactors) -> optx.Solution
             stats["multipliers_eq"]
         )
 
+    # Same scale recipe as the LS variants: general portion scales by
+    # ``s_ineq / s_f``; the bound portion is already in user units
+    # because bound rows are not scaled.
     if "multipliers_ineq" in stats and s_ineq.size > 0:
-        # The general portion of multipliers_ineq is scaled; the bound
-        # portion (appended at the end) is in user units already (we
-        # do not scale bound rows).  Build a scaling vector that
-        # matches the actual length of ``multipliers_ineq``.
         mults = jnp.asarray(stats["multipliers_ineq"])
         n_general = s_ineq.size
         if mults.shape[0] >= n_general:
@@ -743,8 +742,35 @@ def unscale_solution(sol: optx.Solution, factors: ScaleFactors) -> optx.Solution
         else:  # pragma: no cover -- defensive
             stats["multipliers_ineq_user"] = mults
 
+    # QP-side multipliers (Han-Powell / LPEC-A / next-QP warm-start
+    # view) — surfaced for advanced diagnostics so users can compare
+    # them against the LS variant in user units.
+    if "multipliers_eq_qp" in stats and s_eq.size > 0:
+        stats["multipliers_eq_qp_user"] = (s_eq / s_f) * jnp.asarray(
+            stats["multipliers_eq_qp"]
+        )
+
+    if "multipliers_ineq_qp" in stats and s_ineq.size > 0:
+        mults_qp = jnp.asarray(stats["multipliers_ineq_qp"])
+        n_general = s_ineq.size
+        if mults_qp.shape[0] >= n_general:
+            scale_vec_qp = jnp.concatenate(
+                [s_ineq / s_f, jnp.ones(mults_qp.shape[0] - n_general)]
+            )
+            stats["multipliers_ineq_qp_user"] = scale_vec_qp * mults_qp
+        else:  # pragma: no cover -- defensive
+            stats["multipliers_ineq_qp_user"] = mults_qp
+
     if "final_grad_norm" in stats:
         stats["final_grad_norm_user"] = jnp.asarray(stats["final_grad_norm"]) / s_f
+
+    if "final_lagrangian_grad_norm" in stats:
+        stats["final_lagrangian_grad_norm_user"] = (
+            jnp.asarray(stats["final_lagrangian_grad_norm"]) / s_f
+        )
+
+    if "final_objective" in stats:
+        stats["final_objective_user"] = jnp.asarray(stats["final_objective"]) / s_f
 
     stats["scale_factors"] = factors
     stats["merit_penalty_note"] = "scaled units"
@@ -792,6 +818,11 @@ _SCALED_LABEL_KEYS = (
     "lbfgs_sty",
     "lbfgs_relcurv",
     "lbfgs_diag_cond",
+    # ``|c|`` is the max over scaled user constraints and (unscaled)
+    # bound rows.  No single ``s_f``-style transform recovers the
+    # user-unit max from the scalar; flag it so users do not compare
+    # this directly against ``atol_user``.
+    "constraint_violation",
 )
 
 
@@ -887,7 +918,16 @@ def wrap_verbose_for_scaling(
         def wrapped_silent(**_kwargs: tuple) -> None:
             no_verbose(**_kwargs)
 
-        wrapped_silent._slsqp_scale_factors = factors  # ty: ignore[unresolved-attribute]
+        # Setattr keeps the assignment on a single statement so the
+        # ``ty: ignore`` directive lands on the unresolved-attribute
+        # site (ty otherwise emits the warning on the assignment line
+        # while the suppression sits on the value line after ruff's
+        # multi-line split).
+        setattr(  # noqa: B010 -- need ty-ignore on a single line
+            wrapped_silent,
+            "_slsqp_scale_factors",
+            factors,
+        )
         return wrapped_silent
     if user_verbose is True:
         target = slsqp_verbose

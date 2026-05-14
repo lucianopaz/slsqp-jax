@@ -28,6 +28,7 @@ from collections.abc import Callable
 from typing import Any, Optional, cast
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
@@ -78,6 +79,7 @@ from slsqp_jax.types import (
     GradFn,
     HVPFn,
     JacobianFn,
+    Scalar,
     Vector,
 )
 from slsqp_jax.utils import to_scalar
@@ -613,7 +615,7 @@ class SLSQP(optx.AbstractMinimiser):
             multipliers_eq_seed = jnp.zeros((m_eq,))
         multipliers_ineq_seed = jnp.zeros((m_ineq_total,))
 
-        prev_grad_lagrangian = compute_lagrangian_gradient(
+        seed_grad_lagrangian = compute_lagrangian_gradient(
             grad, eq_jac, ineq_jac, multipliers_eq_seed, multipliers_ineq_seed
         )
 
@@ -633,8 +635,8 @@ class SLSQP(optx.AbstractMinimiser):
             multipliers_ineq_qp=multipliers_ineq_seed,
             multipliers_eq_ls=multipliers_eq_seed,
             multipliers_ineq_ls=multipliers_ineq_seed,
-            prev_grad_lagrangian=prev_grad_lagrangian,
-            grad_lagrangian=prev_grad_lagrangian,
+            kkt_residual_grad=seed_grad_lagrangian,
+            grad_lagrangian=seed_grad_lagrangian,
             merit_penalty=merit_penalty,
             bound_jac=bound_jac,
             qp_iterations=jnp.array(0),
@@ -700,11 +702,18 @@ class SLSQP(optx.AbstractMinimiser):
         stats = {
             "num_steps": state.step_count,
             "final_objective": state.f_val,
+            # ``final_grad_norm`` is the *objective* gradient norm
+            # ``||grad f||``.  ``final_lagrangian_grad_norm`` is the
+            # Lagrangian gradient norm ``||grad_x L||``, which is the
+            # quantity the relative-stationarity convergence test
+            # consumes.  Both are surfaced so users can plug either
+            # into a KKT check; auto-scaling unscales both via ``/ s_f``.
             "final_grad_norm": jnp.linalg.norm(state.grad),
+            "final_lagrangian_grad_norm": jnp.linalg.norm(state.grad_lagrangian),
             "merit_penalty": state.merit_penalty,
             "total_qp_iterations": state.qp_iterations,
             "last_qp_converged": state.qp_converged,
-            "qp_tolerance": 1e-8,
+            "qp_tolerance": self.atol,
             # Stationarity-quality multipliers (Hessian-free LS recovery
             # at the final iterate).  Suitable for plugging into
             # ``||∇f − Jᵀ λ||`` and verifying KKT stationarity.  The LS
@@ -758,7 +767,7 @@ class SLSQP(optx.AbstractMinimiser):
         A_ineq = state.ineq_jac[:m_ineq_general]
         b_ineq = -state.ineq_val[:m_ineq_general]
 
-        kkt_residual = jnp.linalg.norm(state.prev_grad_lagrangian)
+        kkt_residual = jnp.linalg.norm(state.kkt_residual_grad)
         initial_active_set = (
             state.prev_active_set[:m_ineq_general] if m_ineq_general > 0 else None
         )
@@ -866,6 +875,17 @@ class SLSQP(optx.AbstractMinimiser):
                 ),
             )
 
+        # Scalarise ``self.atol`` defensively: if the user constructed
+        # ``ToleranceConfig.atol`` as a ``jnp.array([1e-6])`` the size-1
+        # leak would propagate into the EXPAND ramp and break the
+        # active-set loop's ``jax.lax.cond`` predicates.  The matching
+        # scalarisation for ``mu`` is right above (see the
+        # ``test_size_one_atol_does_not_leak_to_proximal_mu`` regression
+        # in ``tests/test_slsqp.py``).
+        qp_tol: Scalar | float = self.atol
+        if isinstance(self.atol, jax.Array):
+            qp_tol = jnp.reshape(jnp.asarray(self.atol), ())
+
         qp_result = solve_qp(
             hvp_fn=hvp_fn,
             g=g,
@@ -875,6 +895,7 @@ class SLSQP(optx.AbstractMinimiser):
             b_ineq=b_ineq,
             max_iter=self.qp_max_iter,
             max_cg_iter=self.qp_max_cg_iter,
+            tol=qp_tol,
             initial_active_set=initial_active_set,
             kkt_residual=kkt_residual,
             proximal_mu=mu,

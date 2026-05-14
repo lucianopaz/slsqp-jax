@@ -36,6 +36,17 @@ def _make_craig_projection_ctx(
     per-projector-call CRAIG convergence flags inside the CG loop are
     not threaded through.  The multiplier-recovery closure runs CG on
     the normal equations ``A A^T λ = -A (B d + g)``.
+
+    Failure mode (deliberate):  if either the particular-solution solve
+    or any per-call projection solve produces non-finite values, those
+    values are *not* silently re-mapped to zeros.  They flow through to
+    the projected-CG ``d`` so the QP layer's :func:`slsqp_jax.qp.
+    _inner_check.inner_ok` predicate (``isfinite(result.d).all()``)
+    catches the failure as a hard ``inner_failed`` event.  The previous
+    silent zeroing degenerated CRAIG into the identity projection on
+    rank-deficient ``A_work``, leading the active-set loop to consume
+    a meaningless direction (and meaningless multipliers) while
+    reporting clean convergence.
     """
     sub = make_active_subproblem(
         hvp_fn=hvp_fn,
@@ -50,8 +61,6 @@ def _make_craig_projection_ctx(
     d_p_free, d_p_craig_conv = craig_solve(
         sub.A_work, sub.b_work, tol=craig_tol, max_iter=craig_max_iter
     )
-    d_p_free_finite = jnp.isfinite(d_p_free).all()
-    d_p_free = jnp.where(d_p_free_finite, d_p_free, jnp.zeros_like(d_p_free))
     d_p = d_p_free + sub.d_fixed if sub.has_fixed else d_p_free
 
     def project(v: Vector) -> Vector:
@@ -62,7 +71,6 @@ def _make_craig_projection_ctx(
             tol=craig_tol,
             max_iter=craig_max_iter,
         )
-        x_proj = jnp.where(jnp.isfinite(x_proj).all(), x_proj, jnp.zeros_like(x_proj))
         return v_work - x_proj
 
     reg_diag = jnp.where(active_mask, 0.0, 1.0)

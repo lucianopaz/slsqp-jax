@@ -126,6 +126,92 @@ def test_result_message_returns_empty_for_non_enum():
     assert _result_message(object()) == ""
 
 
+def test_result_message_falls_back_to_value_attr():
+    """When the equinox metadata lookup fails, ``_result_message`` falls
+    back to the ``value`` / ``message`` instance attribute (older
+    releases of equinox exposed the message string there)."""
+
+    class _LegacyResult:
+        # Pretend to be an equinox enum item by missing _enumeration so
+        # _enum_class falls back to type(result), which has no
+        # _index_to_message attribute -- forcing the for-loop fallback.
+        value = "legacy-message-string"
+
+    assert _result_message(_LegacyResult()) == "legacy-message-string"
+
+
+def test_result_message_falls_back_to_message_attr():
+    """The fallback loop also tries the ``message`` attribute."""
+
+    class _LegacyResult:
+        message = "fallback-via-message-attr"
+
+    assert _result_message(_LegacyResult()) == "fallback-via-message-attr"
+
+
+# ---------------------------------------------------------------------------
+# Signal serialisation
+# ---------------------------------------------------------------------------
+
+
+def test_debug_report_print_summary_writes_to_file():
+    """``print_summary`` writes the rendered report plus a trailing newline.
+
+    Pins the explicit ``file=`` branch so the renderer is callable
+    outside the diagnostic-context interactive print.
+    """
+    import io as _io
+
+    solver = SLSQP()
+    x0 = jnp.array([-1.2, 1.0])
+    report = diagnose(solver, _rosenbrock, x0, max_steps=5)
+    out = _io.StringIO()
+    report.print_summary(file=out)
+    text = out.getvalue()
+    assert text.startswith("=")
+    assert text.endswith("\n")
+    assert "SLSQP-JAX Debug Report" in text
+
+
+def test_debug_report_print_summary_defaults_to_stdout(capsys):
+    """Default ``file=None`` routes through ``sys.stdout`` (covers the
+    fallback branch of the ternary in ``print_summary``)."""
+    solver = SLSQP()
+    x0 = jnp.array([-1.2, 1.0])
+    report = diagnose(solver, _rosenbrock, x0, max_steps=5)
+    report.print_summary()
+    cap = capsys.readouterr()
+    assert "SLSQP-JAX Debug Report" in cap.out
+
+
+def test_signal_to_dict_round_trips_through_json():
+    """``_signal_to_dict`` produces a JSON-serialisable structure
+    that includes only the artifact *keys* (the array data itself is
+    intentionally dropped)."""
+    from slsqp_jax.diagnostics.report import _signal_to_dict
+
+    sig = Signal(
+        name="example",
+        specificity="specific",
+        magnitude="extreme",
+        confidence="high",
+        summary="A short summary.",
+        detail="Detail.",
+        evidence={"k": 1.0},
+        suggestions=["try X", "try Y"],
+        artifacts={"big_array": jnp.eye(3)},
+        offending_step=4,
+    )
+    payload = _signal_to_dict(sig)
+    encoded = json.dumps(payload)
+    decoded = json.loads(encoded)
+    assert decoded["name"] == "example"
+    assert decoded["evidence"] == {"k": 1.0}
+    # Artifact data is not serialised; only the key list is kept.
+    assert decoded["artifact_keys"] == ["big_array"]
+    assert "big_array" not in decoded
+
+
 def test_enum_value_returns_none_on_non_enum():
     """``_enum_value`` is the load-bearing helper for both name and
     message lookups; non-enum inputs must return ``None`` rather than

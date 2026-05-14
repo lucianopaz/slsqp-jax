@@ -271,6 +271,48 @@ class TestCraigUnpreconditioned:
         assert result.converged
 
 
+class TestCraigNonfinitePropagation:
+    """Regression: CRAIG must not silently zero non-finite projection
+    solves.
+
+    The previous behaviour replaced a non-finite ``craig_solve`` output
+    with zeros via ``jnp.where(isfinite, ..., zeros)`` inside
+    ``_make_craig_projection_ctx``.  That degenerated CRAIG into the
+    identity projection on rank-deficient ``A_work``, letting the QP
+    active-set loop consume a meaningless direction (and meaningless
+    multipliers) while reporting clean convergence.  The fix lets
+    NaN/Inf flow through to the projected-CG ``d`` so the QP layer's
+    ``inner_ok`` predicate (``isfinite(result.d).all()``) catches it.
+    """
+
+    def test_nonfinite_particular_solution_propagates(self, monkeypatch):
+        from slsqp_jax.inner import craig as craig_module
+        from slsqp_jax.qp._inner_check import inner_ok
+
+        hvp_fn, g, A, b, active_mask, _, _ = _make_qp()
+
+        original_craig_solve = craig_module.craig_solve
+
+        def patched_craig_solve(A_arg, rhs, tol=1e-10, max_iter=100):
+            # Force the *first* invocation (the particular-solution
+            # solve in ``_make_craig_projection_ctx``) to return NaN.
+            # Subsequent calls (the per-projector calls) keep the
+            # genuine implementation; we only need one infection point
+            # to verify that the fix surfaces NaN through to ``d``.
+            x = original_craig_solve(A_arg, rhs, tol=tol, max_iter=max_iter)[0]
+            return jnp.full_like(x, jnp.nan), jnp.array(False)
+
+        monkeypatch.setattr(craig_module, "craig_solve", patched_craig_solve)
+
+        solver = craig_module.ProjectedCGCraig(
+            max_cg_iter=20, cg_tol=1e-10, craig_tol=1e-12, craig_max_iter=50
+        )
+        result = solver.solve(hvp_fn, g, A, b, active_mask, precond_fn=None)
+
+        assert not bool(jnp.isfinite(result.d).all())
+        assert not bool(inner_ok(result))
+
+
 class TestCraigConstraintPreconditioner:
     """ProjectedCGCraig with use_constraint_preconditioner=True (covers lines 783-805)."""
 
@@ -534,7 +576,7 @@ class TestNonScalarAdaptiveTol:
 
     Optimistix's ``ImplicitAdjoint.apply`` re-traces the primal step
     function during the adjoint computation (and on the forward pass with
-    the default adjoint).  If ``state.prev_grad_lagrangian`` ever carries
+    the default adjoint).  If ``state.kkt_residual_grad`` ever carries
     an unexpected leading axis, the Eisenstat-Walker tolerance computed
     in ``solver.py`` becomes shape ``(1,)``.  That used to broadcast every
     ``r0_norm_sq < cg_tol ** 2`` comparison to ``(1,)`` and trigger

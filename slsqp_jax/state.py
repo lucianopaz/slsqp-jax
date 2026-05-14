@@ -524,7 +524,15 @@ class SLSQPState(eqx.Module):
             :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers`).
             At ``init()`` initialised to zeros — bound blocks only get
             populated once ``step()`` runs the post-step recovery.
-        prev_grad_lagrangian: Previous Lagrangian gradient (for L-BFGS update).
+        kkt_residual_grad: Lagrangian-gradient snapshot consumed by the
+            next QP subproblem as the KKT-residual proxy
+            (``kkt_residual = ||state.kkt_residual_grad||`` inside
+            :meth:`SLSQP._solve_qp_subproblem`).  Currently always
+            written equal to :attr:`grad_lagrangian` at the end of each
+            step; the field is kept separate from ``grad_lagrangian``
+            purely so that future variants (e.g. carrying a *previous*
+            iterate's Lagrangian gradient instead of the current one)
+            can be introduced without re-shaping the state pytree.
         grad_lagrangian: Current gradient of the Lagrangian evaluated at
             the accepted iterate using the LS multipliers (matching the
             L-BFGS secant pair).  Reused by ``terminate`` so the
@@ -575,8 +583,13 @@ class SLSQPState(eqx.Module):
     multipliers_eq_ls: Float[Array, " m_eq"]
     multipliers_ineq_ls: Float[Array, " m_ineq"]
 
-    # Previous Lagrangian gradient for L-BFGS y = grad_L_new - grad_L_old
-    prev_grad_lagrangian: Vector
+    # Lagrangian-gradient proxy for the next QP's KKT residual.  Always
+    # written equal to ``grad_lagrangian`` at the end of each step; kept
+    # as a separate field so future variants can carry a different
+    # snapshot here without re-shaping the state pytree.  Read once per
+    # QP solve as ``kkt_residual = ||state.kkt_residual_grad||`` in
+    # :meth:`SLSQP._solve_qp_subproblem`.
+    kkt_residual_grad: Vector
 
     # Current Lagrangian gradient at the accepted iterate, computed with
     # the LS multipliers (matching the L-BFGS secant pair).  Reused by

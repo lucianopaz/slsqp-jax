@@ -262,6 +262,49 @@ def test_signal_infeasible_termination_synthetic(
 # ---------------------------------------------------------------------------
 
 
+def test_ls_floor_for_falls_back_when_solver_lacks_attribute(
+    make_summary, make_state, make_eval_context
+):
+    """``_ls_floor_for`` must degrade to :data:`_LS_COLLAPSE_FALLBACK_FLOOR`
+    when the solver instance does not expose ``line_search_max_steps``
+    (e.g. a synthetic stand-in built without the SLSQP scaffolding).
+
+    Pins the fallback branch in :func:`slsqp_jax.diagnostics.signals._ls_floor_for`.
+    """
+    from slsqp_jax.diagnostics.signals import (
+        _LS_COLLAPSE_FALLBACK_FLOOR,
+        EvalContext,
+        _ls_floor_for,
+    )
+
+    class _BareSolver:
+        rtol = 1e-6
+        atol = 1e-6
+        max_steps = 100
+        # No ``line_search_max_steps`` attribute at all.
+
+    ctx = EvalContext(
+        solver=_BareSolver(),  # type: ignore[arg-type]
+        rtol=1e-6,
+        atol=1e-6,
+        max_steps=100,
+    )
+    assert _ls_floor_for(ctx) == _LS_COLLAPSE_FALLBACK_FLOOR
+
+    # And a solver whose attribute is non-int / non-positive must also
+    # fall back -- the predicate uses ``isinstance(int) and > 0``.
+    class _BogusSolver(_BareSolver):
+        line_search_max_steps = 0  # invalid: <= 0 forces fallback
+
+    ctx2 = EvalContext(
+        solver=_BogusSolver(),  # type: ignore[arg-type]
+        rtol=1e-6,
+        atol=1e-6,
+        max_steps=100,
+    )
+    assert _ls_floor_for(ctx2) == _LS_COLLAPSE_FALLBACK_FLOOR
+
+
 def test_signal_line_search_collapse_synthetic_alpha_floor(
     make_summary, make_state, make_eval_context
 ):
@@ -371,6 +414,35 @@ def test_signal_divergence_rollback_triggered_does_not_fire_when_clean(
     assert sig is None
 
 
+def test_signal_divergence_rollback_offending_step_via_diverging_flag(
+    make_summary, make_state, make_eval_context
+):
+    """Offending-step locator hits the ``diverging`` short-circuit branch.
+
+    The locator tries the ``diverging`` flag first (immediate exit) and
+    only falls back to ``blowup_count > prev_blowup`` when no summary
+    has ``diverging`` set.  This test pins the ``diverging`` branch.
+    """
+    summaries = [
+        make_summary(step_count=1),
+        make_summary(step_count=2, diverging=True, blowup_count=0),
+        make_summary(step_count=3, diverging=True, blowup_count=1),
+    ]
+    state = make_state(
+        n=4,
+        diagnostics_overrides={
+            "divergence_triggered": True,
+            "n_divergence_blowups": 2,
+        },
+    )
+    ctx = make_eval_context()
+    sig = _find_evaluator("divergence_rollback_triggered")(
+        ctx, state, summaries, RESULTS.iterate_blowup
+    )
+    assert sig is not None
+    assert sig.offending_step == 2
+
+
 def test_signal_merit_penalty_explosion_synthetic(
     make_summary, make_state, make_eval_context
 ):
@@ -452,4 +524,30 @@ def test_signal_penalty_starvation_does_not_fire_when_rho_grew(
     )
     # The frozen prefix is only 3 steps long (rhos[3] = 5.0 breaks
     # it), which is below the ``max(5, n_steps // 3)`` minimum.
+    assert sig is None
+
+
+def test_signal_penalty_starvation_does_not_fire_when_violations_non_monotone(
+    make_summary, make_state, make_eval_context
+):
+    """A non-monotone feasibility trajectory must not trip starvation.
+
+    The signal requires the violation series to be monotone non-
+    decreasing across the frozen prefix (the load-bearing notion is
+    "feasibility decayed silently").  A trajectory that *bounces*
+    isn't a starvation event and should return ``None`` from the
+    monotone check before the growth-ratio test fires.
+    """
+    # Frozen rho prefix of 9 steps; violations rise then fall, so
+    # the monotone non-decreasing test fails.
+    violations = [1e-7, 2e-7, 4e-7, 8e-7, 4e-7, 2e-6, 4e-6, 8e-6, 1e-5]
+    summaries = [
+        make_summary(step_count=k + 1, merit_penalty=1.0, max_eq_violation=v)
+        for k, v in enumerate(violations)
+    ]
+    state = make_state(n=4)
+    ctx = make_eval_context(atol=1e-7)
+    sig = _find_evaluator("penalty_starvation")(
+        ctx, state, summaries, RESULTS.merit_stagnation
+    )
     assert sig is None

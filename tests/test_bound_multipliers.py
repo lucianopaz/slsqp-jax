@@ -678,3 +678,75 @@ class TestCoveragePaths:
         # ``1 - ||x||^2 >= 0``, so the constraint is inactive at the
         # optimum and the solver should return ``y ≈ 0``.
         np.testing.assert_allclose(y, [0.0, 0.0], atol=1e-5)
+
+
+class TestPenaltyUpdateBoundClamp:
+    """Han-Powell penalty update must ignore wrong-sign bound multipliers.
+
+    The QP-side bound block of ``multipliers_ineq`` is recovered as
+    ``where(at_lower, reduced_grad[lower_idx], 0)`` (and the symmetric
+    upper-side rule).  A "barely active" bound paired with a wrong-sign
+    reduced gradient produces a large *negative* multiplier whose
+    absolute value would otherwise inflate ``rho`` permanently —
+    ``update_penalty_parameter`` is monotone non-decreasing.  The fix in
+    ``_step_body.py`` builds a separate ``multipliers_ineq_for_penalty``
+    vector that clamps the bound block to ``max(0, ·)`` before the
+    penalty call.  The QP step direction, the LS recovery, the LPEC-A
+    predictor, and the QP warm-start all keep the raw signed multipliers.
+    """
+
+    def test_penalty_update_ignores_wrong_sign_bound_multipliers(self):
+        """A negative bound block does not change ``rho`` after the clamp."""
+        from slsqp_jax.merit import update_penalty_parameter
+
+        m_ineq_general = 0
+
+        # Equality multipliers: small and signed.
+        mult_eq = jnp.array([0.5])
+        # Inequality multipliers: empty general block, large *negative*
+        # bound-lower block (the wrong-sign reduced-gradient noise we
+        # want to filter out before the penalty update), no upper-bound
+        # rows.
+        raw_mult_ineq = jnp.array([-5.0, -3.0])
+
+        # Reproduce the clamp the step body applies before the penalty
+        # call.
+        clamped_mult_ineq = raw_mult_ineq.at[m_ineq_general:].set(
+            jnp.maximum(raw_mult_ineq[m_ineq_general:], 0.0)
+        )
+
+        rho_initial = jnp.array(1.0)
+        rho_after_raw = update_penalty_parameter(rho_initial, mult_eq, raw_mult_ineq)
+        rho_after_clamped = update_penalty_parameter(
+            rho_initial, mult_eq, clamped_mult_ineq
+        )
+
+        # Without the clamp, the abs(-5) bound multiplier ratchets rho
+        # well above 5 (margin = 1.1).
+        assert float(rho_after_raw) > 5.0
+        # With the clamp, only the equality multiplier (|0.5|) remains;
+        # margin * 0.5 = 0.55 < 1.0, so rho stays at the floor.
+        assert float(rho_after_clamped) == pytest.approx(1.0)
+
+    def test_penalty_update_keeps_legitimate_positive_bound_multiplier(self):
+        """A genuine *positive* bound multiplier still ratchets ``rho``.
+
+        Sanity check that the clamp does not mask the dual-feasible
+        side: a bound multiplier of ``+5`` is still taken into account
+        (and brings ``rho`` up to ``margin * 5 = 5.5``).
+        """
+        from slsqp_jax.merit import update_penalty_parameter
+
+        mult_eq = jnp.zeros(0)
+        raw_mult_ineq = jnp.array([5.0, 0.0])
+        clamped_mult_ineq = jnp.maximum(raw_mult_ineq, 0.0)
+
+        rho_initial = jnp.array(1.0)
+        rho_after_raw = update_penalty_parameter(rho_initial, mult_eq, raw_mult_ineq)
+        rho_after_clamped = update_penalty_parameter(
+            rho_initial, mult_eq, clamped_mult_ineq
+        )
+
+        # Clamp is a no-op on positive multipliers.
+        assert float(rho_after_raw) == pytest.approx(float(rho_after_clamped))
+        assert float(rho_after_clamped) > 5.0

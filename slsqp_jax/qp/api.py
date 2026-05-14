@@ -36,7 +36,7 @@ def solve_qp(
     b_ineq: Float[Array, " m_ineq"],
     max_iter: int = 100,
     max_cg_iter: int = 50,
-    tol: float = 1e-8,
+    tol: Scalar | float = 1e-8,
     expand_factor: float = 1.0,
     initial_active_set: Bool[Array, " m_ineq"] | None = None,
     kkt_residual: Scalar | float = 0.0,
@@ -126,6 +126,18 @@ def solve_qp(
     m_eq = A_eq.shape[0]
     m_ineq = A_ineq.shape[0]
     m_total = m_eq + m_ineq
+
+    # Squash any size-1 leak from the caller (e.g. an SLSQP solver
+    # whose ``atol`` was constructed as ``jnp.array([1e-6])``).
+    # Downstream the active-set loop combines ``tol`` with EXPAND
+    # constants and uses it inside JAX comparisons; a ``(1,)``-shape
+    # value broadcasts the comparison output to ``(1,)`` and triggers
+    # ``TypeError: Pred must be a scalar`` deep inside ``jax.lax.cond``.
+    # The matching scalarisation for ``mu`` lives in
+    # ``SLSQP._solve_qp_subproblem`` (the
+    # ``test_size_one_atol_does_not_leak_to_proximal_mu`` regression).
+    if isinstance(tol, Array):
+        tol = jnp.reshape(tol, ())
 
     use_expand = active_set_method != "lpeca"
     effective_predicted = (
