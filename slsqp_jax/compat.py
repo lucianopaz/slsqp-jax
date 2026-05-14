@@ -824,6 +824,9 @@ def minimize_like_scipy(
     has_aux: bool = False,
     throw: bool = False,
     verbose: bool | Callable[..., None] = False,
+    auto_scale: bool | str = True,
+    auto_scale_target_gradient: float | None = None,
+    auto_scale_max_factor: float | None = None,
 ) -> optx.Solution:
     """Minimise a function using SLSQP with a SciPy-like interface.
 
@@ -886,6 +889,39 @@ def minimize_like_scipy(
     verbose
         Passed to the ``SLSQP`` constructor.  ``False`` (default) for
         silent, ``True`` to print all diagnostics, or a custom callable.
+        When ``auto_scale`` is on the built-in printer is wrapped to
+        show user-unit values for ``f`` / ``|c|`` / ``|grad_f|`` /
+        ``|grad_L|`` / ``|d|``; merit / rho / gamma / L-BFGS internals
+        keep a ``(s)`` suffix on their label to flag scaled units.
+        See :func:`slsqp_jax.wrap_verbose_for_scaling`.
+    auto_scale
+        Automatic problem scaling at the initial point (gradient-based,
+        IPOPT/KNITRO-style).  **On by default** as of this release.
+
+        * ``True`` (default) -> ``"balanced"`` (``target_gradient=1.0,
+          max_factor=1e3``).  Both shrinks (when ``||grad|| > 1``)
+          and amplifies (up to 1000x, when ``||grad|| < 1``).
+          Idempotent on well-scaled problems where ``||grad||=1``;
+          fully fixes the documented ``||J_eq|| >> ||grad_f||``
+          divergence cascade.  The ``1e3`` cap keeps amplification
+          well below typical AD relative-error noise floors.
+        * ``False`` -> no wrapping (previous behaviour).
+        * ``"knitro"`` -> ``target=1.0, max_factor=1.0`` (strict
+          shrink-only; opt-in for users who want zero amplification).
+        * ``"ipopt"`` -> ``target=100.0, max_factor=1.0`` (very
+          conservative; may not fix all cascades).
+        * ``"aggressive"`` -> ``target=1.0, max_factor=1e6`` (pushes
+          amplification to the noise-floor limit).
+
+        When scaling is applied, ``sol.stats`` carries a
+        ``scale_factors`` entry plus ``_user``-suffixed copies of the
+        multiplier vectors and the Lagrangian gradient norm.  ``atol``
+        is auto-compensated so the user-perceived feasibility
+        tolerance is preserved regardless of the constraint shrink.
+    auto_scale_target_gradient
+        Optional explicit override of the mode's ``target_gradient``.
+    auto_scale_max_factor
+        Optional explicit override of the mode's ``max_factor``.
 
     Returns
     -------
@@ -1084,25 +1120,140 @@ def minimize_like_scipy(
             f"minimize_like_scipy: unrecognized option(s): {sorted(opts.keys())!r}"
         )
 
+    # Auto-scaling: when on (default), wrap fn / constraints / Jacobians /
+    # HVPs by the gradient-based scale factors evaluated at x0, and
+    # compensate atol so the user-perceived feasibility tolerance is
+    # preserved.  See slsqp_jax.scaling for the math + design rationale.
+    from slsqp_jax.scaling import (
+        auto_scaled_problem,
+        resolve_scaling_mode,
+        unscale_solution,
+        wrap_verbose_for_scaling,
+    )
+
+    scaling_cfg = resolve_scaling_mode(
+        auto_scale,
+        target_gradient=auto_scale_target_gradient,
+        max_factor=auto_scale_max_factor,
+    )
+
+    if scaling_cfg is not None:
+        # Snapshot the tolerance fields into local Python floats so the
+        # type checker can track them through the rebuild below.
+        from typing import cast as _cast
+
+        _tol = _cast(ToleranceConfig, tolerance)
+        prev_rtol = float(_tol.rtol)
+        prev_atol = float(_tol.atol)
+        prev_max_steps = int(_tol.max_steps)
+        prev_min_steps = int(_tol.min_steps)
+        prev_stag_tol = float(_tol.stagnation_tol)
+        prev_div_factor = float(_tol.divergence_factor)
+        prev_div_patience = int(_tol.divergence_patience)
+
+        scaled = auto_scaled_problem(
+            fn=wrapped_fn,
+            x0=x0,
+            args=args,
+            has_aux=True,
+            eq_constraint_fn=parsed.eq_constraint_fn,
+            ineq_constraint_fn=parsed.ineq_constraint_fn,
+            obj_grad_fn=obj_grad_fn,
+            eq_jac_fn=parsed.eq_jac_fn,
+            ineq_jac_fn=parsed.ineq_jac_fn,
+            obj_hvp_fn=obj_hvp_fn,
+            eq_hvp_fn=parsed.eq_hvp_fn,
+            ineq_hvp_fn=parsed.ineq_hvp_fn,
+            scaling_config=scaling_cfg,
+            atol_user=prev_atol,
+        )
+
+        # Override atol to atol_internal so the inner solver's
+        # convergence tests match the user-perceived feasibility
+        # tolerance.  rtol is invariant to a uniform s_f rescaling
+        # so we leave it untouched.
+        tolerance = ToleranceConfig(
+            rtol=prev_rtol,
+            atol=scaled.factors.atol_internal,
+            max_steps=prev_max_steps,
+            min_steps=prev_min_steps,
+            stagnation_tol=prev_stag_tol,
+            divergence_factor=prev_div_factor,
+            divergence_patience=prev_div_patience,
+        )
+        config = SLSQPConfig(
+            tolerance=tolerance,
+            lbfgs=lbfgs,
+            line_search=line_search,
+            qp=qp,
+            proximal=proximal,
+            preconditioner=preconditioner,
+            lpeca=lpeca,
+            adaptive_cg=adaptive_cg,
+        )
+
+        effective_fn = scaled.fn
+        effective_eq_fn = scaled.eq_constraint_fn
+        effective_ineq_fn = scaled.ineq_constraint_fn
+        effective_obj_grad = scaled.obj_grad_fn
+        effective_eq_jac = scaled.eq_jac_fn
+        effective_ineq_jac = scaled.ineq_jac_fn
+        effective_obj_hvp = scaled.obj_hvp_fn
+        effective_eq_hvp = scaled.eq_hvp_fn
+        effective_ineq_hvp = scaled.ineq_hvp_fn
+        # We pass verbose=False to SLSQP and patch in the scale-aware
+        # wrapper post-construction via ``eqx.tree_at``.  This bypasses
+        # SLSQP's ``__check_init__`` ``_strip_fmt`` adapter which would
+        # otherwise truncate the (label, value, fmt) 3-tuples to
+        # 2-tuples and degrade the printed formatting.
+        effective_verbose = False
+    else:
+        scaled = None
+        effective_fn = wrapped_fn
+        effective_eq_fn = parsed.eq_constraint_fn
+        effective_ineq_fn = parsed.ineq_constraint_fn
+        effective_obj_grad = obj_grad_fn
+        effective_eq_jac = parsed.eq_jac_fn
+        effective_ineq_jac = parsed.ineq_jac_fn
+        effective_obj_hvp = obj_hvp_fn
+        effective_eq_hvp = parsed.eq_hvp_fn
+        effective_ineq_hvp = parsed.ineq_hvp_fn
+        effective_verbose = verbose
+
     solver = SLSQP(
         config=config,
-        eq_constraint_fn=parsed.eq_constraint_fn,
-        ineq_constraint_fn=parsed.ineq_constraint_fn,
+        eq_constraint_fn=effective_eq_fn,
+        ineq_constraint_fn=effective_ineq_fn,
         n_eq_constraints=parsed.n_eq_constraints,
         n_ineq_constraints=parsed.n_ineq_constraints,
         bounds=jax_bounds,
-        obj_grad_fn=obj_grad_fn,
-        eq_jac_fn=parsed.eq_jac_fn,
-        ineq_jac_fn=parsed.ineq_jac_fn,
-        obj_hvp_fn=obj_hvp_fn,
-        eq_hvp_fn=parsed.eq_hvp_fn,
-        ineq_hvp_fn=parsed.ineq_hvp_fn,
+        obj_grad_fn=effective_obj_grad,
+        eq_jac_fn=effective_eq_jac,
+        ineq_jac_fn=effective_ineq_jac,
+        obj_hvp_fn=effective_obj_hvp,
+        eq_hvp_fn=effective_eq_hvp,
+        ineq_hvp_fn=effective_ineq_hvp,
         inner_solver=inner_solver,
-        verbose=verbose,  # type: ignore[arg-type]
+        verbose=effective_verbose,  # type: ignore[arg-type]
     )
 
+    if scaled is not None:
+        # Post-construction patch: install the scale-aware verbose
+        # wrapper directly, bypassing ``__check_init__``'s
+        # ``_strip_fmt`` adapter (which would otherwise drop the
+        # ``.6e`` / ``.3e`` format specifiers).  We do this even
+        # when ``verbose=False`` so the diagnostics layer can pick
+        # the factors off ``solver.verbose._slsqp_scale_factors``
+        # for its Auto-scaling section.  ``verbose`` is a static
+        # ``eqx.field`` so neither ``eqx.tree_at`` nor
+        # ``dataclasses.replace`` can swap it without retriggering
+        # ``__check_init__``; ``object.__setattr__`` is the
+        # idiomatic escape hatch for static-field overrides.
+        wrapped_verbose = wrap_verbose_for_scaling(verbose, scaled.factors)
+        object.__setattr__(solver, "verbose", wrapped_verbose)
+
     sol = optx.minimise(
-        wrapped_fn,
+        effective_fn,
         solver,
         x0,
         args=args,
@@ -1110,4 +1261,6 @@ def minimize_like_scipy(
         max_steps=max_steps,
         throw=throw,
     )
+    if scaled is not None:
+        sol = unscale_solution(sol, scaled.factors)
     return sol

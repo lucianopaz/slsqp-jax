@@ -14,6 +14,8 @@ The `SLSQP` solver is built on top of [Optimistix](https://github.com/patrick-ki
 
 > **Breaking API change.** The previous flat `SLSQP(rtol=…, atol=…, max_steps=…, …)` constructor has been replaced with a single nested `SLSQPConfig` argument. All examples below use the new layout; users on `slsqp_jax.compat.minimize_like_scipy` need no changes. See [`REFACTOR_NOTES.md`](REFACTOR_NOTES.md) for the migration mapping (every removed flat kwarg is listed alongside its new sub-config home) and a side-by-side migration example.
 
+> **Behaviour change: automatic problem scaling is on by default.** As of this release, `slsqp_jax.minimize_like_scipy` enables gradient-based automatic scaling at the initial point (`auto_scale=True`, resolving to the new `"balanced"` mode with `target_gradient=1.0, max_factor=1e3`). Well-scaled problems are unaffected (every factor stays at `1.0`); badly-scaled problems where `||J_eq||` and `||grad_f||` differ by orders of magnitude are now automatically reconciled, eliminating the `penalty_starvation -> merit_penalty_explosion -> divergence_rollback` cascade documented in the diagnostics notes. Multipliers and the Lagrangian gradient norm are unscaled before being returned in `sol.stats`; `atol` is auto-compensated so user-perceived feasibility is preserved. Pass `auto_scale=False` to opt out of the new default and recover the previous behaviour. See the [Auto-scaling](#auto-scaling-default-on) section below for the full contract.
+
 ## Installation
 
 You can install the package from PyPI using any standard method:
@@ -233,6 +235,63 @@ Bounds play a **dual role** in the solver, following the projected-SQP methodolo
 2. **Hard projection** — after every line search step (and at initialisation), the iterate is *projected* (clipped) onto the feasible box. This guarantees that the objective and constraint functions are **never evaluated outside the bounds**, which is critical when those functions are undefined or ill-conditioned outside the box (e.g. a log-likelihood with positivity constraints on its parameters).
 
 ## Algorithm
+
+<a id="auto-scaling-default-on"></a>
+
+### Auto-scaling (default-on)
+
+`slsqp_jax.minimize_like_scipy` evaluates the gradient of the objective and the Jacobian of every constraint at the initial point `x0` and, by default, multiplies each component by a scalar so that `||grad||_inf` matches a target after scaling (gradient-based scaling, IPOPT/KNITRO-style). The scaled problem is what the inner solver actually sees; the outputs are unscaled before being returned to the user. This is implemented in `slsqp_jax.scaling` and reachable through three entry points:
+
+- `slsqp_jax.minimize_like_scipy(..., auto_scale=True)` — the recommended path. `auto_scale=True` is the new default.
+- `slsqp_jax.auto_scaled_minimise(fn, solver, x0, ..., auto_scale=True)` — a thin wrapper around `optimistix.minimise` for users who construct an `SLSQP` instance themselves.
+- `slsqp_jax.auto_scaled_problem(fn, x0, ..., scaling_config=cfg)` and `slsqp_jax.unscale_solution(sol, factors)` — the raw helpers for users who want to drive the `optx.minimise` call directly.
+
+The motivating failure mode is documented in the diagnostic notes for the feasible-start divergence run: a `||J_eq|| ~ 70` vs `||grad_f|| ~ 0.018` magnitude mismatch (~4000x) drove a `penalty_starvation -> merit_penalty_explosion -> divergence_rollback` cascade that no amount of solver tuning could fix. Manually rescaling the constraint solved it; the auto-scaler does the same thing automatically.
+
+**Modes (string or bool aliases for `auto_scale`).** Each mode is a `(target_gradient, max_factor)` pair:
+
+| `auto_scale` | `target_gradient` | `max_factor` | Behaviour |
+| --- | --- | --- | --- |
+| `True` (default) / `"balanced"` | `1.0` | `10^3` | Both shrinks (`||grad|| > 1`) and amplifies (`||grad|| < 1`) up to 1000x. Idempotent on well-scaled problems where `||grad||=1`. The `1e3` cap keeps amplification well below typical AD relative-error noise floors (~`1e-12`). |
+| `"knitro"` | `1.0` | `1.0` | Strict shrink-only. Opt-in for users who want zero amplification under any circumstances. |
+| `"ipopt"` | `100.0` | `1.0` | IPOPT default. Very conservative; may not fix all cascades because it never amplifies and only shrinks gradients above `100`. |
+| `"aggressive"` | `1.0` | `10^6` | Pushes amplification to the noise-floor limit. Opt-in for problems where `||grad_f(x0)||` is genuinely small (and the user has audited their AD for cancellation). |
+| `False` | — | — | No wrapping; the previous (pre-feature) behaviour. Use this if you have output-exactness assertions tied to the unscaled path. |
+
+Explicit overrides via `auto_scale_target_gradient=` / `auto_scale_max_factor=` win over the mode preset.
+
+**Mathematics.** For each component (objective + each constraint row) with gradient `g` evaluated at `x0`:
+
+```
+norm = max(||g||_inf, grad_floor)
+s = clip(target_gradient / norm, eps, max_factor)
+```
+
+Rows whose `||g||_inf < grad_floor` (default `1e-12`) are *skipped*: `s = 1.0` and a `UserWarning` is emitted. The wrappers are then `f_scaled = s_f * f`, `c_scaled = s * c` (element-wise), `J_scaled = s[:, None] * J`, and per-row scaling on the per-component constraint HVPs.
+
+**`atol` compensation.** The user's feasibility tolerance is preserved automatically:
+
+```
+s_min = min(min(s_eq), min(s_ineq), 1.0)
+atol_internal = atol_user * s_min
+```
+
+so that `|c_scaled[i]| <= atol_internal` implies `|c_user[i]| <= atol_user` for the worst-scaled row. The compensated tolerance is what the solver actually uses; the user's `atol` is what the user sees. `rtol` is invariant to a uniform `s_f` rescaling and is left untouched.
+
+**Output unscaling.** When scaling is applied, `sol.stats` carries:
+
+- `scale_factors` — the `ScaleFactors` instance with `s_f`, `s_eq`, `s_ineq`, the user/internal `atol` pair, and skipped-row counts.
+- `multipliers_eq_user`, `multipliers_ineq_user` — multipliers in user units (`lambda_user = (s / s_f) * lambda_scaled`).
+- `final_grad_norm_user` — the Lagrangian gradient norm in user units (`||grad_L||_user = ||grad_L||_scaled / s_f`).
+- `merit_penalty_note = "scaled units"` — the merit penalty `rho` lives in scaled space; this label flags the unit.
+
+**Verbose-printer behaviour.** When `verbose=True` is combined with `auto_scale=True`, the built-in printer (`slsqp_verbose`) is wrapped so that each per-step line reports user-unit values for the quantities that have a clean unscaled equivalent (`f`, `|c|`, `|grad_f|`, `|grad_L|`, `|grad_L|/|L|`, `|d|`), and keeps a `(s)` suffix on the column label for quantities that genuinely live in scaled space (`merit`, `Δmerit`, `rho`, `gamma`, `s·y`, `rel_curv`, `kappa_B`). A one-line preamble printed once at iteration 0 reports the active factors.
+
+User-supplied verbose callables (`verbose=callable`) are invoked with an additional `scale_factors` keyword argument and the *scaled* state — i.e. the wrapper does not silently rewrite the inputs. The exported `slsqp_jax.wrap_verbose_for_scaling(callback, factors)` helper is available for users who want the same unscaling pipeline applied to their own callback.
+
+**Diagnostic-report integration.** The `DebugReport` rendered by `slsqp_jax.diagnose_minimize_like_scipy` (and the `diagnostic_run` context manager) automatically picks up the active scale factors from the solver's verbose attribute and renders an `Auto-scaling` section listing `s_f`, `s_eq` / `s_ineq` summaries, the `atol_user` / `atol_internal` pair, and the skipped-row counts. The `Final iterate metrics` block uses user-unit values where they are well-defined and flags the rest with `(scaled)`. Two of the existing signal evaluators (`merit_penalty_explosion`, `penalty_starvation`) carry an updated suggestion list pointing at this section as the first thing to check.
+
+**Asymmetric defaults across runners.** `minimize_like_scipy` and the `diagnostic_run` / `diagnose_minimize_like_scipy` paths default to `auto_scale=True` (the user-facing recommended setting). The lower-level `slsqp_jax.diagnostics.debug_run` does not run through the scaling layer at all — it is a debug-the-raw-solver tool by design — but users can route through `auto_scaled_minimise` instead when they want both the diagnostics and the auto-scaling.
 
 ### Overview
 
