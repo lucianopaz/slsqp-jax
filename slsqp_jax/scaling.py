@@ -805,8 +805,24 @@ def _make_user_unit_value(key: str, value: Any, factors: ScaleFactors) -> Any:
     return value
 
 
-def _adapt_entry(key: str, entry: tuple, factors: ScaleFactors) -> tuple:
-    """Rewrite a single ``(label, value[, fmt])`` tuple for the verbose call."""
+def _adapt_entry(
+    key: str,
+    entry: tuple,
+    factors: ScaleFactors,
+    needs_scaled_suffix: bool,
+) -> tuple:
+    """Rewrite a single ``(label, value[, fmt])`` tuple for the verbose call.
+
+    ``needs_scaled_suffix`` is precomputed once by
+    :func:`wrap_verbose_for_scaling` from ``factors`` (which never
+    changes across the run) and threaded in here as a Python ``bool``.
+    Computing it lazily inside this function would require reading
+    ``factors.s_eq`` / ``factors.s_ineq`` (both ``jax.Array``) as
+    concrete values, which fails under :func:`jax.jit` tracing of the
+    enclosing ``step`` -- the verbose callback runs inside the jitted
+    step (Optimistix's outer driver and ``debug_run``'s inner
+    ``jit_step`` both jit ``step``).
+    """
     if len(entry) == 3:
         label, value, fmt = entry
     else:
@@ -815,17 +831,29 @@ def _adapt_entry(key: str, entry: tuple, factors: ScaleFactors) -> tuple:
     if key in _UNSCALABLE_KEYS_OBJ_DIVIDE:
         new_value = _make_user_unit_value(key, value, factors)
         new_label = label
-    elif key in _SCALED_LABEL_KEYS and (
-        factors.s_f != 1.0
-        or (factors.s_eq.size > 0 and float(jnp.min(factors.s_eq)) != 1.0)
-        or (factors.s_ineq.size > 0 and float(jnp.min(factors.s_ineq)) != 1.0)
-    ):
+    elif key in _SCALED_LABEL_KEYS and needs_scaled_suffix:
         new_value = value
         new_label = f"{label}(s)"
     else:
         new_value = value
         new_label = label
     return (new_label, new_value, fmt) if fmt is not None else (new_label, new_value)
+
+
+def _scaling_is_active(factors: ScaleFactors) -> bool:
+    """Return ``True`` iff at least one factor is non-trivial (``!= 1``).
+
+    Reads ``factors.s_eq`` and ``factors.s_ineq`` (both ``jax.Array``)
+    as concrete host values; must be called only outside any
+    :func:`jax.jit` trace context.
+    """
+    if factors.s_f != 1.0:
+        return True
+    if factors.s_eq.size > 0 and float(jnp.min(factors.s_eq)) != 1.0:
+        return True
+    if factors.s_ineq.size > 0 and float(jnp.min(factors.s_ineq)) != 1.0:
+        return True
+    return False
 
 
 def wrap_verbose_for_scaling(
@@ -878,6 +906,12 @@ def wrap_verbose_for_scaling(
         f"min(s_eq)={s_eq_min:.3e}, min(s_ineq)={s_ineq_min:.3e}; "
         "merit/rho/gamma/L-BFGS columns are in scaled units (suffix '(s)')."
     )
+    # Precompute the "needs (s) suffix" decision once on the host.
+    # ``factors`` is invariant across the run, so reading its array
+    # fields is safe here (eager) but would crash inside the jitted
+    # step where ``_adapt_entry`` runs.  See the docstring on
+    # ``_adapt_entry`` for the full rationale.
+    needs_scaled_suffix = _scaling_is_active(factors)
     # Stash the preamble + factors on the wrapper so the runner can
     # surface it at iteration 0; we cannot eagerly print because the
     # verbose callback is invoked under JIT trace.
@@ -894,7 +928,7 @@ def wrap_verbose_for_scaling(
         if isinstance(user_verbose, bool):
             adapted: dict[str, tuple] = {}
             for k, v in kwargs.items():
-                adapted[k] = _adapt_entry(k, v, factors)
+                adapted[k] = _adapt_entry(k, v, factors, needs_scaled_suffix)
             target(**adapted)
         else:
             # User-supplied callable: pass scaled values through with
