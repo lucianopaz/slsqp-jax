@@ -185,6 +185,39 @@ def test_multiple_diagnoses_can_fire_together():
     assert {"stale_lbfgs_curvature", "noise_floor_stationarity_stall"} <= names
 
 
+def test_penalty_starvation_cascade_fires_on_pair():
+    """``penalty_starvation`` + ``merit_penalty_explosion`` together name
+    the documented feasible-start divergence cascade.
+
+    Exercises :func:`_build_penalty_starvation_cascade`: the
+    ``related_signals`` list must include both load-bearing signals
+    plus any optional ones (``divergence_rollback_triggered``,
+    ``lbfgs_conditioning_extreme``, ``line_search_collapse``) that
+    happen to fire as well.
+    """
+    sigs = [
+        _signal("penalty_starvation"),
+        _signal("merit_penalty_explosion"),
+        _signal("divergence_rollback_triggered"),
+        _signal("line_search_collapse", specificity="ambiguous"),
+    ]
+    diags = evaluate_diagnoses(sigs)
+    cascade = next((d for d in diags if d.name == "penalty_starvation_cascade"), None)
+    assert cascade is not None
+    assert "penalty_starvation" in cascade.related_signals
+    assert "merit_penalty_explosion" in cascade.related_signals
+    assert "divergence_rollback_triggered" in cascade.related_signals
+    assert "line_search_collapse" in cascade.related_signals
+    assert "Han-Powell" in cascade.cause
+    assert any("perturb" in s.lower() for s in cascade.suggestions)
+
+
+def test_penalty_starvation_cascade_does_not_fire_alone():
+    """``penalty_starvation`` alone is not enough to name the cascade."""
+    diags = evaluate_diagnoses([_signal("penalty_starvation")])
+    assert all(d.name != "penalty_starvation_cascade" for d in diags)
+
+
 def test_diagnosis_dataclass_carries_related_signals():
     sigs = [
         _signal("lbfgs_conditioning_extreme"),

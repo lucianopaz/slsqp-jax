@@ -574,3 +574,569 @@ def test_report_renders_auto_scaling_section() -> None:
 def test_auto_scale_rescues_feasible_start_portfolio() -> None:
     """Auto-scaling rescues the feasible-start divergence cascade."""
     raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# User-unit scaling stats (final_objective_user, final_lagrangian_grad_norm_user,
+# multipliers_*_qp_user)
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_stats_user_unit_objective() -> None:
+    """``final_objective_user = final_objective / s_f`` under auto-scaling."""
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    def c_eq(x):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    x0 = np.zeros(3)
+    sol = minimize_like_scipy(
+        f,
+        x0,
+        constraints={"type": "eq", "fun": c_eq},
+        auto_scale=True,
+    )
+    factors = sol.stats["scale_factors"]
+    s_f = float(factors.s_f)
+
+    assert "final_objective_user" in sol.stats
+    np.testing.assert_allclose(
+        float(sol.stats["final_objective_user"]),
+        float(sol.stats["final_objective"]) / s_f,
+        rtol=1e-12,
+    )
+
+
+def test_scaled_stats_user_unit_lagrangian_grad_norm() -> None:
+    """``final_lagrangian_grad_norm_user = ||grad_L||_scaled / s_f``."""
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    def c_eq(x):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    x0 = np.zeros(3)
+    sol = minimize_like_scipy(
+        f,
+        x0,
+        constraints={"type": "eq", "fun": c_eq},
+        auto_scale=True,
+    )
+    factors = sol.stats["scale_factors"]
+    s_f = float(factors.s_f)
+
+    assert "final_lagrangian_grad_norm" in sol.stats
+    assert "final_lagrangian_grad_norm_user" in sol.stats
+    np.testing.assert_allclose(
+        float(sol.stats["final_lagrangian_grad_norm_user"]),
+        float(sol.stats["final_lagrangian_grad_norm"]) / s_f,
+        rtol=1e-12,
+    )
+
+
+def test_scaled_stats_user_unit_qp_multipliers() -> None:
+    """``multipliers_eq_qp_user`` and ``multipliers_ineq_qp_user`` exist
+    and follow the same scale recipe as the LS variants."""
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    def c_eq(x):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    x0 = np.zeros(3)
+    sol = minimize_like_scipy(
+        f,
+        x0,
+        constraints={"type": "eq", "fun": c_eq},
+        auto_scale=True,
+    )
+    factors = sol.stats["scale_factors"]
+
+    assert "multipliers_eq_qp_user" in sol.stats
+    expected_eq_user = (factors.s_eq / factors.s_f) * sol.stats["multipliers_eq_qp"]
+    np.testing.assert_allclose(
+        np.asarray(sol.stats["multipliers_eq_qp_user"]),
+        np.asarray(expected_eq_user),
+        atol=1e-12,
+    )
+
+
+def test_unscaled_stats_no_user_unit_keys() -> None:
+    """Without auto-scaling the user-unit keys are absent.
+
+    They are added by ``unscale_solution``; running ``optx.minimise``
+    directly (no scaling wrapper) keeps the bare scaled/unscaled-units
+    contract unchanged.
+    """
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    x0 = np.zeros(3)
+    sol = minimize_like_scipy(f, x0, auto_scale=False)
+    assert "final_objective_user" not in sol.stats
+    assert "final_lagrangian_grad_norm_user" not in sol.stats
+    assert "multipliers_eq_qp_user" not in sol.stats
+
+
+# ---------------------------------------------------------------------------
+# Proximal mu_min floor under auto-scaling
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_proximal_mu_min_preserves_user_atol_compat_path(
+    monkeypatch,
+) -> None:
+    """``minimize_like_scipy`` pins ``_proximal_mu_min`` to user-atol.
+
+    Without the fix in ``compat.py``, the freshly-constructed
+    ``SLSQP`` resolved its ``_proximal_mu_min`` against
+    ``factors.atol_internal``, which under auto-scaling can be orders
+    of magnitude smaller than the user's pre-scaling ``atol``.  This
+    test monkey-patches ``optx.minimise`` to capture the constructed
+    solver and asserts the resolved floor.
+    """
+    from slsqp_jax import compat as _compat
+
+    captured: dict[str, object] = {}
+
+    real_minimise = _compat.optx.minimise
+
+    def capturing_minimise(fn, solver, x0, *args, **kwargs):
+        captured["solver"] = solver
+        return real_minimise(fn, solver, x0, *args, **kwargs)
+
+    monkeypatch.setattr(_compat.optx, "minimise", capturing_minimise)
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    # ||J_eq|| = 70 forces s_eq < 1 and atol_internal < user atol.
+    def c_eq(x):
+        return jnp.array([70.0 * jnp.sum(x) - 5.0])
+
+    x0 = np.zeros(3)
+    user_atol = 1e-6
+    minimize_like_scipy(
+        f,
+        x0,
+        constraints={"type": "eq", "fun": c_eq},
+        auto_scale=True,
+        options={"atol": user_atol},
+    )
+
+    captured_solver = captured.get("solver")
+    assert captured_solver is not None, "optx.minimise was never called"
+    # Because ``proximal_mu_min`` is left unset by ``minimize_like_scipy``,
+    # the compat fix should pin the static field to the user's atol.
+    assert float(captured_solver._proximal_mu_min) == pytest.approx(user_atol)
+
+
+def test_scaled_proximal_mu_min_preserves_user_atol_replace_callables_path() -> None:
+    """``auto_scaled_minimise`` already preserves user-atol resolution.
+
+    ``scaling._replace_solver_callables`` shallow-copies an
+    already-constructed ``SLSQP`` whose static ``_proximal_mu_min`` was
+    resolved against the user's pre-scaling ``atol``; this test pins
+    that contract.
+    """
+
+    def f(x, args):
+        return jnp.sum((x - 1.0) ** 2), None
+
+    def c_eq(x, args):
+        return jnp.array([70.0 * jnp.sum(x) - 5.0])
+
+    from slsqp_jax import SLSQPConfig, ToleranceConfig
+
+    user_atol = 1e-6
+    config = SLSQPConfig(tolerance=ToleranceConfig(atol=user_atol))
+    solver = SLSQP(
+        config=config,
+        eq_constraint_fn=c_eq,
+        n_eq_constraints=1,
+    )
+    # Pre-scaling resolution is the only path here — the field is set
+    # by ``__init__`` against the user's tolerance.
+    assert float(solver._proximal_mu_min) == pytest.approx(user_atol)
+
+    x0 = jnp.zeros(3)
+    auto_scaled_minimise(
+        f,
+        solver,
+        x0,
+        args=None,
+        auto_scale=True,
+        has_aux=True,
+        max_steps=20,
+    )
+    # ``auto_scaled_minimise`` does not reconstruct the solver; the
+    # static field is unchanged after the run.
+    assert float(solver._proximal_mu_min) == pytest.approx(user_atol)
+
+
+def test_scaled_proximal_mu_min_honours_explicit_user_value(
+    monkeypatch,
+) -> None:
+    """An explicit ``proximal_mu_min`` is honoured even under scaling."""
+    from slsqp_jax import compat as _compat
+
+    captured: dict[str, object] = {}
+
+    real_minimise = _compat.optx.minimise
+
+    def capturing_minimise(fn, solver, x0, *args, **kwargs):
+        captured["solver"] = solver
+        return real_minimise(fn, solver, x0, *args, **kwargs)
+
+    monkeypatch.setattr(_compat.optx, "minimise", capturing_minimise)
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    def c_eq(x):
+        return jnp.array([70.0 * jnp.sum(x) - 5.0])
+
+    x0 = np.zeros(3)
+    explicit_mu_min = 1e-4
+    minimize_like_scipy(
+        f,
+        x0,
+        constraints={"type": "eq", "fun": c_eq},
+        auto_scale=True,
+        options={"proximal_mu_min": explicit_mu_min},
+    )
+
+    captured_solver = captured.get("solver")
+    assert captured_solver is not None
+    assert float(captured_solver._proximal_mu_min) == pytest.approx(explicit_mu_min)
+
+
+# ---------------------------------------------------------------------------
+# Helper coverage: empty-array branches + low-level wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_grad_inf_norm_empty_array_returns_zero() -> None:
+    """``_grad_inf_norm`` short-circuits for size-zero gradients."""
+    from slsqp_jax.scaling import _grad_inf_norm
+
+    assert _grad_inf_norm(jnp.zeros((0,))) == 0.0
+
+
+def test_row_inf_norms_empty_jacobian_returns_zero_array() -> None:
+    """``_row_inf_norms`` returns an empty ``np.ndarray`` for size-zero input."""
+    from slsqp_jax.scaling import _row_inf_norms
+
+    out = _row_inf_norms(jnp.zeros((0, 3)))
+    assert out.shape == (0,)
+
+
+def test_compute_scale_factors_with_no_aux_objective() -> None:
+    """``has_aux=False`` exercises the alternate ``_scalar_fn`` branch."""
+
+    def fn(x, args):
+        return jnp.sum(x**2)
+
+    factors = compute_scale_factors_at_x0(
+        fn,
+        np.array([2.0, 3.0]),
+        args=None,
+        has_aux=False,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    assert factors.s_f > 0
+
+
+def test_compute_scale_factors_with_user_eq_jac_returning_1d() -> None:
+    """A user-supplied 1-D ``eq_jac_fn`` lifts to a (1, n) matrix."""
+
+    def fn(x, args):
+        return jnp.sum(x**2), None
+
+    def eq_fn(x, args):
+        return jnp.array([jnp.sum(x) - 1.0])
+
+    def eq_jac(x, args):
+        # 1-D row that the wrapper must reshape to (1, n).
+        return jnp.array([1.0, 1.0, 1.0])
+
+    factors = compute_scale_factors_at_x0(
+        fn,
+        np.array([1.0, 2.0, 3.0]),
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        eq_jac_fn=eq_jac,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    assert factors.s_eq.shape == (1,)
+
+
+def test_compute_scale_factors_with_user_ineq_jac_returning_1d() -> None:
+    """A user-supplied 1-D ``ineq_jac_fn`` lifts to a (1, n) matrix."""
+
+    def fn(x, args):
+        return jnp.sum(x**2), None
+
+    def ineq_fn(x, args):
+        return jnp.array([jnp.sum(x) - 1.0])
+
+    def ineq_jac(x, args):
+        return jnp.array([1.0, 1.0, 1.0])
+
+    factors = compute_scale_factors_at_x0(
+        fn,
+        np.array([1.0, 2.0, 3.0]),
+        args=None,
+        has_aux=True,
+        ineq_constraint_fn=ineq_fn,
+        ineq_jac_fn=ineq_jac,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    assert factors.s_ineq.shape == (1,)
+
+
+def test_compute_scale_factors_eq_row_below_floor_warns() -> None:
+    """A near-zero equality row triggers the per-row skip warning."""
+
+    def fn(x, args):
+        return jnp.sum(x**2), None
+
+    def eq_fn(x, args):
+        return jnp.array([1e-20 * jnp.sum(x)])  # effectively zero gradient
+
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always")
+        factors = compute_scale_factors_at_x0(
+            fn,
+            np.array([1.0, 2.0]),
+            args=None,
+            has_aux=True,
+            eq_constraint_fn=eq_fn,
+            target_gradient=1.0,
+            max_factor=1e3,
+            grad_floor=1e-12,
+        )
+    assert factors.n_skipped_eq == 1
+    assert any("eq[0]" in str(w.message) for w in ws)
+    assert float(factors.s_eq[0]) == 1.0
+
+
+def test_compute_scale_factors_ineq_row_below_floor_warns() -> None:
+    """A near-zero inequality row triggers the per-row skip warning."""
+
+    def fn(x, args):
+        return jnp.sum(x**2), None
+
+    def ineq_fn(x, args):
+        return jnp.array([1e-20 * jnp.sum(x)])
+
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always")
+        factors = compute_scale_factors_at_x0(
+            fn,
+            np.array([1.0, 2.0]),
+            args=None,
+            has_aux=True,
+            ineq_constraint_fn=ineq_fn,
+            target_gradient=1.0,
+            max_factor=1e3,
+            grad_floor=1e-12,
+        )
+    assert factors.n_skipped_ineq == 1
+    assert any("ineq[0]" in str(w.message) for w in ws)
+    assert float(factors.s_ineq[0]) == 1.0
+
+
+def test_wrap_objective_no_aux_returns_aux_none() -> None:
+    """``_wrap_objective(has_aux=False)`` returns ``(s_f * value, None)``."""
+    from slsqp_jax.scaling import _wrap_objective
+
+    def fn(x, args):
+        return jnp.sum(x**2)
+
+    wrapped = _wrap_objective(fn, s_f=2.0, has_aux=False)
+    value, aux = wrapped(jnp.array([1.0, 2.0]), None)
+    assert float(value) == pytest.approx(2.0 * 5.0)
+    assert aux is None
+
+
+def test_wrap_constraint_hvp_scales_per_row() -> None:
+    """``_wrap_constraint_hvp`` multiplies row ``i`` of the (m, n) HVP stack
+    by ``s_row[i]``."""
+    from slsqp_jax.scaling import _wrap_constraint_hvp
+
+    def hvp(x, v, args):
+        # Two constraint rows; per-component HVP convention.
+        return jnp.array([[1.0, 1.0], [2.0, 2.0]])
+
+    s_row = jnp.array([3.0, 5.0])
+    wrapped = _wrap_constraint_hvp(hvp, s_row)
+    out = wrapped(jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]), None)
+    np.testing.assert_allclose(np.asarray(out), np.array([[3.0, 3.0], [10.0, 10.0]]))
+
+
+def test_make_user_unit_value_short_circuits_when_sf_is_one() -> None:
+    """``_make_user_unit_value`` is a no-op when ``s_f == 1.0``."""
+    from slsqp_jax.scaling import _make_user_unit_value
+
+    factors = ScaleFactors(
+        s_f=1.0,
+        s_eq=jnp.array([]),
+        s_ineq=jnp.array([]),
+        atol_user=1e-6,
+        atol_internal=1e-6,
+        target_gradient=1.0,
+        max_factor=1.0,
+        grad_floor=1e-12,
+    )
+    assert _make_user_unit_value("objective", 7.0, factors) == 7.0
+
+
+def test_make_user_unit_value_returns_value_for_unknown_key() -> None:
+    """Keys not in :data:`_UNSCALABLE_KEYS_OBJ_DIVIDE` are passed through."""
+    from slsqp_jax.scaling import _make_user_unit_value
+
+    factors = ScaleFactors(
+        s_f=2.0,
+        s_eq=jnp.array([]),
+        s_ineq=jnp.array([]),
+        atol_user=1e-6,
+        atol_internal=1e-6,
+        target_gradient=1.0,
+        max_factor=1.0,
+        grad_floor=1e-12,
+    )
+    # ``"merit"`` is in the scaled-label set, not the unscalable-divide
+    # set; ``_make_user_unit_value`` returns it unchanged.
+    assert _make_user_unit_value("merit", 9.0, factors) == 9.0
+
+
+def test_scaling_is_active_via_ineq_branch() -> None:
+    """``_scaling_is_active`` returns ``True`` when only ``s_ineq`` is non-trivial."""
+    from slsqp_jax.scaling import _scaling_is_active
+
+    factors = ScaleFactors(
+        s_f=1.0,
+        s_eq=jnp.array([1.0]),
+        s_ineq=jnp.array([0.5]),
+        atol_user=1e-6,
+        atol_internal=5e-7,
+        target_gradient=1.0,
+        max_factor=1e3,
+        grad_floor=1e-12,
+    )
+    assert _scaling_is_active(factors) is True
+
+
+def test_scaling_is_active_returns_false_when_all_trivial() -> None:
+    """All trivial factors -> ``False``."""
+    from slsqp_jax.scaling import _scaling_is_active
+
+    factors = ScaleFactors(
+        s_f=1.0,
+        s_eq=jnp.array([1.0]),
+        s_ineq=jnp.array([1.0]),
+        atol_user=1e-6,
+        atol_internal=1e-6,
+        target_gradient=1.0,
+        max_factor=1.0,
+        grad_floor=1e-12,
+    )
+    assert _scaling_is_active(factors) is False
+
+
+# ---------------------------------------------------------------------------
+# auto_scaled_minimise: adjoint forwarding + non-SLSQP guard
+# ---------------------------------------------------------------------------
+
+
+def test_auto_scaled_minimise_passthrough_forwards_adjoint() -> None:
+    """``adjoint`` is forwarded into ``optx.minimise`` on the
+    ``auto_scale=False`` passthrough path."""
+    import optimistix as optx
+
+    def f(x, args):
+        return jnp.sum((x - 1.0) ** 2), None
+
+    x0 = jnp.array([0.0, 0.0])
+    solver = SLSQP()
+    sol = auto_scaled_minimise(
+        f,
+        solver,
+        x0,
+        args=None,
+        auto_scale=False,
+        has_aux=True,
+        max_steps=50,
+        adjoint=optx.RecursiveCheckpointAdjoint(),
+    )
+    np.testing.assert_allclose(np.asarray(sol.value), np.array([1.0, 1.0]), rtol=1e-5)
+
+
+def test_auto_scaled_minimise_scaled_path_forwards_adjoint() -> None:
+    """``adjoint`` is forwarded into ``optx.minimise`` on the scaled path."""
+    import optimistix as optx
+
+    def f(x, args):
+        return jnp.sum((x - 1.0) ** 2), None
+
+    def c_eq(x, args):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    x0 = jnp.zeros(3)
+    solver = SLSQP(eq_constraint_fn=c_eq, n_eq_constraints=1)
+    sol = auto_scaled_minimise(
+        f,
+        solver,
+        x0,
+        args=None,
+        auto_scale=True,
+        has_aux=True,
+        max_steps=50,
+        adjoint=optx.RecursiveCheckpointAdjoint(),
+    )
+    np.testing.assert_allclose(np.asarray(sol.value), np.full(3, 5.0 / 3.0), rtol=1e-4)
+
+
+def test_auto_scaled_minimise_rejects_non_slsqp_solver() -> None:
+    """Auto-scaling requires an SLSQP solver to forward callables to."""
+    import optimistix as optx
+
+    class _NotSLSQP(optx.AbstractMinimiser):
+        rtol = 1e-6
+        atol = 1e-6
+        norm = optx.max_norm
+
+        def init(self, *_args, **_kwargs):  # pragma: no cover -- never called
+            ...
+
+        def step(self, *_args, **_kwargs):  # pragma: no cover -- never called
+            ...
+
+        def terminate(self, *_args, **_kwargs):  # pragma: no cover -- never called
+            ...
+
+        def postprocess(self, *_args, **_kwargs):  # pragma: no cover -- never called
+            ...
+
+    def f(x, args):
+        return jnp.sum(x**2), None
+
+    with pytest.raises(TypeError, match="auto_scaled_minimise: solver"):
+        auto_scaled_minimise(
+            f,
+            _NotSLSQP(),
+            jnp.array([1.0, 2.0]),
+            args=None,
+            auto_scale=True,
+            has_aux=True,
+        )

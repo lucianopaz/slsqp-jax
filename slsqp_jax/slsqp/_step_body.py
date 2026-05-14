@@ -94,10 +94,32 @@ def _step_impl(
     d_norm = jnp.reshape(jnp.linalg.norm(direction), ())
     is_zero_step_pre = jnp.reshape((d_norm < self.atol) & qp_result.converged, ())
 
+    # Han-Powell penalty update: drop wrong-sign reduced-gradient noise
+    # from the QP-side bound multipliers before letting them ratchet
+    # ``rho``.  ``update_penalty_parameter`` reads ``max(abs(.))``, so a
+    # large *negative* reduced-gradient value at a "barely active" bound
+    # would otherwise inflate ``rho`` permanently (the rule is monotone
+    # non-decreasing).  Clamping to dual-feasible magnitudes here mirrors
+    # the post-step LS bound-multiplier recovery in
+    # :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers` and only
+    # affects the penalty calculation.  The QP step direction,
+    # ``state.multipliers_ineq_qp``, ``qp_result.multipliers_ineq``, the
+    # LS multiplier recovery, the LPEC-A predictor, and the QP active-set
+    # warm-start all keep the raw signed multipliers.
+    n_lower = self._n_lower_bounds
+    n_upper = self._n_upper_bounds
+    m_ineq_general = self.n_ineq_constraints
+    if (n_lower + n_upper) > 0:
+        mult_ineq_for_penalty = qp_result.multipliers_ineq.at[m_ineq_general:].set(
+            jnp.maximum(qp_result.multipliers_ineq[m_ineq_general:], 0.0)
+        )
+    else:
+        mult_ineq_for_penalty = qp_result.multipliers_ineq
+
     new_penalty = update_penalty_parameter(
         state.merit_penalty,
         qp_result.multipliers_eq,
-        qp_result.multipliers_ineq,
+        mult_ineq_for_penalty,
     )
     merit_penalty = jnp.where(qp_result.converged, new_penalty, state.merit_penalty)
 
@@ -494,7 +516,7 @@ def _step_impl(
         multipliers_ineq_qp=multipliers_ineq_qp_for_state,
         multipliers_eq_ls=ls_mult_eq,
         multipliers_ineq_ls=ls_mult_ineq_full,
-        prev_grad_lagrangian=grad_lagrangian_new,
+        kkt_residual_grad=grad_lagrangian_new,
         grad_lagrangian=grad_lagrangian_new,
         merit_penalty=merit_penalty,
         bound_jac=state.bound_jac,

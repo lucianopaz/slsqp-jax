@@ -987,6 +987,32 @@ class TestMinimizeLikeScipy:
         # Just check it ran without error and produced some output
         assert sol.value is not None
 
+    def test_verbose_runs_without_auto_scaling(self, capsys):
+        """``verbose=True`` with ``auto_scale=False`` exercises the direct
+        ``SLSQP(verbose=True)`` construction path.
+
+        Under default auto-scaling ``compat.minimize_like_scipy``
+        constructs the underlying solver with ``verbose=False`` and
+        patches the scale-aware wrapper in afterwards, so the bare
+        ``verbose=True`` branch in ``SLSQP.__init__`` only fires when
+        scaling is disabled.
+        """
+
+        def fun(x):
+            return x[0] ** 2 + x[1] ** 2
+
+        x0 = np.array([3.0, -2.0])
+        sol = minimize_like_scipy(
+            fun,
+            x0,
+            verbose=True,
+            auto_scale=False,
+            options={"max_steps": 10},
+        )
+        cap = capsys.readouterr()
+        assert sol.value is not None
+        assert len(cap.out) > 0
+
     def test_throw_false(self):
         """throw=False should return a solution even if not converged."""
 

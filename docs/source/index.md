@@ -304,7 +304,7 @@ Each SLSQP iteration performs four steps:
 1. **QP subproblem**: Construct a quadratic approximation of the objective using the frozen L-BFGS Hessian and linearise the constraints around the current point. Solve the resulting QP to obtain a search direction.
 2. **Line search**: Use a Han-Powell L1 merit function $\phi(x;\rho) = f(x) + \rho (\lVert c_{\text{eq}}\rVert_1 + \lVert\max(0, -c_{\text{ineq}})\rVert_1)$ with backtracking Armijo conditions to determine the step size.
 3. **Accept step**: Update the iterate $x_{k+1} = x_k + \alpha d_k$.
-4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla_x L(x_{k+1}, \lambda_{k+1}) - \nabla_x L(x_k, \lambda_{k+1})$. The secant condition (Nocedal & Wright §18.3) requires both Lagrangian gradients to use the **same** multipliers $\lambda_{k+1}$ (the blended multipliers). The initial Hessian uses **component-wise secant diagonal scaling**: $B_0 = \text{diag}(d)$ where $d_i = |y_i \cdot s_i| / (s_i^2 + \epsilon)$, clipped to $[10^{-2}, 10^{6}]$. This gives $d_i \approx |H_{ii}|$ for diagonal Hessians regardless of the step direction. The classical Shanno-Phua formula $d_i = y_i^2 / (y^T s)$ uses a single scalar normalizer, producing $d \propto h_i^2$ for multi-component steps, which severely underestimates curvature and causes 10-100x slowdowns.
+4. **Hessian update**: Append the new curvature pair $(s, y)$ to the L-BFGS history, where $y$ is either an exact HVP probe $\nabla^2 L(x_k) s$ (if HVP functions are provided) or the gradient difference $\nabla_x L(x_{k+1}, \lambda_{k+1}) - \nabla_x L(x_k, \lambda_{k+1})$. The secant condition (Nocedal & Wright §18.3) requires both Lagrangian gradients to use the **same** multipliers $\lambda_{k+1}$; this code uses the *Hessian-free LS multiplier estimate* recovered at $x_{k+1}$ for both endpoints (see "Hessian-free LS multiplier recovery" below). The initial Hessian uses **component-wise secant diagonal scaling**: $B_0 = \text{diag}(d)$ where $d_i = |y_i \cdot s_i| / (s_i^2 + \epsilon)$, clipped to $[10^{-4}, 10^{6}]$. This gives $d_i \approx |H_{ii}|$ for diagonal Hessians regardless of the step direction. The classical Shanno-Phua formula $d_i = y_i^2 / (y^T s)$ uses a single scalar normalizer, producing $d \propto h_i^2$ for multi-component steps, which severely underestimates curvature and causes 10-100x slowdowns.
 
 ### Scaling considerations: why L-BFGS over BFGS
 
@@ -328,7 +328,7 @@ where $W = (\gamma S, Y)$ is the horizontal concatenation of matrices $\gamma S$
 
 $$y_{\text{damped}} = \theta \, y + (1 - \theta) \, B_0 s, \quad \text{where } \theta \text{ ensures } s^T y_{\text{damped}} \geq \eta \, s^T B_0 s$$
 
-This is $O(n)$, always well-conditioned (since $B_0 = \text{diag}(d)$ is clipped to $[10^{-2}, 10^6]$), and avoids the circular dependency where a badly-conditioned $B$ poisons its own damping.  The damping threshold $\eta$ is configurable via `damping_threshold` (default 0.2, Powell's standard value). Setting `damping_threshold=0.0` disables damping entirely.
+This is $O(n)$, always well-conditioned (since $B_0 = \text{diag}(d)$ is clipped to $[10^{-4}, 10^6]$), and avoids the circular dependency where a badly-conditioned $B$ poisons its own damping.  The damping threshold $\eta$ is configurable via `damping_threshold` (default 0.2, Powell's standard value). Setting `damping_threshold=0.0` disables damping entirely.
 
 **Eigenvalue monitoring and soft reset.**  The solver tracks the condition number of $B_0$ via $\kappa = \max(d)/\min(d)$.  When $\kappa$ exceeds $10^6$, a **soft reset** drops all but the most recent $(s, y)$ pair (VARCHEN Algorithm 1, Step 7).  This is less aggressive than the full diagonal or identity reset, preserving the most relevant curvature information while shedding stale pairs that contribute to ill-conditioning.
 
@@ -712,7 +712,10 @@ $$
 
 The inner matrix $(\mu I + A_{\text{eq}} B^{-1} A_{\text{eq}}^T)$ is only $m_{\text{eq}} \times m_{\text{eq}}$ (tiny) and is factored once per QP solve. Each preconditioner application costs $O(kn + mn)$. This ensures the preconditioner matches the actual QP system matrix and avoids the pathological case where a plain $B^{-1}$ preconditioner amplifies the proximal eigenvalues when $\gamma$ is small.
 
-For projected (constrained) CG, the preconditioner is applied as $z = P(M(P(r)))$, where $P$ is the null-space projector. The extra projection ensures the preconditioned direction stays in the feasible subspace (Nocedal & Wright, Chapter 16).
+For projected (constrained) CG, two preconditioner application paths are available:
+
+* The **simple null-space form** (default) applies $z = P(M(r))$, where $P$ is the null-space projector and $M \approx \tilde B^{-1}$.  Because the residual $r$ already lies in $\text{null}(A)$ after the active-set step, $P(M(P(r))) = P(M(r))$, so a single projection suffices.
+* The **constraint preconditioner** of Gould, Hribar & Nocedal (SIAM J. Sci. Comput. 23(4), 2001) is enabled when `use_constraint_preconditioner=True` (which is auto-enabled in Newton-CG mode, `use_exact_hvp_in_qp=True`).  It applies $z = M r - M A^T (A M A^T)^{-1} A M r$, i.e. the projection is done in the $M^{-1}$ inner product rather than the Euclidean one.  This preserves the $M^{-1}$-orthogonality of the CG iterates inside $\text{null}(A)$ and is markedly more robust on ill-conditioned problems.  The extra cost is $m$ additional preconditioner applies to form $M A^T$, amortised over all CG iterations of the QP solve.
 
 Preconditioning is enabled by default (`use_preconditioner=True`). Robust SPD guards ensure that if the preconditioner produces a non-positive-definite result for any residual, CG silently falls back to unpreconditioned mode for that step.
 

@@ -1181,12 +1181,31 @@ def minimize_like_scipy(
             divergence_factor=prev_div_factor,
             divergence_patience=prev_div_patience,
         )
+
+        # Pin the proximal ``mu_min`` floor to the *user's* pre-scaling
+        # ``atol`` rather than letting ``SLSQP.__init__`` resolve it
+        # against the (possibly much smaller) ``atol_internal``.  Under
+        # auto-scaling ``atol_internal = atol_user * min(s_min, 1.0)``;
+        # without this override the proximal ``mu`` clip would float to
+        # the compensated tolerance, allowing ``(1/mu) A_eq^T A_eq`` to
+        # blow up by ``1 / min(s_min, 1.0)`` and ill-condition the
+        # proximal HVP.  Only fire when the user did not specify
+        # ``mu_min`` explicitly (``None`` ≡ "resolve against atol").
+        if proximal.mu_min is None:
+            proximal_for_scaled = ProximalConfig(
+                tau=proximal.tau,
+                mu_min=prev_atol,
+                mu_max=proximal.mu_max,
+            )
+        else:
+            proximal_for_scaled = proximal
+
         config = SLSQPConfig(
             tolerance=tolerance,
             lbfgs=lbfgs,
             line_search=line_search,
             qp=qp,
-            proximal=proximal,
+            proximal=proximal_for_scaled,
             preconditioner=preconditioner,
             lpeca=lpeca,
             adaptive_cg=adaptive_cg,
