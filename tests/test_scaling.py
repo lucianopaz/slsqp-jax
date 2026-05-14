@@ -392,6 +392,87 @@ def test_verbose_unscaling_columns(capsys: pytest.CaptureFixture) -> None:
     assert "2.000e+00" in cap.out
 
 
+def test_verbose_adapter_under_jit_with_sf_equal_one() -> None:
+    """Regression: the verbose adapter must not concretise ``s_eq`` / ``s_ineq``.
+
+    The verbose callback runs inside the ``jax.jit``-compiled
+    ``SLSQP.step`` (Optimistix's outer driver and ``debug_run``'s
+    inner ``jit_step`` both jit it).  Earlier the ``(s)`` suffix
+    decision in ``_adapt_entry`` did ``float(jnp.min(factors.s_eq))``
+    and ``float(jnp.min(factors.s_ineq))`` lazily, guarded by
+    ``factors.s_f != 1.0`` short-circuit.  When ``s_f == 1.0``
+    (``auto_scale="knitro"``, ``"ipopt"``, or any
+    ``auto_scale_max_factor=1.0`` configuration on a problem with
+    ``||grad_f||_inf < target_gradient``), the short-circuit failed
+    open and the concrete reads triggered ``ConcretizationTypeError``.
+
+    The fix precomputes the bool eagerly in
+    ``wrap_verbose_for_scaling``; this test pins that contract by
+    invoking the wrapper on a tracer-typed value with ``s_f == 1.0``
+    and non-trivial ``s_eq`` / ``s_ineq``.
+    """
+    import jax
+
+    factors = ScaleFactors(
+        s_f=1.0,
+        s_eq=jnp.array([0.5]),
+        s_ineq=jnp.array([0.25, 2.0]),
+        atol_user=1e-6,
+        atol_internal=2.5e-7,
+        target_gradient=1.0,
+        max_factor=1.0,
+        grad_floor=1e-12,
+    )
+    captured: dict[str, Any] = {}
+
+    def collector(**kwargs: tuple) -> None:
+        captured.update(kwargs)
+
+    wrapped = wrap_verbose_for_scaling(collector, factors)
+
+    @jax.jit
+    def call_under_jit(merit_value: jax.Array) -> jax.Array:
+        wrapped(merit=("merit", merit_value, ".3e"))
+        return merit_value + 1.0
+
+    out = call_under_jit(jnp.asarray(3.5))
+    assert float(out) == pytest.approx(4.5)
+    assert captured["scale_factors"] is factors
+    assert captured["merit"][0] == "merit"
+
+
+def test_minimize_like_scipy_max_factor_one_runs_under_jit() -> None:
+    """End-to-end smoke test for ``auto_scale_max_factor=1.0`` (``s_f=1``).
+
+    Reproducer for the ConcretizationTypeError observed when the
+    verbose adapter was called from inside Optimistix's jitted
+    iteration loop with ``s_f`` clipped exactly to ``1.0``.
+    """
+
+    def f(x):
+        return jnp.sum((x - 1.0) ** 2)
+
+    def c_eq(x):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    def c_ineq(x):
+        return jnp.array([x[0] - 0.1])
+
+    x0 = jnp.zeros(3)
+    sol = minimize_like_scipy(
+        fun=f,
+        x0=x0,
+        constraints=(
+            {"type": "eq", "fun": c_eq},
+            {"type": "ineq", "fun": c_ineq},
+        ),
+        auto_scale=True,
+        auto_scale_max_factor=1.0,
+        options={"max_steps": 100},
+    )
+    np.testing.assert_allclose(np.asarray(sol.value), np.full(3, 5.0 / 3.0), rtol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # auto_scaled_minimise (lower-level path)
 # ---------------------------------------------------------------------------
