@@ -226,6 +226,7 @@ def fake_solver():
         rtol = 1e-6
         atol = 1e-6
         max_steps = 100
+        line_search_max_steps = 20
 
     return _FakeSolver()
 

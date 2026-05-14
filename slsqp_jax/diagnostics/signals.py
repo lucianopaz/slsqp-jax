@@ -422,6 +422,13 @@ def _eval_eq_jacobian_rank_deficient(
 
 _LBFGS_KAPPA_THRESHOLD = 1e6
 _LBFGS_KAPPA_STREAK = 3
+# Single-step "burst" trigger: catches catastrophic one-shot blow-ups
+# that the streak gate misses (the L-BFGS reset chain typically clamps
+# back to identity within one or two steps after the spike, so the
+# streak never reaches its 3-step minimum).  Two orders of magnitude
+# above ``_LBFGS_KAPPA_THRESHOLD`` so a routine "above-but-recovering"
+# kappa does not also fire the burst clause.
+_LBFGS_KAPPA_BURST = 1e8
 
 
 def _eval_lbfgs_conditioning_extreme(
@@ -432,14 +439,22 @@ def _eval_lbfgs_conditioning_extreme(
 ) -> Optional[Signal]:
     """Per-step: L-BFGS B0 diagonal condition number is extreme.
 
-    Cheap predicate (scalar): the L-BFGS diagonal condition-number
-    proxy ``max_diag / min_diag`` (carried on
-    :attr:`StepSummary.diag_kappa`) has been above
-    :data:`_LBFGS_KAPPA_THRESHOLD` (= ``1e6``) for the last
-    :data:`_LBFGS_KAPPA_STREAK` (= ``3``) consecutive steps.  Three
-    is the ``soft reset`` patience the L-BFGS reset chain uses; once
-    the streak reaches that length the chain triggers a soft reset,
-    so it is also the right point to flag the user.
+    Cheap predicate (scalar): either of two clauses fires.
+
+    1. **Streak**: the L-BFGS diagonal condition-number proxy
+       ``max_diag / min_diag`` (carried on
+       :attr:`StepSummary.diag_kappa`) has been above
+       :data:`_LBFGS_KAPPA_THRESHOLD` (= ``1e6``) for the last
+       :data:`_LBFGS_KAPPA_STREAK` (= ``3``) consecutive steps.
+       Three is the ``soft reset`` patience the L-BFGS reset chain
+       uses; once the streak reaches that length the chain triggers a
+       soft reset, so it is also the right point to flag the user.
+    2. **Burst**: the *current* step's ``diag_kappa`` is above
+       :data:`_LBFGS_KAPPA_BURST` (= ``1e8``), which catches
+       catastrophic one-shot blow-ups (e.g. ``kappa = 1e+09`` for a
+       single step before the reset chain clamps back to identity).
+       The streak gate cannot catch these because the post-spike
+       identity reset breaks the streak after one step.
 
     Build_artifacts (only invoked if the predicate fires): pulls the
     full L-BFGS diagonal (``n * 8`` bytes — fits in L1 even for very
@@ -450,41 +465,57 @@ def _eval_lbfgs_conditioning_extreme(
     identity-reset skip lock, bad initial scaling), so the report
     cannot pin it on one without more evidence.
     """
-    if not _streak_just_reached(
+    burst_fired = float(summary.diag_kappa) > _LBFGS_KAPPA_BURST
+    streak_fired = _streak_just_reached(
         summaries,
         lambda s: s.diag_kappa > _LBFGS_KAPPA_THRESHOLD,
         _LBFGS_KAPPA_STREAK,
-    ):
+    )
+    if not (streak_fired or burst_fired):
         return None
+    mode = "burst" if burst_fired else "streak"
 
     diagonal = _to_numpy(state.lbfgs_history.diagonal)
     gamma = float(state.lbfgs_history.gamma)
     history_count = int(state.lbfgs_history.count)
 
-    threshold_ratio = summary.diag_kappa / _LBFGS_KAPPA_THRESHOLD
+    if burst_fired:
+        threshold_ratio = float(summary.diag_kappa) / _LBFGS_KAPPA_BURST
+        clause_summary = (
+            f"a single-step burst above {_LBFGS_KAPPA_BURST:.0e} "
+            "(catastrophic one-shot blow-up)"
+        )
+    else:
+        threshold_ratio = float(summary.diag_kappa) / _LBFGS_KAPPA_THRESHOLD
+        clause_summary = (
+            f"a streak of {_LBFGS_KAPPA_STREAK} consecutive iterations "
+            f"above {_LBFGS_KAPPA_THRESHOLD:.0e}"
+        )
 
     detail = (
         f"L-BFGS B0 diagonal condition number kappa(B0) = "
         f"{summary.diag_kappa:.3e} (min={summary.min_diag:.3e}, "
-        f"max={summary.max_diag:.3e}) has exceeded 1e6 for "
-        f"{_LBFGS_KAPPA_STREAK} consecutive iterations, the same "
-        "patience the L-BFGS reset chain uses for its soft reset.  "
+        f"max={summary.max_diag:.3e}) tripped the "
+        f"{mode!r} clause: {clause_summary}.  "
         "Extreme conditioning is consistent with several causes: "
         "(i) stale curvature pairs whose s/y vectors are no longer "
         "informative at the current iterate, (ii) the post-identity-"
         "reset skip lock the AGENTS.md describes (lowering "
-        "``lbfgs_skip_floor`` from 1e-8 to 1e-12 was the fix), and "
-        "(iii) badly-scaled variables.  Each cause has a different "
-        "fix; check ``state.lbfgs_history.count`` and the "
-        "``n_lbfgs_skips`` counter to disambiguate."
+        "``lbfgs_skip_floor`` from 1e-8 to 1e-12 was the fix), "
+        "(iii) badly-scaled variables, and (iv) a fallback projected-"
+        "gradient direction (after a QP-budget exhaustion) being "
+        "appended to the L-BFGS history as if it were a Newton "
+        "secant.  Each cause has a different fix; check "
+        "``state.lbfgs_history.count`` and the ``n_lbfgs_skips`` "
+        "counter to disambiguate."
     )
     return _build_signal(
         name="lbfgs_conditioning_extreme",
         specificity="ambiguous",
         summary=(
             f"The L-BFGS B0 diagonal looks suspicious because its "
-            f"condition number is {summary.diag_kappa:.3e} (>1e6) "
-            f"for {_LBFGS_KAPPA_STREAK} consecutive iterations."
+            f"condition number is {summary.diag_kappa:.3e} ({mode} "
+            f"clause: {clause_summary})."
         ),
         detail=detail,
         evidence={
@@ -492,7 +523,12 @@ def _eval_lbfgs_conditioning_extreme(
             "min_diag": summary.min_diag,
             "max_diag": summary.max_diag,
             "threshold": _LBFGS_KAPPA_THRESHOLD,
+            "burst_threshold": _LBFGS_KAPPA_BURST,
             "streak": _LBFGS_KAPPA_STREAK,
+            # ``burst_clause = 1`` ⇔ the single-step burst fired,
+            # ``burst_clause = 0`` ⇔ the streak fired.  Encoded as int
+            # because :attr:`Signal.evidence` is typed numeric-only.
+            "burst_clause": 1 if burst_fired else 0,
             "step": summary.step_count,
         },
         threshold_ratio=threshold_ratio,
@@ -614,6 +650,36 @@ def _eval_multiplier_recovery_noise(
     )
 
 
+# Hard floor used as a fallback when the solver's LS budget cannot be
+# read off ``EvalContext`` (e.g. synthetic tests that use a stand-in
+# solver).  ``2 ** -20 ~= 9.5e-7`` is the SciPy/SLSQP default; multiply
+# by 10 so a single backtracking step above the floor still triggers.
+_LS_COLLAPSE_FALLBACK_FLOOR = 10.0 * (2.0**-20)
+
+
+def _ls_floor_for(ctx: EvalContext) -> float:
+    """Return ``10 * 2**-line_search.max_steps`` for the active solver.
+
+    The backtracking line search halves ``alpha`` at most
+    ``line_search.max_steps`` times before giving up, so the smallest
+    accepted ``alpha`` on success is ``2**-max_steps``.  We multiply
+    by 10 so an LS that bottomed out within one backtracking step of
+    the floor still trips the predicate (matches the ``magnitude_for``
+    bucketing of "marginal" = within 10x).
+
+    Falls back to :data:`_LS_COLLAPSE_FALLBACK_FLOOR` (the SciPy default
+    ``max_steps == 20``) when the solver instance does not expose the
+    ``line_search_max_steps`` accessor — this lets the synthetic test
+    suite use a minimal stand-in solver without pulling in the full
+    :class:`SLSQP` class.
+    """
+    solver = ctx.solver
+    max_steps = getattr(solver, "line_search_max_steps", None)
+    if not isinstance(max_steps, int) or max_steps <= 0:
+        return _LS_COLLAPSE_FALLBACK_FLOOR
+    return 10.0 * (2.0**-max_steps)
+
+
 def _eval_line_search_collapse(
     ctx: EvalContext,
     final_state: "SLSQPState",
@@ -624,7 +690,14 @@ def _eval_line_search_collapse(
 
     Cheap predicate: the cumulative ``tail_ls_failures`` counter is
     > 0 (the line search failed at the last iteration) and the
-    minimum line-search alpha across the run was below 1e-10.
+    minimum line-search alpha across the run was at or below the
+    LS floor ``10 * 2**-line_search.max_steps`` (i.e. within one
+    backtracking step of the smallest ``alpha`` the line search will
+    ever accept).  See :func:`_ls_floor_for` for the derivation —
+    the previous hard-coded ``1e-10`` literal could never fire on
+    the default ``LineSearchConfig.max_steps == 20`` solver because
+    the LS floor itself is ``2**-20 ~= 9.5e-7``.
+
     Specificity: ``ambiguous`` — a stuck LS is consistent with a bad
     L-BFGS direction, a too-small merit penalty, or a non-descent
     QP step.
@@ -639,14 +712,15 @@ def _eval_line_search_collapse(
     diag = final_state.diagnostics
     tail_failures = int(diag.tail_ls_failures)
     alpha_min = float(diag.ls_alpha_min)
-    if not (tail_failures > 0 and alpha_min < 1e-10):
+    ls_floor = _ls_floor_for(ctx)
+    if not (tail_failures > 0 and alpha_min <= ls_floor):
         return None
 
-    # Locate the offending step (first time alpha falls below 1e-10
-    # while the LS was reporting failure).
+    # Locate the offending step (first time alpha drops to the LS
+    # floor while the LS was reporting failure).
     offending_step = None
     for s in summaries:
-        if (not s.ls_success) and s.last_alpha < 1e-10:
+        if (not s.ls_success) and s.last_alpha <= ls_floor:
             offending_step = int(s.step_count)
             break
     if offending_step is None:
@@ -663,11 +737,12 @@ def _eval_line_search_collapse(
     )
     final_diagonal = _to_numpy(final_state.lbfgs_history.diagonal)
 
-    threshold_ratio = 1e-10 / max(alpha_min, 1e-300)
+    threshold_ratio = ls_floor / max(alpha_min, 1e-300)
 
     detail = (
         f"The line search reached its smallest accepted alpha "
-        f"({alpha_min:.3e}) below 1e-10 and exited with "
+        f"({alpha_min:.3e}) at or below the LS floor "
+        f"({ls_floor:.3e} = 10 * 2**-max_ls_steps) and exited with "
         f"{tail_failures} tail line-search failures.  This is "
         "consistent with (i) a non-descent direction the QP returned "
         "(L-BFGS conditioning, stale curvature), (ii) a too-small "
@@ -684,14 +759,15 @@ def _eval_line_search_collapse(
         specificity="ambiguous",
         summary=(
             f"The line search looks suspicious because alpha "
-            f"collapsed to {alpha_min:.3e} (< 1e-10) and the run "
-            f"exited with {tail_failures} tail line-search failures."
+            f"collapsed to {alpha_min:.3e} (<= LS floor "
+            f"{ls_floor:.3e}) and the run exited with "
+            f"{tail_failures} tail line-search failures."
         ),
         detail=detail,
         evidence={
             "ls_alpha_min": alpha_min,
             "tail_ls_failures": tail_failures,
-            "threshold": 1e-10,
+            "ls_floor": ls_floor,
         },
         threshold_ratio=threshold_ratio,
         suggestions=[
@@ -1015,6 +1091,391 @@ def _eval_infeasible_termination(
     )
 
 
+# Default ``divergence_patience`` from :class:`SLSQPConfig` (3).  The
+# magnitude of :func:`_eval_divergence_rollback_triggered` is
+# normalised by this value so a run that triggered exactly one
+# rollback fires at "marginal" magnitude and a run that triggered the
+# rollback ten times fires at "moderate" / "extreme".
+_DIVERGENCE_PATIENCE_DEFAULT = 3
+
+
+def _eval_divergence_rollback_triggered(
+    ctx: EvalContext,
+    final_state: "SLSQPState",
+    summaries: list["StepSummary"],
+    coarse_result: Any,
+) -> Optional[Signal]:
+    """End-of-run: best-iterate divergence rollback fired during the run.
+
+    Cheap predicate: ``final_state.diagnostics.divergence_triggered``
+    is ``True`` (the rollback latched at least once) OR
+    ``n_divergence_blowups > 0`` (a blow-up was observed even if
+    patience was not yet reached).  The rollback is the
+    "best-iterate-rescue" guardrail described in ``AGENTS.md``
+    "Best-iterate divergence rollback"; if it fires, the run hit a
+    catastrophic merit blow-up and the iterate the driver returned is
+    ``state.best_x``, not the attempted final iterate.
+
+    Specificity: ``specific``.  This datum is essentially diagnostic
+    for "the run blew up and was rescued by rollback" — no other
+    failure mode flips ``divergence_triggered``.
+    """
+    if not summaries:
+        return None  # pragma: no cover
+    diag = final_state.diagnostics
+    triggered = bool(diag.divergence_triggered)
+    n_blowups = int(diag.n_divergence_blowups)
+    if not (triggered or n_blowups > 0):
+        return None
+
+    last = summaries[-1]
+    # Locate the offending step: first ``StepSummary`` recording a
+    # blow-up event (``blowup_count`` > 0 immediately after a step
+    # whose ``blowup_count`` was 0, or simply the first step with
+    # ``diverging`` set).  Falls back to the final summary when no
+    # such step is found.
+    offending_step: Optional[int] = None
+    prev_blowup = 0
+    for s in summaries:
+        if s.diverging:
+            offending_step = int(s.step_count)
+            break
+        if s.blowup_count > prev_blowup:
+            offending_step = int(s.step_count)
+            break
+        prev_blowup = int(s.blowup_count)
+    if offending_step is None:
+        offending_step = int(last.step_count)  # pragma: no cover
+
+    threshold_ratio = max(float(n_blowups), 1.0) / float(_DIVERGENCE_PATIENCE_DEFAULT)
+
+    detail = (
+        f"The best-iterate divergence rollback latched (triggered = "
+        f"{triggered}, n_divergence_blowups = {n_blowups}).  This "
+        "means the merit function suffered a catastrophic blow-up "
+        "(``merit_new - best_merit > divergence_factor * "
+        "max(|best_merit|, 1)`` for ``divergence_patience`` "
+        "consecutive steps; defaults are ``10.0`` and ``3``) and the "
+        "iterate the driver returned was overwritten with "
+        "``state.best_x``.  The L-BFGS history, multipliers and "
+        "gradients still reflect the *attempted* step, so the "
+        "report's 'Final iterate metrics' section may show post-"
+        "blow-up values that do not correspond to the actually-"
+        "returned iterate.  See ``AGENTS.md`` 'Best-iterate "
+        "divergence rollback'.  The first blow-up was at step "
+        f"{offending_step}; inspect the trajectory around there for "
+        "the failure mechanism (typically L-BFGS poisoning + "
+        "merit-penalty over-correction)."
+    )
+    return _build_signal(
+        name="divergence_rollback_triggered",
+        specificity="specific",
+        summary=(
+            "The best-iterate divergence rollback looks suspicious "
+            f"because it latched (triggered={triggered}) after "
+            f"{n_blowups} blow-up event(s); the returned iterate is "
+            "``best_x``, not the attempted final iterate."
+        ),
+        detail=detail,
+        evidence={
+            "divergence_triggered": 1 if triggered else 0,
+            "n_divergence_blowups": n_blowups,
+            "patience_default": _DIVERGENCE_PATIENCE_DEFAULT,
+            "offending_step": offending_step,
+        },
+        threshold_ratio=threshold_ratio,
+        suggestions=[
+            "Inspect the trajectory around the offending step "
+            "(use ``capture_state_at_step``) for an L-BFGS diagonal "
+            "blow-up paired with a merit-penalty jump — the usual "
+            "cascade is QP-budget exhaustion → noisy curvature pair "
+            "appended → kappa(B0) explosion → unrecoverable QP "
+            "direction → merit blow-up → rollback.",
+            "Try ``use_exact_hvp_in_qp=True`` so the QP no longer "
+            "depends on the L-BFGS approximation (the most common "
+            "way to break the cascade).",
+            "Lower ``divergence_patience`` so the rollback fires "
+            "earlier, before the post-blow-up state corrupts other "
+            "quantities the report surfaces.",
+        ],
+        artifacts={},
+        offending_step=offending_step,
+    )
+
+
+# Total-trajectory ratio threshold: ``rho`` grew by 6+ orders of
+# magnitude across the run.  The Han-Powell penalty update is meant
+# to grow ``rho`` monotonically by small factors per step; a 1e6
+# total span is a strong indicator of an over-correction cycle.
+_RHO_EXPLOSION_TOTAL_RATIO = 1e6
+# Per-step ratio threshold: ``rho`` jumped by 1000x or more in a
+# single step.  Either threshold tripping is enough.
+_RHO_EXPLOSION_STEP_RATIO = 1e3
+
+
+def _eval_merit_penalty_explosion(
+    ctx: EvalContext,
+    final_state: "SLSQPState",
+    summaries: list["StepSummary"],
+    coarse_result: Any,
+) -> Optional[Signal]:
+    """End-of-run: merit penalty ``rho`` exploded across the trajectory.
+
+    Cheap predicate: either
+    ``max(rho) / max(min(rho), 1) > _RHO_EXPLOSION_TOTAL_RATIO``
+    (the trajectory-wide span exceeds 1e6) OR
+    ``max(rho[i] / max(rho[i-1], 1)) > _RHO_EXPLOSION_STEP_RATIO``
+    (a single-step jump exceeds 1e3).  Either pattern signals that
+    the Han-Powell penalty update over-corrected, usually because
+    the QP direction was poisoned by a degenerate inner solve and
+    the merit function's predicted reduction stopped agreeing with
+    the realised one.
+
+    Specificity: ``specific``.  ``rho`` is monotone-non-decreasing
+    by construction, and the update cadence is bounded by problem
+    geometry; a 6-orders-of-magnitude span across the run or a
+    1000x jump in one step has a narrow set of causes (L-BFGS
+    poisoning + merit catch-up is the dominant one).
+    """
+    if not summaries:
+        return None  # pragma: no cover
+    rhos = [max(float(s.merit_penalty), 1.0) for s in summaries]
+    min_rho = min(rhos)
+    max_rho = max(rhos)
+    ratio_total = max_rho / min_rho
+    if len(rhos) > 1:
+        per_step_ratios = [rhos[i] / rhos[i - 1] for i in range(1, len(rhos))]
+        ratio_step = max(per_step_ratios)
+        # Step where the largest single-step jump happened (1-indexed
+        # to match ``StepSummary.step_count`` semantics).
+        jump_idx_zero = max(range(1, len(rhos)), key=lambda i: rhos[i] / rhos[i - 1])
+        jump_step = int(summaries[jump_idx_zero].step_count)
+    else:
+        ratio_step = 1.0
+        jump_step = int(summaries[-1].step_count)
+
+    total_fired = ratio_total > _RHO_EXPLOSION_TOTAL_RATIO
+    step_fired = ratio_step > _RHO_EXPLOSION_STEP_RATIO
+    if not (total_fired or step_fired):
+        return None
+
+    threshold_ratio = max(
+        ratio_total / _RHO_EXPLOSION_TOTAL_RATIO,
+        ratio_step / _RHO_EXPLOSION_STEP_RATIO,
+    )
+
+    detail = (
+        "The merit penalty ``rho`` trajectory exploded across the "
+        f"run: span ratio ``max(rho) / max(min(rho), 1) = "
+        f"{ratio_total:.3e}`` (threshold "
+        f"{_RHO_EXPLOSION_TOTAL_RATIO:.0e}), largest single-step "
+        f"jump ``{ratio_step:.3e}`` (threshold "
+        f"{_RHO_EXPLOSION_STEP_RATIO:.0e}, at step {jump_step}).  "
+        "The Han-Powell update grows ``rho`` monotonically by "
+        "small factors per step; a span this large is the "
+        "merit function trying to catch up after a QP step poisoned "
+        "the predicted-vs-realised merit reduction (usually because "
+        "an L-BFGS pair from a fallback projected-gradient direction "
+        "was appended to the curvature buffer and corrupted the "
+        "subsequent Newton direction).  Once ``rho`` is over-sized, "
+        "every subsequent line search has to absorb a much larger "
+        "merit derivative and typically collapses to the LS floor."
+    )
+    return _build_signal(
+        name="merit_penalty_explosion",
+        specificity="specific",
+        summary=(
+            "The merit penalty ``rho`` looks suspicious because it "
+            f"spanned {ratio_total:.3e}x across the run "
+            f"(min={min_rho:.3e}, max={max_rho:.3e}; largest "
+            f"single-step jump {ratio_step:.3e}x at step {jump_step})."
+        ),
+        detail=detail,
+        evidence={
+            "rho_min": min_rho,
+            "rho_max": max_rho,
+            "rho_ratio_total": ratio_total,
+            "rho_ratio_step": ratio_step,
+            "rho_threshold_total": _RHO_EXPLOSION_TOTAL_RATIO,
+            "rho_threshold_step": _RHO_EXPLOSION_STEP_RATIO,
+            "jump_step": jump_step,
+        },
+        threshold_ratio=threshold_ratio,
+        suggestions=[
+            "Try ``use_exact_hvp_in_qp=True`` so the QP no longer "
+            "depends on the L-BFGS approximation; the merit-penalty "
+            "over-correction is almost always downstream of an "
+            "L-BFGS poisoning event.",
+            "Raise ``qp_max_iter`` so QP-budget exhaustion (which "
+            "forces the projected-gradient fallback that poisons the "
+            "L-BFGS history) is less likely.",
+            "Cap the merit penalty growth by passing a smaller "
+            "``proximal_mu_max`` if the equality constraints are "
+            "well-scaled; the ceiling prevents runaway ``rho``.",
+        ],
+        artifacts={
+            "rho_trajectory": np.asarray(rhos, dtype=float),
+        },
+        offending_step=jump_step if step_fired else None,
+    )
+
+
+# ``rho`` is treated as "frozen" for the prefix when its span is
+# below this multiplicative tolerance.  ``rho`` is mutated by an
+# additive-then-clip update in the solver, so a true "did not move"
+# signal needs a tiny epsilon rather than equality testing.
+_RHO_FROZEN_TOL = 1.0 + 1e-9
+# Minimum violation growth that constitutes "drift": the worst
+# infeasibility at the end of the prefix must be at least this
+# multiple of the worst infeasibility at the start.
+_STARVATION_VIOLATION_GROWTH = 5.0
+# The frozen-prefix must span at least this many steps (and at
+# least 5 absolute) to fire.  Short prefixes are noise.
+_STARVATION_PREFIX_FRACTION = 1.0 / 3.0
+
+
+def _eval_penalty_starvation(
+    ctx: EvalContext,
+    final_state: "SLSQPState",
+    summaries: list["StepSummary"],
+    coarse_result: Any,
+) -> Optional[Signal]:
+    """End-of-run: ``rho`` stayed at its initial value while feasibility drifted.
+
+    Cheap predicate: the longest prefix of summaries during which
+    ``rho`` is constant (within :data:`_RHO_FROZEN_TOL`) spans at
+    least ``max(5, n_steps // 3)`` steps, ``max_eq_violation`` is
+    monotone non-decreasing across that prefix, and grew by at
+    least :data:`_STARVATION_VIOLATION_GROWTH` (= 5x) from the
+    first to the last step of the prefix.
+
+    Catches the "started feasible, drifted off, ``rho`` never grew"
+    pathology described in the diagnostic notes for the feasible-
+    start divergence run: the Han-Powell directional-derivative test
+    cannot trigger a ``rho`` increase when the ``f`` reduction alone
+    satisfies it, so feasibility can decay silently for many steps.
+
+    Specificity: ``specific``.
+    """
+    if not summaries:
+        return None  # pragma: no cover
+    n_steps = len(summaries)
+    min_prefix = max(5, n_steps // 3)
+    if n_steps < min_prefix:
+        return None
+    # Identify the longest leading prefix where ``rho`` is frozen.
+    rho0 = max(float(summaries[0].merit_penalty), 1.0)
+    prefix_end = 0
+    for i, s in enumerate(summaries):
+        rho_i = max(float(s.merit_penalty), 1.0)
+        ratio = max(rho_i / rho0, rho0 / rho_i)
+        if ratio > _RHO_FROZEN_TOL:
+            break
+        prefix_end = i
+    prefix_len = prefix_end + 1
+    if prefix_len < min_prefix:
+        return None
+
+    prefix = summaries[: prefix_end + 1]
+    eq_violations = [float(s.max_eq_violation) for s in prefix]
+    ineq_violations = [float(s.max_ineq_violation) for s in prefix]
+    # Treat eq + ineq as a unified "infeasibility" proxy so the test
+    # works for both equality- and inequality-only problems.
+    violations = [max(e, i) for e, i in zip(eq_violations, ineq_violations)]
+    # Monotone non-decreasing test (with a small tolerance to
+    # absorb numerical jitter at the floor).
+    monotone = all(
+        violations[i] >= violations[i - 1] - 1e-15 for i in range(1, len(violations))
+    )
+    if not monotone:
+        return None
+    start_violation = violations[0]
+    end_violation = violations[-1]
+    # Need a non-zero starting violation to avoid 0/0; if it is at
+    # the floor, require an absolute growth above ``atol`` instead.
+    atol = ctx.atol
+    if start_violation > 0 and start_violation > atol:
+        growth_ratio = end_violation / start_violation
+    else:
+        # Compare against ``atol`` so a near-zero start that grew to
+        # ``5 * atol`` qualifies (the canonical feasible-start case).
+        growth_ratio = end_violation / max(atol, 1e-300)
+    if growth_ratio < _STARVATION_VIOLATION_GROWTH:
+        return None
+
+    threshold_ratio = growth_ratio / _STARVATION_VIOLATION_GROWTH
+
+    detail = (
+        f"The merit penalty ``rho`` stayed constant at "
+        f"{rho0:.3e} for the first {prefix_len} of {n_steps} "
+        "iterations while the worst infeasibility grew "
+        f"monotonically from {start_violation:.3e} to "
+        f"{end_violation:.3e}.  This is the textbook "
+        "'penalty-starved feasibility drift' pattern: the "
+        "Han-Powell directional-derivative test cannot trigger a "
+        "``rho`` increase when the ``f`` reduction alone satisfies "
+        "the predicted-vs-realised inequality, so the merit "
+        "function happily accepts steps that improve ``f`` at the "
+        "cost of feasibility.  When feasibility eventually decays "
+        "enough to require a real ``rho`` correction, the catch-up "
+        "is usually huge and downstream poisons the L-BFGS history "
+        "(see ``merit_penalty_explosion`` and "
+        "``divergence_rollback_triggered`` for the typical "
+        "downstream signals).  See ``AGENTS.md`` 'L1 merit "
+        "directional derivative' for the update rule."
+    )
+    return _build_signal(
+        name="penalty_starvation",
+        specificity="specific",
+        summary=(
+            "The merit penalty ``rho`` looks suspicious because it "
+            f"stayed constant at {rho0:.3e} for {prefix_len} of "
+            f"{n_steps} steps while max-infeasibility grew "
+            f"{growth_ratio:.1f}x (from {start_violation:.3e} to "
+            f"{end_violation:.3e})."
+        ),
+        detail=detail,
+        evidence={
+            "rho_initial": rho0,
+            "frozen_prefix_steps": prefix_len,
+            "n_steps": n_steps,
+            "violation_start": start_violation,
+            "violation_end": end_violation,
+            "growth_ratio": growth_ratio,
+            "growth_threshold": _STARVATION_VIOLATION_GROWTH,
+        },
+        threshold_ratio=threshold_ratio,
+        suggestions=[
+            "If the supplied initial iterate is exactly feasible, "
+            "perturb it slightly (e.g. ``x0 + atol * sign_vector``) "
+            "so the merit-penalty update mechanism warms ``rho`` up "
+            "before feasibility drifts.",
+            "Bump the initial ``merit_penalty`` so the feasibility "
+            "term has weight from step 1.",
+            "Check the magnitude balance between the constraint "
+            "Jacobian and the objective gradient: if "
+            "``eq_jac_min_sv_est`` (in the diagnostics block) is "
+            "much larger than ``||grad_f||``, the constraint is "
+            "much steeper than the objective and the merit "
+            "function cannot reconcile their natural scales without "
+            "a huge ``rho``.  Rescaling the constraint (e.g. drop "
+            "the ``1/target`` division if the constraint is "
+            "``(h(x) - target) / target``) so ``||J_eq||`` is "
+            "comparable to ``||grad_f||`` is the durable fix.",
+            "If LPEC-A is enabled, raise ``lpeca_warmup_steps`` so "
+            "the predictor does not contaminate the early-iteration "
+            "active set on a near-feasible iterate.",
+        ],
+        artifacts={
+            "rho_prefix": np.asarray(
+                [float(s.merit_penalty) for s in prefix], dtype=float
+            ),
+            "violations_prefix": np.asarray(violations, dtype=float),
+        },
+        offending_step=int(prefix[-1].step_count),
+    )
+
+
 def _result_name_safe(result: Any) -> str:
     """Wrap :func:`slsqp_jax.diagnostics.report._result_name` for use here.
 
@@ -1082,6 +1543,24 @@ register_evaluator(
     specificity="specific",
     flavour="end_of_run",
     evaluator=_eval_infeasible_termination,
+)
+register_evaluator(
+    "divergence_rollback_triggered",
+    specificity="specific",
+    flavour="end_of_run",
+    evaluator=_eval_divergence_rollback_triggered,
+)
+register_evaluator(
+    "merit_penalty_explosion",
+    specificity="specific",
+    flavour="end_of_run",
+    evaluator=_eval_merit_penalty_explosion,
+)
+register_evaluator(
+    "penalty_starvation",
+    specificity="specific",
+    flavour="end_of_run",
+    evaluator=_eval_penalty_starvation,
 )
 
 

@@ -169,3 +169,55 @@ def test_signal_infeasible_termination_integration():
         s.max_ineq_violation > solver.atol for s in report.run.summaries
     )
     assert "infeasible_termination" in fired_names or persistent_infeasibility
+
+
+@pytest.mark.skip(
+    reason=(
+        "Requires a problem that drives the best-iterate divergence "
+        "rollback at least once.  The canonical reproducer is the "
+        "feasible-start ``Portfolio(n=5000)`` run from the diagnostic "
+        "session that motivated this signal: it cascades QP-budget "
+        "exhaustion → L-BFGS poisoning → merit-penalty over-correction "
+        "→ rollback over ~17 outer steps.  Synthetic test owns the "
+        "signal-firing contract; wiring up the portfolio reproducer "
+        "(or an equivalent toy that consistently rolls back without "
+        "depending on a 5000-variable bound-heavy QP) is on the "
+        "follow-up wishlist."
+    )
+)
+def test_signal_divergence_rollback_triggered_integration():
+    """Best-iterate divergence rollback fires on a real failing run."""
+    raise NotImplementedError
+
+
+@pytest.mark.skip(
+    reason=(
+        "Requires a problem whose Han-Powell ``rho`` jumps by 1e3+ in "
+        "a single step or spans 1e6+ across the run.  Canonical "
+        "reproducer: feasible-start ``Portfolio(n=5000)`` from the "
+        "diagnostic session, where ``rho`` jumps ``1.0 → 4.5e+04 → "
+        "6.9e+09`` over three consecutive steps.  Synthetic test "
+        "owns the signal-firing contract; the real-problem trigger "
+        "is on the follow-up wishlist."
+    )
+)
+def test_signal_merit_penalty_explosion_integration():
+    """Merit penalty explosion fires when ``rho`` jumps in a single step."""
+    raise NotImplementedError
+
+
+@pytest.mark.skip(
+    reason=(
+        "Requires a problem whose initial iterate is feasible (or "
+        "near-feasible) and whose merit-penalty update mechanism "
+        "stays starved while feasibility drifts.  Canonical "
+        "reproducer: feasible-start ``Portfolio(n=5000)`` from the "
+        "diagnostic session, where ``rho`` stays at 1.0 for the "
+        "first 13 steps while ``max|c_eq|`` walks from ~3.5e-7 to "
+        "~3.5e-6.  Synthetic test owns the signal-firing contract; "
+        "the real-problem trigger is on the follow-up wishlist."
+    )
+)
+def test_signal_penalty_starvation_integration():
+    """Penalty starvation fires on a feasible-start drift trajectory."""
+    raise NotImplementedError

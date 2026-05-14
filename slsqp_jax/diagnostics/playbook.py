@@ -98,10 +98,21 @@ SCOPE_BY_TERMINATION: dict[int, set[str]] = {
         "lbfgs_conditioning_extreme",
         "merit_oscillation",
         "line_search_collapse",
+        "divergence_rollback_triggered",
+        "merit_penalty_explosion",
+        "penalty_starvation",
     },
     _enum_value(RESULTS.infeasible): {
         "infeasible_termination",
         "eq_jacobian_rank_deficient",
+        # Same divergence-rollback chain that latches ``iterate_blowup``
+        # also routes here when the rolled-back ``best_x`` is itself
+        # infeasible at termination.
+        "divergence_rollback_triggered",
+        "merit_penalty_explosion",
+        "penalty_starvation",
+        "lbfgs_conditioning_extreme",
+        "line_search_collapse",
     },
     _enum_value(RESULTS.nonlinear_max_steps_reached): set(),
     _enum_value(RESULTS.successful): set(),
@@ -327,6 +338,54 @@ def _build_active_set_churn(signals: list["Signal"]) -> Diagnosis:
     )
 
 
+def _build_penalty_starvation_cascade(signals: list["Signal"]) -> Diagnosis:
+    """Build the "penalty-starved feasibility drift cascade" diagnosis."""
+    by_name = _signals_by_name(signals)
+    related = sorted(
+        n
+        for n in (
+            "penalty_starvation",
+            "merit_penalty_explosion",
+            "divergence_rollback_triggered",
+            "lbfgs_conditioning_extreme",
+            "line_search_collapse",
+        )
+        if n in by_name
+    )
+    return Diagnosis(
+        name="penalty_starvation_cascade",
+        cause=(
+            "The merit penalty ``rho`` stayed at its initial value "
+            "while feasibility drifted (the Han-Powell directional-"
+            "derivative test cannot trigger a ``rho`` increase when "
+            "the ``f`` reduction alone satisfies it).  Once "
+            "feasibility decayed enough to demand a real correction, "
+            "the merit-penalty update over-corrected by several "
+            "orders of magnitude in a single step; that catch-up "
+            "poisons subsequent QP directions and the line search "
+            "collapses to the LS floor.  This cascade typically "
+            "ends with the best-iterate divergence rollback firing, "
+            "leaving the user with an iterate slightly worse than "
+            "any one the run actually visited.  Started feasible "
+            "but ended infeasible is the canonical signature."
+        ),
+        suggestions=[
+            "Perturb the initial iterate slightly off-feasibility "
+            "(e.g. ``x0 + atol * sign_vector``) so the merit "
+            "penalty update mechanism warms ``rho`` up before the "
+            "feasibility drift accumulates.",
+            "Bump the initial ``merit_penalty`` so the feasibility "
+            "term has weight from step 1 and the directional-"
+            "derivative test cannot ignore constraint violation.",
+            "Try ``use_exact_hvp_in_qp=True`` so the QP step "
+            "stays clean even if the merit penalty over-corrects "
+            "later — this breaks the L-BFGS poisoning leg of the "
+            "cascade.",
+        ],
+        related_signals=related,
+    )
+
+
 def _build_noise_floor_stall(signals: list["Signal"]) -> Diagnosis:
     """Build the "noise-floor stationarity stall" diagnosis."""
     return Diagnosis(
@@ -383,6 +442,13 @@ RULES: list[Rule] = [
         name="noise_floor_stationarity_stall",
         predicate=lambda fired: "multiplier_recovery_noise" in fired,
         build=_build_noise_floor_stall,
+    ),
+    Rule(
+        name="penalty_starvation_cascade",
+        predicate=lambda fired: (
+            "penalty_starvation" in fired and "merit_penalty_explosion" in fired
+        ),
+        build=_build_penalty_starvation_cascade,
     ),
 ]
 
