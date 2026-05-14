@@ -8,9 +8,11 @@ warm-start of the next QP.  By construction this should:
 
 * Cancel ``∇L`` exactly on bound-active indices (up to the residual on
   the equality / general-inequality multipliers).
-* Make ``state.multipliers_ineq[m_general:]`` reproduce the analytic
+* Make ``state.multipliers_ineq_ls[m_general:]`` reproduce the analytic
   bound multipliers of a closed-form QP to (close to) machine
-  precision.
+  precision (the bound block is identical between the QP-side and
+  LS-side multiplier vectors — both go through the same post-step
+  recovery in :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers`).
 * Lower the relative-stationarity ratio ``||∇L|| / max(|L|, 1)`` for
   bound-heavy problems where the QP-level recovery used to leave the
   ratio above ``rtol``.
@@ -143,7 +145,7 @@ class TestNLPBoundMultiplierRecovery:
         # Bounds are layout [general; lower; upper]; here m_general = 0,
         # n_lower = n, n_upper = 0 (bounds are [0, +inf]).
         m_general = 0
-        bound_mult_lower = state.multipliers_ineq[m_general : m_general + n]
+        bound_mult_lower = state.multipliers_ineq_ls[m_general : m_general + n]
         np.testing.assert_allclose(bound_mult_lower, mu_star_lower, atol=1e-7)
 
         # All recovered bound multipliers must be non-negative.
@@ -152,7 +154,7 @@ class TestNLPBoundMultiplierRecovery:
         # Stationarity: ||∇L|| / max(|L|, 1) should be tiny.
         grad_L = state.grad_lagrangian
         # Lagrangian value at the solution
-        L = state.f_val - state.multipliers_ineq @ state.ineq_val
+        L = state.f_val - state.multipliers_ineq_ls @ state.ineq_val
         rel_stationarity = jnp.linalg.norm(grad_L) / jnp.maximum(jnp.abs(L), 1.0)
         assert float(rel_stationarity) < 1e-8, (
             f"relative stationarity {float(rel_stationarity):.3e} exceeds 1e-8"
@@ -198,7 +200,7 @@ class TestNLPBoundMultiplierRecovery:
         np.testing.assert_allclose(y, x_star, atol=1e-7)
 
         # Layout: [general; lower; upper] with m_general = 0, n_lower = 0.
-        bound_mult_upper = state.multipliers_ineq
+        bound_mult_upper = state.multipliers_ineq_ls
         np.testing.assert_allclose(bound_mult_upper, mu_star_upper, atol=1e-7)
         assert jnp.all(bound_mult_upper >= -1e-12)
 
@@ -247,7 +249,7 @@ class TestNLPBoundMultiplierRecovery:
         np.testing.assert_allclose(y, x_star, atol=5e-6)
 
         # Bound multipliers (no general inequalities here, m_general = 0).
-        bound_mult_lower = state.multipliers_ineq[:n]
+        bound_mult_lower = state.multipliers_ineq_ls[:n]
         np.testing.assert_allclose(bound_mult_lower, mu_star, atol=5e-6)
         assert jnp.all(bound_mult_lower >= -1e-10)
 
@@ -297,15 +299,16 @@ class TestNLPBoundMultiplierRecovery:
         # Layout: [general; lower; upper].  m_general = 0; only z has a
         # finite lower bound, so n_lower = 1.  The recovered multiplier
         # should equal +∂f/∂z = 2 at the optimum.
-        bound_mult_lower = state.multipliers_ineq
+        bound_mult_lower = state.multipliers_ineq_ls
         np.testing.assert_allclose(bound_mult_lower, [2.0], atol=1e-6)
         assert jnp.all(bound_mult_lower >= -1e-12)
 
     def test_no_bounds_path_unchanged(self):
         """When ``bounds=None`` the recovery is a no-op.
 
-        ``state.multipliers_ineq`` then carries only general-inequality
-        multipliers and the splice should never touch it.
+        ``state.multipliers_ineq_ls`` then carries only
+        general-inequality multipliers and the splice should never
+        touch it.
         """
 
         def objective(x, args):
@@ -325,7 +328,7 @@ class TestNLPBoundMultiplierRecovery:
         y, state = _run_solver(solver, objective, x0)
 
         np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-5)
-        assert state.multipliers_ineq.shape == (1,)
+        assert state.multipliers_ineq_ls.shape == (1,)
 
 
 class TestNLPBoundMultiplierStagnationRegression:
@@ -403,19 +406,23 @@ class TestNLPBoundMultiplierStagnationRegression:
         assert float(jnp.max(x_sol)) <= 1.0 + 1e-7
 
         # Bound multipliers are dual-feasible (μ ≥ 0).  General-ineq +
-        # bound multipliers all live in ``state.multipliers_ineq``;
-        # all of them must be non-negative under our sign convention.
-        bound_mults = state.multipliers_ineq
+        # bound multipliers all live in ``state.multipliers_ineq_ls``;
+        # all of them must be non-negative under our sign convention
+        # (the LS recovery applies a ``max(0, ·)`` clamp on active
+        # rows, so this is structurally guaranteed).
+        bound_mults = state.multipliers_ineq_ls
         assert float(jnp.min(bound_mults)) >= -1e-8, (
             f"min(bound mult) = {float(jnp.min(bound_mults)):.3e}"
         )
 
-        # Relative stationarity at the returned iterate.
+        # Relative stationarity at the returned iterate (uses the LS
+        # multipliers — the same vector consumed by `_terminate_impl`'s
+        # convergence test).
         L = state.f_val
-        if state.multipliers_eq.shape[0] > 0:
-            L = L - state.multipliers_eq @ state.eq_val
-        if state.multipliers_ineq.shape[0] > 0:
-            L = L - state.multipliers_ineq @ state.ineq_val
+        if state.multipliers_eq_ls.shape[0] > 0:
+            L = L - state.multipliers_eq_ls @ state.eq_val
+        if state.multipliers_ineq_ls.shape[0] > 0:
+            L = L - state.multipliers_ineq_ls @ state.ineq_val
         rel_stationarity = jnp.linalg.norm(state.grad_lagrangian) / jnp.maximum(
             jnp.abs(L), 1.0
         )

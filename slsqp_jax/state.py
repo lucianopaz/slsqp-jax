@@ -489,14 +489,47 @@ class SLSQPState(eqx.Module):
         eq_jac: Jacobian of equality constraints at x_k.
         ineq_jac: Jacobian of inequality constraints at x_k.
         lbfgs_history: L-BFGS history for matrix-free Hessian approximation.
-        multipliers_eq: Lagrange multipliers for equality constraints.
-        multipliers_ineq: Lagrange multipliers for inequality constraints.
+        multipliers_eq_qp: QP-recovered equality multipliers
+            ``λ_QP = (A_k A_kᵀ)⁻¹ A_k (B d + g_k)`` from the active-set QP
+            solver.  Consumed by Han-Powell's penalty rule
+            (``update_penalty_parameter``), the LPEC-A predictor's
+            ``rho_bar`` proximity measure, and the active-set warm-start
+            of the next QP.  Carries ``O(s_f / s_eq · cond(B))`` noise
+            when the L-BFGS Hessian is poorly conditioned or when
+            auto-scaling inflates the multiplier scale; do **not** use
+            for ``∇f − Jᵀλ`` stationarity checks.
+        multipliers_ineq_qp: QP-recovered inequality multipliers
+            (general-inequality block + bound block).  The bound block
+            comes from the post-line-search recovery in
+            :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers` so
+            it agrees with ``multipliers_ineq_ls`` for the bound rows;
+            only the general-inequality block carries the QP noise.
+            Consumed by Han-Powell + LPEC-A + warm-start.
+        multipliers_eq_ls: Hessian-free least-squares multipliers
+            ``λ_LS = (J(x_{k+1}) J(x_{k+1})ᵀ)⁻¹ J(x_{k+1}) ∇f(x_{k+1})``
+            recovered post-line-search at the accepted iterate (see
+            :mod:`slsqp_jax.slsqp.multipliers`).  Independent of ``B``,
+            ``d`` and ``α``.  Consumed by the L-BFGS secant pair (so
+            the same vector is used at both endpoints) and by
+            ``_terminate_impl``'s Lagrangian-value denominator.  These
+            are the multipliers exposed via
+            ``Solution.stats["multipliers_eq"]`` because they are the
+            stationarity-quality estimate.  At ``init()`` time both
+            ``_qp`` and ``_ls`` are seeded from the same ``lstsq``
+            solution at ``x_0``.
+        multipliers_ineq_ls: Hessian-free LS inequality multipliers
+            (general-inequality block from
+            :mod:`slsqp_jax.slsqp.multipliers` with active-row
+            ``max(0, ·)`` clamp + bound block from
+            :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers`).
+            At ``init()`` initialised to zeros — bound blocks only get
+            populated once ``step()`` runs the post-step recovery.
         prev_grad_lagrangian: Previous Lagrangian gradient (for L-BFGS update).
         grad_lagrangian: Current gradient of the Lagrangian evaluated at
-            the accepted iterate using the *blended* multipliers
-            consistent with the line-search step size.  Reused by
-            ``terminate`` so the stationarity check does not fall out
-            of sync with the L-BFGS secant pair.
+            the accepted iterate using the LS multipliers (matching the
+            L-BFGS secant pair).  Reused by ``terminate`` so the
+            stationarity check does not fall out of sync with the L-BFGS
+            secant pair.
         merit_penalty: Current penalty parameter for L1 merit function.
         bound_jac: Constant Jacobian for bound constraints (computed once in init).
         qp_iterations: Total accumulated QP active-set iterations across all steps.
@@ -528,16 +561,26 @@ class SLSQPState(eqx.Module):
     # L-BFGS history for matrix-free Hessian approximation (O(kn) storage)
     lbfgs_history: LBFGSHistory
 
-    # Lagrange multipliers from QP solution
-    multipliers_eq: Float[Array, " m_eq"]
-    multipliers_ineq: Float[Array, " m_ineq"]
+    # QP-recovered Lagrange multipliers (Han-Powell, LPEC-A, warm-start).
+    # Carry ``O(s_f / s_eq * cond(B))`` noise; do NOT use for stationarity.
+    # The bound block of ``multipliers_ineq_qp`` is the post-step bound
+    # recovery (same as the bound block of ``multipliers_ineq_ls``).
+    multipliers_eq_qp: Float[Array, " m_eq"]
+    multipliers_ineq_qp: Float[Array, " m_ineq"]
+
+    # Hessian-free least-squares multipliers recovered post-line-search at
+    # the accepted iterate.  Independent of B, d, alpha; consumed by the
+    # L-BFGS secant pair and by the convergence-test Lagrangian.  These
+    # are the multipliers exposed via ``Solution.stats["multipliers_*"]``.
+    multipliers_eq_ls: Float[Array, " m_eq"]
+    multipliers_ineq_ls: Float[Array, " m_ineq"]
 
     # Previous Lagrangian gradient for L-BFGS y = grad_L_new - grad_L_old
     prev_grad_lagrangian: Vector
 
     # Current Lagrangian gradient at the accepted iterate, computed with
-    # the *blended* multipliers (matching the L-BFGS secant pair).  Reused
-    # by ``terminate`` for stationarity so the check is consistent with
+    # the LS multipliers (matching the L-BFGS secant pair).  Reused by
+    # ``terminate`` for stationarity so the check is consistent with
     # what ``step`` saw.
     grad_lagrangian: Vector
 

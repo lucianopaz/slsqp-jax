@@ -44,6 +44,11 @@ from slsqp_jax.merit import (
     update_penalty_parameter,
 )
 from slsqp_jax.slsqp.hvp import build_exact_lagrangian_hvp
+from slsqp_jax.slsqp.multipliers import (
+    compute_at_lower_mask,
+    compute_at_upper_mask,
+    recover_ls_multipliers_at_iterate,
+)
 from slsqp_jax.slsqp.termination import TerminationFlags, coarse_outcome
 from slsqp_jax.state import SLSQPDiagnostics, SLSQPState
 from slsqp_jax.types import Vector
@@ -132,49 +137,76 @@ def _step_impl(
     ineq_jac_general_new = self._ineq_jac_impl(y_new, args)
     ineq_jac_new = jnp.concatenate([ineq_jac_general_new, state.bound_jac], axis=0)
 
-    blended_mult_eq = state.multipliers_eq + alpha * (
-        qp_result.multipliers_eq - state.multipliers_eq
-    )
-    blended_mult_ineq = state.multipliers_ineq + alpha * (
-        qp_result.multipliers_ineq - state.multipliers_ineq
-    )
-
     m_ineq_general_static = self.n_ineq_constraints
     m_bounds_static = self._n_lower_bounds + self._n_upper_bounds
     n_lower_static = self._n_lower_bounds
+    n_upper_static = self._n_upper_bounds
+
+    # Free-mask at x_{k+1}: the LS multiplier recovery is restricted to
+    # the free subspace so the at-bound gradient components do not leak
+    # into the equality / general-inequality multipliers (those
+    # components belong to the subsequent bound-multiplier recovery).
     if m_bounds_static > 0:
-        mult_ineq_general_blended = (
-            blended_mult_ineq[:m_ineq_general_static]
-            if m_ineq_general_static > 0
-            else jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
-        )
+        at_lower_full = compute_at_lower_mask(y_new, self.bounds, self._lower_indices)
+        at_upper_full = compute_at_upper_mask(y_new, self.bounds, self._upper_indices)
+        free_mask = ~(at_lower_full | at_upper_full)
+    else:
+        free_mask = None
+
+    # Hessian-free LS multiplier recovery at x_{k+1}.  Independent of
+    # B / d / alpha; replaces the alpha-blended QP multipliers as the
+    # multiplier vector consumed by the L-BFGS secant pair and the
+    # convergence-test Lagrangian.  The QP-recovered multipliers are
+    # still surfaced separately on ``state.multipliers_*_qp`` for
+    # Han-Powell, LPEC-A and the QP active-set warm-start.
+    ineq_val_general_new = (
+        ineq_val_new[:m_ineq_general_static]
+        if m_ineq_general_static > 0
+        else jnp.zeros((0,), dtype=ineq_val_new.dtype)
+    )
+    ineq_jac_general_active = (
+        ineq_jac_new[:m_ineq_general_static]
+        if m_ineq_general_static > 0
+        else jnp.zeros((0, grad_new.shape[0]), dtype=grad_new.dtype)
+    )
+    ls_mult_eq, ls_mult_ineq_general = recover_ls_multipliers_at_iterate(
+        grad_new=grad_new,
+        eq_jac_new=eq_jac_new,
+        ineq_jac_general_new=ineq_jac_general_active,
+        ineq_val_general_new=ineq_val_general_new,
+        free_mask=free_mask,
+        active_tol=self.atol,
+    )
+
+    # Bound multipliers — re-use the existing post-step recovery, fed
+    # the LS equality and general-inequality multipliers so the whole
+    # stationarity-side multiplier vector is internally consistent.
+    if m_bounds_static > 0:
         mu_lower_corr, mu_upper_corr = self._recover_bound_multipliers(
             y_new=y_new,
             grad_new=grad_new,
             eq_jac_new=eq_jac_new,
             ineq_jac_new=ineq_jac_new,
-            mult_eq=blended_mult_eq,
-            mult_ineq_general=mult_ineq_general_blended,
+            mult_eq=ls_mult_eq,
+            mult_ineq_general=ls_mult_ineq_general,
         )
-        if n_lower_static > 0:
-            blended_mult_ineq = blended_mult_ineq.at[
-                m_ineq_general_static : m_ineq_general_static + n_lower_static
-            ].set(mu_lower_corr)
-        if self._n_upper_bounds > 0:
-            blended_mult_ineq = blended_mult_ineq.at[
-                m_ineq_general_static + n_lower_static :
-            ].set(mu_upper_corr)
     else:
-        mu_lower_corr = jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
-        mu_upper_corr = jnp.zeros((0,), dtype=blended_mult_ineq.dtype)
+        mu_lower_corr = jnp.zeros((0,), dtype=grad_new.dtype)
+        mu_upper_corr = jnp.zeros((0,), dtype=grad_new.dtype)
+
+    # Stitch the full inequality LS multiplier (general + lower-bound +
+    # upper-bound blocks) for downstream consumption.
+    ls_mult_ineq_full = jnp.concatenate(
+        [ls_mult_ineq_general, mu_lower_corr, mu_upper_corr], axis=0
+    )
 
     s = y_new - y
     grad_lagrangian_new = compute_lagrangian_gradient(
         grad_new,
         eq_jac_new,
         ineq_jac_new,
-        blended_mult_eq,
-        blended_mult_ineq,
+        ls_mult_eq,
+        ls_mult_ineq_full,
     )
 
     if self._obj_hvp_impl is not None:
@@ -182,8 +214,8 @@ def _step_impl(
             fn=fn,
             y=y,
             args=args,
-            multipliers_eq=blended_mult_eq,
-            multipliers_ineq=blended_mult_ineq,
+            multipliers_eq=ls_mult_eq,
+            multipliers_ineq=ls_mult_ineq_full,
             obj_hvp_impl=self._obj_hvp_impl,
             eq_hvp_contrib_impl=self._eq_hvp_contrib_impl,
             ineq_hvp_contrib_impl=self._ineq_hvp_contrib_impl,
@@ -195,8 +227,8 @@ def _step_impl(
             state.grad,
             state.eq_jac,
             state.ineq_jac,
-            blended_mult_eq,
-            blended_mult_ineq,
+            ls_mult_eq,
+            ls_mult_ineq_full,
         )
         y_for_lbfgs = grad_lagrangian_new - grad_lagrangian_old
 
@@ -367,22 +399,31 @@ def _step_impl(
         ),
     )
 
+    # QP-side state writeback: keep the QP-recovered general-inequality
+    # multipliers (Han-Powell, LPEC-A and the next QP's warm-start
+    # consume them) but splice the LS bound recovery into the bound
+    # block — bound rows have no QP-side recovery (they are excluded
+    # from the QP's `(A_ineq, b_ineq)` pair on purpose) so the LS
+    # bound block is the only post-step value either side has.
     if m_bounds_static > 0:
-        multipliers_ineq_for_state = qp_result.multipliers_ineq
+        multipliers_ineq_qp_for_state = qp_result.multipliers_ineq
         if n_lower_static > 0:
-            multipliers_ineq_for_state = multipliers_ineq_for_state.at[
+            multipliers_ineq_qp_for_state = multipliers_ineq_qp_for_state.at[
                 m_ineq_general_static : m_ineq_general_static + n_lower_static
             ].set(mu_lower_corr)
-        if self._n_upper_bounds > 0:
-            multipliers_ineq_for_state = multipliers_ineq_for_state.at[
+        if n_upper_static > 0:
+            multipliers_ineq_qp_for_state = multipliers_ineq_qp_for_state.at[
                 m_ineq_general_static + n_lower_static :
             ].set(mu_upper_corr)
     else:
-        multipliers_ineq_for_state = qp_result.multipliers_ineq
+        multipliers_ineq_qp_for_state = qp_result.multipliers_ineq
 
     # Granular termination-code classification, mirrored at the new
     # iterate so ``state.termination_code`` agrees with the value
-    # ``terminate()`` will eventually settle on.
+    # ``terminate()`` will eventually settle on.  Uses the LS
+    # multipliers for the Lagrangian denominator so the numerator
+    # (``grad_lagrangian_new`` is LS-based) and denominator share the
+    # same multiplier vector.
     m_eq_static = self.n_eq_constraints
     m_ineq_total_static = (
         self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
@@ -400,12 +441,10 @@ def _step_impl(
     primal_feasible_new = jnp.reshape(eq_feasible_new & ineq_feasible_new, ())
     lagrangian_val_new = f_val_new
     if m_eq_static > 0:
-        lagrangian_val_new = lagrangian_val_new - jnp.dot(
-            qp_result.multipliers_eq, eq_val_new
-        )
+        lagrangian_val_new = lagrangian_val_new - jnp.dot(ls_mult_eq, eq_val_new)
     if m_ineq_total_static > 0:
         lagrangian_val_new = lagrangian_val_new - jnp.dot(
-            multipliers_ineq_for_state, ineq_val_new
+            ls_mult_ineq_full, ineq_val_new
         )
     grad_norm_new = jnp.linalg.norm(grad_lagrangian_new)
     rtol_target_new = self.rtol * jnp.maximum(jnp.abs(lagrangian_val_new), 1.0)
@@ -451,8 +490,10 @@ def _step_impl(
         eq_jac=eq_jac_new,
         ineq_jac=ineq_jac_new,
         lbfgs_history=new_lbfgs_history,
-        multipliers_eq=qp_result.multipliers_eq,
-        multipliers_ineq=multipliers_ineq_for_state,
+        multipliers_eq_qp=qp_result.multipliers_eq,
+        multipliers_ineq_qp=multipliers_ineq_qp_for_state,
+        multipliers_eq_ls=ls_mult_eq,
+        multipliers_ineq_ls=ls_mult_ineq_full,
         prev_grad_lagrangian=grad_lagrangian_new,
         grad_lagrangian=grad_lagrangian_new,
         merit_penalty=merit_penalty,
@@ -490,8 +531,8 @@ def _step_impl(
     kkt = jnp.linalg.norm(grad_lagrangian_new)
     lagrangian_val_est = (
         f_val_new
-        - jnp.dot(qp_result.multipliers_eq, eq_val_new)
-        - jnp.dot(qp_result.multipliers_ineq, ineq_val_new)
+        - jnp.dot(ls_mult_eq, eq_val_new)
+        - jnp.dot(ls_mult_ineq_full, ineq_val_new)
     )
     rel_kkt = kkt / jnp.maximum(jnp.abs(lagrangian_val_est), 1.0)
     dir_norm = jnp.linalg.norm(direction)
@@ -554,9 +595,9 @@ def _terminate_impl(
 
     lagrangian_val = state.f_val
     if m_eq > 0:
-        lagrangian_val = lagrangian_val - state.multipliers_eq @ state.eq_val
+        lagrangian_val = lagrangian_val - state.multipliers_eq_ls @ state.eq_val
     if m_ineq_total > 0:
-        lagrangian_val = lagrangian_val - state.multipliers_ineq @ state.ineq_val
+        lagrangian_val = lagrangian_val - state.multipliers_ineq_ls @ state.ineq_val
 
     grad_norm = jnp.linalg.norm(grad_lagrangian)
     rtol_target = self.rtol * jnp.maximum(jnp.abs(lagrangian_val), 1.0)
