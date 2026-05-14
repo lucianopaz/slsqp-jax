@@ -148,13 +148,21 @@ def recover_bound_multipliers(
     # satisfy the test exactly; the relative term only kicks in for
     # variables the line search drove to within fp precision of a
     # bound without explicit clipping.
-    eps = jnp.asarray(jnp.finfo(y_new.dtype).eps, dtype=y_new.dtype)
-    bound_tol = jnp.asarray(1e-12, dtype=y_new.dtype) + eps * (1.0 + jnp.abs(y_new))
+    #
+    # The full-coordinate at-bound masks are computed via
+    # :func:`slsqp_jax.slsqp.multipliers.compute_at_lower_mask` /
+    # ``compute_at_upper_mask`` so this recovery and the LS multiplier
+    # recovery in :mod:`slsqp_jax.slsqp.multipliers` share the
+    # identical predicate.
+    from slsqp_jax.slsqp.multipliers import (
+        compute_at_lower_mask,
+        compute_at_upper_mask,
+    )
 
     if n_lower > 0:
         lower_idx = jnp.asarray(lower_indices, dtype=jnp.int32)
-        lb_at_idx = bounds[lower_idx, 0]
-        at_lower = (y_new[lower_idx] - lb_at_idx) <= bound_tol[lower_idx]
+        at_lower_full = compute_at_lower_mask(y_new, bounds, lower_indices)
+        at_lower = at_lower_full[lower_idx]
         mu_lower_corr = jnp.maximum(
             jnp.where(at_lower, partial_grad_L[lower_idx], 0.0),
             0.0,
@@ -164,8 +172,8 @@ def recover_bound_multipliers(
 
     if n_upper > 0:
         upper_idx = jnp.asarray(upper_indices, dtype=jnp.int32)
-        ub_at_idx = bounds[upper_idx, 1]
-        at_upper = (ub_at_idx - y_new[upper_idx]) <= bound_tol[upper_idx]
+        at_upper_full = compute_at_upper_mask(y_new, bounds, upper_indices)
+        at_upper = at_upper_full[upper_idx]
         mu_upper_corr = jnp.maximum(
             jnp.where(at_upper, -partial_grad_L[upper_idx], 0.0),
             0.0,

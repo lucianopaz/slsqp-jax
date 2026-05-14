@@ -214,6 +214,7 @@ def test_diff_summaries_treats_both_nan_as_equal():
         "lbfgs_skipped": False,
         "max_abs_mult_eq": 0.0,
         "max_abs_mult_ineq": 0.0,
+        "qp_vs_ls_multiplier_ratio": 1.0,
         "n_active_ineq": 0,
         "eq_jac_min_sv_est": float("inf"),
         "projected_grad_norm": float("inf"),

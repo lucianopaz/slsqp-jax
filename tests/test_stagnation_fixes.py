@@ -655,10 +655,12 @@ class TestAlphaScaledMultipliers:
         y = x0
         y, state, _ = solver.step(objective, y, None, {}, state, frozenset())
 
-        # If alpha=1 (full step), multipliers_eq should be the raw QP value.
-        # We can't directly check if alpha was 1, but for this well-posed
-        # problem the QP multipliers should be non-zero and meaningful.
-        assert jnp.abs(state.multipliers_eq[0]) > 1e-10
+        # The QP multipliers should be non-zero and meaningful for this
+        # well-posed problem.  The post-rewire field name is
+        # `multipliers_eq_qp` (split from the legacy `multipliers_eq`
+        # to expose the Hessian-free LS variant separately on
+        # `multipliers_eq_ls`).
+        assert jnp.abs(state.multipliers_eq_qp[0]) > 1e-10
 
     def test_bounds_convergence_with_alpha_scaling(self):
         """Bound-constrained problem should still converge with alpha-scaling.

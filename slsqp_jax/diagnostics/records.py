@@ -90,8 +90,21 @@ class StepSummary:
             ring buffer.
         lbfgs_skipped: Whether the L-BFGS append skipped its curvature
             pair this step (delta of ``diagnostics.n_lbfgs_skips``).
-        max_abs_mult_eq: ``max(|lambda_eq|)`` at the post-step iterate.
-        max_abs_mult_ineq: ``max(|mu_ineq|)`` at the post-step iterate.
+        max_abs_mult_eq: ``max(|lambda_eq_ls|)`` at the post-step
+            iterate (the stationarity-quality multiplier — the same
+            vector exposed via ``Solution.stats["multipliers_eq"]``).
+        max_abs_mult_ineq: ``max(|mu_ineq_ls|)`` at the post-step
+            iterate.
+        qp_vs_ls_multiplier_ratio: Maximum
+            ``|λ_qp[i]| / max(|λ_ls[i]|, eps)`` across active equality +
+            general-inequality rows.  Surfaces "the QP multiplier was
+            ``N x`` larger than the stationarity multiplier this step",
+            which is the textbook signature of QP-multiplier inflation
+            (poor L-BFGS conditioning + auto-scaling).  Always ``1.0``
+            on the very first step where both are seeded from the same
+            ``lstsq`` initialisation; settles around ``1.0`` near a
+            clean KKT point and grows on noisy / ill-conditioned
+            iterates.
         n_active_ineq: Number of active inequality constraints (general
             + bounds) at the post-step iterate.
         eq_jac_min_sv_est: Lower bound on the smallest singular value
@@ -147,6 +160,7 @@ class StepSummary:
 
     max_abs_mult_eq: float
     max_abs_mult_ineq: float
+    qp_vs_ls_multiplier_ratio: float
     n_active_ineq: int
 
     eq_jac_min_sv_est: float
@@ -205,9 +219,9 @@ class StepSummary:
 
         lagrangian_value = f_val
         if m_eq > 0:
-            lagrangian_value -= float(jnp.dot(state.multipliers_eq, eq_val))
+            lagrangian_value -= float(jnp.dot(state.multipliers_eq_ls, eq_val))
         if m_ineq > 0:
-            lagrangian_value -= float(jnp.dot(state.multipliers_ineq, ineq_val))
+            lagrangian_value -= float(jnp.dot(state.multipliers_ineq_ls, ineq_val))
 
         grad_lagrangian_norm = float(jnp.linalg.norm(state.grad_lagrangian))
         rel_kkt = grad_lagrangian_norm / max(abs(lagrangian_value), 1.0)
@@ -218,11 +232,34 @@ class StepSummary:
         diag_kappa = max_diag / max(min_diag, 1e-30)
 
         max_abs_mult_eq = (
-            float(jnp.max(jnp.abs(state.multipliers_eq))) if m_eq > 0 else 0.0
+            float(jnp.max(jnp.abs(state.multipliers_eq_ls))) if m_eq > 0 else 0.0
         )
         max_abs_mult_ineq = (
-            float(jnp.max(jnp.abs(state.multipliers_ineq))) if m_ineq > 0 else 0.0
+            float(jnp.max(jnp.abs(state.multipliers_ineq_ls))) if m_ineq > 0 else 0.0
         )
+
+        # qp_vs_ls_multiplier_ratio: max ratio across all eq +
+        # general-inequality rows (the bound block agrees identically
+        # between _qp and _ls so it does not contribute).  Computed in
+        # one pass over the concatenated multiplier vectors with a
+        # numerical floor so a near-zero LS multiplier does not
+        # produce a spurious infinity.
+        ratio_eps = 1e-30
+        if m_eq > 0 or m_ineq > 0:
+            mult_qp_concat_parts = []
+            mult_ls_concat_parts = []
+            if m_eq > 0:
+                mult_qp_concat_parts.append(state.multipliers_eq_qp)
+                mult_ls_concat_parts.append(state.multipliers_eq_ls)
+            if m_ineq > 0:
+                mult_qp_concat_parts.append(state.multipliers_ineq_qp)
+                mult_ls_concat_parts.append(state.multipliers_ineq_ls)
+            mult_qp_concat = jnp.concatenate(mult_qp_concat_parts, axis=0)
+            mult_ls_concat = jnp.concatenate(mult_ls_concat_parts, axis=0)
+            denom = jnp.maximum(jnp.abs(mult_ls_concat), ratio_eps)
+            qp_vs_ls_multiplier_ratio = float(jnp.max(jnp.abs(mult_qp_concat) / denom))
+        else:
+            qp_vs_ls_multiplier_ratio = 1.0
         n_active_ineq = int(jnp.sum(state.prev_active_set.astype(jnp.int32)))
 
         qp_iterations_total = int(state.qp_iterations)
@@ -275,6 +312,7 @@ class StepSummary:
             lbfgs_skipped=lbfgs_skipped,
             max_abs_mult_eq=max_abs_mult_eq,
             max_abs_mult_ineq=max_abs_mult_ineq,
+            qp_vs_ls_multiplier_ratio=qp_vs_ls_multiplier_ratio,
             n_active_ineq=n_active_ineq,
             eq_jac_min_sv_est=float(diag.eq_jac_min_sv_est),
             projected_grad_norm=float(state.last_projected_grad_norm),

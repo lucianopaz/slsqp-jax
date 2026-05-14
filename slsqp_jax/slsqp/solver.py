@@ -524,8 +524,8 @@ class SLSQP(optx.AbstractMinimiser):
                 fn=fn,
                 y=y,
                 args=args,
-                multipliers_eq=state.multipliers_eq,
-                multipliers_ineq=state.multipliers_ineq,
+                multipliers_eq=state.multipliers_eq_qp,
+                multipliers_ineq=state.multipliers_ineq_qp,
                 obj_hvp_impl=self._obj_hvp_impl,
                 eq_hvp_contrib_impl=self._eq_hvp_contrib_impl,
                 ineq_hvp_contrib_impl=self._ineq_hvp_contrib_impl,
@@ -608,13 +608,13 @@ class SLSQP(optx.AbstractMinimiser):
         lbfgs_history = lbfgs_init(n, self.lbfgs_memory)
 
         if m_eq > 0:
-            multipliers_eq, _, _, _ = jnp.linalg.lstsq(eq_jac.T, grad)
+            multipliers_eq_seed, _, _, _ = jnp.linalg.lstsq(eq_jac.T, grad)
         else:
-            multipliers_eq = jnp.zeros((m_eq,))
-        multipliers_ineq = jnp.zeros((m_ineq_total,))
+            multipliers_eq_seed = jnp.zeros((m_eq,))
+        multipliers_ineq_seed = jnp.zeros((m_ineq_total,))
 
         prev_grad_lagrangian = compute_lagrangian_gradient(
-            grad, eq_jac, ineq_jac, multipliers_eq, multipliers_ineq
+            grad, eq_jac, ineq_jac, multipliers_eq_seed, multipliers_ineq_seed
         )
 
         merit_penalty = jnp.array(1.0)
@@ -629,8 +629,10 @@ class SLSQP(optx.AbstractMinimiser):
             eq_jac=eq_jac,
             ineq_jac=ineq_jac,
             lbfgs_history=lbfgs_history,
-            multipliers_eq=multipliers_eq,
-            multipliers_ineq=multipliers_ineq,
+            multipliers_eq_qp=multipliers_eq_seed,
+            multipliers_ineq_qp=multipliers_ineq_seed,
+            multipliers_eq_ls=multipliers_eq_seed,
+            multipliers_ineq_ls=multipliers_ineq_seed,
             prev_grad_lagrangian=prev_grad_lagrangian,
             grad_lagrangian=prev_grad_lagrangian,
             merit_penalty=merit_penalty,
@@ -703,8 +705,28 @@ class SLSQP(optx.AbstractMinimiser):
             "total_qp_iterations": state.qp_iterations,
             "last_qp_converged": state.qp_converged,
             "qp_tolerance": 1e-8,
-            "multipliers_eq": state.multipliers_eq,
-            "multipliers_ineq": state.multipliers_ineq,
+            # Stationarity-quality multipliers (Hessian-free LS recovery
+            # at the final iterate).  Suitable for plugging into
+            # ``||∇f − Jᵀ λ||`` and verifying KKT stationarity.  The LS
+            # variant differs from a strict scipy SLSQP recovery in two
+            # ways: (1) the active-set rule is value-based at the final
+            # iterate (``c_ineq <= active_tol``); (2) active-row
+            # inequality multipliers are clamped at ``0`` for dual
+            # feasibility.  On well-conditioned problems near a clean
+            # KKT point these match the QP-side estimate to fp
+            # precision; on ill-conditioned or noisy iterates the LS
+            # variant is the cleaner indicator of "is this iterate
+            # stationary?".
+            "multipliers_eq": state.multipliers_eq_ls,
+            "multipliers_ineq": state.multipliers_ineq_ls,
+            # QP-side multipliers (Han-Powell / LPEC-A / next-QP
+            # warm-start view).  Asymptotically agree with the LS
+            # variant as ``x_k → x*``; differ on the order of the
+            # L-BFGS conditioning when ``B`` is a poor approximation
+            # or when auto-scaling inflates the multiplier scale.
+            # Provided for advanced diagnostics.
+            "multipliers_eq_qp": state.multipliers_eq_qp,
+            "multipliers_ineq_qp": state.multipliers_ineq_qp,
             "stagnation": state.stagnation,
             "ls_fatal": state.ls_fatal,
             "qp_fatal": state.qp_fatal,
@@ -758,8 +780,8 @@ class SLSQP(optx.AbstractMinimiser):
                     grad=state.grad,
                     A_ineq=state.ineq_jac,
                     A_eq=state.eq_jac,
-                    lambda_ineq=state.multipliers_ineq,
-                    mu_eq=state.multipliers_eq,
+                    lambda_ineq=state.multipliers_ineq_qp,
+                    mu_eq=state.multipliers_eq_qp,
                     sigma=self.lpeca_sigma,
                     beta=self.lpeca_beta,
                     trust_threshold=self.lpeca_trust_threshold,
@@ -856,7 +878,7 @@ class SLSQP(optx.AbstractMinimiser):
             initial_active_set=initial_active_set,
             kkt_residual=kkt_residual,
             proximal_mu=mu,
-            prev_multipliers_eq=state.multipliers_eq,
+            prev_multipliers_eq=state.multipliers_eq_qp,
             precond_fn=precond_fn,
             cg_tol=adaptive_tol,
             cg_regularization=self.cg_regularization,

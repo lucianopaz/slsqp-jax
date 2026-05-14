@@ -355,7 +355,7 @@ class TestOuterIntegration:
         )
         _, state = _run_solver(with_hr, objective, x0)
         diag = get_diagnostics(state)
-        L_val = state.f_val - state.multipliers_eq @ state.eq_val
+        L_val = state.f_val - state.multipliers_eq_ls @ state.eq_val
         rtol_target = with_hr.rtol * max(float(jnp.abs(L_val)), 1.0)
 
         # The diagnostics low-water mark must be at least as small as
