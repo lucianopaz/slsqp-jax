@@ -1312,6 +1312,15 @@ def _eval_merit_penalty_explosion(
             "Cap the merit penalty growth by passing a smaller "
             "``proximal_mu_max`` if the equality constraints are "
             "well-scaled; the ceiling prevents runaway ``rho``.",
+            "If the run was launched with ``auto_scale=False`` (or via "
+            "a path that bypasses :func:`slsqp_jax.minimize_like_scipy`), "
+            "enable auto-scaling -- a runaway ``rho`` is almost always "
+            "the merit function trying to reconcile mismatched objective "
+            "and constraint magnitudes.  The Auto-scaling section of "
+            "the report (when present) lists the factors that were "
+            "applied; if the signal still fires under default-on "
+            "auto-scaling, try ``auto_scale='aggressive'`` or supply "
+            "your own scaling.",
         ],
         artifacts={
             "rho_trajectory": np.asarray(rhos, dtype=float),
@@ -1465,6 +1474,15 @@ def _eval_penalty_starvation(
             "If LPEC-A is enabled, raise ``lpeca_warmup_steps`` so "
             "the predictor does not contaminate the early-iteration "
             "active set on a near-feasible iterate.",
+            "If the run was launched with ``auto_scale=False`` (or via "
+            "a path that bypasses :func:`slsqp_jax.minimize_like_scipy`), "
+            "enable auto-scaling -- the ``||J_eq|| >> ||grad_f||`` "
+            "magnitude mismatch that triggers penalty starvation is "
+            "exactly what gradient-based scaling is designed to fix.  "
+            "The Auto-scaling section of the report (when present) "
+            "lists the factors that were applied; if the signal still "
+            "fires under default-on auto-scaling, try "
+            "``auto_scale='aggressive'`` or supply your own scaling.",
         ],
         artifacts={
             "rho_prefix": np.asarray(

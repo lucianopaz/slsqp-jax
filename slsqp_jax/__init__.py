@@ -75,6 +75,17 @@ from slsqp_jax.merit import (
 )
 from slsqp_jax.qp import solve_qp
 from slsqp_jax.results import RESULTS, is_successful
+from slsqp_jax.scaling import (
+    ScaledProblem,
+    ScaleFactors,
+    ScalingConfig,
+    auto_scaled_minimise,
+    auto_scaled_problem,
+    compute_scale_factors_at_x0,
+    resolve_scaling_mode,
+    unscale_solution,
+    wrap_verbose_for_scaling,
+)
 from slsqp_jax.slsqp import SLSQP
 from slsqp_jax.slsqp.solver import STAGNATION_MESSAGE
 from slsqp_jax.state import (
@@ -122,6 +133,16 @@ __all__ = [
     "ParsedConstraints",
     "parse_constraints",
     "minimize_like_scipy",
+    # Auto-scaling
+    "ScaleFactors",
+    "ScaledProblem",
+    "ScalingConfig",
+    "auto_scaled_minimise",
+    "auto_scaled_problem",
+    "compute_scale_factors_at_x0",
+    "resolve_scaling_mode",
+    "unscale_solution",
+    "wrap_verbose_for_scaling",
     # Diagnostics
     "DebugReport",
     "DebugRunResult",

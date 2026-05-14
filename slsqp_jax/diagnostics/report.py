@@ -122,6 +122,12 @@ class DebugReport:
     run: "DebugRunResult"
     signals: dict[str, Any] = field(default_factory=dict)
     diagnoses: list[Any] = field(default_factory=list)
+    # ``scale_factors`` is populated post-hoc by the intercept layer
+    # when the run was launched under :func:`slsqp_jax.minimize_like_scipy`
+    # with ``auto_scale=True``.  ``None`` (the default) means the run
+    # was not auto-scaled (or the run was launched outside the
+    # auto-scaling integration).
+    scale_factors: Optional[Any] = None
 
     @classmethod
     def from_run(cls, run: "DebugRunResult") -> "DebugReport":
@@ -131,7 +137,21 @@ class DebugReport:
             name = getattr(sig, "name", None)
             if isinstance(name, str):
                 signals_by_name[name] = sig
-        return cls(run=run, signals=signals_by_name, diagnoses=[])
+        # If the solver's verbose callable was wrapped by
+        # ``slsqp_jax.scaling.wrap_verbose_for_scaling``, the factors
+        # are stashed on the callable as ``_slsqp_scale_factors``.
+        # Pull them onto the report so :meth:`_render_auto_scaling`
+        # can surface them.
+        scale_factors: Optional[Any] = None
+        verbose_attr = getattr(getattr(run, "solver", None), "verbose", None)
+        if verbose_attr is not None:
+            scale_factors = getattr(verbose_attr, "_slsqp_scale_factors", None)
+        return cls(
+            run=run,
+            signals=signals_by_name,
+            diagnoses=[],
+            scale_factors=scale_factors,
+        )
 
     # ------------------------------------------------------------------
     # Rendering
@@ -148,6 +168,7 @@ class DebugReport:
         out = io.StringIO()
         self._render_header(out)
         self._render_termination(out)
+        self._render_auto_scaling(out)
         self._render_summary_metrics(out)
         self._render_signals(out)
         self._render_diagnoses(out)
@@ -250,24 +271,144 @@ class DebugReport:
             out.write(wrapped + "\n")
         out.write("\n")
 
+    def _render_auto_scaling(self, out: io.StringIO) -> None:
+        """Render the Auto-scaling section when factors are present.
+
+        The section lists ``s_f``, the min/max/median of ``s_eq`` /
+        ``s_ineq``, the user vs internal ``atol`` pair, and any
+        skipped-row counters.  Skipped because the section sits
+        directly above the summary metrics, the user can immediately
+        see whether the printed metrics live in scaled or user units
+        (per the ``(scaled)`` suffixes added in
+        :meth:`_render_summary_metrics`).
+        """
+        sf = self.scale_factors
+        if sf is None:
+            return
+        try:
+            import numpy as np
+
+            s_f = float(sf.s_f)
+            s_eq = np.asarray(sf.s_eq) if sf.s_eq is not None else np.zeros((0,))
+            s_ineq = np.asarray(sf.s_ineq) if sf.s_ineq is not None else np.zeros((0,))
+            atol_user = float(sf.atol_user)
+            atol_internal = float(sf.atol_internal)
+            target_g = float(sf.target_gradient)
+            max_factor = float(sf.max_factor)
+            n_skipped_eq = int(sf.n_skipped_eq)
+            n_skipped_ineq = int(sf.n_skipped_ineq)
+            skipped_obj = bool(sf.skipped_obj)
+        except (AttributeError, ValueError, TypeError):  # pragma: no cover
+            return
+
+        out.write("Auto-scaling\n")
+        out.write("-" * _REPORT_WIDTH + "\n")
+        suffix = " (skipped: ||grad_f|| < grad_floor)" if skipped_obj else ""
+        out.write(
+            f"  s_f:                       {_fmt_e(s_f)}  "
+            f"(target_gradient={target_g:.3g}, max_factor={max_factor:.3g})"
+            f"{suffix}\n"
+        )
+
+        def _summary(name: str, vec: "np.ndarray", n_skipped: int) -> None:
+            if vec.size == 0:
+                return
+            mn = float(vec.min())
+            mx = float(vec.max())
+            md = float(np.median(vec))
+            out.write(
+                f"  {name} min/max/median:    "
+                f"{_fmt_e(mn)} / {_fmt_e(mx)} / {_fmt_e(md)}  "
+                f"(n_rows={vec.size}, n_skipped={n_skipped})\n"
+            )
+
+        _summary("s_eq  ", s_eq, n_skipped_eq)
+        _summary("s_ineq", s_ineq, n_skipped_ineq)
+        out.write(f"  atol_user:                 {_fmt_e(atol_user)}\n")
+        out.write(
+            f"  atol_internal:             {_fmt_e(atol_internal)}  "
+            "(user-feasibility preserved)\n"
+        )
+        out.write(
+            "  Note: f / |c| / |grad| / |grad_L| metrics below are in "
+            "USER units (unscaled).\n"
+            "        merit / rho / gamma / L-BFGS internals are flagged "
+            "(scaled) where they apply.\n"
+        )
+        out.write("\n")
+
     def _render_summary_metrics(self, out: io.StringIO) -> None:
         run = self.run
         if not run.summaries:
             return
         last = run.summaries[-1]
+        sf = self.scale_factors
+        s_f = float(sf.s_f) if sf is not None else 1.0
+        # ``f``, ``|grad|`` and ``|grad_L|`` scale uniformly by ``s_f``;
+        # ``rel_kkt = ||grad_L|| / max(|L|, 1)`` is *not* uniformly
+        # scaled because the safeguard ``max(|L|, 1)`` clips when the
+        # Lagrangian collapses below 1, breaking the ``s_f`` cancellation.
+        # We surface the scaled value directly; users who care about the
+        # unsafeguarded ratio can divide ``||grad_L||`` by ``|L|``
+        # themselves from the un-scaled fields above.
+        f_user = float(last.f_val) / s_f if s_f != 0 else float(last.f_val)
+        grad_norm_user = (
+            float(last.grad_norm) / s_f if s_f != 0 else float(last.grad_norm)
+        )
+        grad_L_user = (
+            float(last.grad_lagrangian_norm) / s_f
+            if s_f != 0
+            else float(last.grad_lagrangian_norm)
+        )
+        L_user = (
+            float(last.lagrangian_value) / s_f
+            if s_f != 0
+            else float(last.lagrangian_value)
+        )
+        # ``max|c_eq|`` and ``max(0, -c_ineq)`` are per-row scaled by
+        # ``s_eq[i]`` / ``s_ineq[i]`` -- different multipliers per
+        # row -- so a clean unscale would need the per-row violation
+        # vector, which the summary does not store.  We surface the
+        # scaled max with a ``(scaled)`` flag rather than misreport.
+        scaled_active = sf is not None
+        scaled_tag = "(scaled)" if scaled_active else ""
         out.write("Final iterate metrics\n")
         out.write("-" * _REPORT_WIDTH + "\n")
-        out.write(f"  f(x):                  {_fmt_e(last.f_val)}\n")
-        out.write(f"  L1 merit:              {_fmt_e(last.merit)}\n")
-        out.write(f"  Lagrangian L:          {_fmt_e(last.lagrangian_value)}\n")
-        out.write(f"  ||grad||:              {_fmt_e(last.grad_norm)}\n")
-        out.write(f"  ||grad_L||:            {_fmt_e(last.grad_lagrangian_norm)}\n")
-        out.write(f"  ||grad_L||/max(|L|,1): {_fmt_e(last.rel_kkt)}\n")
-        out.write(f"  max|c_eq|:             {_fmt_e(last.max_eq_violation)}\n")
-        out.write(f"  max(0, -c_ineq):       {_fmt_e(last.max_ineq_violation)}\n")
-        out.write(f"  rho (merit penalty):   {_fmt_e(last.merit_penalty)}\n")
+        out.write(f"  f(x):                  {_fmt_e(f_user)}\n")
+        out.write(
+            f"  L1 merit:              {_fmt_e(last.merit)} {scaled_tag}\n"
+            if scaled_active
+            else f"  L1 merit:              {_fmt_e(last.merit)}\n"
+        )
+        out.write(f"  Lagrangian L:          {_fmt_e(L_user)}\n")
+        out.write(f"  ||grad||:              {_fmt_e(grad_norm_user)}\n")
+        out.write(f"  ||grad_L||:            {_fmt_e(grad_L_user)}\n")
+        out.write(
+            f"  ||grad_L||/max(|L|,1): {_fmt_e(last.rel_kkt)} {scaled_tag}\n"
+            if scaled_active
+            else f"  ||grad_L||/max(|L|,1): {_fmt_e(last.rel_kkt)}\n"
+        )
+        out.write(
+            f"  max|c_eq|:             {_fmt_e(last.max_eq_violation)} {scaled_tag}\n"
+            if scaled_active
+            else f"  max|c_eq|:             {_fmt_e(last.max_eq_violation)}\n"
+        )
+        out.write(
+            f"  max(0, -c_ineq):       {_fmt_e(last.max_ineq_violation)} {scaled_tag}\n"
+            if scaled_active
+            else f"  max(0, -c_ineq):       {_fmt_e(last.max_ineq_violation)}\n"
+        )
+        out.write(
+            f"  rho (merit penalty):   {_fmt_e(last.merit_penalty)} {scaled_tag}\n"
+            if scaled_active
+            else f"  rho (merit penalty):   {_fmt_e(last.merit_penalty)}\n"
+        )
         out.write(f"  last alpha:            {_fmt_e(last.last_alpha)}\n")
-        out.write(f"  L-BFGS gamma:          {_fmt_e(last.gamma)}\n")
+        out.write(
+            f"  L-BFGS gamma:          {_fmt_e(last.gamma)} {scaled_tag}\n"
+            if scaled_active
+            else f"  L-BFGS gamma:          {_fmt_e(last.gamma)}\n"
+        )
         out.write(
             f"  L-BFGS diag kappa:     {_fmt_e(last.diag_kappa)} "
             f"(min={_fmt_e(last.min_diag)}, max={_fmt_e(last.max_diag)})\n"
