@@ -960,13 +960,22 @@ Each fired signal carries a single ranking field, `confidence ∈ {low, medium, 
 | Signal | Flavour | Specificity | Threshold |
 | ------ | ------- | ----------- | --------- |
 | `eq_jacobian_rank_deficient` | per-step | specific | `eq_jac_min_sv_est < 1e-8` (cumulative low-water) |
-| `lbfgs_conditioning_extreme` | per-step | ambiguous | `max_diag/min_diag > 1e6` for ≥ 3 consecutive steps |
+| `lbfgs_conditioning_extreme` | per-step | ambiguous | `max_diag/min_diag > 1e6` for ≥ 3 consecutive steps OR a single-step burst above `1e8` |
 | `multiplier_recovery_noise` | end-of-run | specific | textbook noise-floor signature (see `AGENTS.md`) |
-| `line_search_collapse` | end-of-run | ambiguous | `tail_ls_failures > 0` AND `ls_alpha_min < 1e-10` |
+| `line_search_collapse` | end-of-run | ambiguous | `tail_ls_failures > 0` AND `ls_alpha_min <= 10 × 2**-line_search.max_steps` (the LS floor) |
 | `qp_budget_or_pingpong` | end-of-run | generic | `n_qp_budget_exhausted > 0` OR `n_qp_ping_pong > 0` |
 | `merit_oscillation` | end-of-run | generic | `n_merit_regressions > step_count / 10` |
 | `lpeca_overpredicting` | end-of-run | ambiguous | `n_lpeca_capped / step_count > 0.5` OR `n_lpeca_bypassed == step_count` |
 | `infeasible_termination` | end-of-run | specific | termination code ∈ `{infeasible, nonfinite}` OR feasibility never satisfied |
+| `divergence_rollback_triggered` | end-of-run | specific | `divergence_triggered == True` OR `n_divergence_blowups > 0` (best-iterate rollback fired) |
+| `merit_penalty_explosion` | end-of-run | specific | `max(rho)/min(rho) > 1e6` OR a single-step `rho` jump above `1e3` |
+| `penalty_starvation` | end-of-run | specific | `rho` constant for the first `max(5, n_steps // 3)` steps while `max_eq_violation` (or `max_ineq_violation`) grew monotonically by at least `5×` |
+
+The `lbfgs_conditioning_extreme` predicate carries two clauses: the original "streak" (`> 1e6` for 3 consecutive iterations, the same patience the L-BFGS reset chain uses) and a single-step "burst" above `1e8` that catches catastrophic one-shot blow-ups (e.g. `kappa(B0) = 1.1e+09` for a single step before the reset chain clamps back to identity). The streak gate alone misses these because the post-spike identity reset breaks the streak after one step. The fired signal carries `evidence["burst_clause"] == 1` when the burst clause fired, `0` when the streak fired.
+
+The `line_search_collapse` predicate keys on the LS floor `10 × 2**-line_search.max_steps` (≈ `9.5e-6` for the default `LineSearchConfig.max_steps == 20`) rather than a fixed `1e-10` literal: backtracking can never accept an `alpha` below `2**-max_steps` regardless of how badly the QP step misbehaves, so a hard `< 1e-10` threshold could never trip on the default solver. Solvers with a custom `LineSearchConfig.max_steps` get the floor recomputed automatically through `EvalContext`.
+
+The three end-of-run signals `divergence_rollback_triggered`, `merit_penalty_explosion`, and `penalty_starvation` together cover the "feasible-start divergence cascade" failure mode: the run starts at or near feasibility, the Han-Powell penalty update stays starved while feasibility drifts (`penalty_starvation`), the merit-penalty update eventually over-corrects when the drift is noticed (`merit_penalty_explosion`), the resulting QP step poisons the L-BFGS history, the line search collapses, and the best-iterate divergence rollback fires (`divergence_rollback_triggered`). The multi-signal rule `penalty_starvation_cascade` (in `slsqp_jax/diagnostics/playbook.py`) names the chain when both `penalty_starvation` and `merit_penalty_explosion` are present.
 
 The set is append-only; adding a new signal requires (a) one function in `slsqp_jax/diagnostics/signals.py` with a docstring citing the relevant `AGENTS.md` section + the threshold inline, (b) a `register_evaluator(...)` call, and (c) matching `test_signal_<name>_synthetic` + `test_signal_<name>_integration` in `tests/diagnostics/`. The cap-policy enforcement test (`tests/diagnostics/test_registry.py`) fails CI if either test is missing.
 
