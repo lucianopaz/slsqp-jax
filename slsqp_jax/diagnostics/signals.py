@@ -1318,9 +1318,18 @@ def _eval_merit_penalty_explosion(
             "the merit function trying to reconcile mismatched objective "
             "and constraint magnitudes.  The Auto-scaling section of "
             "the report (when present) lists the factors that were "
-            "applied; if the signal still fires under default-on "
-            "auto-scaling, try ``auto_scale='aggressive'`` or supply "
-            "your own scaling.",
+            "applied.",
+            "The new ``auto_scale=True`` (uniform mode, default) uses a "
+            "single shared scalar across all constraint rows -- it "
+            "prevents the cascade without flattening the relative row "
+            "magnitudes.  If your constraints have intentionally "
+            "heterogeneous magnitudes (e.g. a top-level budget plus "
+            "smaller sub-budgets) this is the right mode.  If a single "
+            "constraint row has *vastly* different gradient magnitude "
+            "from the rest, ``auto_scale='balanced'`` (per-row, the "
+            "old default) flattens those rows individually and may "
+            "rescue the run.  ``auto_scale='aggressive'`` raises the "
+            "amplification ceiling for very small-gradient problems.",
         ],
         artifacts={
             "rho_trajectory": np.asarray(rhos, dtype=float),
@@ -1480,9 +1489,19 @@ def _eval_penalty_starvation(
             "magnitude mismatch that triggers penalty starvation is "
             "exactly what gradient-based scaling is designed to fix.  "
             "The Auto-scaling section of the report (when present) "
-            "lists the factors that were applied; if the signal still "
-            "fires under default-on auto-scaling, try "
-            "``auto_scale='aggressive'`` or supply your own scaling.",
+            "lists the factors that were applied.",
+            "The new ``auto_scale=True`` (uniform mode, default) "
+            "preserves the relative row magnitudes between constraints "
+            "while bringing the constraint Jacobian into the same "
+            "range as the objective gradient -- the right choice when "
+            "your constraints encode meaningful inter-row structure "
+            "(e.g. a top-level budget plus smaller sub-budgets).  If "
+            "*one* constraint row has vastly different gradient "
+            "magnitude from the rest and that's not a meaningful "
+            "spread, ``auto_scale='balanced'`` (per-row, the old "
+            "default) flattens those rows individually and may rescue "
+            "the run.  ``auto_scale='aggressive'`` raises the "
+            "amplification ceiling.",
         ],
         artifacts={
             "rho_prefix": np.asarray(
