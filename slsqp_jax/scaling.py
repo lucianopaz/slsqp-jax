@@ -134,34 +134,55 @@ _SCALE_FLOOR = 1e-300
 
 @dataclass(frozen=True)
 class ScalingConfig:
-    """Parameters for :func:`compute_scale_factors_at_x0`.
+    """Parameters for :func:`compute_scale_factors_at_x0` (per-row) and
+    :func:`compute_uniform_scale_factors_at_x0` (uniform).
 
     Attributes:
         target_gradient: Desired ``||grad||_inf`` after scaling.
-            ``s = target_gradient / ||grad||`` (clipped).
-        max_factor: Upper bound on the scale factor itself.  Caps
-            *amplification* (small gradients).  ``max_factor=1.0``
-            means "shrink-only" (KNITRO/IPOPT).  ``max_factor=1e3``
-            (the project default) is "balanced": shrink *or* amplify
-            up to 1000x, which is well below typical AD relative-error
-            noise floors (~1e-12) so amplification cannot promote
-            roundoff to signal under any reasonable AD.
+            ``s = target_gradient / ||grad||`` (clipped).  Under
+            ``uniform=True`` this same target is consumed by both
+            the objective scalar ``s_f`` and the single shared
+            constraint scalar ``s_c``.
+        max_factor: Bound on the scale factor.  Under ``uniform=False``
+            (per-row modes) this is a one-sided amplification cap, so
+            ``s in [eps, max_factor]``; ``max_factor=1.0`` means
+            "shrink-only" (KNITRO/IPOPT).  Under ``uniform=True`` the
+            bound is **symmetric** so ``s in [1/max_factor, max_factor]``
+            and the value must satisfy ``max_factor >= 1.0``; passing
+            ``max_factor=1.0`` under uniform disables scaling entirely
+            and emits a UserWarning.  The project default ``max_factor=1e3``
+            is well below typical AD relative-error noise floors
+            (~1e-12) so amplification cannot promote roundoff to
+            signal under any reasonable AD.
         grad_floor: Rows whose ``||grad||_inf`` falls below this
             value are *skipped* (left at ``s = 1.0``).  ``1e-12`` is
             the right default: it is comfortably above ``eps`` so
             machine-zero is caught, but small enough that genuinely
             tiny-but-non-degenerate gradients still get scaled.
+        uniform: When ``True``, apply a single shared scalar ``s_c``
+            across **all** constraint rows (equality and inequality
+            unioned) preserving inter-row ratios; clip ``s_c`` and
+            ``s_f`` symmetrically by ``max_factor``; set
+            ``atol_internal = s_c * atol_user`` exactly (no
+            ``min(., 1.0)`` cap, so ``atol_internal`` can exceed
+            ``atol_user``).  When ``False`` (the legacy default) each
+            constraint row gets its own factor and ``atol_internal =
+            atol_user * min(min(s_eq), min(s_ineq), 1.0)``.
     """
 
     target_gradient: float = 1.0
     max_factor: float = 1e3
     grad_floor: float = 1e-12
+    uniform: bool = False
 
 
 # Modes accepted by :func:`resolve_scaling_mode`.  ``True`` resolves
-# to ``"balanced"`` and is the new default for the user-facing
+# to ``"uniform"`` and is the default for the user-facing
 # ``minimize_like_scipy`` / ``auto_scaled_minimise`` entry points.
+# ``"balanced"`` and the other per-row modes remain available for
+# users who want the old row-flattening behavior.
 _MODE_TABLE: dict[str, ScalingConfig] = {
+    "uniform": ScalingConfig(target_gradient=1.0, max_factor=1e3, uniform=True),
     "balanced": ScalingConfig(target_gradient=1.0, max_factor=1e3),
     "knitro": ScalingConfig(target_gradient=1.0, max_factor=1.0),
     "ipopt": ScalingConfig(target_gradient=100.0, max_factor=1.0),
@@ -178,9 +199,10 @@ def resolve_scaling_mode(
     """Map a user-facing ``auto_scale`` argument to a :class:`ScalingConfig`.
 
     Args:
-        mode: ``True`` -> ``"balanced"``, ``False`` -> ``None``
-            (no scaling), or one of ``"balanced"``, ``"knitro"``,
-            ``"ipopt"``, ``"aggressive"``.
+        mode: ``True`` -> ``"uniform"`` (the default), ``False`` ->
+            ``None`` (no scaling), or one of the string aliases
+            ``"uniform"``, ``"balanced"``, ``"knitro"``, ``"ipopt"``,
+            ``"aggressive"``.
         target_gradient: Optional explicit override of the mode's
             default target.  ``None`` uses the mode default.
         max_factor: Optional explicit override of the mode's default
@@ -192,11 +214,12 @@ def resolve_scaling_mode(
     Raises:
         ValueError: If ``mode`` is a string that is not one of the
             recognised aliases.
+        TypeError: If ``mode`` is neither a bool nor a string.
     """
     if mode is False:
         return None
     if mode is True:
-        key = "balanced"
+        key = "uniform"
     elif isinstance(mode, str):
         key = mode.lower()
     else:
@@ -228,24 +251,31 @@ def resolve_scaling_mode(
 
 @dataclass(frozen=True)
 class ScaleFactors:
-    """The factors :func:`compute_scale_factors_at_x0` returned.
+    """The factors :func:`compute_scale_factors_at_x0` (per-row) or
+    :func:`compute_uniform_scale_factors_at_x0` (uniform) returned.
 
     Attributes:
         s_f: Scalar objective-scaling factor (``f_scaled = s_f * f``).
             ``1.0`` when no scaling was applied or the objective
             gradient was below ``grad_floor``.
-        s_eq: Per-row equality-constraint factors, shape
-            ``(m_eq,)``.  Empty array when ``m_eq == 0``.
-        s_ineq: Per-row inequality-constraint factors, shape
-            ``(m_ineq,)``.  Empty array when ``m_ineq == 0``.  Note
-            that this is the *general* inequality count -- bound
-            constraints are scaled separately (and trivially) by the
-            bound-handling machinery.
+        s_eq: Equality-constraint factors, shape ``(m_eq,)``.  Empty
+            array when ``m_eq == 0``.  Per-row varying under
+            ``uniform=False``; constant-valued (every entry equals
+            the shared ``s_c``) under ``uniform=True``.
+        s_ineq: Inequality-constraint factors, shape ``(m_ineq,)``.
+            Empty array when ``m_ineq == 0``.  Note that this is the
+            *general* inequality count -- bound constraints are
+            scaled separately (and trivially) by the bound-handling
+            machinery.  Per-row under ``uniform=False``; constant
+            and equal to the same shared ``s_c`` as ``s_eq`` under
+            ``uniform=True``.
         atol_user: The user-supplied feasibility tolerance.
         atol_internal: The compensated tolerance handed to the inner
-            solver.  ``atol_internal = atol_user * min(s.min(), 1.0)``
-            so that ``|c_scaled| <= atol_internal`` implies
-            ``|c_user| <= atol_user`` for the worst-scaled row.
+            solver.  Under ``uniform=False`` this is
+            ``atol_user * min(min(s_eq), min(s_ineq), 1.0)`` (worst-row
+            conservative).  Under ``uniform=True`` this is
+            ``s_c * atol_user`` exactly (can exceed ``atol_user`` when
+            ``s_c > 1``).
         target_gradient: Echo of the :class:`ScalingConfig` field
             actually used.
         max_factor: Echo of the :class:`ScalingConfig` field
@@ -253,11 +283,19 @@ class ScaleFactors:
         grad_floor: Echo of the :class:`ScalingConfig` field
             actually used.
         n_skipped_eq: Number of equality rows whose
-            ``||grad_eq[i]||_inf`` was below ``grad_floor``.
+            ``||grad_eq[i]||_inf`` was below ``grad_floor``.  Always
+            ``0`` under ``uniform=True`` (uniform mode does not
+            skip individual rows).
         n_skipped_ineq: Number of inequality rows whose
-            ``||grad_ineq[i]||_inf`` was below ``grad_floor``.
+            ``||grad_ineq[i]||_inf`` was below ``grad_floor``.  Always
+            ``0`` under ``uniform=True``.
         skipped_obj: ``True`` when ``||grad_f||_inf`` was below
             ``grad_floor`` (a :class:`UserWarning` was emitted).
+        uniform: ``True`` when the factors were produced by
+            :func:`compute_uniform_scale_factors_at_x0` (single
+            shared ``s_c`` across constraints, symmetric ``max_factor``
+            clipping, exact-equivalence ``atol_internal``).  ``False``
+            for the per-row :func:`compute_scale_factors_at_x0`.
     """
 
     s_f: float
@@ -271,6 +309,7 @@ class ScaleFactors:
     n_skipped_eq: int = 0
     n_skipped_ineq: int = 0
     skipped_obj: bool = False
+    uniform: bool = False
 
 
 @dataclass(frozen=True)
@@ -307,15 +346,37 @@ class ScaledProblem:
 def _scale_one(
     grad_inf: float, *, target_gradient: float, max_factor: float, grad_floor: float
 ) -> tuple[float, bool]:
-    """Compute one scale factor from a gradient infinity-norm.
+    """Compute one scale factor from a gradient infinity-norm (per-row mode).
 
     Returns ``(s, skipped)`` where ``skipped`` is ``True`` iff the
-    row was below the floor and ``s = 1.0`` was emitted.
+    row was below the floor and ``s = 1.0`` was emitted.  Uses the
+    legacy one-sided clipping ``s in [_SCALE_FLOOR, max_factor]``.
     """
     if grad_inf < grad_floor:
         return 1.0, True
     s = target_gradient / max(grad_inf, _SCALE_FLOOR)
     s = float(np.clip(s, _SCALE_FLOOR, max_factor))
+    return s, False
+
+
+def _scale_one_symmetric(
+    grad_inf: float, *, target_gradient: float, max_factor: float, grad_floor: float
+) -> tuple[float, bool]:
+    """Compute one scale factor with **symmetric** clipping (uniform mode).
+
+    Returns ``(s, skipped)`` where ``skipped`` is ``True`` iff
+    ``grad_inf < grad_floor`` (then ``s = 1.0``).  Otherwise
+    ``s = clip(target_gradient / grad_inf, 1/max_factor, max_factor)``,
+    i.e. the scale can amplify *or* shrink by up to ``max_factor``.
+
+    The caller is expected to have validated ``max_factor >= 1.0`` so
+    the symmetric interval is non-empty.
+    """
+    if grad_inf < grad_floor:
+        return 1.0, True
+    s = target_gradient / max(grad_inf, _SCALE_FLOOR)
+    lower = 1.0 / max_factor
+    s = float(np.clip(s, lower, max_factor))
     return s, False
 
 
@@ -507,6 +568,220 @@ def compute_scale_factors_at_x0(
     )
 
 
+def _evaluate_obj_grad_inf_norm(
+    fn: Callable,
+    x0: jax.Array,
+    args: Any,
+    has_aux: bool,
+    obj_grad_fn: Optional[GradFn],
+) -> float:
+    """Evaluate ``||grad f(x0)||_inf`` via user-supplied grad or AD fallback."""
+    if obj_grad_fn is not None:
+        grad_f = jnp.asarray(obj_grad_fn(x0, args))
+    else:
+        if has_aux:
+
+            def _scalar_fn(x: jax.Array) -> jax.Array:
+                return fn(x, args)[0]
+        else:
+
+            def _scalar_fn(x: jax.Array) -> jax.Array:
+                return fn(x, args)
+
+        grad_f = jax.grad(_scalar_fn)(x0)
+    return _grad_inf_norm(jnp.asarray(grad_f))
+
+
+def _evaluate_constraint_row_norms(
+    constraint_fn: Optional[ConstraintFn],
+    jac_fn: Optional[JacobianFn],
+    x0: jax.Array,
+    args: Any,
+) -> np.ndarray:
+    """Per-row inf-norms of a constraint Jacobian at ``x0`` (empty if absent)."""
+    if constraint_fn is None:
+        return np.zeros((0,), dtype=float)
+    if jac_fn is not None:
+        jac = jnp.asarray(jac_fn(x0, args))
+    else:
+        jac = jax.jacrev(lambda x: constraint_fn(x, args))(x0)
+    jac_arr = jnp.asarray(jac)
+    if jac_arr.ndim == 1:
+        jac_arr = jac_arr[None, :]
+    return _row_inf_norms(jac_arr)
+
+
+def compute_uniform_scale_factors_at_x0(
+    fn: Callable,
+    x0: jax.Array,
+    args: Any,
+    has_aux: bool,
+    *,
+    eq_constraint_fn: Optional[ConstraintFn] = None,
+    ineq_constraint_fn: Optional[ConstraintFn] = None,
+    obj_grad_fn: Optional[GradFn] = None,
+    eq_jac_fn: Optional[JacobianFn] = None,
+    ineq_jac_fn: Optional[JacobianFn] = None,
+    target_gradient: float = 1.0,
+    max_factor: float = 1e3,
+    grad_floor: float = 1e-12,
+    atol_user: float = 1e-6,
+) -> ScaleFactors:
+    """Evaluate gradients at ``x0`` and return **uniform** scale factors.
+
+    Uniform mode applies a single shared scalar ``s_c`` to every
+    constraint row (equality and inequality unioned) and an
+    independent scalar ``s_f`` to the objective; both are clipped
+    symmetrically by ``max_factor`` so they can amplify *or* shrink.
+    The feasibility tolerance is propagated as
+    ``atol_internal = s_c * atol_user`` exactly, so the inner solver's
+    feasibility test corresponds 1-1 to the user-unit test
+    ``|c_user[i]| <= atol_user`` regardless of which direction
+    ``s_c`` moved.
+
+    Args:
+        fn: Objective.  ``(x, args) -> value`` or
+            ``(x, args) -> (value, aux)`` when ``has_aux=True``.
+        x0: Initial iterate.
+        args: Extra payload threaded through ``fn`` / constraints.
+        has_aux: Whether ``fn`` returns ``(value, aux)``.
+        eq_constraint_fn: Optional equality constraint function.
+        ineq_constraint_fn: Optional inequality constraint function.
+        obj_grad_fn: Optional user-supplied objective gradient.
+            When ``None`` we fall back to ``jax.grad(fn)``.
+        eq_jac_fn: Optional user-supplied equality Jacobian.
+            ``jax.jacrev`` fallback.
+        ineq_jac_fn: Optional user-supplied inequality Jacobian.
+            ``jax.jacrev`` fallback.
+        target_gradient: See :class:`ScalingConfig`.  Consumed by both
+            ``s_f`` and ``s_c`` derivations.
+        max_factor: See :class:`ScalingConfig`.  Must be ``>= 1.0``.
+            ``max_factor == 1.0`` is legal but disables scaling and
+            emits a :class:`UserWarning`.
+        grad_floor: See :class:`ScalingConfig`.
+        atol_user: User-perceived feasibility tolerance.  The
+            returned :attr:`ScaleFactors.atol_internal` is
+            ``s_c * atol_user`` and may exceed ``atol_user`` when
+            ``s_c > 1``.
+
+    Returns:
+        A :class:`ScaleFactors` instance with ``uniform=True``,
+        ``s_eq = jnp.full((m_eq,), s_c)``, and
+        ``s_ineq = jnp.full((m_ineq,), s_c)``.
+
+    Raises:
+        ValueError: If ``max_factor < 1.0`` (the symmetric interval
+            ``[1/max_factor, max_factor]`` would be empty).
+
+    Notes:
+        Emits a :class:`UserWarning` when ``||grad_f(x0)||_inf`` is
+        below ``grad_floor`` (``s_f = 1.0``), when every constraint
+        row's gradient inf-norm is below ``grad_floor``
+        (``s_c = 1.0``), or when ``max_factor == 1.0`` (scaling
+        disabled).  No per-row warnings are emitted under uniform
+        mode -- the cross-row max dominates the per-row check, and
+        per-row magnitudes are intentionally preserved.
+    """
+    if max_factor < 1.0:
+        raise ValueError(
+            f"compute_uniform_scale_factors_at_x0: max_factor must be >= 1.0 "
+            f"for uniform mode (the symmetric clipping interval "
+            f"[1/max_factor, max_factor] would otherwise be empty); got "
+            f"max_factor={max_factor!r}.  For shrink-only per-row scaling "
+            "pass auto_scale='knitro' instead."
+        )
+    if max_factor == 1.0:
+        warnings.warn(
+            "auto_scale: uniform mode with max_factor=1.0 disables "
+            "scaling entirely (s_f and s_c are pinned to 1.0).  "
+            "Consider auto_scale='knitro' for shrink-only per-row "
+            "behavior, or a larger max_factor to allow scaling.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    x0 = jnp.asarray(x0, dtype=float)
+
+    grad_f_inf = _evaluate_obj_grad_inf_norm(fn, x0, args, has_aux, obj_grad_fn)
+    s_f, skipped_obj = _scale_one_symmetric(
+        grad_f_inf,
+        target_gradient=target_gradient,
+        max_factor=max_factor,
+        grad_floor=grad_floor,
+    )
+    if skipped_obj:
+        warnings.warn(
+            "auto_scale: ||grad_f(x0)||_inf = "
+            f"{grad_f_inf:.3e} is below grad_floor = "
+            f"{grad_floor:.0e}; the objective will not be scaled "
+            "(s_f = 1.0).  Either pick a different starting point "
+            "or pass auto_scale=False and supply your own scaling.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    eq_row_norms = _evaluate_constraint_row_norms(eq_constraint_fn, eq_jac_fn, x0, args)
+    ineq_row_norms = _evaluate_constraint_row_norms(
+        ineq_constraint_fn, ineq_jac_fn, x0, args
+    )
+    m_eq = int(eq_row_norms.shape[0])
+    m_ineq = int(ineq_row_norms.shape[0])
+
+    if m_eq + m_ineq == 0:
+        # No constraints: s_c trivially 1.0, atol_internal = atol_user.
+        s_c = 1.0
+        s_eq = jnp.zeros((0,), dtype=float)
+        s_ineq = jnp.zeros((0,), dtype=float)
+        atol_internal = float(atol_user)
+    else:
+        # ``max_row_norm`` over the union of equality + general-inequality
+        # rows.  This is the value that drives ``s_c``; preserving the
+        # *ratio* between rows is the whole point of uniform mode, so
+        # individual rows below ``grad_floor`` do not get special
+        # treatment -- they ride the same ``s_c`` as everything else.
+        if m_eq > 0 and m_ineq > 0:
+            max_row_norm = float(np.maximum(eq_row_norms.max(), ineq_row_norms.max()))
+        elif m_eq > 0:
+            max_row_norm = float(eq_row_norms.max())
+        else:
+            max_row_norm = float(ineq_row_norms.max())
+
+        if max_row_norm < grad_floor:
+            warnings.warn(
+                "auto_scale: all constraint Jacobian row inf-norms at "
+                f"x0 are below grad_floor = {grad_floor:.0e} "
+                f"(max = {max_row_norm:.3e}); constraints will not be "
+                "scaled (s_c = 1.0).  Either pick a different starting "
+                "point or pass auto_scale=False and supply your own "
+                "scaling.",
+                UserWarning,
+                stacklevel=2,
+            )
+            s_c = 1.0
+        else:
+            s_c_raw = target_gradient / max(max_row_norm, _SCALE_FLOOR)
+            s_c = float(np.clip(s_c_raw, 1.0 / max_factor, max_factor))
+
+        s_eq = jnp.full((m_eq,), s_c, dtype=float)
+        s_ineq = jnp.full((m_ineq,), s_c, dtype=float)
+        atol_internal = float(s_c) * float(atol_user)
+
+    return ScaleFactors(
+        s_f=float(s_f),
+        s_eq=s_eq,
+        s_ineq=s_ineq,
+        atol_user=float(atol_user),
+        atol_internal=atol_internal,
+        target_gradient=float(target_gradient),
+        max_factor=float(max_factor),
+        grad_floor=float(grad_floor),
+        n_skipped_eq=0,
+        n_skipped_ineq=0,
+        skipped_obj=skipped_obj,
+        uniform=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Wrapping helpers
 # ---------------------------------------------------------------------------
@@ -608,33 +883,52 @@ def auto_scaled_problem(
 ) -> ScaledProblem:
     """Build a :class:`ScaledProblem` from the user's callables and ``x0``.
 
-    Computes scale factors via
-    :func:`compute_scale_factors_at_x0`, wraps every supplied
-    callable, and returns the bundle.  Callables left as ``None``
-    stay as ``None`` -- the SLSQP solver will fall back to its AD
-    paths, which automatically pick up the scaling from the wrapped
-    ``fn`` / ``constraint_fn`` callables.
+    Computes scale factors via either :func:`compute_scale_factors_at_x0`
+    (when ``scaling_config.uniform`` is ``False`` — the legacy per-row
+    behavior) or :func:`compute_uniform_scale_factors_at_x0` (when
+    ``True`` — a single shared scalar across all constraint rows),
+    wraps every supplied callable, and returns the bundle.  Callables
+    left as ``None`` stay as ``None`` -- the SLSQP solver will fall
+    back to its AD paths, which automatically pick up the scaling
+    from the wrapped ``fn`` / ``constraint_fn`` callables.
 
     The returned :attr:`ScaledProblem.fn` adheres to the
     ``has_aux=True`` convention (returning ``(value, aux)`` even when
     the user's ``fn`` returned just a value), matching what
     ``optimistix.minimise`` expects on the SLSQP path.
     """
-    factors = compute_scale_factors_at_x0(
-        fn=fn,
-        x0=x0,
-        args=args,
-        has_aux=has_aux,
-        eq_constraint_fn=eq_constraint_fn,
-        ineq_constraint_fn=ineq_constraint_fn,
-        obj_grad_fn=obj_grad_fn,
-        eq_jac_fn=eq_jac_fn,
-        ineq_jac_fn=ineq_jac_fn,
-        target_gradient=scaling_config.target_gradient,
-        max_factor=scaling_config.max_factor,
-        grad_floor=scaling_config.grad_floor,
-        atol_user=atol_user,
-    )
+    if scaling_config.uniform:
+        factors = compute_uniform_scale_factors_at_x0(
+            fn=fn,
+            x0=x0,
+            args=args,
+            has_aux=has_aux,
+            eq_constraint_fn=eq_constraint_fn,
+            ineq_constraint_fn=ineq_constraint_fn,
+            obj_grad_fn=obj_grad_fn,
+            eq_jac_fn=eq_jac_fn,
+            ineq_jac_fn=ineq_jac_fn,
+            target_gradient=scaling_config.target_gradient,
+            max_factor=scaling_config.max_factor,
+            grad_floor=scaling_config.grad_floor,
+            atol_user=atol_user,
+        )
+    else:
+        factors = compute_scale_factors_at_x0(
+            fn=fn,
+            x0=x0,
+            args=args,
+            has_aux=has_aux,
+            eq_constraint_fn=eq_constraint_fn,
+            ineq_constraint_fn=ineq_constraint_fn,
+            obj_grad_fn=obj_grad_fn,
+            eq_jac_fn=eq_jac_fn,
+            ineq_jac_fn=ineq_jac_fn,
+            target_gradient=scaling_config.target_gradient,
+            max_factor=scaling_config.max_factor,
+            grad_floor=scaling_config.grad_floor,
+            atol_user=atol_user,
+        )
 
     fn_scaled = _wrap_objective(fn, factors.s_f, has_aux)
     eq_fn_scaled = (
@@ -939,13 +1233,31 @@ def wrap_verbose_for_scaling(
     # print to ``stderr`` via ``warnings``-free path; the verbose
     # printer itself uses ``jax.debug.print``.
     s_f = factors.s_f
-    s_eq_min = float(jnp.min(factors.s_eq)) if factors.s_eq.size > 0 else 1.0
-    s_ineq_min = float(jnp.min(factors.s_ineq)) if factors.s_ineq.size > 0 else 1.0
-    preamble = (
-        f"[auto-scale] s_f={s_f:.3e}, "
-        f"min(s_eq)={s_eq_min:.3e}, min(s_ineq)={s_ineq_min:.3e}; "
-        "merit/rho/gamma/L-BFGS columns are in scaled units (suffix '(s)')."
-    )
+    if factors.uniform:
+        # Under uniform mode ``s_eq`` and ``s_ineq`` are constant-valued
+        # and equal to the same shared scalar ``s_c``; collapse the
+        # display to a single value.  When neither group has rows
+        # ``s_c`` is the trivial 1.0.
+        if factors.s_eq.size > 0:
+            s_c = float(factors.s_eq[0])
+        elif factors.s_ineq.size > 0:
+            s_c = float(factors.s_ineq[0])
+        else:
+            s_c = 1.0
+        preamble = (
+            f"[auto-scale] (uniform) s_f={s_f:.3e}, s_c={s_c:.3e}, "
+            f"atol_internal={factors.atol_internal:.3e} "
+            f"(atol_user={factors.atol_user:.3e}); "
+            "merit/rho/gamma/L-BFGS columns are in scaled units (suffix '(s)')."
+        )
+    else:
+        s_eq_min = float(jnp.min(factors.s_eq)) if factors.s_eq.size > 0 else 1.0
+        s_ineq_min = float(jnp.min(factors.s_ineq)) if factors.s_ineq.size > 0 else 1.0
+        preamble = (
+            f"[auto-scale] s_f={s_f:.3e}, "
+            f"min(s_eq)={s_eq_min:.3e}, min(s_ineq)={s_ineq_min:.3e}; "
+            "merit/rho/gamma/L-BFGS columns are in scaled units (suffix '(s)')."
+        )
     # Precompute the "needs (s) suffix" decision once on the host.
     # ``factors`` is invariant across the run, so reading its array
     # fields is safe here (eager) but would crash inside the jitted
@@ -1042,13 +1354,20 @@ def auto_scaled_minimise(
             replaced with their scaled counterparts.
         x0: Initial iterate.
         args: Extra payload threaded through ``fn`` / constraints.
-        auto_scale: ``True`` (default) -> ``"balanced"`` mode.
-            ``False`` -> no scaling (passthrough).  String -> mode
-            name (see :func:`resolve_scaling_mode`).
+        auto_scale: ``True`` (default) -> ``"uniform"`` mode (a
+            single shared ``s_c`` across all constraint rows +
+            independent ``s_f`` for the objective, both symmetrically
+            clipped by ``max_factor``).  ``False`` -> no scaling
+            (passthrough).  String -> explicit mode name; pass
+            ``"balanced"`` to recover the legacy per-row default.
+            See :func:`resolve_scaling_mode` for the full table.
         auto_scale_target_gradient: Optional explicit target
-            gradient override.
+            gradient override.  Under ``uniform`` mode this is
+            consumed by both ``s_f`` and ``s_c`` derivations.
         auto_scale_max_factor: Optional explicit max-factor
-            override.
+            override.  Under ``uniform`` mode the symmetric bound
+            requires ``max_factor >= 1.0`` (smaller raises
+            ``ValueError``; ``== 1.0`` warns).
         has_aux: Whether ``fn`` returns ``(value, aux)``.
         options: Forwarded to ``optx.minimise``.
         max_steps: Forwarded to ``optx.minimise``.
@@ -1060,6 +1379,9 @@ def auto_scaled_minimise(
         An :class:`optx.Solution`; when scaling was applied, the
         ``stats`` dict carries ``scale_factors`` and the ``_user``
         suffixed fields documented on :func:`unscale_solution`.
+        Under ``uniform`` mode the ``ScaleFactors`` instance has
+        ``uniform=True`` and ``s_eq`` / ``s_ineq`` constant-valued
+        and equal to the same shared ``s_c``.
     """
     from slsqp_jax.slsqp import SLSQP
 
@@ -1233,6 +1555,7 @@ __all__ = [
     "auto_scaled_minimise",
     "auto_scaled_problem",
     "compute_scale_factors_at_x0",
+    "compute_uniform_scale_factors_at_x0",
     "resolve_scaling_mode",
     "unscale_solution",
     "wrap_verbose_for_scaling",

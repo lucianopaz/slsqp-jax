@@ -898,30 +898,60 @@ def minimize_like_scipy(
         Automatic problem scaling at the initial point (gradient-based,
         IPOPT/KNITRO-style).  **On by default** as of this release.
 
-        * ``True`` (default) -> ``"balanced"`` (``target_gradient=1.0,
-          max_factor=1e3``).  Both shrinks (when ``||grad|| > 1``)
-          and amplifies (up to 1000x, when ``||grad|| < 1``).
-          Idempotent on well-scaled problems where ``||grad||=1``;
-          fully fixes the documented ``||J_eq|| >> ||grad_f||``
-          divergence cascade.  The ``1e3`` cap keeps amplification
-          well below typical AD relative-error noise floors.
-        * ``False`` -> no wrapping (previous behaviour).
+        * ``True`` (default) -> ``"uniform"`` (``target_gradient=1.0,
+          max_factor=1e3, uniform=True``).  A single shared scalar
+          ``s_c`` is applied to *every* constraint row (equality +
+          general inequality) and a separate ``s_f`` to the objective,
+          both **symmetrically** clipped to
+          ``[1/max_factor, max_factor]``.  Preserves inter-row
+          magnitude ratios (the right default for budget-style
+          problems where one constraint is intentionally orders of
+          magnitude larger than the others); fully fixes the
+          documented ``||J_eq|| >> ||grad_f||`` divergence cascade.
+          Note that ``atol_internal = s_c * atol_user`` (no
+          ``min(., 1.0)`` cap, so the feasibility tolerance handed
+          to the inner solver can *exceed* ``atol_user`` when
+          ``s_c > 1``).
+        * ``"balanced"`` -> ``target_gradient=1.0, max_factor=1e3,
+          uniform=False``.  The legacy per-row default.  Each
+          constraint row gets its own factor driving
+          ``||grad c_i||_inf -> 1``.  Flattens inter-row magnitudes;
+          opt-in when one row's gradient is *vastly* out of band and
+          that's not a meaningful spread.
+        * ``False`` -> no wrapping (pre-feature behaviour).
         * ``"knitro"`` -> ``target=1.0, max_factor=1.0`` (strict
-          shrink-only; opt-in for users who want zero amplification).
+          shrink-only per-row; opt-in for users who want zero
+          amplification).
         * ``"ipopt"`` -> ``target=100.0, max_factor=1.0`` (very
-          conservative; may not fix all cascades).
-        * ``"aggressive"`` -> ``target=1.0, max_factor=1e6`` (pushes
-          amplification to the noise-floor limit).
+          conservative per-row; may not fix all cascades).
+        * ``"aggressive"`` -> ``target=1.0, max_factor=1e6``
+          (per-row, pushes amplification to the noise-floor limit).
 
         When scaling is applied, ``sol.stats`` carries a
         ``scale_factors`` entry plus ``_user``-suffixed copies of the
         multiplier vectors and the Lagrangian gradient norm.  ``atol``
         is auto-compensated so the user-perceived feasibility
-        tolerance is preserved regardless of the constraint shrink.
+        tolerance is preserved (uniform mode does this via
+        ``atol_internal = s_c * atol_user``; per-row modes via
+        ``atol_internal = atol_user * min(min(s_eq), min(s_ineq),
+        1.0)``).
     auto_scale_target_gradient
         Optional explicit override of the mode's ``target_gradient``.
+        Under ``uniform`` mode this value is consumed by both the
+        ``s_f`` derivation (against ``||grad_f||_inf``) and the
+        ``s_c`` derivation (against the cross-row max
+        ``max_i ||grad c_i||_inf``); under per-row modes it drives
+        every row's individual factor.
     auto_scale_max_factor
         Optional explicit override of the mode's ``max_factor``.
+        Under ``uniform`` mode the bound is **symmetric** so the
+        scale factor lives in ``[1/max_factor, max_factor]`` and
+        the value must satisfy ``max_factor >= 1.0`` (smaller
+        raises ``ValueError``; ``max_factor == 1.0`` is legal but
+        emits a ``UserWarning`` because it disables scaling).
+        Under per-row modes the bound is one-sided
+        (``s in [eps, max_factor]``); ``max_factor == 1.0`` means
+        shrink-only.
 
     Returns
     -------

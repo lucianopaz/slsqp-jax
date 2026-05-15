@@ -298,36 +298,66 @@ class DebugReport:
             n_skipped_eq = int(sf.n_skipped_eq)
             n_skipped_ineq = int(sf.n_skipped_ineq)
             skipped_obj = bool(sf.skipped_obj)
+            uniform = bool(getattr(sf, "uniform", False))
         except (AttributeError, ValueError, TypeError):  # pragma: no cover
             return
 
         out.write("Auto-scaling\n")
         out.write("-" * _REPORT_WIDTH + "\n")
+        mode_tag = " (uniform)" if uniform else ""
         suffix = " (skipped: ||grad_f|| < grad_floor)" if skipped_obj else ""
         out.write(
-            f"  s_f:                       {_fmt_e(s_f)}  "
+            f"  s_f:                       {_fmt_e(s_f)}{mode_tag}  "
             f"(target_gradient={target_g:.3g}, max_factor={max_factor:.3g})"
             f"{suffix}\n"
         )
 
-        def _summary(name: str, vec: "np.ndarray", n_skipped: int) -> None:
-            if vec.size == 0:
-                return
-            mn = float(vec.min())
-            mx = float(vec.max())
-            md = float(np.median(vec))
+        if uniform:
+            # Under uniform mode every row carries the same shared
+            # scalar ``s_c``; collapse the min/max/median display to a
+            # single line.  The reader can confirm scale-preservation
+            # at a glance instead of having to compare three numbers.
+            if s_eq.size > 0:
+                s_c_val = float(s_eq[0])
+                eq_label = f" (m_eq={s_eq.size})"
+            elif s_ineq.size > 0:
+                s_c_val = float(s_ineq[0])
+                eq_label = ""
+            else:
+                s_c_val = 1.0
+                eq_label = " (no constraints)"
+            n_general_ineq = s_ineq.size
+            ineq_label = f" (m_ineq={n_general_ineq})" if n_general_ineq > 0 else ""
             out.write(
-                f"  {name} min/max/median:    "
-                f"{_fmt_e(mn)} / {_fmt_e(mx)} / {_fmt_e(md)}  "
-                f"(n_rows={vec.size}, n_skipped={n_skipped})\n"
+                f"  s_c (shared):              {_fmt_e(s_c_val)}"
+                f"{eq_label}{ineq_label}\n"
             )
+        else:
 
-        _summary("s_eq  ", s_eq, n_skipped_eq)
-        _summary("s_ineq", s_ineq, n_skipped_ineq)
+            def _summary(name: str, vec: "np.ndarray", n_skipped: int) -> None:
+                if vec.size == 0:
+                    return
+                mn = float(vec.min())
+                mx = float(vec.max())
+                md = float(np.median(vec))
+                out.write(
+                    f"  {name} min/max/median:    "
+                    f"{_fmt_e(mn)} / {_fmt_e(mx)} / {_fmt_e(md)}  "
+                    f"(n_rows={vec.size}, n_skipped={n_skipped})\n"
+                )
+
+            _summary("s_eq  ", s_eq, n_skipped_eq)
+            _summary("s_ineq", s_ineq, n_skipped_ineq)
         out.write(f"  atol_user:                 {_fmt_e(atol_user)}\n")
+        if uniform:
+            atol_note = (
+                "(uniform: atol_internal = s_c * atol_user; "
+                "may exceed atol_user when s_c > 1)"
+            )
+        else:
+            atol_note = "(user-feasibility preserved)"
         out.write(
-            f"  atol_internal:             {_fmt_e(atol_internal)}  "
-            "(user-feasibility preserved)\n"
+            f"  atol_internal:             {_fmt_e(atol_internal)}  {atol_note}\n"
         )
         out.write(
             "  Note: f / |c| / |grad| / |grad_L| metrics below are in "

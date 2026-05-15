@@ -20,6 +20,7 @@ from slsqp_jax import (
     ScaleFactors,
     auto_scaled_minimise,
     compute_scale_factors_at_x0,
+    compute_uniform_scale_factors_at_x0,
     minimize_like_scipy,
     resolve_scaling_mode,
     wrap_verbose_for_scaling,
@@ -31,25 +32,38 @@ from slsqp_jax import (
 
 
 def test_resolve_scaling_mode_aliases() -> None:
-    """``True`` resolves to ``"balanced"``; ``False`` to ``None``."""
+    """``True`` resolves to ``"uniform"``; ``False`` to ``None``;
+    per-row modes remain available via their string aliases."""
     cfg_true = resolve_scaling_mode(True)
-    cfg_balanced = resolve_scaling_mode("balanced")
-    assert cfg_true == cfg_balanced
+    cfg_uniform = resolve_scaling_mode("uniform")
+    assert cfg_true == cfg_uniform
     assert cfg_true.target_gradient == 1.0
     assert cfg_true.max_factor == 1e3
+    assert cfg_true.uniform is True
+
+    cfg_balanced = resolve_scaling_mode("balanced")
+    assert cfg_balanced.target_gradient == 1.0
+    assert cfg_balanced.max_factor == 1e3
+    assert cfg_balanced.uniform is False
+    # Sanity: balanced and uniform differ only in the ``uniform`` flag
+    # at default settings (same target/max_factor/grad_floor).
+    assert cfg_true != cfg_balanced
 
     assert resolve_scaling_mode(False) is None
 
     cfg_knitro = resolve_scaling_mode("knitro")
     assert cfg_knitro.max_factor == 1.0
     assert cfg_knitro.target_gradient == 1.0
+    assert cfg_knitro.uniform is False
 
     cfg_ipopt = resolve_scaling_mode("ipopt")
     assert cfg_ipopt.target_gradient == 100.0
     assert cfg_ipopt.max_factor == 1.0
+    assert cfg_ipopt.uniform is False
 
     cfg_aggr = resolve_scaling_mode("aggressive")
     assert cfg_aggr.max_factor == 1e6
+    assert cfg_aggr.uniform is False
 
 
 def test_resolve_scaling_mode_unknown_raises() -> None:
@@ -57,6 +71,299 @@ def test_resolve_scaling_mode_unknown_raises() -> None:
         resolve_scaling_mode("foobar")
     with pytest.raises(TypeError):
         resolve_scaling_mode(1)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Uniform-mode unit tests (compute_uniform_scale_factors_at_x0)
+# ---------------------------------------------------------------------------
+
+
+def _uniform_problem(
+    eq_rows: list[float] | None = None,
+    ineq_rows: list[float] | None = None,
+    *,
+    obj_grad_norm: float = 1.0,
+    n: int = 3,
+):
+    """Build a toy uniform-test problem with one row per requested norm.
+
+    Each constraint row ``r`` evaluates to ``r * x[0] - 1.0`` (linear in
+    ``x[0]``), so its Jacobian row is ``[r, 0, ..., 0]`` and the
+    inf-norm of that row is exactly ``|r|``.  This gives us tight
+    control over the per-row gradient inf-norm sequence the
+    ``compute_uniform_scale_factors_at_x0`` helper sees.
+    """
+    obj_grad_norm = float(obj_grad_norm)
+
+    def fn(x, args):
+        return obj_grad_norm * jnp.sum(x), None
+
+    eq_fn = None
+    if eq_rows:
+        eq_rows_arr = jnp.asarray(eq_rows, dtype=float)
+
+        def eq_fn(x, args):
+            return eq_rows_arr * x[0] - 1.0
+
+    ineq_fn = None
+    if ineq_rows:
+        ineq_rows_arr = jnp.asarray(ineq_rows, dtype=float)
+
+        def ineq_fn(x, args):
+            return ineq_rows_arr * x[0] - 1.0
+
+    x0 = np.zeros(n)
+    return fn, eq_fn, ineq_fn, x0
+
+
+def test_uniform_mode_single_scalar_across_constraints() -> None:
+    """One row eq + one row ineq with disparate norms get the same ``s_c``."""
+    fn, eq_fn, ineq_fn, x0 = _uniform_problem(eq_rows=[1e2], ineq_rows=[1e6])
+    factors = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        ineq_constraint_fn=ineq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+        atol_user=1e-6,
+    )
+    assert factors.uniform is True
+    assert factors.s_eq.shape == (1,)
+    assert factors.s_ineq.shape == (1,)
+    s_c_eq = float(factors.s_eq[0])
+    s_c_ineq = float(factors.s_ineq[0])
+    assert s_c_eq == s_c_ineq
+    # max row norm = 1e6, target = 1, raw = 1e-6, clipped at 1/max_factor = 1e-3
+    np.testing.assert_allclose(s_c_eq, 1e-3)
+
+
+def test_uniform_mode_cross_group_max_driven_by_larger_group() -> None:
+    """``s_c`` is driven by the larger of eq/ineq row norms (symmetric)."""
+    # Case 1: ineq is larger.
+    fn, eq_fn, ineq_fn, x0 = _uniform_problem(eq_rows=[1e2], ineq_rows=[1e6])
+    fac_a = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        ineq_constraint_fn=ineq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    # Case 2: eq is larger (symmetric mirror).
+    fn, eq_fn, ineq_fn, x0 = _uniform_problem(eq_rows=[1e6], ineq_rows=[1e2])
+    fac_b = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        ineq_constraint_fn=ineq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    # Both should produce the same s_c (max(eq, ineq) is symmetric).
+    np.testing.assert_allclose(float(fac_a.s_eq[0]), float(fac_b.s_eq[0]))
+
+
+def test_uniform_mode_preserves_row_ratios() -> None:
+    """Every eq/ineq row shares the same ``s_c``; ratios survive scaling."""
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e2, 1e4, 1e0])
+    factors = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        target_gradient=1.0,
+        max_factor=1e6,  # generous cap so no clipping fires
+    )
+    s_eq = np.asarray(factors.s_eq)
+    assert s_eq.shape == (3,)
+    np.testing.assert_allclose(s_eq, s_eq[0])
+    # Post-scaling Jacobian row ratios equal pre-scaling ratios.
+    pre = np.array([1e2, 1e4, 1e0])
+    post = pre * float(s_eq[0])
+    np.testing.assert_allclose(post / post[0], pre / pre[0])
+
+
+def test_uniform_mode_atol_can_exceed_user_atol() -> None:
+    """When ``s_c > 1`` (tiny constraint gradient), ``atol_internal > atol_user``."""
+    # ||grad c|| = 1e-4 -> raw s_c = 1e4 -> clipped at max_factor = 1e3.
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e-4])
+    factors = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+        atol_user=1e-6,
+    )
+    s_c = float(factors.s_eq[0])
+    assert s_c > 1.0
+    assert factors.atol_internal > factors.atol_user
+    np.testing.assert_allclose(factors.atol_internal, s_c * factors.atol_user)
+
+
+def test_uniform_mode_symmetric_max_factor_clipping() -> None:
+    """Both upper and lower clipping bounds fire under uniform mode."""
+    # Lower clip (huge constraint gradient): raw s_c < 1/max_factor.
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e9])
+    f_lo = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    np.testing.assert_allclose(float(f_lo.s_eq[0]), 1e-3)
+
+    # Upper clip (tiny constraint gradient): raw s_c > max_factor.
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e-9])
+    f_hi = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    np.testing.assert_allclose(float(f_hi.s_eq[0]), 1e3)
+
+
+def test_uniform_mode_max_factor_one_disables_scaling_and_warns() -> None:
+    """``max_factor=1.0`` collapses the symmetric interval and emits a warning."""
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e6])
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        factors = compute_uniform_scale_factors_at_x0(
+            fn,
+            x0,
+            args=None,
+            has_aux=True,
+            eq_constraint_fn=eq_fn,
+            target_gradient=1.0,
+            max_factor=1.0,
+            atol_user=1e-6,
+        )
+        msgs = [str(wi.message) for wi in w]
+    # s_f = 1, s_c = 1, atol_internal = atol_user
+    np.testing.assert_allclose(factors.s_f, 1.0)
+    np.testing.assert_allclose(float(factors.s_eq[0]), 1.0)
+    np.testing.assert_allclose(factors.atol_internal, factors.atol_user)
+    # Single UserWarning naming the alternative.
+    assert any("max_factor=1.0 disables scaling" in m and "knitro" in m for m in msgs)
+
+
+def test_uniform_mode_max_factor_below_one_raises() -> None:
+    """``max_factor < 1.0`` raises ValueError naming the alternative."""
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e6])
+    with pytest.raises(ValueError, match="knitro"):
+        compute_uniform_scale_factors_at_x0(
+            fn,
+            x0,
+            args=None,
+            has_aux=True,
+            eq_constraint_fn=eq_fn,
+            max_factor=0.5,
+        )
+
+
+def test_uniform_mode_constraint_jacobian_below_floor_warns_once() -> None:
+    """All-degenerate Jacobian: one warning, ``s_c = 1.0``."""
+    # Three eq rows all at gradient inf-norm 1e-15 (below 1e-12 default floor).
+    fn, eq_fn, _, x0 = _uniform_problem(eq_rows=[1e-15, 5e-16, 1e-14])
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        factors = compute_uniform_scale_factors_at_x0(
+            fn,
+            x0,
+            args=None,
+            has_aux=True,
+            eq_constraint_fn=eq_fn,
+            target_gradient=1.0,
+            max_factor=1e3,
+            grad_floor=1e-12,
+        )
+        msgs = [str(wi.message) for wi in w]
+    # All rows share s_c = 1 (no per-row skipping under uniform).
+    np.testing.assert_allclose(np.asarray(factors.s_eq), np.ones(3))
+    # Single grad_floor warning, not three.
+    floor_msgs = [m for m in msgs if "all constraint Jacobian row inf-norms" in m]
+    assert len(floor_msgs) == 1
+
+
+def test_uniform_mode_no_constraints_is_no_op() -> None:
+    """No eq/ineq inputs: ``s_c = 1``, ``atol_internal = atol_user``."""
+    fn, _, _, x0 = _uniform_problem()  # eq_rows=ineq_rows=None
+    factors = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        target_gradient=1.0,
+        max_factor=1e3,
+        atol_user=1e-6,
+    )
+    assert factors.uniform is True
+    assert factors.s_eq.size == 0
+    assert factors.s_ineq.size == 0
+    np.testing.assert_allclose(factors.atol_internal, factors.atol_user)
+
+
+def test_balanced_mode_still_per_row_after_default_change() -> None:
+    """Explicit ``auto_scale='balanced'`` reproduces the old per-row behavior.
+
+    Load-bearing: after the default-mode flip, users who explicitly opt
+    into ``"balanced"`` must still get the documented cascade-fixing
+    behavior (each row's gradient inf-norm gets driven to
+    ``target_gradient``).
+    """
+    fn, eq_fn, ineq_fn, x0 = _uniform_problem(eq_rows=[70.0], ineq_rows=[0.018])
+    cfg = resolve_scaling_mode("balanced")
+    assert cfg.uniform is False
+    factors_b = compute_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        ineq_constraint_fn=ineq_fn,
+        target_gradient=cfg.target_gradient,
+        max_factor=cfg.max_factor,
+        grad_floor=cfg.grad_floor,
+    )
+    # Per-row balancing: each row hit ~ target/norm.
+    np.testing.assert_allclose(float(factors_b.s_eq[0]), 1.0 / 70.0, rtol=1e-2)
+    np.testing.assert_allclose(float(factors_b.s_ineq[0]), 1.0 / 0.018, rtol=1e-2)
+
+    # Same problem under uniform: both rows share the *same* s_c
+    # (driven by max(70, 0.018) = 70), so the ratio 70/0.018 ≈ 3889 is
+    # preserved post-scaling.
+    factors_u = compute_uniform_scale_factors_at_x0(
+        fn,
+        x0,
+        args=None,
+        has_aux=True,
+        eq_constraint_fn=eq_fn,
+        ineq_constraint_fn=ineq_fn,
+        target_gradient=1.0,
+        max_factor=1e3,
+    )
+    s_c = float(factors_u.s_eq[0])
+    assert float(factors_u.s_ineq[0]) == s_c  # cross-group uniform
+    post_ratio = (70.0 * s_c) / (0.018 * s_c)
+    pre_ratio = 70.0 / 0.018
+    np.testing.assert_allclose(post_ratio, pre_ratio)
 
 
 def _toy_problem_factory(
@@ -314,7 +621,13 @@ def test_solution_invariant_under_scaling_quadratic() -> None:
 
 
 def test_minimize_like_scipy_default_on_smoke() -> None:
-    """Default-on populates ``scale_factors`` and produces a finite result."""
+    """Default-on populates ``scale_factors`` and produces a finite result.
+
+    Under the new default the populated ``ScaleFactors`` is in uniform
+    mode (``uniform=True``).  We additionally pin a constrained problem
+    so ``s_eq`` is non-empty and confirm that it is constant-valued
+    (the load-bearing uniform-mode invariant).
+    """
 
     def f(x):
         return jnp.sum(x**2)
@@ -322,8 +635,40 @@ def test_minimize_like_scipy_default_on_smoke() -> None:
     x0 = np.array([2.0, 3.0])
     sol = minimize_like_scipy(f, x0)
     assert "scale_factors" in sol.stats
-    assert isinstance(sol.stats["scale_factors"], ScaleFactors)
+    factors = sol.stats["scale_factors"]
+    assert isinstance(factors, ScaleFactors)
+    assert factors.uniform is True
     assert np.all(np.isfinite(np.asarray(sol.value)))
+
+    # Constrained variant: confirm s_eq / s_ineq are constant-valued.
+    def c_eq(x):
+        return jnp.array([jnp.sum(x) - 5.0])
+
+    def c_ineq(x):
+        return jnp.array([x[0] - 0.1, x[1] - 0.2])
+
+    sol2 = minimize_like_scipy(
+        f,
+        x0,
+        constraints=(
+            {"type": "eq", "fun": c_eq},
+            {"type": "ineq", "fun": c_ineq},
+        ),
+        options={"max_steps": 100},
+    )
+    factors2 = sol2.stats["scale_factors"]
+    assert factors2.uniform is True
+    s_eq = np.asarray(factors2.s_eq)
+    s_ineq = np.asarray(factors2.s_ineq)
+    # All eq rows share the same s_c.
+    if s_eq.size > 0:
+        np.testing.assert_allclose(s_eq, s_eq[0])
+    # All ineq rows share the same s_c.
+    if s_ineq.size > 0:
+        np.testing.assert_allclose(s_ineq, s_ineq[0])
+    # Eq and ineq share the *same* s_c (cross-group uniform).
+    if s_eq.size > 0 and s_ineq.size > 0:
+        assert float(s_eq[0]) == float(s_ineq[0])
 
 
 def test_minimize_like_scipy_explicit_off_path() -> None:
@@ -442,11 +787,18 @@ def test_verbose_adapter_under_jit_with_sf_equal_one() -> None:
 
 
 def test_minimize_like_scipy_max_factor_one_runs_under_jit() -> None:
-    """End-to-end smoke test for ``auto_scale_max_factor=1.0`` (``s_f=1``).
+    """End-to-end smoke test for ``auto_scale_max_factor=1.0`` under the
+    legacy per-row ``"balanced"`` mode (``s_f=1``).
 
     Reproducer for the ConcretizationTypeError observed when the
     verbose adapter was called from inside Optimistix's jitted
     iteration loop with ``s_f`` clipped exactly to ``1.0``.
+
+    Note: under the new default ``auto_scale=True`` (uniform mode),
+    ``max_factor=1.0`` collapses the symmetric clipping interval to
+    ``[1, 1]`` and disables scaling entirely (with a UserWarning).
+    This test pins ``auto_scale="balanced"`` so the original
+    "shrink-only" intent of ``max_factor=1.0`` is preserved.
     """
 
     def f(x):
@@ -466,7 +818,7 @@ def test_minimize_like_scipy_max_factor_one_runs_under_jit() -> None:
             {"type": "eq", "fun": c_eq},
             {"type": "ineq", "fun": c_ineq},
         ),
-        auto_scale=True,
+        auto_scale="balanced",
         auto_scale_max_factor=1.0,
         options={"max_steps": 100},
     )
