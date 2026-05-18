@@ -36,8 +36,23 @@ class ToleranceConfig(eqx.Module):
     """Outer-loop tolerances and iteration / divergence budgets.
 
     Attributes:
-        rtol: Relative tolerance for the stationarity convergence check.
-            ``||grad_L|| <= rtol * max(|L|, 1)``.  Default ``1e-6``.
+        rtol: Relative tolerance for the stationarity convergence
+            check.  The test is the filterSQP normalised KKT residual
+            (Fletcher & Leyffer, *User manual for filterSQP*, eqs. 5
+            and 6):
+            ``||grad_L|| <= rtol * max(mu_max, 1)`` where
+            ``mu_max = max_i {||grad_f||_2, |nu_i|, ||a_i||_2 |lambda_i|}``
+            is the largest single contributor to the Lagrangian
+            gradient residual (objective-gradient norm, every bound
+            multiplier, and every general-constraint
+            ``||row||_2 * |multiplier|``).  The same test is applied
+            to the inexact projected-gradient numerator
+            ``||W_tilde g||`` when
+            :attr:`AdaptiveCGConfig.use_inexact_stationarity` is on.
+            Replaces the legacy ``|L|``-based denominator so the
+            test is invariant to absolute objective magnitude and
+            tracks multiplier blow-up under near-rank-deficient
+            active sets.  Default ``1e-6``.
         atol: Absolute tolerance for primal feasibility and a number of
             internal heuristic floors (steepest-descent fallback,
             adaptive CG tolerance floor, default proximal mu floor).

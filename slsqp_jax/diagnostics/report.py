@@ -374,13 +374,12 @@ class DebugReport:
         last = run.summaries[-1]
         sf = self.scale_factors
         s_f = float(sf.s_f) if sf is not None else 1.0
-        # ``f``, ``|grad|`` and ``|grad_L|`` scale uniformly by ``s_f``;
-        # ``rel_kkt = ||grad_L|| / max(|L|, 1)`` is *not* uniformly
-        # scaled because the safeguard ``max(|L|, 1)`` clips when the
-        # Lagrangian collapses below 1, breaking the ``s_f`` cancellation.
-        # We surface the scaled value directly; users who care about the
-        # unsafeguarded ratio can divide ``||grad_L||`` by ``|L|``
-        # themselves from the un-scaled fields above.
+        # ``f``, ``|grad|``, ``|grad_L|`` and filterSQP ``mu_max`` all
+        # scale uniformly by ``s_f``.  ``rel_kkt`` remains the legacy
+        # ``||grad_L|| / max(|L|, 1)`` diagnostic and is not uniformly
+        # scaled because the safeguard clips when the Lagrangian
+        # collapses below 1.  The live convergence ratio is
+        # ``kkt_ratio = ||grad_L|| / max(mu_max, 1)``.
         f_user = float(last.f_val) / s_f if s_f != 0 else float(last.f_val)
         grad_norm_user = (
             float(last.grad_norm) / s_f if s_f != 0 else float(last.grad_norm)
@@ -413,10 +412,12 @@ class DebugReport:
         out.write(f"  Lagrangian L:          {_fmt_e(L_user)}\n")
         out.write(f"  ||grad||:              {_fmt_e(grad_norm_user)}\n")
         out.write(f"  ||grad_L||:            {_fmt_e(grad_L_user)}\n")
+        out.write(f"  mu_max:                {_fmt_e(last.kkt_scale / s_f)}\n")
+        out.write(f"  ||grad_L||/max(mu,1):  {_fmt_e(last.kkt_ratio)}\n")
         out.write(
-            f"  ||grad_L||/max(|L|,1): {_fmt_e(last.rel_kkt)} {scaled_tag}\n"
+            f"  legacy ||grad_L||/|L|: {_fmt_e(last.rel_kkt)} {scaled_tag}\n"
             if scaled_active
-            else f"  ||grad_L||/max(|L|,1): {_fmt_e(last.rel_kkt)}\n"
+            else f"  legacy ||grad_L||/|L|: {_fmt_e(last.rel_kkt)}\n"
         )
         out.write(
             f"  max|c_eq|:             {_fmt_e(last.max_eq_violation)} {scaled_tag}\n"
@@ -591,7 +592,7 @@ class DebugReport:
         out.write("Trajectory (per-step)\n")
         out.write("-" * _REPORT_WIDTH + "\n")
         header = (
-            f"{'step':>5}  {'f':>12}  {'merit':>12}  {'rel_KKT':>10}  "
+            f"{'step':>5}  {'f':>12}  {'merit':>12}  {'KKT_r':>10}  "
             f"{'alpha':>10}  {'qpit':>5}  {'qpok':>5}  {'lsok':>5}\n"
         )
         out.write(header)
@@ -612,7 +613,7 @@ class DebugReport:
                 continue
             out.write(
                 f"{s.step_count:>5d}  {_fmt_e(s.f_val):>12}  "
-                f"{_fmt_e(s.merit):>12}  {_fmt_e(s.rel_kkt):>10}  "
+                f"{_fmt_e(s.merit):>12}  {_fmt_e(s.kkt_ratio):>10}  "
                 f"{_fmt_e(s.last_alpha):>10}  {s.qp_iterations_step:>5d}  "
                 f"{str(s.qp_converged):>5}  {str(s.ls_success):>5}\n"
             )

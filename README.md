@@ -484,6 +484,17 @@ solver = SLSQP(
 )
 ```
 
+**Multiplier-scale-aware stationarity test (filterSQP eqs. 5–6).** The relative-stationarity convergence test uses the filterSQP normalised KKT residual (Fletcher & Leyffer, *User manual for filterSQP*):
+
+$$
+\mu_{\max} = \max_i \left\{\, \lVert \nabla f \rVert_2,\; |\nu_i|,\; \lVert a_i \rVert_2\,|\lambda_i| \,\right\}, \qquad
+r = \frac{\lVert \nabla_x L \rVert_2}{\max(\mu_{\max},\,1)} \;\le\; \texttt{rtol}.
+$$
+
+The denominator $\mu_{\max}$ is the largest single contributor to the Lagrangian-gradient sum: the objective-gradient norm (one term), every bound multiplier $|\nu_i|$ (one per active bound — bound Jacobian rows have unit L2 norm by construction), and every general-constraint row contribution $\lVert a_i \rVert_2 \cdot |\lambda_i|$ (one per equality and per general inequality). This replaces the legacy $\max(|L|,1)$ denominator so the test is invariant to the absolute magnitude of the Lagrangian *value* and stays well-defined when multipliers grow under near-rank-deficient active sets. The same denominator is applied to the inexact projected-gradient numerator $\lVert \widetilde W g \rVert$ when `use_inexact_stationarity=True`, so the meaning of `rtol` is consistent across both stationarity paths.
+
+`sol.stats["kkt_scale"]` exposes $\mu_{\max}$ on the final iterate in user units (the scaling layer divides the internal value by `s_f` when `auto_scale` is on). `sol.stats["kkt_ratio"]` exposes the exact dimensionless residual that the internal solver compared against `rtol`, $r = \lVert \nabla_x L \rVert_2 / \max(\mu_{\max}, 1)$, and is the safest post-hoc audit value. If you recompute the ratio manually under auto-scaling, remember that the hard floor is in internal units; in user units the equivalent denominator is $\max(\mu_{\max}^{\text{user}}, 1 / s_f)$, not always $\max(\mu_{\max}^{\text{user}}, 1)$. The verbose printer surfaces $\mu_{\max}$ per step under the `μ_max` column.
+
 ### NLP-level bound multiplier recovery
 
 When box constraints are present, the inequality multiplier vector
@@ -493,7 +504,7 @@ $\mu_{\text{ineq}} \in \mathbb{R}^{m_{\text{ineq}}}$ stored in
 appears in the Lagrangian gradient
 $\nabla_x L = \nabla f - J_{\text{eq}}^T \lambda - J_{\text{ineq}}^T \mu_{\text{ineq}}$
 and therefore directly affects the relative-stationarity convergence test
-$\lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(|L|, 1)$.
+$\lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(\mu_{\max}, 1)$ (see [Convergence safeguards](#convergence-safeguards) for the definition of $\mu_{\max}$).
 
 For each accepted SLSQP step the bound multipliers are **recomputed from
 the partial Lagrangian gradient at $x_{k+1}$**, after the line search.
@@ -789,7 +800,7 @@ Convergence requires either (a) the strict pair `stationarity & primal_feasibili
 
 ### Zero-step convergence detection (guarded QP-KKT success)
 
-When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations the `state.qp_optimal` flag latches, and the convergence test is augmented with the disjunct
+When the QP solver repeatedly converges with $\lVert d \rVert < \texttt{atol}$, the current point satisfies the QP's KKT conditions (within `cg_tol`) even though the outer stationarity criterion $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(\mu_{\max}, 1)$ may not be met — typically because of residual multiplier imprecision from the regularised Cholesky projection. After `zero_step_patience` (default 3) consecutive zero-step iterations the `state.qp_optimal` flag latches, and the convergence test is augmented with the disjunct
 
 $$
 \text{qp\_kkt\_success} = \text{qp\_optimal} \land \text{primal\_feasible} \land \text{ls\_success} \land \bigl( \alpha \geq 1 - 10^{-6} \bigr) \land \text{has\_min\_steps}.
@@ -807,13 +818,13 @@ solver = SLSQP(
 
 ### Inexact stationarity (HR-STCG outer disjunct)
 
-For runs that use `HRInexactSTCG` as the inner solver, the classical Lagrangian-gradient stationarity test $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(|L|, 1)$ can stagnate at a multiplier-recovery noise floor — the iterate is genuinely at a KKT point but $\lVert \nabla_x L \rVert$ never drops below the floor because the recovered $\lambda$ carries $O(\varepsilon \cdot \kappa(A A^T))$ noise that contaminates $\nabla_x L = \nabla f - A^T \lambda$. The Heinkenschloss-Ridzal *projected* gradient $\lVert \widetilde{W}_k (g + B d_p) \rVert$ does **not** suffer this floor: the null-space projector annihilates the multiplier-direction component of the gradient by construction, so it stays clean even when $\lambda$ does not. The latest projected gradient norm from each QP solve is forwarded into the outer state as `state.last_projected_grad_norm`, and the diagnostics block accumulates a low-water mark `min_projected_grad_norm`.
+For runs that use `HRInexactSTCG` as the inner solver, the classical Lagrangian-gradient stationarity test $\lVert \nabla_x L \rVert \leq \texttt{rtol} \cdot \max(\mu_{\max}, 1)$ can stagnate at a multiplier-recovery noise floor — the iterate is genuinely at a KKT point but $\lVert \nabla_x L \rVert$ never drops below the floor because the recovered $\lambda$ carries $O(\varepsilon \cdot \kappa(A A^T))$ noise that contaminates $\nabla_x L = \nabla f - A^T \lambda$. The Heinkenschloss-Ridzal *projected* gradient $\lVert \widetilde{W}_k (g + B d_p) \rVert$ does **not** suffer this floor: the null-space projector annihilates the multiplier-direction component of the gradient by construction, so it stays clean even when $\lambda$ does not. The latest projected gradient norm from each QP solve is forwarded into the outer state as `state.last_projected_grad_norm`, and the diagnostics block accumulates a low-water mark `min_projected_grad_norm`.
 
 The opt-in flag `use_inexact_stationarity` (default `False`) augments the stationarity branch of `terminate()` with a disjunct on `state.last_projected_grad_norm`:
 
-$$\text{stationarity} = \bigl( \lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(|L|, 1) \bigr) \;\lor\; \bigl( \texttt{use\_inexact\_stationarity} \land \lVert \widetilde{W}_k g \rVert \le \texttt{rtol} \cdot \max(|L|, 1) \bigr).$$
+$$\text{stationarity} = \bigl( \lVert \nabla_x L \rVert \le \texttt{rtol} \cdot \max(\mu_{\max}, 1) \bigr) \;\lor\; \bigl( \texttt{use\_inexact\_stationarity} \land \lVert \widetilde{W}_k g \rVert \le \texttt{rtol} \cdot \max(\mu_{\max}, 1) \bigr).$$
 
-The same disjunction is mirrored in `step()`'s convergence latch so both call sites agree. Primal feasibility (`max|c_eq| ≤ atol` and `max(0, -c_ineq) ≤ atol`) is still required regardless of which stationarity branch fires; the disjunct only relaxes the *gradient* test, not the constraint test. The toggle is independent of the inner solver — supplying `HRInexactSTCG` without setting the flag leaves the run on the classical test (the projected-gradient field is populated but ignored), while setting the flag with a non-HR inner solver leaves `last_projected_grad_norm = inf` so the disjunct cannot fire. Use this when a profile run shows `|∇L|/|L|` stalling above `rtol` while feasibility is reached and `min_projected_grad_norm / |L|` (visible in `get_diagnostics(state)`) is well below it; if the projected gradient is also stuck, the iterate is genuinely not stationary and the toggle will not change the outcome.
+The same disjunction is mirrored in `step()`'s convergence latch so both call sites agree. Primal feasibility (`max|c_eq| ≤ atol` and `max(0, -c_ineq) ≤ atol`) is still required regardless of which stationarity branch fires; the disjunct only relaxes the *gradient* test, not the constraint test. The toggle is independent of the inner solver — supplying `HRInexactSTCG` without setting the flag leaves the run on the classical test (the projected-gradient field is populated but ignored), while setting the flag with a non-HR inner solver leaves `last_projected_grad_norm = inf` so the disjunct cannot fire. Use this when a profile run shows `|∇L|/max(μ_max,1)` stalling above `rtol` while feasibility is reached and `min_projected_grad_norm / max(μ_max,1)` (visible in `get_diagnostics(state)` / diagnostics reports) is well below it; if the projected gradient is also stuck, the iterate is genuinely not stationary and the toggle will not change the outcome.
 
 ```python
 solver = SLSQP(
@@ -924,7 +935,8 @@ Prior to this release `n_lbfgs_skips` was computed as `new.count == state.count`
 
 The built-in `verbose=True` callback now prints, in addition to the step summary:
 
-- `|∇L|/|L|` - the relative stationarity ratio used by the convergence test.
+- `μ_max` - the filterSQP stationarity scale used by the convergence test denominator.
+- `|∇L|/|L|` - the legacy relative stationarity diagnostic (still useful for comparing old logs, but not the active convergence denominator).
 - `|W̃g|` - the inner solver's projected-gradient norm (the noise-aware stationarity proxy used by `use_inexact_stationarity`); `+inf` for inner solvers that do not produce it.
 - `Δmerit` - signed change of the L1 merit versus the best-so-far.
 - `skip` - whether this step skipped the L-BFGS curvature update.
@@ -934,7 +946,7 @@ The built-in `verbose=True` callback now prints, in addition to the step summary
 - `fix#` - number of non-trivial bound-fixing inner solves used this step.
 - `LS tail` - current consecutive line-search failure counter.
 
-Together these let you distinguish "the solver is slow because of active-set churn" (`#fix` oscillating) from "the QP is producing bad directions" (`skip` or `LS ok: False` repeatedly) from "noise-floor stationarity stall rescuable by `use_inexact_stationarity`" (`|W̃g|/|L|` well below `|∇L|/|L|` and below `rtol` while `|∇L|/|L|` is stuck above) from "post-identity-reset L-BFGS skip lock" (`κ_B = 1.0e+00`, `skip = True`, `rel_curv` near `eps`) from "we are simply running out of iterations" (`|∇L|/|L|` decreasing monotonically but not below `rtol`).
+Together these let you distinguish "the solver is slow because of active-set churn" (`#fix` oscillating) from "the QP is producing bad directions" (`skip` or `LS ok: False` repeatedly) from "noise-floor stationarity stall rescuable by `use_inexact_stationarity`" (`|W̃g|/max(μ_max,1)` well below `|∇L|/max(μ_max,1)` and below `rtol` while the classical ratio is stuck above) from "post-identity-reset L-BFGS skip lock" (`κ_B = 1.0e+00`, `skip = True`, `rel_curv` near `eps`) from "we are simply running out of iterations" (`|∇L|/max(μ_max,1)` decreasing monotonically but not below `rtol`).
 
 #### Bound-fix inner-solve short-circuit
 
@@ -968,11 +980,11 @@ report.print_summary()
 The report includes:
 
 1. The granular `slsqp_jax.RESULTS` termination code (with the exact message string) and the coarse `optx.RESULTS` it maps to.
-2. Final-iterate metrics (`||grad_L||/max(|L|,1)`, primal feasibility, `rho`, L-BFGS condition number).
+2. Final-iterate metrics (`||grad_L||/max(μ_max,1)`, primal feasibility, `rho`, L-BFGS condition number).
 3. Fired signals — partitioned into "in scope for this termination code" and "less likely given the termination mode" (per `SCOPE_BY_TERMINATION`); within each group sorted by `confidence` (`high` → `medium` → `low`). Each signal carries a one-line summary, the evidence numbers, the artifact keys it built (e.g. `J_eq`, `JJT`, `singular_values`), and concrete suggestions.
 4. Multi-signal diagnoses — pattern matches against fired-signal sets (e.g. `lbfgs_conditioning_extreme + line_search_collapse → stale_lbfgs_curvature`). Single-signal cases are surfaced directly without a rule.
 5. A prose-annotated dump of every `SLSQPDiagnostics` counter (counters' docstrings drive the prose).
-6. An ASCII trajectory chart of `(step, f, merit, rel_KKT, alpha, qp_iter, qp_ok, ls_ok)`.
+6. An ASCII trajectory chart of `(step, f, merit, KKT_r, alpha, qp_iter, qp_ok, ls_ok)`, where `KKT_r = ||grad_L||/max(μ_max,1)`.
 
 ### Quick start for `minimize_like_scipy` users
 

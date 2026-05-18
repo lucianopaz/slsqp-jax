@@ -14,9 +14,14 @@ share their inputs by structure.
 * :func:`coarse_outcome` — collapse the same flags onto the
   ``optx.RESULTS`` enum that the Optimistix driver requires.  Used
   by ``terminate``.
+* :func:`compute_mu_max` — filterSQP's normalisation denominator
+  (Fletcher & Leyffer, *User manual for filterSQP*, eq. 5) used as
+  the reference scale for the relative-stationarity convergence
+  test.  See the docstring for the exact formula.
 
-Both are thin pattern-matchers over the same flag set; refactoring
-either one in the future should preserve their structural symmetry.
+Both classification helpers are thin pattern-matchers over the same
+flag set; refactoring either one in the future should preserve their
+structural symmetry.
 """
 
 from __future__ import annotations
@@ -26,9 +31,10 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optimistix as optx
-from jaxtyping import Array, Bool
+from jaxtyping import Array, Bool, Float
 
 from slsqp_jax.results import RESULTS
+from slsqp_jax.types import Scalar, Vector
 
 
 class TerminationFlags(NamedTuple):
@@ -143,4 +149,73 @@ def coarse_outcome(flags: TerminationFlags) -> tuple[Bool[Array, ""], optx.RESUL
     return done, result
 
 
-__all__ = ["TerminationFlags", "classify_outcome", "coarse_outcome"]
+def compute_mu_max(
+    grad_f: Vector,
+    eq_jac: Float[Array, "m_eq n"],
+    ineq_jac_general: Float[Array, "m_ineq_general n"],
+    mult_eq: Float[Array, " m_eq"],
+    mult_ineq_general: Float[Array, " m_ineq_general"],
+    mult_bound: Float[Array, " m_bound"],
+) -> Scalar:
+    """filterSQP normalisation denominator (eq. 5 of the manual).
+
+    Computes::
+
+        μ_max = max_i { ‖∇f‖₂, |ν_i|, ‖a_i‖₂ · |λ_i| }
+
+    where the max is over the objective-gradient norm (one term),
+    every bound multiplier ``ν_i`` (one term per active bound), and
+    every general-constraint contribution ``‖a_i‖₂ · |λ_i|`` (one
+    term per equality and per general inequality, ``a_i`` being the
+    Jacobian row).  The result is the *largest single contributor*
+    to the residual ``‖∇f − Jᵀλ − νᵀI_b‖`` and is exactly the
+    reference scale filterSQP uses in eq. (6).
+
+    Bound rows are not passed via a Jacobian: by construction the
+    bound block of :func:`build_bound_jacobian` has rows ``±e_i`` of
+    L2 norm ``1``, so ``‖a_i‖₂·|ν_i| = |ν_i|`` and we can feed the
+    bound multipliers in directly.  This also matches the
+    Fletcher–Leyffer split of ``λ`` (general) and ``ν`` (bound)
+    multipliers in the manual.
+
+    The empty-constraint case reduces cleanly to ``‖∇f‖₂``.
+
+    Args:
+        grad_f: Objective gradient ``∇f(x)``, shape ``(n,)``.
+        eq_jac: Equality-constraint Jacobian, shape ``(m_eq, n)``.
+            May be empty (``m_eq == 0``).
+        ineq_jac_general: General-inequality-constraint Jacobian,
+            shape ``(m_ineq_general, n)``.  *Excludes* the bound
+            block — bound contributions are passed via
+            ``mult_bound``.  May be empty.
+        mult_eq: Equality multipliers ``λ_eq``, shape ``(m_eq,)``.
+        mult_ineq_general: General-inequality multipliers
+            ``λ_ineq``, shape ``(m_ineq_general,)``.
+        mult_bound: Bound multipliers ``ν`` (lower bounds stacked on
+            upper bounds, matching the layout of the bound block of
+            ``state.multipliers_ineq_ls``), shape ``(m_bound,)``.
+
+    Returns:
+        Scalar ``μ_max``.  Has the dtype of ``grad_f``.
+    """
+    grad_norm = jnp.linalg.norm(grad_f)
+    eq_terms = jnp.linalg.norm(eq_jac, axis=1) * jnp.abs(mult_eq)
+    ineq_terms = jnp.linalg.norm(ineq_jac_general, axis=1) * jnp.abs(mult_ineq_general)
+    bound_terms = jnp.abs(mult_bound)
+    buf = jnp.concatenate(
+        [
+            jnp.reshape(grad_norm, (1,)),
+            eq_terms,
+            ineq_terms,
+            bound_terms,
+        ]
+    )
+    return jnp.reshape(jnp.max(buf), ())
+
+
+__all__ = [
+    "TerminationFlags",
+    "classify_outcome",
+    "coarse_outcome",
+    "compute_mu_max",
+]

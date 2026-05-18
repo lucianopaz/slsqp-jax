@@ -13,9 +13,10 @@ warm-start of the next QP.  By construction this should:
   precision (the bound block is identical between the QP-side and
   LS-side multiplier vectors — both go through the same post-step
   recovery in :func:`slsqp_jax.slsqp.bounds.recover_bound_multipliers`).
-* Lower the relative-stationarity ratio ``||∇L|| / max(|L|, 1)`` for
-  bound-heavy problems where the QP-level recovery used to leave the
-  ratio above ``rtol``.
+* Lower both the legacy ``||∇L|| / max(|L|, 1)`` diagnostic and the
+  active filterSQP-normalised stationarity ratio for bound-heavy
+  problems where the QP-level recovery used to leave the residual above
+  ``rtol``.
 
 References:
 
@@ -151,7 +152,7 @@ class TestNLPBoundMultiplierRecovery:
         # All recovered bound multipliers must be non-negative.
         assert jnp.all(bound_mult_lower >= -1e-12)
 
-        # Stationarity: ||∇L|| / max(|L|, 1) should be tiny.
+        # Legacy stationarity diagnostic: ||∇L|| / max(|L|, 1) should be tiny.
         grad_L = state.grad_lagrangian
         # Lagrangian value at the solution
         L = state.f_val - state.multipliers_ineq_ls @ state.ineq_val
@@ -336,9 +337,11 @@ class TestNLPBoundMultiplierStagnationRegression:
 
     These exercise the original failure mode: on a Portfolio-style
     problem with many active bounds, the QP-level bound-mult recovery
-    used to leave ``||∇L|| / max(|L|, 1)`` pinned above ``rtol`` even
-    though the constraints were satisfied and ``alpha = 1``.  With the
-    NLP-level recovery the ratio should drop sharply.
+    used to leave the Lagrangian-gradient residual pinned above
+    ``rtol`` even though the constraints were satisfied and
+    ``alpha = 1``.  With the NLP-level recovery both the active
+    filterSQP-normalised ratio and the legacy ``|L|`` diagnostic should
+    drop sharply.
 
     The ``sol.result`` field is intentionally NOT used for the
     convergence assertion: best-iterate rollback / merit-stagnation can
@@ -384,7 +387,7 @@ class TestNLPBoundMultiplierStagnationRegression:
 
         Checks (1) primal feasibility (eq, ineq, bounds), (2) dual
         feasibility on the bound multipliers (≥ 0), and (3) the
-        relative-stationarity ratio
+        legacy relative-stationarity diagnostic
         ``||∇L|| / max(|L|, 1) <= rtol_target``.
 
         ``rtol_target`` is intentionally looser than the solver's own
