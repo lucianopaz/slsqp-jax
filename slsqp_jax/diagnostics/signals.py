@@ -54,8 +54,9 @@ class EvalContext:
     Threaded through the runner so per-step + end-of-run evaluators
     can read the user's :attr:`rtol` / :attr:`atol` (e.g. for the
     ``multiplier_recovery_noise`` test which compares against
-    ``rtol * max(|L|, 1)``) without taking a stateful dependency on
-    the solver instance.
+    ``rtol * max(mu_max, 1)`` — see
+    :func:`slsqp_jax.slsqp.termination.compute_mu_max`) without
+    taking a stateful dependency on the solver instance.
 
     Attributes:
         solver: The :class:`slsqp_jax.SLSQP` instance the run used.
@@ -565,10 +566,10 @@ def _eval_multiplier_recovery_noise(
 
     The textbook signature documented in ``AGENTS.md``:
 
-    * ``min_projected_grad_norm / |L| < rtol`` (the inner solver's
-      noise-aware stationarity proxy already passed)
-    * ``|grad_L| / |L| > rtol`` (the classical stationarity proxy
-      did not)
+    * ``min_projected_grad_norm / max(mu_max, 1) < rtol`` (the inner
+      solver's noise-aware stationarity proxy already passed)
+    * ``|grad_L| / max(mu_max, 1) > rtol`` (the classical
+      stationarity proxy did not)
     * ``n_steps_inexact_below_classical / step_count > 0.5`` (more
       than half the iterations had a strictly-cleaner projected
       gradient than classical, i.e. multiplier-recovery noise was
@@ -584,11 +585,11 @@ def _eval_multiplier_recovery_noise(
         return None  # pragma: no cover
     diag = final_state.diagnostics
     last = summaries[-1]
-    L_abs = max(abs(last.lagrangian_value), 1.0)
+    kkt_scale = max(last.kkt_scale, 1.0)
     rtol = ctx.rtol
 
-    classical_ratio = last.grad_lagrangian_norm / L_abs
-    proj_ratio = float(diag.min_projected_grad_norm) / L_abs
+    classical_ratio = last.grad_lagrangian_norm / kkt_scale
+    proj_ratio = float(diag.min_projected_grad_norm) / kkt_scale
     n_inexact_below = int(diag.n_steps_inexact_below_classical)
     fraction_below = n_inexact_below / max(last.step_count, 1)
 
@@ -607,9 +608,9 @@ def _eval_multiplier_recovery_noise(
 
     detail = (
         "The inner solver's projected-gradient norm low-water mark "
-        f"satisfies ||W g|| / |L| = {proj_ratio:.3e} < rtol "
+        f"satisfies ||W g|| / max(mu_max, 1) = {proj_ratio:.3e} < rtol "
         f"({rtol:.1e}), while the classical Lagrangian gradient "
-        f"ratio ||grad_L|| / |L| = {classical_ratio:.3e} is still "
+        f"ratio ||grad_L|| / max(mu_max, 1) = {classical_ratio:.3e} is still "
         "above rtol.  This is the textbook signature of multiplier-"
         "recovery noise contaminating the classical stationarity "
         'test (see AGENTS.md "Inexact stationarity disjunct").  '

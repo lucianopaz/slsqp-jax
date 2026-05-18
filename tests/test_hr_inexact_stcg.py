@@ -33,6 +33,7 @@ from slsqp_jax import (
     ProjectedCGCraig,
     get_diagnostics,
 )
+from slsqp_jax.slsqp.termination import compute_mu_max
 from tests.conftest import _make_slsqp
 
 jax.config.update("jax_enable_x64", True)
@@ -331,7 +332,7 @@ class TestOuterIntegration:
         )
 
     def test_inexact_stationarity_toggle_can_fire(self):
-        """When the projected-gradient floor lands below rtol*|L|, ON converges."""
+        """When the projected-gradient floor lands below rtol*mu_max, ON converges."""
         objective, eq_constraint, x0, _, m_eq = _build_synthetic_ill_conditioned(
             seed=11
         )
@@ -355,8 +356,15 @@ class TestOuterIntegration:
         )
         _, state = _run_solver(with_hr, objective, x0)
         diag = get_diagnostics(state)
-        L_val = state.f_val - state.multipliers_eq_ls @ state.eq_val
-        rtol_target = with_hr.rtol * max(float(jnp.abs(L_val)), 1.0)
+        mu_max = compute_mu_max(
+            grad_f=state.grad,
+            eq_jac=state.eq_jac,
+            ineq_jac_general=state.ineq_jac,
+            mult_eq=state.multipliers_eq_ls,
+            mult_ineq_general=state.multipliers_ineq_ls,
+            mult_bound=jnp.zeros((0,), dtype=state.grad.dtype),
+        )
+        rtol_target = with_hr.rtol * max(float(mu_max), 1.0)
 
         # The diagnostics low-water mark must be at least as small as
         # the rtol target on at least one iteration whenever the

@@ -1063,6 +1063,17 @@ def unscale_solution(sol: optx.Solution, factors: ScaleFactors) -> optx.Solution
             jnp.asarray(stats["final_lagrangian_grad_norm"]) / s_f
         )
 
+    # filterSQP eq. (5) ``μ_max`` scales linearly with ``s_f``: every
+    # candidate in the max (``||∇f||``, ``|ν_i|``, ``||a_i||·|λ_i|``)
+    # carries one factor of ``s_f`` under our scaling convention
+    # (``∇f`` scales by ``s_f``, ``ν`` and ``λ`` carry compensating
+    # ``s_f/s_c`` factors that combine with the per-row ``s_c`` on
+    # ``||a_i||`` to leave a net ``s_f``).  Unscaling is therefore a
+    # plain division by ``s_f``.  Keep the public ``kkt_scale`` key in
+    # user units, matching the rest of the unscaled solution contract.
+    if "kkt_scale" in stats:
+        stats["kkt_scale"] = jnp.asarray(stats["kkt_scale"]) / s_f
+
     if "final_objective" in stats:
         stats["final_objective_user"] = jnp.asarray(stats["final_objective"]) / s_f
 
@@ -1099,6 +1110,9 @@ _UNSCALABLE_KEYS_OBJ_DIVIDE = (
     # the ratio is preserved exactly.  No transform required.
     # ``|projected_grad|_scaled = s_f * |projected_grad|``.
     "proj_grad_norm",
+    # filterSQP eq. (5) ``μ_max`` scales linearly with ``s_f`` (every
+    # candidate in the max carries one ``s_f``); divide by ``s_f``.
+    "kkt_scale",
 )
 
 # Keys to flag with ``(scaled)`` in the printed label.  Anything not
@@ -1461,8 +1475,11 @@ def _replace_solver_callables(solver: Any, scaled: ScaledProblem) -> Any:
 
     # Override atol to atol_internal so the inner solver's
     # convergence checks match the user-perceived feasibility.  We
-    # leave rtol untouched: it tests ``|grad_L| / max(|L|, 1)``,
-    # which is invariant to a uniform ``s_f`` rescaling.
+    # leave rtol untouched: it tests ``|grad_L| / max(mu_max, 1)``
+    # (filterSQP eqs. 5–6), and every term in ``mu_max`` carries one
+    # factor of ``s_f``.  The hard ``max(., 1)`` floor remains in
+    # internal units, so ``postprocess`` exposes the exact internal
+    # dimensionless residual separately as ``stats["kkt_ratio"]``.
     from slsqp_jax.config import ToleranceConfig
 
     new_tol = ToleranceConfig(

@@ -67,6 +67,7 @@ from slsqp_jax.slsqp.preconditioner import (
     build_diagonal_preconditioner,
     build_lbfgs_preconditioner,
 )
+from slsqp_jax.slsqp.termination import compute_mu_max
 from slsqp_jax.slsqp.verbose import no_verbose, slsqp_verbose
 from slsqp_jax.state import (
     QPResult,
@@ -699,6 +700,16 @@ class SLSQP(optx.AbstractMinimiser):
         result: Any,
     ) -> tuple[Vector, Any, dict[str, Any]]:
         y = self._clip_to_bounds(y)
+        m_ineq_general = self.n_ineq_constraints
+        kkt_scale = compute_mu_max(
+            grad_f=state.grad,
+            eq_jac=state.eq_jac,
+            ineq_jac_general=state.ineq_jac[:m_ineq_general],
+            mult_eq=state.multipliers_eq_ls,
+            mult_ineq_general=state.multipliers_ineq_ls[:m_ineq_general],
+            mult_bound=state.multipliers_ineq_ls[m_ineq_general:],
+        )
+        kkt_ratio = jnp.linalg.norm(state.grad_lagrangian) / jnp.maximum(kkt_scale, 1.0)
         stats = {
             "num_steps": state.step_count,
             "final_objective": state.f_val,
@@ -710,6 +721,24 @@ class SLSQP(optx.AbstractMinimiser):
             # into a KKT check; auto-scaling unscales both via ``/ s_f``.
             "final_grad_norm": jnp.linalg.norm(state.grad),
             "final_lagrangian_grad_norm": jnp.linalg.norm(state.grad_lagrangian),
+            # filterSQP normalisation denominator (eq. 5 of the
+            # *User manual for filterSQP*, Fletcher & Leyffer):
+            # ``μ_max = max_i {||∇f||_2, |ν_i|, ||a_i||_2 |λ_i|}``.
+            # This is the reference scale used by the relative-
+            # stationarity convergence test: convergence fires when
+            # ``||∇L|| <= rtol * max(μ_max, 1)``.  Surfaced so users
+            # can audit the actual ratio
+            # ``r = ||∇L|| / max(μ_max, 1)`` independently.  Under
+            # auto-scaling every term in eq. (5) carries one factor
+            # of ``s_f``, so ``unscale_solution`` divides by ``s_f``
+            # to keep the public ``kkt_scale`` stat in user units.
+            "kkt_scale": kkt_scale,
+            # Dimensionless residual actually compared against
+            # ``rtol`` by the internal solver.  This remains unchanged
+            # by ``unscale_solution``; use it for exact post-hoc audit
+            # when auto-scaling is on because the hard ``max(., 1)``
+            # floor lives in internal scaled units.
+            "kkt_ratio": kkt_ratio,
             "merit_penalty": state.merit_penalty,
             "total_qp_iterations": state.qp_iterations,
             "last_qp_converged": state.qp_converged,

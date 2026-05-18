@@ -26,6 +26,7 @@ import jax.numpy as jnp
 
 from slsqp_jax.merit import compute_merit
 from slsqp_jax.results import RESULTS
+from slsqp_jax.slsqp.termination import compute_mu_max
 
 if TYPE_CHECKING:
     from slsqp_jax.slsqp import SLSQP
@@ -79,8 +80,23 @@ class StepSummary:
         lagrangian_value: Value of the Lagrangian
             ``L = f - lambda_eq^T c_eq - mu_ineq^T c_ineq`` at the
             post-step iterate.
-        rel_kkt: ``grad_lagrangian_norm / max(|L|, 1)`` — exactly the
-            ratio the convergence check compares against ``rtol``.
+        rel_kkt: ``grad_lagrangian_norm / max(|L|, 1)`` — the legacy
+            relative-stationarity proxy.  Surfaced for backward-
+            compatible diagnostics; note that the live convergence
+            check now compares
+            ``grad_lagrangian_norm / max(mu_max, 1)`` against
+            ``rtol`` (filterSQP eqs. 5–6, see
+            :func:`slsqp_jax.slsqp.termination.compute_mu_max`), so
+            ``rel_kkt`` and the actual termination criterion may
+            differ when ``|L|`` and ``mu_max`` disagree.
+        kkt_scale: filterSQP ``mu_max`` denominator at this step.
+            Because ``state.ineq_jac`` already contains the general
+            inequality rows plus the unit-norm bound rows, this summary
+            computes the same maximum by treating the whole inequality
+            block as row-norm-scaled terms.
+        kkt_ratio: Active relative-stationarity ratio used by the
+            convergence test:
+            ``grad_lagrangian_norm / max(kkt_scale, 1)``.
         gamma: Scalar L-BFGS initial-Hessian scaling.
         min_diag: Minimum entry of the L-BFGS per-variable diagonal.
         max_diag: Maximum entry of the L-BFGS per-variable diagonal.
@@ -173,6 +189,8 @@ class StepSummary:
     diverging: bool
     blowup_count: int
     merit_regression_step: bool
+    kkt_scale: float = 0.0
+    kkt_ratio: float = float("inf")
 
     @classmethod
     def from_state(
@@ -225,6 +243,17 @@ class StepSummary:
 
         grad_lagrangian_norm = float(jnp.linalg.norm(state.grad_lagrangian))
         rel_kkt = grad_lagrangian_norm / max(abs(lagrangian_value), 1.0)
+        kkt_scale = float(
+            compute_mu_max(
+                grad_f=state.grad,
+                eq_jac=state.eq_jac,
+                ineq_jac_general=state.ineq_jac,
+                mult_eq=state.multipliers_eq_ls,
+                mult_ineq_general=state.multipliers_ineq_ls,
+                mult_bound=jnp.zeros((0,), dtype=state.grad.dtype),
+            )
+        )
+        kkt_ratio = grad_lagrangian_norm / max(kkt_scale, 1.0)
 
         diagonal = state.lbfgs_history.diagonal
         min_diag = float(jnp.min(diagonal))
@@ -304,6 +333,8 @@ class StepSummary:
             grad_lagrangian_norm=grad_lagrangian_norm,
             lagrangian_value=lagrangian_value,
             rel_kkt=rel_kkt,
+            kkt_scale=kkt_scale,
+            kkt_ratio=kkt_ratio,
             gamma=float(state.lbfgs_history.gamma),
             min_diag=min_diag,
             max_diag=max_diag,

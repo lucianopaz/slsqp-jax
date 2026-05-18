@@ -2000,13 +2000,13 @@ class TestPreconditionedSolver:
 class TestRelativeStationarity:
     """Tests for the relative stationarity convergence criterion."""
 
-    def test_large_lagrangian_converges(self):
-        """When |L| is large at the optimum, the relative criterion should
-        still allow convergence even though ||grad_L|| may exceed a tight
-        absolute threshold.
+    def test_large_objective_offset_converges(self):
+        """A large objective offset should not prevent convergence.
 
-        min (x - 1000)^2 + 1e8  =>  optimum at x=1000, f*=1e8.
-        With rtol=1e-6, threshold = 1e-6 * max(1e8, 1) = 100.
+        The stationarity denominator is now filterSQP's ``mu_max``, not
+        ``|L|``.  Adding ``1e8`` to the objective no longer loosens the
+        stationarity threshold, but the shifted quadratic should still
+        converge normally.
         """
 
         def objective(x, args):
@@ -2206,8 +2206,8 @@ class TestQPKKTSuccessDisjunct:
     """Tests for the guarded ``qp_kkt_success`` disjunct in ``terminate()``.
 
     Background: when the QP is at its model-KKT point but L-BFGS
-    multiplier-recovery noise leaves the relative-stationarity
-    residual ``||grad L|| / max(|L|, 1)`` just above ``rtol``, the
+    multiplier-recovery noise leaves the filterSQP-normalised
+    stationarity residual ``||grad L|| / max(mu_max, 1)`` just above ``rtol``, the
     classical convergence test fails forever and the merit-stagnation
     counter eventually reports ``nonlinear_divergence`` after
     ``max_steps // 10`` iterations.  The ``qp_kkt_success`` disjunct

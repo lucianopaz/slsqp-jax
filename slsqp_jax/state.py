@@ -58,13 +58,16 @@ class InnerSolveResult(NamedTuple):
             ``W̃_k g`` that the inner solver actually iterated against
             (HR 2014, Theorem 3.5).  This is the noise-aware
             stationarity proxy: when the outer SQP enables
-            ``use_inexact_stationarity``, the run is allowed to converge
-            once this value drops below ``rtol * max(|L|, 1)``.  Defaults
-            to ``inf`` so that solvers which do not produce this
-            quantity (i.e. anything other than ``HRInexactSTCG``) cannot
-            accidentally satisfy a ``< rtol`` test even if the user
-            toggles the flag — the inexact path silently degrades to
-            "never converges this way".
+            ``use_inexact_stationarity``, the run is allowed to
+            converge once this value drops below
+            ``rtol * max(mu_max, 1)`` (filterSQP eq. 6 with the shared
+            denominator from
+            :func:`slsqp_jax.slsqp.termination.compute_mu_max`).
+            Defaults to ``inf`` so that solvers which do not produce
+            this quantity (i.e. anything other than ``HRInexactSTCG``)
+            cannot accidentally satisfy a ``< rtol`` test even if the
+            user toggles the flag — the inexact path silently
+            degrades to "never converges this way".
     """
 
     d: Vector
@@ -511,8 +514,11 @@ class SLSQPState(eqx.Module):
             :mod:`slsqp_jax.slsqp.multipliers`).  Independent of ``B``,
             ``d`` and ``α``.  Consumed by the L-BFGS secant pair (so
             the same vector is used at both endpoints) and by
-            ``_terminate_impl``'s Lagrangian-value denominator.  These
-            are the multipliers exposed via
+            ``_terminate_impl``'s filterSQP-style stationarity
+            denominator (the multipliers feed both the Lagrangian
+            gradient numerator and the ``mu_max`` denominator from
+            :func:`slsqp_jax.slsqp.termination.compute_mu_max`).
+            These are the multipliers exposed via
             ``Solution.stats["multipliers_eq"]`` because they are the
             stationarity-quality estimate.  At ``init()`` time both
             ``_qp`` and ``_ls`` are seeded from the same ``lstsq``

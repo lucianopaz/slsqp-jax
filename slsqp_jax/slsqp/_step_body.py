@@ -49,7 +49,11 @@ from slsqp_jax.slsqp.multipliers import (
     compute_at_upper_mask,
     recover_ls_multipliers_at_iterate,
 )
-from slsqp_jax.slsqp.termination import TerminationFlags, coarse_outcome
+from slsqp_jax.slsqp.termination import (
+    TerminationFlags,
+    coarse_outcome,
+    compute_mu_max,
+)
 from slsqp_jax.state import SLSQPDiagnostics, SLSQPState
 from slsqp_jax.types import Vector
 
@@ -443,10 +447,11 @@ def _step_impl(
     # Granular termination-code classification, mirrored at the new
     # iterate so ``state.termination_code`` agrees with the value
     # ``terminate()`` will eventually settle on.  Uses the LS
-    # multipliers for the Lagrangian denominator so the numerator
-    # (``grad_lagrangian_new`` is LS-based) and denominator share the
-    # same multiplier vector.
+    # multipliers so the numerator (``grad_lagrangian_new`` is
+    # LS-based) and the filterSQP μ_max denominator share the same
+    # multiplier vector.
     m_eq_static = self.n_eq_constraints
+    m_ineq_general_for_mu = self.n_ineq_constraints
     m_ineq_total_static = (
         self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
     )
@@ -461,15 +466,27 @@ def _step_impl(
         else jnp.array(True)
     )
     primal_feasible_new = jnp.reshape(eq_feasible_new & ineq_feasible_new, ())
-    lagrangian_val_new = f_val_new
-    if m_eq_static > 0:
-        lagrangian_val_new = lagrangian_val_new - jnp.dot(ls_mult_eq, eq_val_new)
-    if m_ineq_total_static > 0:
-        lagrangian_val_new = lagrangian_val_new - jnp.dot(
-            ls_mult_ineq_full, ineq_val_new
-        )
+    # filterSQP normalisation denominator (eq. 5 of the manual): the
+    # largest single contributor to ``∇_x L = ∇f − Jᵀλ − νᵀI_b``.
+    # Replaces the legacy ``|L|``-based denominator so the test is
+    # invariant to absolute objective magnitude and tracks
+    # multiplier-magnitude blow-up under near-rank-deficient
+    # active sets.  Both ``classical`` and ``inexact`` branches share
+    # the same denominator: even though the projected-gradient
+    # numerator has had the multiplier terms algebraically projected
+    # out, the reference scale "ε relative to the largest
+    # contributor" is the consistent meaning of ``rtol`` across the
+    # two paths.
+    mu_max_new = compute_mu_max(
+        grad_f=grad_new,
+        eq_jac=eq_jac_new,
+        ineq_jac_general=ineq_jac_new[:m_ineq_general_for_mu],
+        mult_eq=ls_mult_eq,
+        mult_ineq_general=ls_mult_ineq_full[:m_ineq_general_for_mu],
+        mult_bound=ls_mult_ineq_full[m_ineq_general_for_mu:],
+    )
     grad_norm_new = jnp.linalg.norm(grad_lagrangian_new)
-    rtol_target_new = self.rtol * jnp.maximum(jnp.abs(lagrangian_val_new), 1.0)
+    rtol_target_new = self.rtol * jnp.maximum(mu_max_new, 1.0)
     classical_stationarity_new = grad_norm_new <= rtol_target_new
     inexact_stationarity_new = qp_result.projected_grad_norm <= rtol_target_new
     stationarity_new = classical_stationarity_new | (
@@ -573,6 +590,7 @@ def _step_impl(
         constraint_violation=("|c|", c_viol, ".3e"),
         kkt_residual=("|∇L|", kkt, ".3e"),
         kkt_relative=("|∇L|/|L|", rel_kkt, ".3e"),
+        kkt_scale=("μ_max", mu_max_new, ".3e"),
         proj_grad_norm=("|W̃g|", qp_result.projected_grad_norm, ".3e"),
         grad_norm=("|∇f|", grad_norm, ".3e"),
         step_size=("α", alpha, ".3e"),
@@ -612,17 +630,23 @@ def _terminate_impl(
     tags: frozenset[object],
 ) -> tuple[Bool[Array, ""], Any]:
     m_eq = self.n_eq_constraints
+    m_ineq_general = self.n_ineq_constraints
     m_ineq_total = self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
     grad_lagrangian = state.grad_lagrangian
 
-    lagrangian_val = state.f_val
-    if m_eq > 0:
-        lagrangian_val = lagrangian_val - state.multipliers_eq_ls @ state.eq_val
-    if m_ineq_total > 0:
-        lagrangian_val = lagrangian_val - state.multipliers_ineq_ls @ state.ineq_val
-
+    # filterSQP normalisation denominator (eq. 5 of the manual).
+    # Mirrors the ``_step_impl`` computation so ``terminate`` and the
+    # per-step ``state.termination_code`` cannot disagree.
+    mu_max = compute_mu_max(
+        grad_f=state.grad,
+        eq_jac=state.eq_jac,
+        ineq_jac_general=state.ineq_jac[:m_ineq_general],
+        mult_eq=state.multipliers_eq_ls,
+        mult_ineq_general=state.multipliers_ineq_ls[:m_ineq_general],
+        mult_bound=state.multipliers_ineq_ls[m_ineq_general:],
+    )
     grad_norm = jnp.linalg.norm(grad_lagrangian)
-    rtol_target = self.rtol * jnp.maximum(jnp.abs(lagrangian_val), 1.0)
+    rtol_target = self.rtol * jnp.maximum(mu_max, 1.0)
     classical_stationarity = grad_norm <= rtol_target
     inexact_stationarity = state.last_projected_grad_norm <= rtol_target
     stationarity = classical_stationarity | (
