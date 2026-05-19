@@ -186,10 +186,12 @@ class TestIdentifyActiveSet:
     def test_empty_inequality_set_short_circuits(self):
         """When ``m_ineq == 0`` the function takes the early-return path.
 
-        The rank-aware size cap below the early return divides by
-        ``m_ineq`` (via ``argsort``), so the function must short-circuit
-        with an empty prediction *before* the cap is computed.  Covers
-        the early-return branch in ``identify_active_set_lpeca``.
+        The rank-aware size cap below the early return calls
+        ``jax.lax.top_k(scores, n_dof)`` with ``n_dof >= 1``, which is
+        not well-defined when ``m_ineq == 0``, so the function must
+        short-circuit with an empty prediction *before* the cap is
+        computed.  Covers the early-return branch in
+        ``identify_active_set_lpeca``.
         """
         c_ineq = jnp.zeros(0)
         c_eq = jnp.array([0.5])
@@ -1027,6 +1029,414 @@ class TestLpecaSizeCap:
         )
         assert not bool(result.valid)
         assert not bool(jnp.any(result.predicted))
+
+
+class TestLpecaSizeCapTopK:
+    """Regression tests for the static ``lax.top_k`` rank-aware size cap.
+
+    The previous implementation computed
+    ``ranks = jnp.argsort(jnp.argsort(-scores))`` and kept rows whose
+    rank was below ``n_dof``.  That nested-argsort lowering hit a JAX/XLA
+    verifier failure on CUDA + ``jax_enable_x64=True``
+    (``permutation_sort_simplifier`` reported ``s32`` vs ``s64``).  The
+    cap now uses ``jax.lax.top_k`` with a static ``k = n_dof``.
+
+    The tests in this class lock in:
+
+    * parity with the old rank-formula selection on tie-free inputs;
+    * tie-tolerant invariants (any consistent tie-break order is fine);
+    * the under-predicted case, where ``top_k`` returns ``-inf``-scored
+      slots that must be filtered out by ``raw_predicted &``;
+    * JIT + ``jax_enable_x64=True`` execution at the problem size that
+      reproduced the original verifier failure;
+    * a flat ``c_ineq`` shape that mirrors what the bound-prediction
+      path passes in production (general inequalities followed by
+      lower / upper bound rows);
+    * a structural guard against reintroducing the nested-argsort
+      pattern in the cap region of ``slsqp_jax/lpeca.py``.
+    """
+
+    @staticmethod
+    def _expected_topk_mask(raw_predicted, c_ineq, n_dof):
+        """Reference selection: keep the ``n_dof`` predicted rows with
+        smallest ``c_ineq`` (largest ``-c_ineq``).  This matches the
+        old ``argsort(argsort(-scores))`` selection on tie-free inputs
+        and is computed with a single host-side ``np.argsort`` so the
+        test reference itself does not depend on the implementation
+        under test.
+        """
+        raw = np.asarray(raw_predicted)
+        c = np.asarray(c_ineq)
+        predicted_idx = np.flatnonzero(raw)
+        if predicted_idx.size == 0:
+            return np.zeros_like(raw, dtype=bool)
+        order = predicted_idx[np.argsort(c[predicted_idx], kind="stable")]
+        kept = order[:n_dof]
+        expected = np.zeros_like(raw, dtype=bool)
+        expected[kept] = True
+        return expected
+
+    @staticmethod
+    def _call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq):
+        """Drive ``identify_active_set_lpeca`` so the cap is the only
+        non-trivial step.
+
+        We synthesise a problem where the trust gate passes and the
+        raw threshold predicate ``c_ineq <= threshold`` reproduces the
+        supplied ``raw_predicted`` mask: feasible rows that should be
+        predicted active are set to exactly ``0.0`` so the predicate
+        fires regardless of ``threshold``, and predicted-but-non-zero
+        rows have their actual ``c_ineq`` value preserved so the cap
+        ranks them by violation magnitude.  Non-predicted rows are
+        shifted into the strictly-feasible regime so the predicate
+        cannot fire.
+        """
+        raw = np.asarray(raw_predicted)
+        c = np.asarray(c_ineq, dtype=np.float64)
+        m_ineq = raw.shape[0]
+        # Use the raw c_ineq for predicted rows; lift the non-predicted
+        # rows above any plausible threshold by adding a constant that
+        # is independent of rho_bar.  ``threshold = (beta * rho_bar)^sigma``
+        # is at most ``rho_bar^sigma`` with ``beta <= 1``, so 1e6 is a
+        # generous separation given the inputs below.
+        non_pred_offset = 1e6
+        c_eff = np.where(raw, c, c + non_pred_offset)
+        # Pad / replace as needed: predicted rows whose value is < 0
+        # would already pass even after the offset, so we clip them to 0
+        # to keep the test fixture predictable.
+        c_eff = np.where(raw, np.minimum(c_eff, 0.0), c_eff)
+
+        c_ineq_jax = jnp.asarray(c_eff, dtype=jnp.float64)
+        c_eq_jax = jnp.zeros(m_eq, dtype=jnp.float64)
+        grad_jax = jnp.zeros(n, dtype=jnp.float64)
+        A_ineq_jax = jnp.zeros((m_ineq, n), dtype=jnp.float64)
+        A_eq_jax = jnp.zeros((m_eq, n), dtype=jnp.float64)
+        lambda_ineq_jax = jnp.zeros(m_ineq, dtype=jnp.float64)
+        mu_eq_jax = jnp.zeros(m_eq, dtype=jnp.float64)
+
+        return identify_active_set_lpeca(
+            c_ineq_jax,
+            c_eq_jax,
+            grad_jax,
+            A_ineq_jax,
+            A_eq_jax,
+            lambda_ineq_jax,
+            mu_eq_jax,
+            sigma=0.9,
+            beta=1.0,
+            trust_threshold=1e9,
+        )
+
+    def test_cap_parity_when_under_budget(self):
+        """``predicted_count < n_dof``: cap is a no-op, mask equals
+        the raw prediction."""
+        n, m_eq = 10, 2
+        # ``m_ineq = 8`` (length of the ``raw_predicted`` array below).
+        n_dof = min(max(n - m_eq - 1, 1), 8)  # = 7
+        raw_predicted = np.array([True, False, True, True, False, False, False, False])
+        assert int(raw_predicted.sum()) < n_dof
+        c_ineq = np.array([-1.0, 5.0, -2.0, -0.5, 3.0, 7.0, 2.5, 4.0], dtype=np.float64)
+
+        result = self._call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq)
+
+        expected = self._expected_topk_mask(raw_predicted, c_ineq, n_dof)
+        np.testing.assert_array_equal(np.asarray(result.predicted), expected)
+        assert not bool(result.capped)
+
+    def test_cap_parity_when_exactly_at_budget(self):
+        """``predicted_count == n_dof``: every predicted row survives,
+        ``capped_flag`` stays ``False``."""
+        n, m_eq = 8, 2
+        # ``m_ineq = 10`` (length of the ``raw_predicted`` array below).
+        n_dof = max(n - m_eq - 1, 1)  # = 5
+        raw_predicted = np.array(
+            [True, False, True, True, False, True, False, True, False, False]
+        )
+        assert int(raw_predicted.sum()) == n_dof
+        c_ineq = np.array(
+            [-1.0, 5.0, -2.0, -0.5, 3.0, -3.0, 7.0, -1.5, 2.0, 4.0],
+            dtype=np.float64,
+        )
+
+        result = self._call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq)
+
+        expected = self._expected_topk_mask(raw_predicted, c_ineq, n_dof)
+        np.testing.assert_array_equal(np.asarray(result.predicted), expected)
+        assert not bool(result.capped)
+
+    def test_cap_parity_when_over_budget(self):
+        """``predicted_count > n_dof``: cap keeps the ``n_dof`` rows
+        with smallest ``c_ineq``, and ``capped_flag`` fires."""
+        n, m_eq = 8, 2
+        # ``m_ineq = 12`` (length of the ``raw_predicted`` array below);
+        # 9 of those 12 rows are predicted, all with distinct
+        # ``c_ineq`` values, so the cap must fire and pick 5.
+        n_dof = max(n - m_eq - 1, 1)  # = 5
+        raw_predicted = np.array(
+            [True, False, True, True, True, True, False, True, True, True, False, True]
+        )
+        assert int(raw_predicted.sum()) > n_dof
+        c_ineq = np.array(
+            [-1.5, 5.0, -3.0, -0.5, -2.5, -1.0, 7.0, -0.25, -4.0, -2.0, 9.0, -3.5],
+            dtype=np.float64,
+        )
+
+        result = self._call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq)
+
+        expected = self._expected_topk_mask(raw_predicted, c_ineq, n_dof)
+        np.testing.assert_array_equal(np.asarray(result.predicted), expected)
+        assert bool(result.capped)
+        assert int(np.asarray(result.predicted).sum()) == n_dof
+
+    def test_cap_tie_invariants_hold_under_any_break_order(self):
+        """When multiple predicted rows share the same ``c_ineq`` value
+        the cap may select either, but the invariants must hold:
+
+        * every selected row is in ``raw_predicted``;
+        * the selected count is at most ``n_dof``;
+        * every selected row's ``c_ineq`` is no larger than any
+          unselected predicted row's ``c_ineq`` (allowing equality on
+          ties).
+        """
+        n, m_eq = 7, 2
+        # ``m_ineq = 8`` (length of the ``raw_predicted`` array below);
+        # six predicted rows, two clusters of ties; the cap must pick
+        # ``n_dof`` of them.
+        n_dof = max(n - m_eq - 1, 1)  # = 4
+        raw_predicted = np.array([True, True, True, True, True, True, False, False])
+        c_ineq = np.array(
+            [-1.0, -1.0, -1.0, -2.0, -2.0, -0.5, 7.0, 9.0],
+            dtype=np.float64,
+        )
+
+        result = self._call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq)
+        selected = np.asarray(result.predicted)
+
+        selected_idx = np.flatnonzero(selected)
+        predicted_idx = np.flatnonzero(raw_predicted)
+        unselected_predicted = np.setdiff1d(predicted_idx, selected_idx)
+
+        assert np.all(raw_predicted[selected_idx]), (
+            "Cap selected at least one row that was not in raw_predicted"
+        )
+        assert selected_idx.size <= n_dof
+        if unselected_predicted.size > 0 and selected_idx.size > 0:
+            max_selected = float(np.max(c_ineq[selected_idx]))
+            min_unselected = float(np.min(c_ineq[unselected_predicted]))
+            assert max_selected <= min_unselected, (
+                f"Cap selected row with c_ineq={max_selected} over an "
+                f"unselected predicted row with c_ineq={min_unselected}"
+            )
+        assert bool(result.capped)
+
+    def test_cap_under_predicted_does_not_activate_non_predicted(self):
+        """``top_k`` returns ``n_dof`` indices regardless of how many
+        rows are actually predicted; when fewer are predicted, the
+        extra slots have score ``-inf`` and point at non-predicted
+        rows.  The ``raw_predicted & selected_mask`` guard must
+        suppress them.
+        """
+        n, m_eq = 12, 2
+        # ``m_ineq = 10`` (length of the ``raw_predicted`` array below);
+        # only two predicted rows, well below the rank-margin budget
+        # ``n_dof = max(n - m_eq - 1, 1) = 9``, so ``top_k`` returns
+        # several non-predicted slots padded with ``-inf`` scores.
+        raw_predicted = np.array(
+            [False, True, False, False, False, True, False, False, False, False]
+        )
+        assert int(raw_predicted.sum()) < max(n - m_eq - 1, 1)
+        c_ineq = np.array(
+            [50.0, -1.0, 60.0, 70.0, 80.0, -2.0, 65.0, 55.0, 45.0, 40.0],
+            dtype=np.float64,
+        )
+
+        result = self._call_lpeca_for_cap(raw_predicted, c_ineq, n, m_eq)
+        selected = np.asarray(result.predicted)
+
+        np.testing.assert_array_equal(selected, raw_predicted)
+        assert not bool(result.capped)
+
+    def test_cap_jit_x64_large_inequalities_compiles(self):
+        """JIT regression at the inequality count that originally
+        triggered the ``permutation_sort_simplifier`` failure.
+
+        The original crash was specific to CUDA + ``jax_enable_x64``.
+        On CPU CI this is a smoke test of the new top-k lowering,
+        not a reproducer of the GPU verifier failure; on a CUDA host
+        with x64 enabled it doubles as a hardware-level regression.
+        """
+        m_ineq = 470
+        n = 300
+        m_eq = 10
+        # Deterministic, varied c_ineq so the threshold predicate fires
+        # for a non-trivial fraction of rows.
+        idx = jnp.arange(m_ineq, dtype=jnp.float64)
+        c_ineq = (idx % 17) * 1e-4 - 1e-3
+        c_eq = jnp.zeros(m_eq, dtype=jnp.float64)
+        grad = jnp.full((n,), 0.25, dtype=jnp.float64)
+        A_ineq = jnp.zeros((m_ineq, n), dtype=jnp.float64)
+        A_eq = jnp.zeros((m_eq, n), dtype=jnp.float64)
+        lambda_ineq = jnp.zeros(m_ineq, dtype=jnp.float64)
+        mu_eq = jnp.zeros(m_eq, dtype=jnp.float64)
+
+        @jax.jit
+        def compiled(c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq):
+            return identify_active_set_lpeca(
+                c_ineq,
+                c_eq,
+                grad,
+                A_ineq,
+                A_eq,
+                lambda_ineq,
+                mu_eq,
+                trust_threshold=1e9,
+                sigma=0.9,
+                beta=1.0,
+            )
+
+        result = compiled(c_ineq, c_eq, grad, A_ineq, A_eq, lambda_ineq, mu_eq)
+
+        assert result.predicted.shape == (m_ineq,)
+        assert result.predicted.dtype == bool
+        assert bool(jnp.isfinite(result.rho_bar))
+        n_dof = min(max(n - m_eq - 1, 1), m_ineq)
+        assert int(jnp.sum(result.predicted.astype(jnp.int32))) <= n_dof
+
+    def test_cap_with_appended_bound_rows(self):
+        """Production scatters bound-row predictions through the same
+        flat ``c_ineq`` vector when ``lpeca_predict_bounds=True``.
+
+        The cap helper itself just sees one flat vector — general
+        inequalities followed by lower / upper bound rows — and must
+        treat them uniformly.  This test exercises that shape so a
+        future refactor cannot accidentally special-case the cap.
+        """
+        m_general = 6
+        m_lower = 4
+        m_upper = 4
+        m_ineq = m_general + m_lower + m_upper  # = 14
+        n = 10
+        m_eq = 3
+        n_dof = min(max(n - m_eq - 1, 1), m_ineq)  # = 6
+
+        # General inequalities: a mix of predicted-active and
+        # well-feasible rows.
+        c_general = np.array([-1.0, -2.0, 5.0, -0.5, 8.0, -3.0])
+        # Bound rows: two lower bounds active, two well inside; two
+        # upper bounds active, two well inside.
+        c_lower = np.array([-0.25, 3.0, -1.5, 2.0])
+        c_upper = np.array([4.0, -0.75, -2.25, 6.0])
+        c_ineq = np.concatenate([c_general, c_lower, c_upper])
+
+        raw_predicted_full = c_ineq <= 0.0
+        # Confirm the fixture is over-budget so the cap fires.
+        assert int(raw_predicted_full.sum()) > n_dof
+
+        result = self._call_lpeca_for_cap(raw_predicted_full, c_ineq, n, m_eq)
+        selected = np.asarray(result.predicted)
+
+        expected = self._expected_topk_mask(raw_predicted_full, c_ineq, n_dof)
+        np.testing.assert_array_equal(selected, expected)
+        assert bool(result.capped)
+        assert int(selected.sum()) == n_dof
+        # The cap must not activate any well-feasible row regardless of
+        # whether it sits in the general, lower-bound, or upper-bound
+        # block.
+        assert not np.any(selected & ~raw_predicted_full)
+
+    def test_cap_helper_source_contains_no_nested_argsort(self):
+        """Structural guard: scan the cap region of
+        ``slsqp_jax/lpeca.py`` for the nested-argsort pattern.
+
+        The cap region is delimited by the ``# Rank-aware size cap``
+        anchor and the *last* ``return LPECAResult(`` line inside
+        ``identify_active_set_lpeca`` (the early-return for
+        ``m_ineq == 0`` is skipped by searching up to the next
+        top-level ``def`` after the anchor).  Comments and docstrings
+        outside the cap region (which may mention ``argsort``
+        historically) are excluded.  Comments inside the cap region
+        are stripped so the historical-pattern reference in the
+        explanatory comment does not trip the check.
+        """
+        import inspect
+        import re
+
+        from slsqp_jax import lpeca as lpeca_module
+
+        source = inspect.getsource(lpeca_module)
+        anchor = "# Rank-aware size cap"
+        terminator = "return LPECAResult("
+        start = source.find(anchor)
+        assert start >= 0, (
+            "Cap anchor not found; update the structural guard if the "
+            "anchor comment was renamed"
+        )
+        # Scope the search to the body of ``identify_active_set_lpeca``
+        # so we don't pick up the duplicate ``return LPECAResult(`` in
+        # ``compute_lpeca_active_set`` below.
+        next_def = source.find("\ndef ", start)
+        if next_def < 0:
+            next_def = len(source)
+        end = source.rfind(terminator, start, next_def)
+        assert end > start, (
+            "No ``return LPECAResult(`` found between the cap anchor "
+            "and the next top-level ``def``; structural guard cannot "
+            "scope itself."
+        )
+        cap_region = source[start:end]
+
+        # Strip ``# ...`` comments so the historical-pattern reference
+        # in the explanatory comment is not counted as active code.
+        code_lines = []
+        for line in cap_region.splitlines():
+            stripped = re.sub(r"\s*#.*$", "", line)
+            code_lines.append(stripped)
+        code_only = "\n".join(code_lines)
+
+        assert "top_k" in code_only, (
+            "Cap region must use ``jax.lax.top_k``; the previous "
+            "nested-argsort pattern may have been reintroduced"
+        )
+        assert "argsort" not in code_only, (
+            "Cap region must not call ``argsort``; reintroducing it "
+            "risks the CUDA+x64 ``permutation_sort_simplifier`` "
+            "verifier failure (jax-ml/jax issue #34096)"
+        )
+
+    def test_cap_jaxpr_contains_top_k_primitive(self):
+        """JAXPR-level guard complementing the source-level check.
+
+        The new cap should lower to a ``top_k`` primitive in the
+        jaxpr text.  We do not assert the absence of ``sort`` because
+        ``lax.top_k`` is allowed to lower through sort-like HLO on
+        some backends/versions (the plan documents this); the
+        invariant we lock in here is "``top_k`` participates in the
+        cap lowering at jaxpr level".
+        """
+        m_ineq, n, m_eq = 16, 8, 2
+        c_ineq = jnp.linspace(-1.0, 1.0, m_ineq)
+        c_eq = jnp.zeros(m_eq)
+        grad = jnp.ones(n) * 0.1
+        A_ineq = jnp.zeros((m_ineq, n))
+        A_eq = jnp.zeros((m_eq, n))
+        lambda_ineq = jnp.zeros(m_ineq)
+        mu_eq = jnp.zeros(m_eq)
+
+        jaxpr = jax.make_jaxpr(identify_active_set_lpeca)(
+            c_ineq,
+            c_eq,
+            grad,
+            A_ineq,
+            A_eq,
+            lambda_ineq,
+            mu_eq,
+        )
+        text = str(jaxpr)
+        assert "top_k" in text, (
+            "identify_active_set_lpeca jaxpr does not contain a "
+            "``top_k`` primitive; the static top-k cap may have been "
+            "replaced.  Jaxpr was:\n" + text
+        )
 
 
 class TestLpecaWarmupGate:
