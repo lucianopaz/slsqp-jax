@@ -50,6 +50,7 @@ problems." *Mathematical Programming*, 117(1-2), 355-386.
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, jaxtyped
@@ -214,9 +215,11 @@ def identify_active_set_lpeca(
     threshold = jnp.where(valid, threshold_raw, 0.0)
     raw_predicted = (c_ineq <= threshold) & valid
 
-    # Rank-aware size cap.  ``n_dof`` is static (computed from shape
-    # constants), so the cap can be expressed with a static mask
-    # ``rank < n_dof`` which is jit-friendly.
+    # Rank-aware size cap.  ``n_dof`` is Python/static, so the cap is a
+    # single static ``lax.top_k`` selection; we never materialise a full
+    # rank vector and we never call nested ``argsort`` (that lowering
+    # triggered a JAX/XLA verifier failure on CUDA+x64, see
+    # ``jax-ml/jax`` issue #34096).
     n_dof_static = max(n - m_eq - 1, 1)
     if m_ineq == 0:
         return LPECAResult(
@@ -228,13 +231,30 @@ def identify_active_set_lpeca(
 
     n_dof = min(n_dof_static, m_ineq)
     # Score: most violated (smallest c_ineq_i) wins.  Non-predicted
-    # entries get -inf so they are never selected.
+    # entries get -inf so their indices, if they happen to appear in the
+    # top-k positions when fewer than ``n_dof`` rows are predicted, are
+    # filtered out by the ``raw_predicted & selected_mask`` guard below.
     scores = jnp.where(raw_predicted, -c_ineq, -jnp.inf)
-    # ``argsort(argsort(-scores))`` produces 0-indexed descending
-    # rank: 0 = largest score = most violated predicted entry.
-    ranks = jnp.argsort(jnp.argsort(-scores))
-    capped_predicted = raw_predicted & (ranks < n_dof)
+    # Static ``top_k`` selection of the ``n_dof`` largest scores.  This
+    # replaces the previous ``argsort(argsort(-scores))`` rank vector,
+    # which lowered to a nested-sort pattern that the XLA
+    # ``permutation_sort_simplifier`` pass rejected on CUDA+x64.
+    _, top_indices = jax.lax.top_k(scores, n_dof)
+    # ``astype(jnp.int32)`` normalises the scatter index dtype; it is
+    # not part of the mathematical selection rule.
+    selected_mask = (
+        jnp.zeros_like(raw_predicted).at[top_indices.astype(jnp.int32)].set(True)
+    )
+    # ``raw_predicted &`` is the load-bearing guard: when fewer than
+    # ``n_dof`` rows are predicted, ``top_k`` returns positions with
+    # score ``-inf`` (non-predicted rows); the AND restores the
+    # invariant that only predicted rows can survive the cap.
+    capped_predicted = raw_predicted & selected_mask
 
+    # Diagnostics are intentionally computed from ``raw_predicted`` so
+    # ``capped_flag`` retains its "more eligible rows were predicted
+    # than the LICQ-margin cap allowed" meaning, independent of the
+    # ``top_k`` selection.
     predicted_count = jnp.sum(raw_predicted.astype(jnp.int32))
     capped_flag = predicted_count > n_dof
 
