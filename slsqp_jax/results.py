@@ -76,6 +76,15 @@ class RESULTS(optx.RESULTS):  # type: ignore[misc]  # ty: ignore[subclass-of-fin
         "returned iterate and consider relaxing constraints or "
         "providing a feasible initial point."
     )
+    infeasible_stationary = (
+        "Converged to a minimum-constraint-violation infeasible "
+        "stationary point. The feasibility-restoration fallback "
+        "(objective weight omega = 0) drove the iterate to a stationary "
+        "point of the constraint-violation measure v(x) that is still "
+        "infeasible (v > atol): the constraints are locally infeasible. "
+        "Inspect c_eq / c_ineq at the returned iterate; the problem as "
+        "posed has no feasible point near this region."
+    )
     qp_subproblem_failure = (
         "Consecutive QP-subproblem failures exceeded "
         "2 * qp_failure_patience. Even after L-BFGS soft-then-identity "

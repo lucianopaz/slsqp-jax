@@ -71,7 +71,15 @@ def _step_impl(
     hvp_fn = self._build_lagrangian_hvp(fn, y, args, state)
     qp_result = self._solve_qp_subproblem(state, hvp_fn, y)
 
-    # Projected steepest-descent fallback direction.
+    # Fallback direction when the QP does not produce a usable step.
+    #
+    # Normal mode (ω = 1): projected steepest descent ``P(-∇f)`` onto
+    # ``null(J_eq)``.  Restoration mode (ω = 0): steepest descent on the
+    # constraint-violation measure ``v(x)``, i.e. ``-∇v``, left
+    # *unprojected* because the goal is to move out of the (infeasible)
+    # constraint manifold to reduce ``‖c_eq‖``.  ``∇v`` uses the same
+    # Jacobian contractions as the L1 merit directional derivative:
+    #   ∇v = J_eqᵀ sign(c_eq) - J_ineq_generalᵀ [c_ineq_general < 0].
     neg_grad = -state.grad
     if self.n_eq_constraints > 0:
         J = state.eq_jac
@@ -80,13 +88,33 @@ def _step_impl(
         JJT_reg = JJT + 1e-10 * jnp.eye(m_eq)
         Jv = J @ neg_grad
         w = jnp.linalg.solve(JJT_reg, Jv)
-        fallback_direction = neg_grad - J.T @ w
+        normal_fallback = neg_grad - J.T @ w
     else:
-        fallback_direction = neg_grad
+        normal_fallback = neg_grad
+
+    m_ineq_general_fb = self.n_ineq_constraints
+    g_feas = jnp.zeros_like(state.grad)
+    if self.n_eq_constraints > 0:
+        g_feas = g_feas + state.eq_jac.T @ jnp.sign(state.eq_val)
+    if m_ineq_general_fb > 0:
+        ineq_jac_general_fb = state.ineq_jac[:m_ineq_general_fb]
+        viol_mask_fb = (state.ineq_val[:m_ineq_general_fb] < 0.0).astype(
+            state.grad.dtype
+        )
+        g_feas = g_feas - ineq_jac_general_fb.T @ viol_mask_fb
+    restoration_fallback = -g_feas
+    fallback_direction = jnp.where(
+        state.restoration, restoration_fallback, normal_fallback
+    )
 
     direction = jnp.where(qp_result.converged, qp_result.direction, fallback_direction)
     zero_direction = jnp.linalg.norm(direction) < 1e-30
-    grad_nonzero = jnp.linalg.norm(state.grad) > self.atol
+    fallback_source_norm = jnp.where(
+        state.restoration,
+        jnp.linalg.norm(restoration_fallback),
+        jnp.linalg.norm(state.grad),
+    )
+    grad_nonzero = fallback_source_norm > self.atol
     direction = jnp.where(
         zero_direction & grad_nonzero & ~qp_result.converged,
         fallback_direction,
@@ -96,7 +124,13 @@ def _step_impl(
     n_vars = state.grad.shape[0]
     direction = jnp.reshape(direction, (n_vars,))
     d_norm = jnp.reshape(jnp.linalg.norm(direction), ())
-    is_zero_step_pre = jnp.reshape((d_norm < self.atol) & qp_result.converged, ())
+    # In restoration mode a near-zero feasibility direction is the
+    # ``∇v ≈ 0`` infeasible-stationary signal, so the zero-step detector
+    # also fires when the QP itself did not "converge" (the linearised
+    # constraints are typically inconsistent at an infeasible point).
+    is_zero_step_pre = jnp.reshape(
+        (d_norm < self.atol) & (qp_result.converged | state.restoration), ()
+    )
 
     # Han-Powell penalty update: drop wrong-sign reduced-gradient noise
     # from the QP-side bound multipliers before letting them ratchet
@@ -125,7 +159,12 @@ def _step_impl(
         qp_result.multipliers_eq,
         mult_ineq_for_penalty,
     )
-    merit_penalty = jnp.where(qp_result.converged, new_penalty, state.merit_penalty)
+    # Freeze the Han-Powell penalty during restoration: with ω = 0 the
+    # merit is ρ·v and the QP/feasibility multipliers are not NLP KKT
+    # multipliers, so they must not ratchet ρ.
+    merit_penalty = jnp.where(
+        qp_result.converged & ~state.restoration, new_penalty, state.merit_penalty
+    )
 
     ls_result = backtracking_line_search(
         fn=fn,
@@ -148,6 +187,7 @@ def _step_impl(
         ineq_jac=state.ineq_jac[: self.n_ineq_constraints]
         if self.n_ineq_constraints > 0
         else None,
+        obj_weight=state.omega,
     )
 
     alpha = ls_result.alpha
@@ -157,6 +197,138 @@ def _step_impl(
     ineq_val_new = ls_result.ineq_val
 
     _, aux = fn(y_new, args)
+
+    # ------------------------------------------------------------------
+    # Feasibility-restoration bookkeeping (Curtis-Johnson-Robinson-Wächter
+    # 2014).  Decided *here*, before the L-BFGS update, so the L-BFGS
+    # append/reset can be frozen on the entry step and throughout
+    # restoration (objective curvature preserved as a metric).  Entry is
+    # gated on a dedicated ``infeasible_stall_count`` that is *disjoint*
+    # from the QP/LS failure counters that drive the L-BFGS reset chain,
+    # guaranteeing entry never coincides with a reset.
+    # ------------------------------------------------------------------
+    m_eq_feas = self.n_eq_constraints
+    m_ineq_total_feas = (
+        self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
+    )
+    eq_violation_new = jnp.max(jnp.abs(eq_val_new)) if m_eq_feas > 0 else jnp.array(0.0)
+    ineq_violation_new = (
+        jnp.max(jnp.maximum(0.0, -ineq_val_new))
+        if m_ineq_total_feas > 0
+        else jnp.array(0.0)
+    )
+    max_violation_new = jnp.maximum(eq_violation_new, ineq_violation_new)
+    primal_feasible_new = jnp.reshape(max_violation_new <= self.atol, ())
+    restoration_exit_feasible = jnp.reshape(
+        max_violation_new <= self.restoration_exit_tol_factor * self.atol, ()
+    )
+
+    # Failure classification.  *Surprising* (feasible) QP / line-search
+    # failures feed the L-BFGS reset chain; their infeasibility-driven
+    # counterparts are split off into the dedicated
+    # ``infeasible_stall_count``.  The ``primal_feasible_new`` factor makes
+    # the two disjoint, so an infeasibility stall can never trip an L-BFGS
+    # reset (or coincide with restoration entry).
+    qp_unconverged = ~qp_result.converged
+    ls_failed = ~ls_result.success
+    qp_real_failure = jnp.reshape(
+        qp_unconverged & ~qp_result.reached_max_iter & primal_feasible_new, ()
+    )
+    ls_real_failure = jnp.reshape(ls_failed & primal_feasible_new, ())
+    # Infeasibility stall: while infeasible, the step made no usable
+    # progress.  Three symptoms count: the QP failed (inconsistent
+    # linearisation), the Han-Powell merit could not find a descent step,
+    # or the QP "converged" to a near-zero direction (``∇v ≈ 0`` at an
+    # infeasible point — the most common case, since at a locally
+    # infeasible iterate the least-violation QP direction collapses to
+    # ``d ≈ 0`` and the line search trivially accepts it).  Without the
+    # zero-step clause restoration would never arm on a cleanly
+    # locally-infeasible problem and the run would silently exhaust
+    # ``max_steps`` (the ``restoration_arming`` guard suppresses the
+    # generic stagnation / infeasible paths while restoration is eligible).
+    infeasible_stall = jnp.reshape(
+        ~primal_feasible_new & (qp_unconverged | ls_failed | is_zero_step_pre), ()
+    )
+    new_consecutive_qp_failures = jnp.where(
+        qp_real_failure,
+        state.consecutive_qp_failures + 1,
+        jnp.array(0),
+    )
+    new_consecutive_ls_failures = jnp.where(
+        ls_real_failure,
+        state.consecutive_ls_failures + 1,
+        jnp.array(0),
+    )
+    new_infeasible_stall_count = jnp.where(
+        infeasible_stall,
+        state.infeasible_stall_count + 1,
+        jnp.array(0),
+    )
+
+    # Restoration entry / exit decisions (effective for the *next* step).
+    cooldown_clear = state.restoration_cooldown == 0
+    under_entry_cap = state.restoration_entries < self.restoration_max_entries
+    entering_restoration = jnp.reshape(
+        jnp.asarray(self.enable_restoration)
+        & ~state.restoration
+        & ~primal_feasible_new
+        & (new_infeasible_stall_count >= self.restoration_patience)
+        & cooldown_clear
+        & under_entry_cap,
+        (),
+    )
+    # "Restoration is eligible to arm" on this infeasible iterate.  Used to
+    # suppress the divergence-rollback and merit-stagnation guardrails
+    # while restoration accumulates its entry patience, so those generic
+    # failure paths cannot terminate the run before restoration takes
+    # over (and so the more informative ``infeasible_stationary`` outcome
+    # wins over the generic ``infeasible`` override).
+    restoration_arming = jnp.reshape(
+        jnp.asarray(self.enable_restoration)
+        & ~state.restoration
+        & ~primal_feasible_new
+        & cooldown_clear
+        & under_entry_cap,
+        (),
+    )
+    exiting_restoration = jnp.reshape(state.restoration & restoration_exit_feasible, ())
+    omega_new = jnp.where(
+        entering_restoration,
+        jnp.array(0.0),
+        jnp.where(exiting_restoration, jnp.array(1.0), state.omega),
+    )
+    restoration_new = jnp.reshape(
+        jnp.where(
+            entering_restoration,
+            jnp.array(True),
+            jnp.where(exiting_restoration, jnp.array(False), state.restoration),
+        ),
+        (),
+    )
+    omega_changed = jnp.reshape(omega_new != state.omega, ())
+
+    infeasible_stall_count_new = jnp.where(
+        entering_restoration | state.restoration,
+        jnp.array(0),
+        new_infeasible_stall_count,
+    )
+    restoration_entries_new = jnp.where(
+        entering_restoration,
+        state.restoration_entries + 1,
+        state.restoration_entries,
+    )
+    restoration_cooldown_new = jnp.where(
+        exiting_restoration,
+        jnp.asarray(self.restoration_cooldown),
+        jnp.where(
+            restoration_new,
+            state.restoration_cooldown,
+            jnp.maximum(state.restoration_cooldown - 1, 0),
+        ),
+    )
+    # Freeze L-BFGS (no append, no reset) on the entry step and while in
+    # restoration so objective curvature is preserved across the switch.
+    should_update_lbfgs = jnp.reshape(~(state.restoration | entering_restoration), ())
 
     grad_new = self._grad_impl(fn, y_new, args)
     eq_jac_new = self._eq_jac_impl(y_new, args)
@@ -258,7 +430,7 @@ def _step_impl(
         )
         y_for_lbfgs = grad_lagrangian_new - grad_lagrangian_old
 
-    new_lbfgs_history = lbfgs_append(
+    computed_history = lbfgs_append(
         state.lbfgs_history,
         s,
         y_for_lbfgs,
@@ -267,56 +439,62 @@ def _step_impl(
         diag_ceil=self.lbfgs_diag_ceil,
     )
 
-    kappa_est = new_lbfgs_history.eig_upper / jnp.maximum(
-        new_lbfgs_history.eig_lower, 1e-30
+    kappa_est = computed_history.eig_upper / jnp.maximum(
+        computed_history.eig_lower, 1e-30
     )
-    new_lbfgs_history = jax.lax.cond(
-        (new_lbfgs_history.count > 1) & (kappa_est > 1e6),
+    computed_history = jax.lax.cond(
+        (computed_history.count > 1) & (kappa_est > 1e6),
         lbfgs_soft_reset,
         lambda h: h,
-        new_lbfgs_history,
+        computed_history,
     )
 
-    qp_real_failure = ~qp_result.converged & ~qp_result.reached_max_iter
-    new_consecutive_qp_failures = jnp.where(
-        qp_real_failure,
-        state.consecutive_qp_failures + 1,
-        jnp.array(0),
-    )
-    new_lbfgs_history = jax.lax.cond(
+    # ``qp_real_failure`` / ``new_consecutive_qp_failures`` /
+    # ``ls_failed`` / ``new_consecutive_ls_failures`` are computed in the
+    # restoration-bookkeeping block above; infeasibility-driven QP stalls
+    # are routed away from ``qp_real_failure`` there so they never trip
+    # these resets.
+    computed_history = jax.lax.cond(
         qp_real_failure & (new_consecutive_qp_failures == 1),
         lbfgs_soft_reset,
         lambda h: h,
-        new_lbfgs_history,
+        computed_history,
     )
-    new_lbfgs_history = jax.lax.cond(
+    computed_history = jax.lax.cond(
         new_consecutive_qp_failures >= self.qp_failure_patience,
         lbfgs_identity_reset,
         lambda h: h,
-        new_lbfgs_history,
+        computed_history,
     )
-
-    ls_failed = ~ls_result.success
-    new_consecutive_ls_failures = jnp.where(
-        ls_failed,
-        state.consecutive_ls_failures + 1,
-        jnp.array(0),
-    )
-    new_lbfgs_history = jax.lax.cond(
+    computed_history = jax.lax.cond(
         ls_failed & (new_consecutive_ls_failures == 1),
         lbfgs_soft_reset,
         lambda h: h,
-        new_lbfgs_history,
+        computed_history,
     )
-    new_lbfgs_history = jax.lax.cond(
+    computed_history = jax.lax.cond(
         new_consecutive_ls_failures >= self.ls_failure_patience,
         lbfgs_identity_reset,
         lambda h: h,
-        new_lbfgs_history,
+        computed_history,
+    )
+
+    # Freeze L-BFGS on the restoration entry step and throughout
+    # restoration: reuse the existing history unchanged so objective
+    # curvature is preserved across the ω switch and restoration entry
+    # never coincides with a curvature reset.
+    new_lbfgs_history = jax.lax.cond(
+        should_update_lbfgs,
+        lambda computed, _old: computed,
+        lambda _computed, old: old,
+        computed_history,
+        state.lbfgs_history,
     )
 
     is_zero_step_post = jnp.reshape(
-        (alpha * d_norm < self.atol) & qp_result.converged & ls_result.success,
+        (alpha * d_norm < self.atol)
+        & (qp_result.converged | state.restoration)
+        & ls_result.success,
         (),
     )
     is_zero_step = jnp.reshape(is_zero_step_pre | is_zero_step_post, ())
@@ -331,7 +509,9 @@ def _step_impl(
     ls_fatal = new_consecutive_ls_failures >= 2 * self.ls_failure_patience
     qp_fatal = new_consecutive_qp_failures >= 2 * self.qp_failure_patience
 
-    merit_new = compute_merit(f_val_new, eq_val_new, ineq_val_new, merit_penalty)
+    merit_new = compute_merit(
+        f_val_new, eq_val_new, ineq_val_new, merit_penalty, state.omega
+    )
     merit_threshold = self.stagnation_tol * jnp.maximum(jnp.abs(state.best_merit), 1.0)
     improved = merit_new < state.best_merit - merit_threshold
     new_best_merit = jnp.where(improved, merit_new, state.best_merit)
@@ -339,14 +519,42 @@ def _step_impl(
     new_steps_without = jnp.where(
         improved, jnp.array(0), state.steps_without_improvement + 1
     )
+    # When the objective weight ω flips (restoration entry/exit) the merit
+    # changes units (``f + ρv`` <-> ``ρv``).  Re-seed the best-merit
+    # tracking with the merit evaluated in the *new* units so the next
+    # step's comparison is well-posed, and suppress this step's
+    # stagnation / divergence bookkeeping (the cross-unit delta is
+    # meaningless).
+    merit_seed_next_units = compute_merit(
+        f_val_new, eq_val_new, ineq_val_new, merit_penalty, omega_new
+    )
+    new_best_merit = jnp.where(omega_changed, merit_seed_next_units, new_best_merit)
+    new_best_x = jnp.where(omega_changed, y_new, new_best_x)
+    new_steps_without = jnp.where(omega_changed, jnp.array(0), new_steps_without)
     patience = self._stagnation_window
-    merit_stagnation = (state.step_count >= patience) & (new_steps_without >= patience)
+    # Suppress merit-stagnation while restoration is armed or active: the
+    # feasibility fallback (or its ``infeasible_stationary`` terminal)
+    # owns the infeasible-stall outcome.
+    merit_stagnation = (
+        (state.step_count >= patience)
+        & (new_steps_without >= patience)
+        & ~restoration_arming
+        & ~state.restoration
+    )
 
     blowup_threshold = self.divergence_factor * jnp.maximum(
         jnp.abs(new_best_merit), 1.0
     )
     merit_finite = jnp.isfinite(merit_new)
-    blowup_now = ((merit_new - new_best_merit) > blowup_threshold) | ~merit_finite
+    # Suppress the divergence rollback on the ω-switch step and while
+    # restoration is armed or active (the penalty ratchet on an infeasible
+    # problem would otherwise trip it before restoration engages).
+    blowup_now = (
+        (((merit_new - new_best_merit) > blowup_threshold) | ~merit_finite)
+        & ~omega_changed
+        & ~restoration_arming
+        & ~state.restoration
+    )
     new_blowup_count = jnp.where(blowup_now, state.blowup_count + 1, jnp.array(0))
     diverging_now = jnp.reshape(new_blowup_count >= self.divergence_patience, ())
     y_returned = jnp.where(diverging_now, new_best_x, y_new)
@@ -423,6 +631,19 @@ def _step_impl(
             1,
             0,
         ),
+        n_restoration_entries=prev_diag.n_restoration_entries
+        + jnp.where(entering_restoration, 1, 0),
+        restoration_triggered=prev_diag.restoration_triggered | entering_restoration,
+        n_restoration_steps=prev_diag.n_restoration_steps
+        + jnp.where(state.restoration, 1, 0),
+        min_violation_in_restoration=jnp.minimum(
+            prev_diag.min_violation_in_restoration,
+            jnp.where(
+                state.restoration,
+                max_violation_new.astype(prev_diag.min_violation_in_restoration.dtype),
+                prev_diag.min_violation_in_restoration,
+            ),
+        ),
     )
 
     # QP-side state writeback: keep the QP-recovered general-inequality
@@ -449,23 +670,9 @@ def _step_impl(
     # ``terminate()`` will eventually settle on.  Uses the LS
     # multipliers so the numerator (``grad_lagrangian_new`` is
     # LS-based) and the filterSQP μ_max denominator share the same
-    # multiplier vector.
-    m_eq_static = self.n_eq_constraints
+    # multiplier vector.  ``primal_feasible_new`` was computed in the
+    # restoration-bookkeeping block above and is reused here.
     m_ineq_general_for_mu = self.n_ineq_constraints
-    m_ineq_total_static = (
-        self.n_ineq_constraints + self._n_lower_bounds + self._n_upper_bounds
-    )
-    eq_feasible_new = (
-        jnp.max(jnp.abs(eq_val_new)) <= self.atol
-        if m_eq_static > 0
-        else jnp.array(True)
-    )
-    ineq_feasible_new = (
-        jnp.max(jnp.maximum(0.0, -ineq_val_new)) <= self.atol
-        if m_ineq_total_static > 0
-        else jnp.array(True)
-    )
-    primal_feasible_new = jnp.reshape(eq_feasible_new & ineq_feasible_new, ())
     # filterSQP normalisation denominator (eq. 5 of the manual): the
     # largest single contributor to ``∇_x L = ∇f − Jᵀλ − νᵀI_b``.
     # Replaces the legacy ``|L|``-based denominator so the test is
@@ -506,6 +713,16 @@ def _step_impl(
     converged_new = jnp.reshape(classical_converged_new | qp_kkt_success_new, ())
     nonfinite_new = ~jnp.all(jnp.isfinite(y_returned))
 
+    # Infeasible stationary point (CJRW 2014): while in restoration the
+    # feasibility direction has collapsed (``new_qp_optimal`` via the
+    # relaxed zero-step detector) yet the iterate remains infeasible.
+    # This is the informative "converged to a minimum-violation
+    # infeasible stationary point" outcome.
+    infeasible_stationary_new = jnp.reshape(
+        restoration_new & new_qp_optimal & ~primal_feasible_new & has_min_steps_new,
+        (),
+    )
+
     flags = TerminationFlags(
         converged=converged_new,
         nonfinite=jnp.reshape(nonfinite_new, ()),
@@ -515,6 +732,7 @@ def _step_impl(
         merit_stagnation=jnp.reshape(merit_stagnation, ()),
         max_iters_reached=jnp.reshape(max_iters_reached_new, ()),
         primal_feasible=primal_feasible_new,
+        infeasible_stationary=infeasible_stationary_new,
     )
     from slsqp_jax.slsqp.termination import classify_outcome
 
@@ -556,6 +774,11 @@ def _step_impl(
         best_x=new_best_x,
         blowup_count=new_blowup_count,
         diverging=diverging_now,
+        omega=omega_new,
+        restoration=restoration_new,
+        infeasible_stall_count=infeasible_stall_count_new,
+        restoration_cooldown=restoration_cooldown_new,
+        restoration_entries=restoration_entries_new,
         diagnostics=new_diagnostics,
     )
 
@@ -599,6 +822,7 @@ def _step_impl(
         merit_delta=("Δmerit", merit_delta, "+.2e"),
         stag_count=("stag#", new_steps_without),
         stagnation=("stag", merit_stagnation),
+        restoration_mode=("R", restoration_new),
         penalty=("ρ", merit_penalty, ".3e"),
         lbfgs_gamma=("γ", new_lbfgs_history.gamma, ".3e"),
         lbfgs_diag_cond=("κ_B", diag_cond, ".1e"),
@@ -675,6 +899,13 @@ def _terminate_impl(
     )
     converged = classical_converged | qp_kkt_success
 
+    # Infeasible stationary point (CJRW 2014): recomputed from state so
+    # ``terminate`` and ``step``'s ``state.termination_code`` agree.
+    infeasible_stationary = jnp.reshape(
+        state.restoration & state.qp_optimal & ~primal_feasible & has_min_steps,
+        (),
+    )
+
     flags = TerminationFlags(
         converged=jnp.reshape(converged, ()),
         nonfinite=jnp.reshape(nonfinite_iter, ()),
@@ -684,6 +915,7 @@ def _terminate_impl(
         merit_stagnation=jnp.reshape(state.stagnation, ()),
         max_iters_reached=jnp.reshape(max_iters_reached, ()),
         primal_feasible=jnp.reshape(primal_feasible, ()),
+        infeasible_stationary=infeasible_stationary,
     )
     return coarse_outcome(flags)
 

@@ -172,6 +172,11 @@ def _synthetic_state(
         best_x=jnp.zeros(n),
         blowup_count=jnp.array(0),
         diverging=jnp.array(False),
+        omega=jnp.array(1.0),
+        restoration=jnp.array(False),
+        infeasible_stall_count=jnp.array(0),
+        restoration_cooldown=jnp.array(0),
+        restoration_entries=jnp.array(0),
         diagnostics=diag,
     )
     if state_overrides:

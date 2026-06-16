@@ -48,20 +48,31 @@ def compute_merit(
     eq_val: Float[Array, " m_eq"],
     ineq_val: Float[Array, " m_ineq"],
     penalty: Scalar,
+    obj_weight: Scalar | float = 1.0,
 ) -> Scalar:
     """Compute the L1-exact penalty merit function value.
 
     The merit function is:
-        φ(x; ρ) = f(x) + ρ * (‖c_eq(x)‖_1 + ‖max(0, -c_ineq(x))‖_1)
+        φ(x; ρ, ω) = ω·f(x) + ρ * (‖c_eq(x)‖_1 + ‖max(0, -c_ineq(x))‖_1)
+
+    where ``ω`` is the *objective weight* (Curtis-Johnson-Robinson-Wächter
+    2014, ``μ`` in their ``φ(x, μ) = μ·f(x) + v(x)``).  In normal SQP mode
+    ``ω = 1`` and this is the classical Han-Powell L1 merit.  In feasibility
+    restoration mode ``ω = 0``, reducing the merit to ``ρ·v(x)`` (i.e.
+    proportional to the constraint-violation measure ``v`` alone) so the
+    same line search drives the iterate toward the feasibility problem
+    ``min v(x)`` without a separate feasibility objective.
 
     Args:
         f_val: Objective function value f(x).
         eq_val: Equality constraint values c_eq(x).
         ineq_val: Inequality constraint values c_ineq(x).
         penalty: Penalty parameter ρ.
+        obj_weight: Objective weight ω (default ``1.0``; ``0.0`` selects
+            the pure feasibility-violation measure).
 
     Returns:
-        Merit function value φ(x; ρ).
+        Merit function value φ(x; ρ, ω).
     """
     # Equality constraint violation: sum of absolute values
     eq_violation = jnp.sum(jnp.abs(eq_val))
@@ -70,7 +81,7 @@ def compute_merit(
     # c_ineq >= 0 is required, so violation occurs when c_ineq < 0
     ineq_violation = jnp.sum(jnp.maximum(0.0, -ineq_val))
 
-    return f_val + penalty * (eq_violation + ineq_violation)
+    return obj_weight * f_val + penalty * (eq_violation + ineq_violation)
 
 
 @jaxtyped(typechecker=beartype)
@@ -138,6 +149,7 @@ def backtracking_line_search(
     upper_bound_mask: tuple[bool, ...] | None = None,
     eq_jac: Float[Array, "m_eq n"] | None = None,
     ineq_jac: Float[Array, "m_ineq_general n"] | None = None,
+    obj_weight: Scalar | float = 1.0,
 ) -> LineSearchResult:
     """Perform backtracking line search with the L1 merit function.
 
@@ -176,6 +188,11 @@ def backtracking_line_search(
         ineq_jac: General inequality constraint Jacobian at x
             (m_ineq_general, n), or None.  Does NOT include bound
             constraint rows.
+        obj_weight: Objective weight ω passed through to
+            :func:`compute_merit` and applied to the ``∇f·d`` term of the
+            directional derivative.  ``1.0`` (default) is the classical
+            Han-Powell merit; ``0.0`` selects feasibility-restoration mode
+            (line search on ``ρ·v(x)`` only).
 
     Returns:
         LineSearchResult with the found step size and function values.
@@ -190,12 +207,15 @@ def backtracking_line_search(
     m_ineq_general = m_ineq - n_bounds
 
     # Current merit value
-    merit_0 = compute_merit(f_val, eq_val, ineq_val, penalty)
+    merit_0 = compute_merit(f_val, eq_val, ineq_val, penalty, obj_weight)
 
     # Proper L1 merit directional derivative:
-    #   D_phi = grad_f . d + rho * sum_i sign(c_eq_i) * (J_eq d)_i
-    #                      - rho * sum_{j: c_ineq_j < 0} (J_ineq d)_j
-    grad_dot_d = jnp.dot(grad, direction)
+    #   D_phi = ω * grad_f . d + rho * sum_i sign(c_eq_i) * (J_eq d)_i
+    #                          - rho * sum_{j: c_ineq_j < 0} (J_ineq d)_j
+    # The objective-gradient term carries the objective weight ω so that
+    # restoration mode (ω = 0) makes the directional derivative depend on
+    # the constraint-violation terms alone.
+    grad_dot_d = obj_weight * jnp.dot(grad, direction)
 
     if eq_jac is not None and eq_val.shape[0] > 0:
         Jd_eq = eq_jac @ direction
@@ -268,7 +288,7 @@ def backtracking_line_search(
         # Concatenate general + bounds
         ineq_new = jnp.concatenate([ineq_new_general, bound_vals])
 
-        merit_new = compute_merit(f_new, eq_new, ineq_new, penalty)
+        merit_new = compute_merit(f_new, eq_new, ineq_new, penalty, obj_weight)
 
         return f_new, eq_new, ineq_new, merit_new
 

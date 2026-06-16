@@ -165,6 +165,7 @@ class SLSQP(optx.AbstractMinimiser):
     _stagnation_window: int = eqx.field(static=True, default=10)
     _proximal_mu_min: float = eqx.field(static=True, default=1e-6)
     _proximal_mu_max: float = eqx.field(static=True, default=0.1)
+    _restoration_cooldown: int = eqx.field(static=True, default=10)
 
     verbose: Callable = eqx.field(static=True, default=False)
 
@@ -324,6 +325,26 @@ class SLSQP(optx.AbstractMinimiser):
     def use_inexact_stationarity(self) -> bool:
         return self.config.adaptive_cg.use_inexact_stationarity
 
+    @property
+    def enable_restoration(self) -> bool:
+        return self.config.restoration.enabled
+
+    @property
+    def restoration_patience(self) -> int:
+        return self.config.restoration.patience
+
+    @property
+    def restoration_max_entries(self) -> int:
+        return self.config.restoration.max_entries
+
+    @property
+    def restoration_exit_tol_factor(self) -> float:
+        return self.config.restoration.exit_tol_factor
+
+    @property
+    def restoration_cooldown(self) -> int:
+        return self._restoration_cooldown
+
     # ------------------------------------------------------------------
     # __check_init__: validate config + precompute derivative closures
     # and bound metadata.
@@ -334,6 +355,15 @@ class SLSQP(optx.AbstractMinimiser):
         object.__setattr__(
             self, "_stagnation_window", max(1, config.tolerance.max_steps // 10)
         )
+
+        if config.restoration.cooldown is not None:
+            object.__setattr__(
+                self, "_restoration_cooldown", int(config.restoration.cooldown)
+            )
+        else:
+            object.__setattr__(
+                self, "_restoration_cooldown", max(1, config.tolerance.max_steps // 10)
+            )
 
         if config.proximal.mu_min is not None:
             object.__setattr__(self, "_proximal_mu_min", config.proximal.mu_min)
@@ -659,6 +689,11 @@ class SLSQP(optx.AbstractMinimiser):
             best_x=y,
             blowup_count=jnp.array(0),
             diverging=jnp.array(False),
+            omega=jnp.array(1.0),
+            restoration=jnp.array(False),
+            infeasible_stall_count=jnp.array(0),
+            restoration_cooldown=jnp.array(0),
+            restoration_entries=jnp.array(0),
             diagnostics=_init_diagnostics(),
         )
 
@@ -786,7 +821,13 @@ class SLSQP(optx.AbstractMinimiser):
         hvp_fn: Callable[[Vector], Vector],
         y: Vector,
     ) -> QPResult:
-        g = state.grad
+        # Objective weight ``ω`` (Curtis-Johnson-Robinson-Wächter 2014):
+        # ``1`` in normal mode, ``0`` in feasibility restoration.  Scaling
+        # the QP gradient by ``ω`` turns the penalty QP into the
+        # feasibility QP (minimise ``½dᵀBd`` s.t. the linearised
+        # constraints) when ``ω == 0`` while reusing the exact same
+        # active-set / inner-solver machinery and ``B`` as the metric.
+        g = state.omega * state.grad
         A_eq = state.eq_jac
         b_eq = -state.eq_val
 

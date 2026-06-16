@@ -19,6 +19,7 @@ from slsqp_jax.config import (
     PreconditionerConfig,
     ProximalConfig,
     QPConfig,
+    RestorationConfig,
     SLSQPConfig,
     ToleranceConfig,
 )
@@ -121,6 +122,7 @@ __all__ = [
     "PreconditionerConfig",
     "LPECAConfig",
     "AdaptiveCGConfig",
+    "RestorationConfig",
     # Termination codes
     "RESULTS",
     "is_successful",

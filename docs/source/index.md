@@ -899,6 +899,45 @@ print(diag.divergence_triggered)    # True iff rollback fired at least once
 print(diag.n_divergence_blowups)    # total blowup events (>=patience when triggered)
 ```
 
+### Feasibility restoration (recoverable)
+
+When the iterate stalls while still primally **infeasible**, the solver can fall back to minimising the constraint violation alone — the *feasibility problem* of Curtis, Johnson, Robinson & Wächter (2014). Rather than building a separate L1 feasibility objective, the existing L1 merit is reused with an **objective weight** `ω` (CJRW's `μ`):
+
+$$\varphi(x;\rho,\omega) = \omega\, f(x) + \rho\, v(x), \qquad v(x) = \lVert c_\text{eq}\rVert_1 + \lVert \max(0,-c_\text{ineq})\rVert_1.$$
+
+- **Normal mode** (`ω = 1`): the classical Han-Powell merit `φ = f + ρ·v`.
+- **Restoration mode** (`ω = 0`): `φ = ρ·v ∝ v`, so the same line search and the same QP (with gradient `g = ω·∇f = 0`, hence `min ½dᵀBd` subject to the linearised constraints) drive the iterate toward `min v(x)`. The frozen L-BFGS matrix `B` is reused as the metric.
+
+`ω` is a traced scalar on `SLSQPState`; all switching is `jnp.where` / `lax.cond` so the step stays jittable.
+
+**The tolerance-window crux (entry must not collide with an L-BFGS reset).** On an infeasible problem the QP linearisation is typically inconsistent and the line search cannot reduce the (penalty-inflated) merit. Left alone, those failures would drive `consecutive_qp_failures` / `consecutive_ls_failures`, which fire the L-BFGS soft/identity-reset chain *before* any stagnation window elapses. The fix splits the failure classification: a *surprising* (feasible) QP / line-search failure feeds the reset-chain counters, while an **infeasibility stall** — `~primal_feasible & (QP unconverged | line search failed | zero-step QP)` — feeds a **dedicated `infeasible_stall_count`** that is *disjoint* from the reset-chain counters (the `primal_feasible` factor separates them). The zero-step clause (a converged QP whose direction collapses to `‖d‖ < atol`) arms restoration on a cleanly locally-infeasible problem, where the least-violation QP direction is `d ≈ 0` and the line search trivially accepts it so neither the QP nor the line search "fails". Restoration is entered once `infeasible_stall_count >= patience`, and the L-BFGS append+reset block is gated by `~(restoration | entering_restoration)` so curvature is **frozen** on the entry step and throughout restoration. Entry and reset are therefore driven by disjoint counters and can never coincide. While restoration is *arming*, the merit-stagnation and best-iterate-divergence guardrails are suppressed so they cannot pre-empt the restoration outcome.
+
+**Recoverable, two-way behaviour.** Once feasibility is regained (`v <= exit_tol_factor · atol`), `ω` flips back to `1`, normal objective minimisation resumes, and a `cooldown` window suppresses immediate re-entry. Anti-cycling is enforced by the cooldown plus a hard `max_entries` cap. The best-merit tracking is re-seeded on every `ω` switch (the merit changes units between `f + ρ·v` and `ρ·v`).
+
+**Termination.** If restoration drives the iterate to a stationary point of `v` that is still infeasible (`∇v ≈ 0`, detected via the zero-step machinery, while `v > atol`), the run terminates with `RESULTS.infeasible_stationary` — "converged to a minimum-violation infeasible stationary point", distinct from the post-hoc `infeasible` override. The coarse `Solution.result` is `nonlinear_divergence`.
+
+Configure via `RestorationConfig` (defaults shown):
+
+```python
+from slsqp_jax import SLSQP, SLSQPConfig, RestorationConfig
+
+solver = SLSQP(
+    eq_constraint_fn=eq_constraint,
+    n_eq_constraints=2,
+    config=SLSQPConfig(
+        restoration=RestorationConfig(
+            enabled=True,        # master switch
+            patience=3,          # infeasible stalls before entering
+            cooldown=None,       # None -> max_steps // 10 (re-entry suppression)
+            max_entries=5,       # anti-cycling hard cap
+            exit_tol_factor=1.0, # exit when v <= exit_tol_factor * atol
+        ),
+    ),
+)
+```
+
+Set `enabled=False` to recover the previous behaviour. Diagnostics surface `n_restoration_entries`, `restoration_triggered`, `n_restoration_steps`, and `min_violation_in_restoration` (via `get_diagnostics`), and the verbose printer gains an `R` column flagging restoration mode. Scope: this is the binary FP/FQP fallback from CJRW (2014) only; the inexact interior-point algorithm and continuous `μ`-steering are out of scope.
+
 ### Diagnostics
 
 `SLSQPState` carries a `diagnostics` field of type `SLSQPDiagnostics` that accumulates lightweight counters and summary statistics on every call to `step()` (branch-free, so they work under JIT). Use `slsqp_jax.get_diagnostics(state)` on the final state to retrieve them:
