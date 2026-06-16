@@ -236,6 +236,49 @@ class AdaptiveCGConfig(eqx.Module):
     use_inexact_stationarity: bool = eqx.field(static=True, default=False)
 
 
+class RestorationConfig(eqx.Module):
+    """Feasibility-restoration (minimum-constraint-violation) fallback.
+
+    When the iterate stalls while still primally infeasible, the solver
+    switches the objective weight ``ω`` (Curtis-Johnson-Robinson-Wächter
+    2014) from ``1`` to ``0``.  The L1 merit ``φ = ω·f + ρ·v`` then
+    reduces to ``ρ·v(x)``, i.e. proportional to the constraint-violation
+    measure ``v(x) = ‖c_eq‖₁ + ‖max(0, -c_ineq)‖₁`` alone, and the same
+    line search drives the iterate toward the feasibility problem
+    ``min v(x)``.  The mode is *recoverable*: once feasibility is regained
+    (``ω`` flips back to ``1``) normal objective minimisation resumes.
+
+    Entry is gated on a dedicated ``infeasible_stall_count`` that is
+    **disjoint** from the L-BFGS-reset failure counters
+    (``consecutive_qp_failures`` / ``consecutive_ls_failures``):
+    infeasibility-driven QP non-convergence increments only this counter,
+    so restoration entry never coincides with an L-BFGS curvature reset.
+    The L-BFGS history is *frozen* (neither appended nor reset) while in
+    restoration so the objective curvature is preserved across the switch.
+
+    Attributes:
+        enabled: Master switch for the feasibility-restoration fallback.
+            Default True.
+        patience: Number of consecutive infeasible QP stalls before
+            entering restoration.  Default 3.
+        cooldown: Number of normal-mode steps after exiting restoration
+            during which re-entry is suppressed (anti-cycling).  ``None``
+            resolves to the stagnation window ``max_steps // 10`` at
+            runtime.  Default ``None``.
+        max_entries: Maximum number of times restoration may be entered
+            in a single solve (anti-cycling hard cap).  Default 5.
+        exit_tol_factor: Restoration exits (``ω`` returns to ``1``) once
+            primal feasibility holds within ``exit_tol_factor * atol``.
+            Default ``1.0``.
+    """
+
+    enabled: bool = eqx.field(static=True, default=True)
+    patience: int = 3
+    cooldown: Optional[int] = None
+    max_entries: int = 5
+    exit_tol_factor: float = 1.0
+
+
 class SLSQPConfig(eqx.Module):
     """Aggregate configuration for :class:`SLSQP`.
 
@@ -255,6 +298,7 @@ class SLSQPConfig(eqx.Module):
     )
     lpeca: LPECAConfig = eqx.field(default_factory=LPECAConfig)
     adaptive_cg: AdaptiveCGConfig = eqx.field(default_factory=AdaptiveCGConfig)
+    restoration: RestorationConfig = eqx.field(default_factory=RestorationConfig)
 
 
 __all__ = [
@@ -266,5 +310,6 @@ __all__ = [
     "PreconditionerConfig",
     "LPECAConfig",
     "AdaptiveCGConfig",
+    "RestorationConfig",
     "SLSQPConfig",
 ]

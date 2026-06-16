@@ -48,6 +48,11 @@ class TerminationFlags(NamedTuple):
     merit_stagnation: Bool[Array, ""]
     max_iters_reached: Bool[Array, ""]
     primal_feasible: Bool[Array, ""]
+    # Feasibility-restoration outcome: the restoration fallback reached a
+    # stationary point of the constraint-violation measure ``v`` that is
+    # still infeasible.  Defaults to ``False`` so legacy call sites that
+    # do not set it keep their previous classification.
+    infeasible_stationary: Bool[Array, ""] = jnp.asarray(False)
 
 
 def classify_outcome(flags: TerminationFlags) -> RESULTS:
@@ -57,13 +62,15 @@ def classify_outcome(flags: TerminationFlags) -> RESULTS:
 
     1. ``successful``
     2. ``nonfinite``
-    3. ``infeasible`` (override on any non-success termination at
+    3. ``infeasible_stationary`` (feasibility-restoration converged to a
+       minimum-violation infeasible stationary point)
+    4. ``infeasible`` (override on any non-success termination at
        an infeasible iterate)
-    4. ``iterate_blowup`` (best-iterate divergence rollback)
-    5. ``line_search_failure``
-    6. ``qp_subproblem_failure``
-    7. ``merit_stagnation``
-    8. ``nonlinear_max_steps_reached``
+    5. ``iterate_blowup`` (best-iterate divergence rollback)
+    6. ``line_search_failure``
+    7. ``qp_subproblem_failure``
+    8. ``merit_stagnation``
+    9. ``nonlinear_max_steps_reached``
     """
     code = RESULTS.successful
     code = RESULTS.where(
@@ -92,11 +99,20 @@ def classify_outcome(flags: TerminationFlags) -> RESULTS:
         code,
     )
     non_success_done = (
-        flags.merit_stagnation | flags.qp_fatal | flags.ls_fatal | flags.diverging
+        flags.merit_stagnation
+        | flags.qp_fatal
+        | flags.ls_fatal
+        | flags.diverging
+        | flags.infeasible_stationary
     )
     code = RESULTS.where(
         jnp.reshape(non_success_done & ~flags.primal_feasible, ()),
         RESULTS.infeasible,
+        code,
+    )
+    code = RESULTS.where(
+        jnp.reshape(flags.infeasible_stationary, ()),
+        RESULTS.infeasible_stationary,
         code,
     )
     code = RESULTS.where(
@@ -125,9 +141,14 @@ def coarse_outcome(flags: TerminationFlags) -> tuple[Bool[Array, ""], optx.RESUL
         | flags.qp_fatal
         | flags.diverging
         | flags.nonfinite
+        | flags.infeasible_stationary
     )
     non_success_done = (
-        flags.merit_stagnation | flags.ls_fatal | flags.qp_fatal | flags.diverging
+        flags.merit_stagnation
+        | flags.ls_fatal
+        | flags.qp_fatal
+        | flags.diverging
+        | flags.infeasible_stationary
     )
     result = jax.lax.cond(
         flags.converged,

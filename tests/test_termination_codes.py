@@ -197,7 +197,15 @@ class TestLiveProblemClassification:
         np.testing.assert_allclose(sol.value, jnp.array([1.0, 1.0]), atol=1e-5)
 
     def test_infeasible_equality_constraints(self):
-        """Mutually inconsistent equality constraints -> ``infeasible``."""
+        """Mutually inconsistent equality constraints.
+
+        With the feasibility-restoration fallback enabled (the default),
+        the solver switches the objective weight ``ω`` to 0, drives the
+        iterate to the minimum-violation stationary point, and reports the
+        more informative ``infeasible_stationary``.  Both that and the
+        generic ``infeasible`` override are acceptable infeasible
+        outcomes.
+        """
 
         def objective(x, args):
             return jnp.sum(x**2), None
@@ -216,8 +224,9 @@ class TestLiveProblemClassification:
         sol = optx.minimise(
             objective, solver, x0, has_aux=True, throw=False, max_steps=50
         )
-        assert sol.stats["slsqp_result"] == RESULTS.infeasible, (
-            f"Expected RESULTS.infeasible, got {sol.stats['slsqp_result']}"
+        result = sol.stats["slsqp_result"]
+        assert result in (RESULTS.infeasible_stationary, RESULTS.infeasible), (
+            f"Expected an infeasible outcome, got {result}"
         )
 
     def test_max_steps_reached_with_feasible_iterate(self):

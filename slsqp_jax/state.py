@@ -431,6 +431,18 @@ class SLSQPDiagnostics(eqx.Module):
     divergence_triggered: Bool[Array, ""]
     min_projected_grad_norm: Scalar
     n_steps_inexact_below_classical: Int[Array, ""]
+    # Feasibility-restoration counters.  ``n_restoration_entries`` counts
+    # how many times the ``ω`` weight flipped 1->0 (restoration was
+    # entered); ``restoration_triggered`` latches ``True`` once that
+    # happens at least once; ``n_restoration_steps`` accumulates the
+    # number of outer steps spent with ``ω == 0``; and
+    # ``min_violation_in_restoration`` is the low-water mark of the
+    # max-norm constraint violation observed while in restoration
+    # (``inf`` if restoration never fired).
+    n_restoration_entries: Int[Array, ""]
+    restoration_triggered: Bool[Array, ""]
+    n_restoration_steps: Int[Array, ""]
+    min_violation_in_restoration: Scalar
 
 
 def _init_diagnostics() -> SLSQPDiagnostics:
@@ -463,6 +475,10 @@ def _init_diagnostics() -> SLSQPDiagnostics:
         divergence_triggered=jnp.array(False),
         min_projected_grad_norm=jnp.asarray(jnp.inf),
         n_steps_inexact_below_classical=jnp.array(0),
+        n_restoration_entries=jnp.array(0),
+        restoration_triggered=jnp.array(False),
+        n_restoration_steps=jnp.array(0),
+        min_violation_in_restoration=jnp.asarray(jnp.inf),
     )
 
 
@@ -671,6 +687,23 @@ class SLSQPState(eqx.Module):
     best_x: Vector
     blowup_count: Int[Array, ""]
     diverging: Bool[Array, ""]
+
+    # Feasibility-restoration (minimum-constraint-violation) fallback
+    # (Curtis-Johnson-Robinson-Wächter 2014).  ``omega`` is the objective
+    # weight ``ω`` threaded into the merit (``φ = ω·f + ρ·v``) and the QP
+    # gradient (``g_eff = ω·∇f``): ``1.0`` in normal mode, ``0.0`` while
+    # minimising the constraint violation ``v(x)``.  ``restoration`` is the
+    # latched mode flag.  ``infeasible_stall_count`` accumulates
+    # consecutive infeasibility-driven QP stalls; it is *disjoint* from
+    # ``consecutive_qp_failures`` so restoration entry never coincides with
+    # an L-BFGS reset.  ``restoration_cooldown`` counts down the
+    # re-entry-suppression window after a recoverable exit, and
+    # ``restoration_entries`` is the anti-cycling hard cap counter.
+    omega: Scalar
+    restoration: Bool[Array, ""]
+    infeasible_stall_count: Int[Array, ""]
+    restoration_cooldown: Int[Array, ""]
+    restoration_entries: Int[Array, ""]
 
     # Granular termination classification using ``slsqp_jax.RESULTS``
     # (see :mod:`slsqp_jax.results`).  Optimistix's ``iterative_solve``

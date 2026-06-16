@@ -15,6 +15,7 @@ from slsqp_jax import (
     PreconditionerConfig,
     ProximalConfig,
     QPConfig,
+    RestorationConfig,
     SLSQPConfig,
     ToleranceConfig,
 )
@@ -70,6 +71,12 @@ _FLAT_TO_NESTED: dict[str, tuple[str, str]] = {
     # Adaptive CG
     "adaptive_cg_tol": ("adaptive_cg", "enabled"),
     "use_inexact_stationarity": ("adaptive_cg", "use_inexact_stationarity"),
+    # Feasibility restoration
+    "restoration_enabled": ("restoration", "enabled"),
+    "restoration_patience": ("restoration", "patience"),
+    "restoration_cooldown": ("restoration", "cooldown"),
+    "restoration_max_entries": ("restoration", "max_entries"),
+    "restoration_exit_tol_factor": ("restoration", "exit_tol_factor"),
 }
 
 _SUBCONFIG_FACTORIES = {
@@ -81,6 +88,7 @@ _SUBCONFIG_FACTORIES = {
     "preconditioner": PreconditionerConfig,
     "lpeca": LPECAConfig,
     "adaptive_cg": AdaptiveCGConfig,
+    "restoration": RestorationConfig,
 }
 
 
