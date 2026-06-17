@@ -223,6 +223,26 @@ def _step_impl(
         max_violation_new <= self.restoration_exit_tol_factor * self.atol, ()
     )
 
+    # Violation-progress test (drives both restoration entry and the
+    # slow-crawl early termination).  ``best_violation`` is the running
+    # minimum max-norm violation over the current infeasible episode
+    # (seeded ``+inf`` so the first infeasible step always counts as
+    # progress).  A step is *meaningful progress* iff it shrinks the
+    # violation by at least ``stall_rtol`` relative to that best.  Steps
+    # below the threshold accumulate the stall counters even when the QP
+    # nominally "converged" and the line search "succeeded" with a small
+    # nonzero direction -- the failure mode the exact zero-step detector
+    # misses.
+    v_new = max_violation_new
+    v_improved_enough = jnp.reshape(
+        v_new < state.best_violation * (1.0 - self.restoration_stall_rtol), ()
+    )
+    best_violation_new = jnp.where(
+        primal_feasible_new,
+        jnp.asarray(jnp.inf),
+        jnp.minimum(state.best_violation, v_new),
+    )
+
     # Failure classification.  *Surprising* (feasible) QP / line-search
     # failures feed the L-BFGS reset chain; their infeasibility-driven
     # counterparts are split off into the dedicated
@@ -246,8 +266,14 @@ def _step_impl(
     # locally-infeasible problem and the run would silently exhaust
     # ``max_steps`` (the ``restoration_arming`` guard suppresses the
     # generic stagnation / infeasible paths while restoration is eligible).
+    # ``~v_improved_enough`` additionally covers the *slow-crawl* case: a
+    # converged QP + successful line search whose nonzero step shrinks the
+    # violation by a negligible amount.  Without it such a crawl would
+    # never accumulate the entry counter and would run to ``max_steps``.
     infeasible_stall = jnp.reshape(
-        ~primal_feasible_new & (qp_unconverged | ls_failed | is_zero_step_pre), ()
+        ~primal_feasible_new
+        & (qp_unconverged | ls_failed | is_zero_step_pre | ~v_improved_enough),
+        (),
     )
     new_consecutive_qp_failures = jnp.where(
         qp_real_failure,
@@ -326,6 +352,23 @@ def _step_impl(
             jnp.maximum(state.restoration_cooldown - 1, 0),
         ),
     )
+    # Restoration slow-crawl stall: count consecutive restoration steps
+    # (``state.restoration`` is the *pre-step* mode flag, so the counter
+    # naturally starts at 0 the step after entry, giving restoration a
+    # full ``stall_patience`` window) that stay infeasible without a
+    # meaningful violation decrease.  When it saturates the run is
+    # terminated at the minimum-violation point via
+    # ``infeasible_stationary`` (see below) -- the exact-zero-step
+    # detector alone never fires on a crawl.
+    restoration_stall_count_new = jnp.where(
+        state.restoration & ~primal_feasible_new & ~v_improved_enough,
+        state.restoration_stall_count + 1,
+        jnp.array(0),
+    )
+    restoration_stalled = jnp.reshape(
+        restoration_stall_count_new >= self.restoration_stall_patience, ()
+    )
+
     # Freeze L-BFGS (no append, no reset) on the entry step and while in
     # restoration so objective curvature is preserved across the switch.
     should_update_lbfgs = jnp.reshape(~(state.restoration | entering_restoration), ())
@@ -557,7 +600,14 @@ def _step_impl(
     )
     new_blowup_count = jnp.where(blowup_now, state.blowup_count + 1, jnp.array(0))
     diverging_now = jnp.reshape(new_blowup_count >= self.divergence_patience, ())
-    y_returned = jnp.where(diverging_now, new_best_x, y_new)
+    # On a restoration slow-crawl stall (terminating below as
+    # ``infeasible_stationary``) return the episode minimum-violation
+    # iterate ``best_x`` rather than the last crawl point.
+    y_returned = jnp.where(
+        diverging_now | (restoration_stalled & ~primal_feasible_new),
+        new_best_x,
+        y_new,
+    )
 
     prev_diag = state.diagnostics
     lbfgs_sty, lbfgs_relcurv, lbfgs_skipped = lbfgs_curvature_diagnostics(
@@ -639,7 +689,7 @@ def _step_impl(
         min_violation_in_restoration=jnp.minimum(
             prev_diag.min_violation_in_restoration,
             jnp.where(
-                state.restoration,
+                state.restoration | entering_restoration,
                 max_violation_new.astype(prev_diag.min_violation_in_restoration.dtype),
                 prev_diag.min_violation_in_restoration,
             ),
@@ -714,12 +764,16 @@ def _step_impl(
     nonfinite_new = ~jnp.all(jnp.isfinite(y_returned))
 
     # Infeasible stationary point (CJRW 2014): while in restoration the
-    # feasibility direction has collapsed (``new_qp_optimal`` via the
-    # relaxed zero-step detector) yet the iterate remains infeasible.
-    # This is the informative "converged to a minimum-violation
-    # infeasible stationary point" outcome.
+    # feasibility direction has either collapsed exactly (``new_qp_optimal``
+    # via the relaxed zero-step detector) or crawled without meaningful
+    # progress for ``stall_patience`` steps (``restoration_stalled``), yet
+    # the iterate remains infeasible.  This is the informative "converged
+    # to a minimum-violation infeasible stationary point" outcome.
     infeasible_stationary_new = jnp.reshape(
-        restoration_new & new_qp_optimal & ~primal_feasible_new & has_min_steps_new,
+        restoration_new
+        & (new_qp_optimal | restoration_stalled)
+        & ~primal_feasible_new
+        & has_min_steps_new,
         (),
     )
 
@@ -779,6 +833,8 @@ def _step_impl(
         infeasible_stall_count=infeasible_stall_count_new,
         restoration_cooldown=restoration_cooldown_new,
         restoration_entries=restoration_entries_new,
+        best_violation=best_violation_new,
+        restoration_stall_count=restoration_stall_count_new,
         diagnostics=new_diagnostics,
     )
 
@@ -900,9 +956,19 @@ def _terminate_impl(
     converged = classical_converged | qp_kkt_success
 
     # Infeasible stationary point (CJRW 2014): recomputed from state so
-    # ``terminate`` and ``step``'s ``state.termination_code`` agree.
+    # ``terminate`` and ``step``'s ``state.termination_code`` agree.  The
+    # slow-crawl stall (``restoration_stall_count``) is OR'd with the
+    # exact-zero-step ``qp_optimal`` path, mirroring ``_step_impl``.
+    restoration_stalled = jnp.reshape(
+        state.restoration
+        & (state.restoration_stall_count >= self.restoration_stall_patience),
+        (),
+    )
     infeasible_stationary = jnp.reshape(
-        state.restoration & state.qp_optimal & ~primal_feasible & has_min_steps,
+        state.restoration
+        & (state.qp_optimal | restoration_stalled)
+        & ~primal_feasible
+        & has_min_steps,
         (),
     )
 

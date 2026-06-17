@@ -699,11 +699,21 @@ class SLSQPState(eqx.Module):
     # an L-BFGS reset.  ``restoration_cooldown`` counts down the
     # re-entry-suppression window after a recoverable exit, and
     # ``restoration_entries`` is the anti-cycling hard cap counter.
+    # ``best_violation`` is the running minimum of the max-norm constraint
+    # violation over the current infeasible episode (reset to ``inf`` once
+    # feasible); it is the reference for the violation-progress test
+    # ``v_new < best_violation * (1 - stall_rtol)``.
+    # ``restoration_stall_count`` accumulates consecutive restoration
+    # steps without a meaningful violation decrease and drives the
+    # early ``infeasible_stationary`` termination of a slow-crawl
+    # restoration.
     omega: Scalar
     restoration: Bool[Array, ""]
     infeasible_stall_count: Int[Array, ""]
     restoration_cooldown: Int[Array, ""]
     restoration_entries: Int[Array, ""]
+    best_violation: Scalar
+    restoration_stall_count: Int[Array, ""]
 
     # Granular termination classification using ``slsqp_jax.RESULTS``
     # (see :mod:`slsqp_jax.results`).  Optimistix's ``iterative_solve``

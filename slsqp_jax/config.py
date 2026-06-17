@@ -270,6 +270,22 @@ class RestorationConfig(eqx.Module):
         exit_tol_factor: Restoration exits (``ω`` returns to ``1``) once
             primal feasibility holds within ``exit_tol_factor * atol``.
             Default ``1.0``.
+        stall_patience: Number of consecutive restoration steps without a
+            *meaningful* constraint-violation decrease before the run is
+            terminated at the minimum-violation point with
+            ``RESULTS.infeasible_stationary``.  This catches the
+            slow-crawl failure mode where the feasibility direction keeps
+            shrinking ``v`` by negligible nonzero amounts (so the exact
+            zero-step detector never fires).  ``None`` resolves to the
+            stagnation window ``max_steps // 10`` at runtime.  Default
+            ``None``.
+        stall_rtol: Minimum per-step *relative* decrease in the
+            constraint violation ``v`` required to count as progress: a
+            step is "progress" iff ``v_new < best_violation * (1 -
+            stall_rtol)``.  Steps below this threshold accumulate the
+            stall counter (and, before entry, the infeasible-stall entry
+            counter), so a near-flat crawl is detected.  Default ``1e-4``
+            (0.01% per step).
     """
 
     enabled: bool = eqx.field(static=True, default=True)
@@ -277,6 +293,8 @@ class RestorationConfig(eqx.Module):
     cooldown: Optional[int] = None
     max_entries: int = 5
     exit_tol_factor: float = 1.0
+    stall_patience: Optional[int] = None
+    stall_rtol: float = 1.0e-4
 
 
 class SLSQPConfig(eqx.Module):

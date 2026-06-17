@@ -913,7 +913,10 @@ Restoration is entered once `infeasible_stall_count >= patience` while infeasibl
 
 **Recoverable, two-way behaviour.** Restoration is a recoverable mode: once feasibility is regained (`v <= exit_tol_factor · atol`), `ω` flips back to `1`, normal objective minimisation resumes, and a `cooldown` window suppresses immediate re-entry. Anti-cycling is enforced by the cooldown plus a hard `max_entries` cap. The best-merit tracking is re-seeded on every `ω` switch (the merit changes units between `f + ρ·v` and `ρ·v`).
 
-**Termination.** If restoration drives the iterate to a stationary point of `v` that is still infeasible (`∇v ≈ 0`, detected via the zero-step machinery, while `v > atol`), the run terminates with `RESULTS.infeasible_stationary` — the "converged to a minimum-violation infeasible stationary point" outcome, distinct from the post-hoc `infeasible` override. The coarse `Solution.result` is `nonlinear_divergence` (there is no successful coarse code for an infeasible NLP).
+**Termination.** Restoration ends in one of two infeasible-stationary ways, both reported as `RESULTS.infeasible_stationary` (the "converged to a minimum-violation infeasible stationary point" outcome, distinct from the post-hoc `infeasible` override; coarse `Solution.result` is `nonlinear_divergence`, as there is no successful coarse code for an infeasible NLP):
+
+1. **Exact stationarity** — the feasibility direction collapses (`∇v ≈ 0`, `‖d‖ < atol`), detected via the zero-step machinery.
+2. **Violation-progress stall** — the feasibility direction keeps *crawling* (nonzero steps that shrink `v` by negligible amounts), so the exact-zero-step detector never fires. A dedicated counter tracks consecutive restoration steps whose relative violation decrease is below `stall_rtol` (`v_new ≥ best_violation · (1 − stall_rtol)`); once it reaches `stall_patience` the run terminates at the episode minimum-violation iterate (`best_x` is returned). Without this, a slow crawl would run to `max_steps` because `merit_stagnation` and the divergence rollback are suppressed during restoration. The same `stall_rtol` progress test also broadens the *entry* trigger, so a slow-crawl infeasible iterate that never produces a hard QP/line-search failure still arms and enters restoration.
 
 Configure via `RestorationConfig` (defaults shown):
 
@@ -930,6 +933,10 @@ solver = SLSQP(
             cooldown=None,       # None -> max_steps // 10 (re-entry suppression)
             max_entries=5,       # anti-cycling hard cap
             exit_tol_factor=1.0, # exit when v <= exit_tol_factor * atol
+            stall_patience=None, # None -> max_steps // 10; restoration steps
+                                 # without meaningful v-progress before
+                                 # terminating at the min-violation point
+            stall_rtol=1e-4,     # min per-step relative v decrease = progress
         ),
     ),
 )
