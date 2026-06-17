@@ -1745,6 +1745,12 @@ class TestStagnationDetection:
         satisfy both.  The merit function will stagnate because no
         direction can reduce constraint violation, and the solver
         should terminate early with a stagnation result.
+
+        Restoration is disabled here so the *stagnation* detector is
+        exercised in isolation: with restoration enabled (the default)
+        this infeasible problem terminates via the more informative
+        ``infeasible_stationary`` path instead (covered in
+        ``tests/test_restoration.py``).
         """
 
         def objective(x, args):
@@ -1759,6 +1765,7 @@ class TestStagnationDetection:
             ineq_constraint_fn=ineq_constraint,
             n_ineq_constraints=2,
             stagnation_tol=1e-12,
+            restoration_enabled=False,
         )
         x0 = jnp.array([0.0])
         _, state, result = self._run_solver_with_result(
