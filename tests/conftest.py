@@ -77,6 +77,8 @@ _FLAT_TO_NESTED: dict[str, tuple[str, str]] = {
     "restoration_cooldown": ("restoration", "cooldown"),
     "restoration_max_entries": ("restoration", "max_entries"),
     "restoration_exit_tol_factor": ("restoration", "exit_tol_factor"),
+    "restoration_stall_patience": ("restoration", "stall_patience"),
+    "restoration_stall_rtol": ("restoration", "stall_rtol"),
 }
 
 _SUBCONFIG_FACTORIES = {

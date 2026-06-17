@@ -166,6 +166,7 @@ class SLSQP(optx.AbstractMinimiser):
     _proximal_mu_min: float = eqx.field(static=True, default=1e-6)
     _proximal_mu_max: float = eqx.field(static=True, default=0.1)
     _restoration_cooldown: int = eqx.field(static=True, default=10)
+    _restoration_stall_patience: int = eqx.field(static=True, default=10)
 
     verbose: Callable = eqx.field(static=True, default=False)
 
@@ -345,6 +346,14 @@ class SLSQP(optx.AbstractMinimiser):
     def restoration_cooldown(self) -> int:
         return self._restoration_cooldown
 
+    @property
+    def restoration_stall_patience(self) -> int:
+        return self._restoration_stall_patience
+
+    @property
+    def restoration_stall_rtol(self) -> float:
+        return self.config.restoration.stall_rtol
+
     # ------------------------------------------------------------------
     # __check_init__: validate config + precompute derivative closures
     # and bound metadata.
@@ -363,6 +372,19 @@ class SLSQP(optx.AbstractMinimiser):
         else:
             object.__setattr__(
                 self, "_restoration_cooldown", max(1, config.tolerance.max_steps // 10)
+            )
+
+        if config.restoration.stall_patience is not None:
+            object.__setattr__(
+                self,
+                "_restoration_stall_patience",
+                int(config.restoration.stall_patience),
+            )
+        else:
+            object.__setattr__(
+                self,
+                "_restoration_stall_patience",
+                max(1, config.tolerance.max_steps // 10),
             )
 
         if config.proximal.mu_min is not None:
@@ -694,6 +716,8 @@ class SLSQP(optx.AbstractMinimiser):
             infeasible_stall_count=jnp.array(0),
             restoration_cooldown=jnp.array(0),
             restoration_entries=jnp.array(0),
+            best_violation=jnp.asarray(jnp.inf),
+            restoration_stall_count=jnp.array(0),
             diagnostics=_init_diagnostics(),
         )
 

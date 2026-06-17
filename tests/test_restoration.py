@@ -145,6 +145,8 @@ class TestRestorationConfig:
         assert cfg.cooldown is None
         assert cfg.max_entries == 5
         assert cfg.exit_tol_factor == 1.0
+        assert cfg.stall_patience is None
+        assert cfg.stall_rtol == 1e-4
 
     def test_property_accessors(self):
         solver = _make_slsqp(
@@ -172,6 +174,22 @@ class TestRestorationConfig:
         )
         assert solver.restoration_cooldown == 17
 
+    def test_stall_patience_none_resolves_to_stagnation_window(self):
+        solver = _make_slsqp(rtol=1e-6, atol=1e-6, max_steps=50)
+        assert solver.restoration_stall_patience == 5
+
+    def test_stall_patience_explicit_is_honoured(self):
+        solver = _make_slsqp(
+            rtol=1e-6, atol=1e-6, max_steps=50, restoration_stall_patience=9
+        )
+        assert solver.restoration_stall_patience == 9
+
+    def test_stall_rtol_accessor(self):
+        solver = _make_slsqp(
+            rtol=1e-6, atol=1e-6, max_steps=50, restoration_stall_rtol=2e-3
+        )
+        assert solver.restoration_stall_rtol == 2e-3
+
 
 # ----------------------------------------------------------------------
 # State seeding + deterministic two-way switch.
@@ -193,6 +211,8 @@ class TestRestorationStateMachine:
         assert int(state.infeasible_stall_count) == 0
         assert int(state.restoration_cooldown) == 0
         assert int(state.restoration_entries) == 0
+        assert np.isinf(float(state.best_violation))
+        assert int(state.restoration_stall_count) == 0
 
     def test_recoverable_exit_resumes_optimization(self):
         """Force the solver into restoration at a feasible iterate; the next
@@ -349,3 +369,92 @@ class TestRestorationLive:
             prev_omega = omega
 
         assert entry_seen, "restoration never entered; cannot check entry window"
+
+
+# ----------------------------------------------------------------------
+# Violation-progress stall: early termination of a slow-crawl restoration.
+# ----------------------------------------------------------------------
+class TestRestorationStall:
+    """The exact zero-step detector only catches a restoration that stops
+    *exactly*.  A restoration that keeps shrinking ``v`` by negligible
+    nonzero amounts (a slow crawl) must instead be caught by the
+    violation-progress stall counter and terminate with
+    ``infeasible_stationary`` well before ``max_steps``.
+
+    To isolate the stall path from the zero-step path the tests disable
+    the zero-step detector (``zero_step_patience`` huge) so the *only*
+    restoration terminal left is ``restoration_stalled``.
+    """
+
+    def test_stall_terminates_before_max_steps(self):
+        objective, eq, x0 = _infeasible_problem()
+        max_steps = 80
+        solver = _make_slsqp(
+            rtol=1e-6,
+            atol=1e-6,
+            eq_constraint_fn=eq,
+            n_eq_constraints=2,
+            max_steps=max_steps,
+            restoration_enabled=True,
+            restoration_patience=3,
+            restoration_stall_patience=3,
+            zero_step_patience=10**9,  # disable the exact-zero-step terminal
+        )
+        sol = optx.minimise(
+            objective, solver, x0, has_aux=True, throw=False, max_steps=max_steps
+        )
+        assert sol.stats["slsqp_result"] == RESULTS.infeasible_stationary
+        # Must have stopped early via the stall path, not exhausted budget.
+        assert int(sol.state.step_count) < max_steps
+        diag = get_diagnostics(sol.state)
+        assert bool(diag.restoration_triggered)
+
+    def test_smaller_stall_patience_terminates_earlier(self):
+        objective, eq, x0 = _infeasible_problem()
+        max_steps = 80
+
+        def run(stall_patience):
+            solver = _make_slsqp(
+                rtol=1e-6,
+                atol=1e-6,
+                eq_constraint_fn=eq,
+                n_eq_constraints=2,
+                max_steps=max_steps,
+                restoration_enabled=True,
+                restoration_patience=3,
+                restoration_stall_patience=stall_patience,
+                zero_step_patience=10**9,
+            )
+            sol = optx.minimise(
+                objective, solver, x0, has_aux=True, throw=False, max_steps=max_steps
+            )
+            return sol
+
+        sol_small = run(2)
+        sol_large = run(6)
+        assert sol_small.stats["slsqp_result"] == RESULTS.infeasible_stationary
+        assert sol_large.stats["slsqp_result"] == RESULTS.infeasible_stationary
+        # A tighter stall patience must terminate no later than a looser one.
+        assert int(sol_small.state.step_count) <= int(sol_large.state.step_count)
+
+    def test_stall_returns_min_violation_iterate(self):
+        """On a stall the returned iterate is finite and infeasible (the
+        minimum-violation point), not a blown-up value."""
+        objective, eq, x0 = _infeasible_problem()
+        solver = _make_slsqp(
+            rtol=1e-6,
+            atol=1e-6,
+            eq_constraint_fn=eq,
+            n_eq_constraints=2,
+            max_steps=80,
+            restoration_enabled=True,
+            restoration_patience=3,
+            restoration_stall_patience=3,
+            zero_step_patience=10**9,
+        )
+        sol = optx.minimise(
+            objective, solver, x0, has_aux=True, throw=False, max_steps=80
+        )
+        assert np.all(np.isfinite(np.asarray(sol.value)))
+        # The min-violation point of x=0 & x=1 is x=0.5 (v=0.5 > atol).
+        np.testing.assert_allclose(sol.value, jnp.array([0.5]), atol=1e-3)

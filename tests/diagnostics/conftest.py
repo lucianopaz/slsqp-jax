@@ -177,6 +177,8 @@ def _synthetic_state(
         infeasible_stall_count=jnp.array(0),
         restoration_cooldown=jnp.array(0),
         restoration_entries=jnp.array(0),
+        best_violation=jnp.asarray(jnp.inf),
+        restoration_stall_count=jnp.array(0),
         diagnostics=diag,
     )
     if state_overrides:
