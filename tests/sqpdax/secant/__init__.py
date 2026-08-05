@@ -1,0 +1,1 @@
+"""sqpdax.secant test package."""
