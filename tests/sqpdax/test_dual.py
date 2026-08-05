@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`slsqp_jax.sqpdax.common.dual`."""
+"""Unit tests for :mod:`slsqp_jax.sqpdax.dual`."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import pytest
 from jax import Array
 
-from slsqp_jax.sqpdax.common.dual import Dual
+from slsqp_jax.sqpdax.dual import Dual
 
 
 def _arange(length: int, start: float = 0.0) -> Array:

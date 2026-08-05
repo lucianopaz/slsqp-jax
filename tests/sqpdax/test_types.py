@@ -1,11 +1,11 @@
-"""Unit tests for :class:`~slsqp_jax.sqpdax.common.types.InitializableModule`."""
+"""Unit tests for :class:`~slsqp_jax.sqpdax.types.InitializableModule`."""
 
 from __future__ import annotations
 
 import equinox as eqx
 import pytest
 
-from slsqp_jax.sqpdax.common.types import InitializableModule
+from slsqp_jax.sqpdax.types import InitializableModule
 
 
 class Leaf(InitializableModule):
