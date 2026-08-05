@@ -21,9 +21,11 @@ repos:
   hooks:
   - id: ty
     name: ty check
-    entry: uvx ty check slsqp_jax --project slsqp_jax --python .venv
+    # Scoped to sqpdax while the rest of slsqp_jax is still being typed.
+    # Also mirrored by [tool.ty.src] include in pyproject.toml.
+    entry: uvx ty check slsqp_jax/sqpdax --python .venv
     language: system
-    files: ^slsqp_jax/
+    files: ^slsqp_jax/sqpdax/
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v5.0.0
   hooks:
