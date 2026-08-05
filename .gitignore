@@ -207,9 +207,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Agents
-AGENTS.md
-
 # Mac
 .DS_Store
 
