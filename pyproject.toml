@@ -51,6 +51,11 @@ fallback-version = "0.0.0"
 select = ["E", "F", "I"]
 ignore = ["E501", "F722"]
 
+# Temporarily type-check only sqpdax; other slsqp_jax modules still have
+# outstanding diagnostics. Broaden include when those are cleaned up.
+[tool.ty.src]
+include = ["slsqp_jax/sqpdax"]
+
 [tool.pytest.ini_options]
 addopts = [
     "--cov=slsqp_jax",
