@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`slsqp_jax.sqpdax.common.registry`."""
+"""Unit tests for :mod:`slsqp_jax.sqpdax.registry`."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import ClassVar
 import equinox as eqx
 import pytest
 
-from slsqp_jax.sqpdax.common.registry import (
+from slsqp_jax.sqpdax.registry import (
     FrozenDict,
     KindRegistryMixin,
     freeze,
