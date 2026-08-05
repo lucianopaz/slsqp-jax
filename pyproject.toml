@@ -65,8 +65,8 @@ addopts = [
     "--junit-xml=.test_durations.xml",
 ]
 testpaths = [
-    "slsqp_jax",
-    "tests",
+    "slsqp_jax/sqpdax",
+    "tests/sqpdax",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -82,6 +82,9 @@ exclude_lines = [
   "if TYPE_CHECKING:",
 ]
 ignore_errors = true
+include = [
+  "slsqp_jax/sqpdax/*",
+]
 omit = [
   "tests/*",
   "slsqp_jax/_benchmark_bootstrap.py",
