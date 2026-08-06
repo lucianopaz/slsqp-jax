@@ -1,11 +1,11 @@
 """NLP problem containers: unevaluated callables and pointwise evaluations."""
 
-from typing import Callable, Protocol, cast, runtime_checkable
+from typing import Callable, Generic, Protocol, cast, runtime_checkable
 
 from equinox import Module, field
 from jaxtyping import Array, Bool
 
-from ..primal import Primal
+from ..primal import PrimalType
 from ..types import (
     EqConstraintFn,
     EqConstraintHVPFn,
@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 
-class EvaluatedProblem(Module):
+class EvaluatedProblem(Module, Generic[PrimalType]):
     """Objective and constraint values at a fixed primal point.
 
     Produced by :meth:`Problem.__call__`. First-order quantities are always
@@ -71,7 +71,7 @@ class EvaluatedProblem(Module):
         Mask of inactive (``+inf``) upper bounds.
     """
 
-    ref: Primal
+    ref: PrimalType
     fn_val: Scalar
     grad_val: Vector_n
     fn_qvp: Callable[[Vector_n], Vector_n] | None = field(static=True)
@@ -112,7 +112,7 @@ class EvaluatedProblem(Module):
 
 
 @runtime_checkable
-class ProblemProtocol(Protocol):
+class ProblemProtocol(Protocol, Generic[PrimalType]):
     """Structural interface shared by NLP problem containers.
 
     Downstream solvers depend on these fields and on
@@ -137,8 +137,14 @@ class ProblemProtocol(Protocol):
     n: int
     meq: int
     mineq: int
+    has_exact_curvature: bool
 
-    def __call__(self, x: Primal, *args, **kwargs) -> EvaluatedProblem: ...
+    def __call__(
+        self, x: PrimalType, *args, **kwargs
+    ) -> EvaluatedProblem[PrimalType]: ...
+
+    @property
+    def has_exact_curvature(self) -> bool: ...
 
 
 class Problem(Module):
@@ -232,7 +238,7 @@ class Problem(Module):
     meq: int
     mineq: int
 
-    def __call__(self, x: Primal, *args, **kwargs) -> EvaluatedProblem:
+    def __call__(self, x: PrimalType, *args, **kwargs) -> EvaluatedProblem[PrimalType]:
         """Evaluate the NLP at ``x``, forwarding ``*args`` / ``**kwargs``.
 
         When :attr:`has_exact_curvature` is true, the returned
@@ -281,7 +287,7 @@ class Problem(Module):
             def ineq_fn_qvp(p: Vector_n) -> Matrix_mineqn:
                 return _ineq_fn_hvp(x.x, p, *args, **kwargs)
 
-        return EvaluatedProblem(  # ty: ignore[invalid-return-type]
+        return EvaluatedProblem(
             ref=x,
             fn_val=fn_val,
             grad_val=grad_val,

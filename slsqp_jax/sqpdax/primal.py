@@ -1,6 +1,6 @@
 """Primal decision variables and interior-point slack variables."""
 
-from typing import Self
+from typing import Self, TypeVar
 
 from equinox import Module
 from jax import numpy as jnp
@@ -12,6 +12,7 @@ __all__ = [
     "Primal",
     "Slack",
     "InteriorPointPrimal",
+    "PrimalType",
 ]
 
 
@@ -225,3 +226,6 @@ class InteriorPointPrimal(Primal):
     def sizes(self) -> tuple[int, int]:
         """Size tuple ``(n, mineq)`` accepted by :meth:`from_flat`."""
         return (self.n, self.mineq)
+
+
+PrimalType = TypeVar("PrimalType", bound=Primal)
