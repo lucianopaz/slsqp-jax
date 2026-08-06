@@ -7,7 +7,7 @@ from equinox import Module
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float
 
-from ..barrier import EvaluatedBarrier, LogBarrier
+from ..barrier.base import EvaluatedBarrier, LogBarrier
 from ..dual import Dual
 from ..primal import InteriorPointPrimal, Primal, PrimalType, Slack
 from ..problem.basic import EvaluatedProblem

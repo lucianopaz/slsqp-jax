@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`slsqp_jax.sqpdax.barrier`."""
+"""Unit tests for :mod:`slsqp_jax.sqpdax.barrier.base`."""
 
 from __future__ import annotations
 
@@ -8,13 +8,7 @@ import pytest
 from slsqp_jax.sqpdax.barrier import EvaluatedBarrier, LogBarrier
 from slsqp_jax.sqpdax.primal import Slack
 
-
-def _slack(n: int, mineq: int, *, fill: float = 2.0) -> Slack:
-    return Slack(
-        s=jnp.full((mineq,), fill),
-        s_lb=jnp.full((n,), fill + 1.0),
-        s_ub=jnp.full((n,), fill + 2.0),
-    )
+from .conftest import make_slack
 
 
 @pytest.mark.parametrize(
@@ -40,7 +34,7 @@ def test_log_barrier_value_grad_hvp(
         null_lb=jnp.asarray(null_lb),
         null_ub=jnp.asarray(null_ub),
     )
-    slack = _slack(n, mineq, fill=2.0)
+    slack = make_slack(n, mineq, fill=2.0)
     evaluated = barrier(slack)
 
     assert isinstance(evaluated, EvaluatedBarrier)

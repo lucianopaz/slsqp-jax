@@ -2,7 +2,7 @@
 
 from typing import cast
 
-from ..barrier import Barrier
+from ..barrier.base import Barrier
 from ..dual import Dual
 from ..primal import InteriorPointPrimal
 from ..problem.basic import ProblemProtocol
