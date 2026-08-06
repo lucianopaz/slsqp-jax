@@ -13,6 +13,7 @@ from jaxtyping import Float
 
 from slsqp_jax.sqpdax.autodiff_utils import (
     _contract_jac_tangent,
+    ad_proxy_from_constants,
     autodiff_wrapper,
     fn_proxy_autodiff,
 )
@@ -328,3 +329,58 @@ def test_autodiff_wrapper_errors(mode: str, grad: Callable | None, match: str):
     """Invalid modes / missing jacobians raise ``ValueError``."""
     with pytest.raises(ValueError, match=match):
         autodiff_wrapper(_scalar_fn, grad, autodiff_mode=mode)  # ty: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("fn_val", "fn_jac", "x"),
+    [
+        (jnp.asarray(9.0), jnp.array([3.0, 12.0]), jnp.array([1.0, 2.0])),
+        (
+            jnp.array([5.0, -1.0]),
+            jnp.array([[2.0, 1.0], [0.5, -3.0]]),
+            jnp.array([1.0, 2.0]),
+        ),
+    ],
+    ids=["scalar", "vector"],
+)
+def test_ad_proxy_from_constants_value_and_grad(fn_val: Array, fn_jac: Array, x: Array):
+    """Surrogate value is ``fn_val``; AD w.r.t. ``arg.x`` recovers ``fn_jac``."""
+    proxy = ad_proxy_from_constants(fn_val, fn_jac)
+    p = Primal(x=x)
+
+    assert jnp.allclose(proxy(p), fn_val)
+    # Value is independent of the primal argument (first-order surrogate).
+    assert jnp.allclose(proxy(Primal(x=x + 10.0)), fn_val)
+
+    if fn_val.ndim == 0:
+        assert jnp.allclose(eqx.filter_grad(proxy)(p).x, fn_jac)
+        assert jnp.allclose(
+            jax.jvp(proxy, (p,), (Primal(x=jnp.ones_like(x)),))[1],
+            jnp.dot(fn_jac, jnp.ones_like(x)),
+        )
+    else:
+        assert jnp.allclose(eqx.filter_jacrev(proxy)(p).x, fn_jac)
+
+
+def test_ad_proxy_from_constants_stops_gradient_into_caches():
+    """Reverse mode must not flow into the closed-over ``fn_val`` / ``fn_jac``."""
+
+    def loss(y: Array) -> Array:
+        fn_val = jnp.sum(y**2)
+        fn_jac = 2 * y
+        return ad_proxy_from_constants(fn_val, fn_jac)(Primal(x=jnp.array([3.0, 4.0])))
+
+    y = jnp.array([1.0, 2.0])
+    assert jnp.allclose(loss(y), jnp.sum(y**2))
+    assert jnp.allclose(jax.grad(loss)(y), jnp.zeros_like(y))
+
+
+def test_ad_proxy_from_constants_jittable():
+    """Proxy evaluation and its gradient remain JIT-compatible."""
+    fn_val = jnp.asarray(4.0)
+    fn_jac = jnp.array([1.0, -2.0])
+    proxy = ad_proxy_from_constants(fn_val, fn_jac)
+    p = Primal(x=jnp.array([0.5, 1.5]))
+
+    assert jnp.allclose(jax.jit(proxy)(p), fn_val)
+    assert jnp.allclose(eqx.filter_jit(eqx.filter_grad(proxy))(p).x, fn_jac)

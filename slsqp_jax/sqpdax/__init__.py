@@ -3,6 +3,7 @@ from . import (
     barrier,
     dual,
     lagrangian,
+    merit,
     primal,
     problem,
     registry,
@@ -24,6 +25,7 @@ from .lagrangian import (
     InteriorPointLagrangian,
     Lagrangian,
 )
+from .merit import Merit, NormMerit
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
 from .secant import LBFGS, CurvatureDiagnostics, Secant
@@ -34,6 +36,7 @@ __all__ = [
     "barrier",
     "dual",
     "lagrangian",
+    "merit",
     "primal",
     "problem",
     "EvaluatedProblem",
@@ -54,6 +57,8 @@ __all__ = [
     "Primal",
     "Slack",
     "InteriorPointPrimal",
+    "Merit",
+    "NormMerit",
     "CurvatureDiagnostics",
     "Secant",
     "LBFGS",
