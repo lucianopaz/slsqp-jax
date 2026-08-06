@@ -226,21 +226,65 @@ def test_contract_jac_tangent_rejects_empty_jac():
             jnp.array([0.5, -0.3]),
             _vec_hvp,
         ),
+        (
+            _primal_fn,
+            lambda p: _primal_jac(p).x,
+            Primal(x=jnp.array([1.0, 2.0])),
+            Primal(x=jnp.array([0.5, -0.25])),
+            lambda p, t: _primal_hvp(p, t).x,
+        ),
     ],
+)
+@pytest.mark.parametrize(
+    ("force_hvp", "hvp_placeholder"),
+    [
+        (False, None),
+        (True, None),
+        (False, _scalar_hvp),  # non-None placeholder also forces a JAX HVP
+    ],
+    ids=["default-no-hvp", "force-hvp", "placeholder-forces-hvp"],
 )
 def test_autodiff_wrapper_jax_mode(
     fn: Callable,
     expected_jac: Callable,
-    x: Array,
-    v: Array,
+    x: Array | Primal,
+    v: Array | Primal,
     expected_hvp: Callable,
+    force_hvp: bool,
+    hvp_placeholder: Callable | None,
 ):
-    """``autodiff_mode='jax'`` builds jac / HVP from ``fn`` alone."""
-    wrapped_fn, grad, hvp = autodiff_wrapper(fn, autodiff_mode="jax")
+    """``autodiff_mode='jax'`` builds jac; HVP only when forced or placeholder."""
+    # The placeholder path is only meaningful for array-valued callables.
+    if hvp_placeholder is not None and isinstance(x, Primal):
+        pytest.skip("placeholder HVP path covered on array callables")
+
+    wrapped_fn, grad, hvp = autodiff_wrapper(
+        fn,
+        hvp=hvp_placeholder,
+        autodiff_mode="jax",
+        force_hvp_in_jax_mode=force_hvp,
+    )
     assert wrapped_fn is fn
+
+    got_grad = grad(x)
+    exp_jac = expected_jac(x)
+    if isinstance(x, Primal):
+        assert jnp.allclose(got_grad.x, exp_jac)
+    else:
+        assert jnp.allclose(got_grad, exp_jac)
+
+    expect_hvp = force_hvp or hvp_placeholder is not None
+    if not expect_hvp:
+        assert hvp is None
+        return
+
     assert hvp is not None
-    assert jnp.allclose(grad(x), expected_jac(x))
-    assert jnp.allclose(hvp(x, v), expected_hvp(x, v))
+    got_hvp = hvp(x, v)
+    exp_hvp = expected_hvp(x, v)
+    if isinstance(x, Primal):
+        assert jnp.allclose(got_hvp.x, exp_hvp)
+    else:
+        assert jnp.allclose(got_hvp, exp_hvp)
 
 
 @pytest.mark.parametrize("with_hvp", [True, False])

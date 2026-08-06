@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, cast, overload
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -211,6 +211,7 @@ def autodiff_wrapper(
     grad: GradCallable | None = None,
     hvp: HVPCallable | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "custom",
+    force_hvp_in_jax_mode: bool = False,
 ) -> tuple[FnCallable, GradCallable, HVPCallable | None]:
     """Resolve ``(fn, grad, hvp)`` according to ``autodiff_mode``.
 
@@ -231,12 +232,21 @@ def autodiff_wrapper(
     autodiff_mode
         Derivative source:
 
-        * ``"jax"`` — ignore ``grad`` / ``hvp`` and build both from ``fn``
-          via :func:`equinox.filter_jacrev` and :func:`equinox.filter_jvp`
-          (works for scalar and vector-valued ``fn``).
+        * ``"jax"`` — ignore ``grad`` / ``hvp`` and build the Jacobian from
+          ``fn`` via :func:`equinox.filter_jacrev` (works for scalar and
+          vector-valued ``fn``). The HVP is built from that Jacobian via
+          :func:`equinox.filter_jvp` only when requested (see
+          ``force_hvp_in_jax_mode``).
         * ``"custom"`` — wrap with :func:`fn_proxy_autodiff` so AD of ``fn``
           uses ``grad`` (and ``hvp`` when given).
         * ``"none"`` — return the three callables unchanged (no AD wiring).
+    force_hvp_in_jax_mode
+        Only used when ``autodiff_mode="jax"``. When ``False`` (default) and
+        ``hvp`` is ``None``, the returned HVP is ``None`` so callers that do
+        not need second-order information avoid building it. When ``True``,
+        or when a non-``None`` ``hvp`` placeholder is passed, an HVP is
+        constructed by differentiating the JAX-built Jacobian. The user
+        ``hvp`` callable itself is never invoked in ``"jax"`` mode.
 
     Returns
     -------
@@ -259,7 +269,9 @@ def autodiff_wrapper(
     >>> from slsqp_jax.sqpdax.autodiff_utils import autodiff_wrapper
     >>> def f(x):
     ...     return jnp.sum(x**2)
-    >>> fn, grad, hvp = autodiff_wrapper(f, autodiff_mode="jax")
+    >>> fn, grad, hvp = autodiff_wrapper(
+    ...     f, autodiff_mode="jax", force_hvp_in_jax_mode=True
+    ... )
     >>> x = jnp.array([1.0, 2.0])
     >>> grad(x).tolist()
     [2.0, 4.0]
@@ -271,14 +283,23 @@ def autodiff_wrapper(
         def _grad(x: Any, *args: Any, **kwargs: Any) -> Any:
             return eqx.filter_jacrev(lambda z: fn(z, *args, **kwargs))(x)
 
-        def _hvp(x: Any, tangent: Any, *args: Any, **kwargs: Any) -> Any:
-            return eqx.filter_jvp(
-                lambda z: _grad(z, *args, **kwargs),
-                (x,),
-                (tangent,),
-            )[1]
+        if hvp is None and not force_hvp_in_jax_mode:
+            resolved_hvp: HVPCallable | None = None
+        else:
 
-        return fn, _grad, _hvp  # ty: ignore[invalid-return-type]
+            def _hvp(x: Any, tangent: Any, *args: Any, **kwargs: Any) -> Any:
+                return eqx.filter_jvp(
+                    lambda z: _grad(z, *args, **kwargs),
+                    (x,),
+                    (tangent,),
+                )[1]
+
+            resolved_hvp = _hvp
+
+        return cast(
+            tuple[FnCallable, GradCallable, HVPCallable | None],
+            (fn, _grad, resolved_hvp),
+        )
 
     if autodiff_mode == "custom":
         if grad is None:
