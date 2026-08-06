@@ -9,7 +9,14 @@ from . import (
     secant,
     types,
 )
-from .barrier import Barrier, LogBarrier
+from .barrier import (
+    AdaptiveBarrierUpdate,
+    Barrier,
+    BarrierUpdate,
+    EvaluatedBarrier,
+    LogBarrier,
+    MonotoneBarrierUpdate,
+)
 from .dual import Dual
 from .lagrangian import (
     EvaluatedLagrangian,
@@ -39,6 +46,10 @@ __all__ = [
     "InitializableModule",
     "LogBarrier",
     "Barrier",
+    "EvaluatedBarrier",
+    "BarrierUpdate",
+    "MonotoneBarrierUpdate",
+    "AdaptiveBarrierUpdate",
     "Dual",
     "Primal",
     "Slack",

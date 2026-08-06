@@ -9,8 +9,8 @@ from equinox import Module
 from jax import numpy as jnp
 from jaxtyping import Array, Bool
 
-from .primal import Slack
-from .types import InitializableModule, Scalar
+from ..primal import Slack
+from ..types import InitializableModule, Scalar
 
 __all__ = ["EvaluatedBarrier", "Barrier", "LogBarrier"]
 
