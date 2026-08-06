@@ -129,3 +129,82 @@ def test_evaluated_hvp_without_curvature_or_secant_raises(
     )
     with pytest.raises(TypeError, match="exact curvature"):
         evaluated.hvp(jnp.ones(problem.n))
+
+
+def test_lagrangian_facades_and_evaluated_api(quadratic_problem: Problem):
+    """Unevaluated facades and evaluated KKT helpers all execute."""
+    lag = Lagrangian(quadratic_problem)
+    x = make_primal()
+    dual = make_dual(
+        quadratic_problem.n, quadratic_problem.meq, quadratic_problem.mineq
+    )
+    evaluated = lag(x, dual)
+
+    assert not evaluated.is_kkt_dual_regularized
+    assert jnp.allclose(lag.objective_fn(x), quadratic_problem.fn(x.x))
+    assert jnp.allclose(lag.objective_grad(x), quadratic_problem.grad(x.x))
+
+    primal_g, dual_g = lag.grad(x, dual)
+    assert jnp.allclose(primal_g.x, evaluated.x_grad)
+    assert jnp.allclose(dual_g.eq_multipliers, evaluated.dual_grad.eq_multipliers)
+    assert jnp.allclose(lag.primal_grad(x, dual).x, evaluated.primal_grad.x)
+    assert jnp.allclose(
+        lag.dual_grad(x, dual).ineq_multipliers, evaluated.dual_grad.ineq_multipliers
+    )
+    assert jnp.allclose(
+        lag.nonbound_constraint_jac(x, dual), evaluated.nonbound_constraint_jac
+    )
+
+    dx = Primal(x=jnp.array([0.1, -0.2]))
+    dlam = Dual(
+        eq_multipliers=jnp.ones((quadratic_problem.meq,)),
+        ineq_multipliers=jnp.full((quadratic_problem.mineq,), 0.5),
+        lb_multipliers=jnp.array([0.05, -0.05]),
+        ub_multipliers=jnp.array([-0.02, 0.03]),
+    )
+    tangent = (dx, dlam)
+
+    assert jnp.allclose(lag.primal_hvp(x, dual, dx).x, evaluated.primal_hvp(dx).x)
+    assert jnp.allclose(
+        lag.kkt_mvp_primal(x, dual, tangent).x, evaluated.kkt_mvp_primal(tangent).x
+    )
+    assert jnp.allclose(
+        lag.kkt_mvp_upper_offdiag(x, dual, tangent).x,
+        evaluated.kkt_mvp_upper_offdiag(tangent).x,
+    )
+    assert jnp.allclose(
+        lag.kkt_mvp_lower_offdiag(x, dual, tangent).eq_multipliers,
+        evaluated.kkt_mvp_lower_offdiag(tangent).eq_multipliers,
+    )
+    assert jnp.allclose(
+        lag.kkt_mvp_dual(x, dual, tangent).eq_multipliers,
+        jnp.zeros((quadratic_problem.meq,)),
+    )
+    assert jnp.allclose(
+        evaluated.kkt_mvp_dual(tangent).ub_multipliers,
+        jnp.zeros((quadratic_problem.n,)),
+    )
+    # Touch evaluated.grad (primal + dual together).
+    g_p, g_d = evaluated.grad
+    assert jnp.allclose(g_p.x, evaluated.x_grad)
+    assert jnp.allclose(g_d.eq_multipliers, evaluated.eq_fn_val)
+
+
+def test_evaluated_hvp_uses_secant_when_present(quadratic_problem: Problem):
+    """Attached secant replaces exact QVPs in :meth:`EvaluatedLagrangian.hvp`."""
+    from slsqp_jax.sqpdax.secant import LBFGS
+
+    secant = LBFGS(n=quadratic_problem.n, memory=4)
+    # Seed one curvature pair so the HVP is a nontrivial operator.
+    s = jnp.array([0.2, -0.1])
+    y = 2.0 * s
+    secant = secant.append(s, y)
+    lag = Lagrangian(quadratic_problem, secant=secant)
+    x = make_primal()
+    dual = make_dual(
+        quadratic_problem.n, quadratic_problem.meq, quadratic_problem.mineq
+    )
+    evaluated = lag(x, dual)
+    assert not evaluated.has_exact_curvature
+    v = jnp.array([0.3, 0.4])
+    assert jnp.allclose(evaluated.hvp(v), secant.hvp(v))

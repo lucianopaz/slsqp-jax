@@ -186,3 +186,87 @@ def test_interior_point_evaluated_requires_ip_primal(quadratic_problem: Problem)
                 )
             ),
         )
+
+
+def test_interior_point_facades_and_grads(quadratic_problem: Problem):
+    """IP unevaluated facades and evaluated primal/dual grads are consistent."""
+    barrier = LogBarrier(
+        weight=jnp.asarray(0.5),
+        null_lb=quadratic_problem.null_lb,
+        null_ub=quadratic_problem.null_ub,
+    )
+    lag = InteriorPointLagrangian(
+        quadratic_problem, secant=None, barrier=barrier, primal_dual=False
+    )
+    x = make_ip_primal(mineq=quadratic_problem.mineq)
+    dual = make_dual(
+        quadratic_problem.n, quadratic_problem.meq, quadratic_problem.mineq
+    )
+    evaluated = lag(x, dual)
+
+    assert jnp.allclose(lag.objective_fn(x), quadratic_problem.fn(x.x))
+    assert jnp.allclose(lag.objective_grad(x), quadratic_problem.grad(x.x))
+    assert jnp.allclose(lag.x_grad(x, dual), evaluated.x_grad)
+    assert jnp.allclose(evaluated.x_grad, lag.primal_grad(x, dual).x)
+
+    pg, dg = lag.grad(x, dual)
+    assert jnp.allclose(pg.x, evaluated.primal_grad.x)
+    assert jnp.allclose(pg.slack.s, evaluated.slack_grad.s)
+    assert jnp.allclose(dg.eq_multipliers, evaluated.dual_grad.eq_multipliers)
+    assert jnp.allclose(lag.dual_grad(x, dual).ineq_multipliers, evaluated.ineq_fn_val)
+
+    # evaluated.grad property (tuple).
+    g_p, g_d = evaluated.grad
+    assert jnp.allclose(g_p.slack.s_lb, evaluated.slack_grad.s_lb)
+    assert jnp.allclose(g_d.lb_multipliers, evaluated.dual_grad.lb_multipliers)
+
+    dx = InteriorPointPrimal(
+        x=jnp.array([0.1, -0.05]),
+        slack=Slack(
+            s=jnp.ones((quadratic_problem.mineq,)),
+            s_lb=0.2 * jnp.ones((quadratic_problem.n,)),
+            s_ub=-0.1 * jnp.ones((quadratic_problem.n,)),
+        ),
+    )
+    dlam = Dual(
+        eq_multipliers=jnp.ones((quadratic_problem.meq,)),
+        ineq_multipliers=jnp.full((quadratic_problem.mineq,), 0.3),
+        lb_multipliers=jnp.linspace(0.01, 0.02, quadratic_problem.n),
+        ub_multipliers=jnp.linspace(0.02, 0.03, quadratic_problem.n),
+    )
+    tangent = (dx, dlam)
+    assert jnp.allclose(
+        lag.kkt_mvp_primal(x, dual, tangent).x, evaluated.kkt_mvp_primal(tangent).x
+    )
+    assert jnp.allclose(
+        lag.kkt_mvp_upper_offdiag(x, dual, tangent).slack.s,
+        evaluated.kkt_mvp_upper_offdiag(tangent).slack.s,
+    )
+    assert jnp.allclose(
+        lag.kkt_mvp_lower_offdiag(x, dual, tangent).eq_multipliers,
+        evaluated.kkt_mvp_lower_offdiag(tangent).eq_multipliers,
+    )
+    mvp_p, mvp_d = lag.kkt_mvp(x, dual, tangent)
+    assert jnp.allclose(mvp_p.x, evaluated.kkt_mvp(tangent)[0].x)
+    assert jnp.allclose(
+        mvp_d.eq_multipliers, evaluated.kkt_mvp(tangent)[1].eq_multipliers
+    )
+
+    x1 = InteriorPointPrimal(
+        x=x.x + jnp.array([0.05, -0.02]),
+        slack=x.slack,
+    )
+    y = lag.curvature_estimate(x1, evaluated)
+    assert jnp.allclose(y, 2.0 * (x1.x - x.x))
+
+
+def test_interior_point_requires_secant_without_curvature():
+    """IP Lagrangian without exact HVPs demands a secant."""
+    problem = make_problem(with_curvature=False)
+    barrier = LogBarrier(
+        weight=jnp.asarray(1.0),
+        null_lb=problem.null_lb,
+        null_ub=problem.null_ub,
+    )
+    with pytest.raises(TypeError, match="secant is required"):
+        InteriorPointLagrangian(problem, secant=None, barrier=barrier)
