@@ -1,4 +1,5 @@
-from . import autodiff_utils, dual, primal, problem, registry, secant, types
+from . import autodiff_utils, barrier, dual, primal, problem, registry, secant, types
+from .barrier import LogBarrier, Barrier
 from .dual import Dual
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, ProblemProtocol, Problem, build_problem
@@ -7,6 +8,7 @@ from .types import InitializableModule
 
 __all__ = [
     "autodiff_utils",
+    "barrier",
     "dual",
     "primal",
     "problem",
@@ -18,6 +20,8 @@ __all__ = [
     "secant",
     "types",
     "InitializableModule",
+    "LogBarrier",
+    "Barrier",
     "Dual",
     "Primal",
     "Slack",
