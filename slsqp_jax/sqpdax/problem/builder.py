@@ -1,6 +1,6 @@
 """Factory for assembling a :class:`~slsqp_jax.sqpdax.problem.basic.Problem`."""
 
-from typing import Literal
+from typing import Literal, cast
 
 from jax import numpy as jnp
 
@@ -172,7 +172,7 @@ def build_problem(
         def eq_fn_jac(x: Vector_n, *args, **kwargs) -> Matrix_meqn:
             return jnp.zeros(shape=(0, n), dtype=x.dtype)
 
-        def eq_fn_hvp(x: Vector_n, p: Vector_n, *args, **kwargs) -> Matrix_meqn:
+        def eq_fn_hvp(x: Vector_n, tangent: Vector_n, *args, **kwargs) -> Matrix_meqn:
             return jnp.zeros(shape=(0, n), dtype=x.dtype)
 
     if ineq_fn is not None:
@@ -197,28 +197,33 @@ def build_problem(
         def ineq_fn_jac(x: Vector_n, *args, **kwargs) -> Matrix_mineqn:
             return jnp.zeros(shape=(0, n), dtype=x.dtype)
 
-        def ineq_fn_hvp(x: Vector_n, p: Vector_n, *args, **kwargs) -> Matrix_mineqn:
+        def ineq_fn_hvp(
+            x: Vector_n, tangent: Vector_n, *args, **kwargs
+        ) -> Matrix_mineqn:
             return jnp.zeros(shape=(0, n), dtype=x.dtype)
 
     _lb = lb if lb is not None else jnp.full(shape=(n,), fill_value=-jnp.inf)
     _ub = ub if ub is not None else jnp.full(shape=(n,), fill_value=jnp.inf)
     null_lb = jnp.isinf(_lb) & (_lb < 0)
     null_ub = jnp.isinf(_ub) & (_ub > 0)
-    return Problem(  # ty: ignore[invalid-return-type]
-        fn=fn,
-        grad=grad,
-        hvp=hvp,
-        eq_fn=eq_fn,
-        ineq_fn=ineq_fn,
-        eq_fn_jac=eq_fn_jac,
-        ineq_fn_jac=ineq_fn_jac,
-        eq_fn_hvp=eq_fn_hvp,
-        ineq_fn_hvp=ineq_fn_hvp,
-        lb=_lb,
-        ub=_ub,
-        null_lb=null_lb,
-        null_ub=null_ub,
-        n=n,
-        meq=meq,
-        mineq=mineq,
+    return cast(
+        Problem,
+        Problem(
+            fn=fn,
+            grad=grad,
+            hvp=hvp,
+            eq_fn=eq_fn,
+            ineq_fn=ineq_fn,
+            eq_fn_jac=eq_fn_jac,
+            ineq_fn_jac=ineq_fn_jac,
+            eq_fn_hvp=eq_fn_hvp,
+            ineq_fn_hvp=ineq_fn_hvp,
+            lb=_lb,
+            ub=_ub,
+            null_lb=null_lb,
+            null_ub=null_ub,
+            n=n,
+            meq=meq,
+            mineq=mineq,
+        ),
     )

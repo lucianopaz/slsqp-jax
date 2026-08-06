@@ -1,6 +1,6 @@
 """Diagonal-initial-Hessian L-BFGS secant with VARCHEN damping."""
 
-from typing import ClassVar, Self
+from typing import ClassVar, Self, cast
 
 import jax
 from equinox import field, tree_at
@@ -155,8 +155,9 @@ class LBFGS(Secant):
         sty = jnp.dot(s, y)
         relative_curvature = jnp.abs(sty) / jnp.maximum(s_norm * y_norm, 1e-30)
         skipped = self.should_skip(s, y)
-        return CurvatureDiagnostics(  # ty: ignore[invalid-return-type]
-            sty, relative_curvature, skipped
+        return cast(
+            CurvatureDiagnostics,
+            CurvatureDiagnostics(sty, relative_curvature, skipped),
         )
 
     def should_skip(self, s: Vector_n, y: Vector_n) -> Bool[Array, ""]:
