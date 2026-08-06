@@ -4,6 +4,7 @@ from . import (
     dual,
     lagrangian,
     merit,
+    preconditioner,
     primal,
     problem,
     registry,
@@ -26,6 +27,12 @@ from .lagrangian import (
     Lagrangian,
 )
 from .merit import Merit, NormMerit
+from .preconditioner import (
+    GenericPreconditioner,
+    IdentityPreconditioner,
+    MatrixPreconditioner,
+    Preconditioner,
+)
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
 from .secant import LBFGS, CurvatureDiagnostics, Secant
@@ -37,6 +44,7 @@ __all__ = [
     "dual",
     "lagrangian",
     "merit",
+    "preconditioner",
     "primal",
     "problem",
     "EvaluatedProblem",
@@ -66,4 +74,8 @@ __all__ = [
     "InteriorPointLagrangian",
     "EvaluatedLagrangian",
     "InteriorPointEvaluatedLagrangian",
+    "Preconditioner",
+    "IdentityPreconditioner",
+    "MatrixPreconditioner",
+    "GenericPreconditioner",
 ]
