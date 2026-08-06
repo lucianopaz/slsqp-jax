@@ -40,6 +40,7 @@ def build_problem(
     lb: Vector_n | None,
     ub: Vector_n | None,
     autodiff_mode: Literal["jax", "custom", "none"] = "custom",
+    force_hvp_in_jax_mode: bool = False,
 ) -> Problem:
     """Assemble an NLP :class:`~slsqp_jax.sqpdax.problem.basic.Problem`.
 
@@ -95,6 +96,9 @@ def build_problem(
         :func:`~slsqp_jax.sqpdax.autodiff_utils.autodiff_wrapper` for the
         objective and each provided constraint family:
         ``"jax"``, ``"custom"`` (default), or ``"none"``.
+    force_hvp_in_jax_mode
+        Whether to force the use of the Hessian-vector product in JAX mode.
+        Forwarded to :func:`~slsqp_jax.sqpdax.autodiff_utils.autodiff_wrapper`.
 
     Returns
     -------
@@ -145,7 +149,9 @@ def build_problem(
     >>> problem.eq_fn(jnp.array([1.0, 2.0])).shape
     (0,)
     """
-    fn, grad, hvp = autodiff_wrapper(fn, grad, hvp, autodiff_mode)
+    fn, grad, hvp = autodiff_wrapper(
+        fn, grad, hvp, autodiff_mode, force_hvp_in_jax_mode
+    )
     if eq_fn is not None:
         try:
             eq_fn, eq_fn_jac, eq_fn_hvp = autodiff_wrapper(
