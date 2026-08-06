@@ -1,15 +1,16 @@
 """Interior-point barrier terms on nonnegative slack variables."""
 
-from typing import Callable
 from abc import abstractmethod
-import jax
-from jax import numpy as jnp
-from equinox import Module
-import equinox as eqx
-from jaxtyping import Array, Bool
-from .primal import Slack
-from .types import Scalar, InitializableModule
+from typing import Callable, cast
 
+import equinox as eqx
+import jax
+from equinox import Module
+from jax import numpy as jnp
+from jaxtyping import Array, Bool
+
+from .primal import Slack
+from .types import InitializableModule, Scalar
 
 __all__ = ["EvaluatedBarrier", "Barrier", "LogBarrier"]
 
@@ -106,15 +107,18 @@ class Barrier(InitializableModule):
         def hvp(tangent: Slack) -> Slack:
             return jax.jvp(wrapped_grad, (slack,), (tangent,))[1]
 
-        return EvaluatedBarrier(
-            slack_ref=slack,
-            weight=self.weight,
-            fn_val=fn_val,
-            grad_val=grad_val,
-            hvp=hvp,
-            null_lb=self.null_lb,
-            null_ub=self.null_ub,
-            original=self,
+        return cast(
+            EvaluatedBarrier,
+            EvaluatedBarrier(
+                slack_ref=slack,
+                weight=self.weight,
+                fn_val=fn_val,
+                grad_val=grad_val,
+                hvp=hvp,
+                null_lb=self.null_lb,
+                null_ub=self.null_ub,
+                original=self,
+            ),
         )
 
     @abstractmethod

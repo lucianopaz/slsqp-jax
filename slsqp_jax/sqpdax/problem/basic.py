@@ -287,21 +287,24 @@ class Problem(Module):
             def ineq_fn_qvp(p: Vector_n) -> Matrix_mineqn:
                 return _ineq_fn_hvp(x.x, p, *args, **kwargs)
 
-        return EvaluatedProblem(
-            ref=x,
-            fn_val=fn_val,
-            grad_val=grad_val,
-            fn_qvp=fn_qvp,
-            eq_fn_val=eq_fn_val,
-            eq_fn_jac_val=eq_fn_jac_val,
-            eq_fn_qvp=eq_fn_qvp,
-            ineq_fn_val=ineq_fn_val,
-            ineq_fn_jac_val=ineq_fn_jac_val,
-            ineq_fn_qvp=ineq_fn_qvp,
-            lb=self.lb,
-            ub=self.ub,
-            null_lb=self.null_lb,
-            null_ub=self.null_ub,
+        return cast(
+            EvaluatedProblem[PrimalType],
+            EvaluatedProblem(
+                ref=x,
+                fn_val=fn_val,
+                grad_val=grad_val,
+                fn_qvp=fn_qvp,
+                eq_fn_val=eq_fn_val,
+                eq_fn_jac_val=eq_fn_jac_val,
+                eq_fn_qvp=eq_fn_qvp,
+                ineq_fn_val=ineq_fn_val,
+                ineq_fn_jac_val=ineq_fn_jac_val,
+                ineq_fn_qvp=ineq_fn_qvp,
+                lb=self.lb,
+                ub=self.ub,
+                null_lb=self.null_lb,
+                null_ub=self.null_ub,
+            ),
         )
 
     @property
