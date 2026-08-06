@@ -97,8 +97,14 @@ def build_problem(
         objective and each provided constraint family:
         ``"jax"``, ``"custom"`` (default), or ``"none"``.
     force_hvp_in_jax_mode
-        Whether to force the use of the Hessian-vector product in JAX mode.
-        Forwarded to :func:`~slsqp_jax.sqpdax.autodiff_utils.autodiff_wrapper`.
+        Forwarded to
+        :func:`~slsqp_jax.sqpdax.autodiff_utils.autodiff_wrapper` for the
+        objective and each provided constraint family. When ``False``
+        (default) and ``autodiff_mode="jax"``, Jacobian callables are built
+        from ``fn`` but HVPs are left ``None`` unless a non-``None`` ``hvp``
+        placeholder is supplied. When ``True``, JAX-mode HVPs are built for
+        every wrapped block so :attr:`~slsqp_jax.sqpdax.problem.basic.Problem.has_exact_curvature`
+        can be true without user-supplied second-order maps.
 
     Returns
     -------
@@ -155,7 +161,7 @@ def build_problem(
     if eq_fn is not None:
         try:
             eq_fn, eq_fn_jac, eq_fn_hvp = autodiff_wrapper(
-                eq_fn, eq_fn_jac, eq_fn_hvp, autodiff_mode
+                eq_fn, eq_fn_jac, eq_fn_hvp, autodiff_mode, force_hvp_in_jax_mode
             )
         except ValueError as e:
             raise ValueError("Failed to autodiff equality constraint: " + str(e)) from e
@@ -178,7 +184,11 @@ def build_problem(
     if ineq_fn is not None:
         try:
             ineq_fn, ineq_fn_jac, ineq_fn_hvp = autodiff_wrapper(
-                ineq_fn, ineq_fn_jac, ineq_fn_hvp, autodiff_mode
+                ineq_fn,
+                ineq_fn_jac,
+                ineq_fn_hvp,
+                autodiff_mode,
+                force_hvp_in_jax_mode,
             )
         except ValueError as e:
             raise ValueError(

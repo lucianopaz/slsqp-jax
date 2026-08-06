@@ -69,6 +69,7 @@ def _call_build(
     lb: Array | None = None,
     ub: Array | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "none",
+    force_hvp_in_jax_mode: bool = False,
 ) -> Problem:
     return build_problem(
         n=n,
@@ -86,6 +87,7 @@ def _call_build(
         lb=lb,
         ub=ub,
         autodiff_mode=autodiff_mode,
+        force_hvp_in_jax_mode=force_hvp_in_jax_mode,
     )
 
 
@@ -199,27 +201,43 @@ def test_build_problem_bounds_and_null_masks(
 
 @pytest.mark.parametrize("autodiff_mode", ["jax", "custom", "none"])
 @pytest.mark.parametrize("with_hvp", [True, False])
+@pytest.mark.parametrize("force_hvp_in_jax_mode", [False, True])
 def test_build_problem_autodiff_modes(
-    autodiff_mode: Literal["jax", "custom", "none"], with_hvp: bool
+    autodiff_mode: Literal["jax", "custom", "none"],
+    with_hvp: bool,
+    force_hvp_in_jax_mode: bool,
 ):
     """Objective derivatives resolve consistently across autodiff modes."""
+    if force_hvp_in_jax_mode and autodiff_mode != "jax":
+        pytest.skip("force_hvp_in_jax_mode only affects jax mode")
+
     x = jnp.array([1.0, -0.5])
     v = jnp.array([0.25, 0.5])
-    hvp = _obj_hvp if with_hvp and autodiff_mode != "jax" else None
-    # ``jax`` mode ignores supplied grad/hvp and rebuilds both from ``fn``.
+    # In jax mode a non-None hvp is only a placeholder that forces building a
+    # JAX HVP; the callable itself is not returned.
+    hvp = _obj_hvp if with_hvp else None
     grad = None if autodiff_mode == "jax" else _obj_grad
     problem = _call_build(
         grad=grad,
         hvp=hvp,
         autodiff_mode=autodiff_mode,
+        force_hvp_in_jax_mode=force_hvp_in_jax_mode,
     )
 
     assert jnp.allclose(problem.fn(x), _obj(x))
     assert jnp.allclose(problem.grad(x), _obj_grad(x))
+
     if autodiff_mode == "jax":
-        assert problem.hvp is not None
-        assert jnp.allclose(problem.hvp(x, v), _obj_hvp(x, v))
-        assert problem.has_exact_curvature
+        expect_hvp = force_hvp_in_jax_mode or with_hvp
+        if expect_hvp:
+            assert problem.hvp is not None
+            assert jnp.allclose(problem.hvp(x, v), _obj_hvp(x, v))
+            # Empty constraint stubs always supply HVPs, so exact curvature
+            # follows the objective HVP alone in this unconstrained build.
+            assert problem.has_exact_curvature
+        else:
+            assert problem.hvp is None
+            assert not problem.has_exact_curvature
     elif with_hvp:
         assert problem.hvp is _obj_hvp
         assert problem.has_exact_curvature
@@ -247,6 +265,7 @@ def test_build_problem_jax_mode_builds_constraint_derivatives():
         eq_fn=eq_fn,
         ineq_fn=ineq_fn,
         autodiff_mode="jax",
+        force_hvp_in_jax_mode=True,
     )
     x = jnp.array([0.5, 0.25])
     v = jnp.array([1.0, -1.0])
