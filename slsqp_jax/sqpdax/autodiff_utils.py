@@ -6,13 +6,17 @@ from collections.abc import Callable
 from typing import Any, Literal, TypeVar, cast, overload
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 from jaxtyping import Array
 
+from .primal import Primal
+
 __all__ = [
     "fn_proxy_autodiff",
     "autodiff_wrapper",
+    "ad_proxy_from_constants",
 ]
 
 FnCallable = TypeVar("FnCallable", bound=Callable[..., Any])
@@ -315,3 +319,69 @@ def autodiff_wrapper(
 
     msg = f"Invalid autodiff_mode: {autodiff_mode!r}"
     raise ValueError(msg)
+
+
+def ad_proxy_from_constants(
+    fn_val: Array,
+    fn_jac: Array,
+) -> Callable[[Primal], Array]:
+    """Build a differentiable surrogate from a cached value and Jacobian.
+
+    NLP callables (``problem.fn``, constraint residuals, …) need not be
+    reverse-mode differentiable, but an :class:`~slsqp_jax.sqpdax.problem.basic.EvaluatedProblem`
+    already stores their value and Jacobian at the current iterate. This
+    returns ``fn(arg: Primal) -> Array`` whose primal value is ``fn_val`` and
+    whose derivative w.r.t. ``arg.x`` is exactly ``fn_jac``, so AD of a
+    consumer (e.g. a merit function) picks up the supplied Jacobian without
+    differentiating the underlying residual.
+
+    Unlike :func:`fn_proxy_autodiff`, this is a stop-gradient first-order
+    surrogate rather than a custom JVP: ``fn_val`` / ``fn_jac`` are often
+    tracers of the computation being differentiated, and
+    ``jax.custom_vjp`` / ``filter_custom_jvp`` cannot close over such
+    tracers. Stopping the gradient through the cached arrays also severs
+    reverse mode through a possibly non-differentiable primal evaluation.
+
+    Parameters
+    ----------
+    fn_val
+        Cached function value at the evaluation point. Scalar for an
+        objective; shape ``(m,)`` for an ``m``-constraint residual.
+    fn_jac
+        Cached Jacobian w.r.t. the decision vector ``x``. Shape ``(n,)``
+        for a scalar objective, or ``(m, n)`` for a vector residual, so
+        that ``tensordot(fn_jac, dx, axes=1)`` yields the JVP.
+
+    Returns
+    -------
+    Callable[[Primal], Array]
+        Surrogate ``fn(arg)`` with value ``fn_val`` and
+        ``∂fn/∂arg.x = fn_jac``.
+
+    Examples
+    --------
+    >>> import equinox as eqx
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.autodiff_utils import ad_proxy_from_constants
+    >>> from slsqp_jax.sqpdax.primal import Primal
+    >>> fn_val = jnp.asarray(9.0)
+    >>> fn_jac = jnp.array([3.0, 12.0])
+    >>> proxy = ad_proxy_from_constants(fn_val, fn_jac)
+    >>> p = Primal(x=jnp.array([1.0, 2.0]))
+    >>> float(proxy(p))
+    9.0
+    >>> eqx.filter_grad(proxy)(p).x.tolist()
+    [3.0, 12.0]
+    """
+    value = jax.lax.stop_gradient(fn_val)
+    jac = jax.lax.stop_gradient(fn_jac)
+
+    def fn(arg: Primal) -> Array:
+        # arg.x - stop_gradient(arg.x) is numerically zero -- so the value stays
+        # exactly `value` -- but carries a unit tangent, injecting `jac` as the
+        # gradient. tensordot contracts `jac`'s trailing (n,) axis with `dx`:
+        # scalar objective -> jac (n,); vector constraint -> jac (m, n) -> (m,).
+        dx = arg.x - jax.lax.stop_gradient(arg.x)
+        return value + jnp.tensordot(jac, dx, axes=1)
+
+    return fn
