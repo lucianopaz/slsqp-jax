@@ -58,6 +58,8 @@ from .subproblem import (
     SubProblemSolver,
     SubProblemSolverState,
     SubProblemSolverStateType,
+    TrustRegionInteriorPointSolver,
+    TrustRegionSolverState,
 )
 from .types import InitializableModule
 
@@ -122,4 +124,6 @@ __all__ = [
     "ProjectedCGSubProblemSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
+    "TrustRegionSolverState",
+    "TrustRegionInteriorPointSolver",
 ]

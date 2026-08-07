@@ -12,6 +12,8 @@ Public leaf solvers:
   — Powell dogleg normal (feasibility) step.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg.SteihaugTointCGTangentialStepSolver`
   — Steihaug–Toint tangential step on a scaled barrier QP.
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.trust_region.TrustRegionInteriorPointSolver`
+  — composite-step trust-region interior-point orchestrator (N&W §19.5).
 """
 
 from . import (
@@ -21,6 +23,7 @@ from . import (
     gradient_projection,
     projected_cg,
     steihaug_toint_cg,
+    trust_region,
 )
 from .active_set_loop import ActiveSetQPSolver, ActiveSetQPSolverState
 from .base import (
@@ -37,6 +40,7 @@ from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
 )
+from .trust_region import TrustRegionInteriorPointSolver, TrustRegionSolverState
 
 __all__ = [
     "active_set_loop",
@@ -45,6 +49,7 @@ __all__ = [
     "gradient_projection",
     "projected_cg",
     "steihaug_toint_cg",
+    "trust_region",
     "RESULTS",
     "SubProblemSolverState",
     "SubProblemSolverStateType",
@@ -60,4 +65,6 @@ __all__ = [
     "ProjectedCGSubProblemSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
+    "TrustRegionSolverState",
+    "TrustRegionInteriorPointSolver",
 ]

@@ -30,6 +30,8 @@ from .solver import (
     SubProblemSolver,
     SubProblemSolverState,
     SubProblemSolverStateType,
+    TrustRegionInteriorPointSolver,
+    TrustRegionSolverState,
 )
 
 __all__ = [
@@ -55,4 +57,6 @@ __all__ = [
     "ProjectedCGSubProblemSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
+    "TrustRegionSolverState",
+    "TrustRegionInteriorPointSolver",
 ]
