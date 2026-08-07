@@ -10,6 +10,7 @@ from . import (
     problem,
     registry,
     secant,
+    step_controller,
     subproblem,
     types,
 )
@@ -39,6 +40,14 @@ from .preconditioner import (
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
 from .secant import LBFGS, CurvatureDiagnostics, Secant
+from .step_controller import (
+    ArmijoLineSearch,
+    LineSearch,
+    LineSearchState,
+    StepController,
+    StepResult,
+    TrustRegionManager,
+)
 from .subproblem import (
     RESULTS,
     ActiveSetQPSolver,
@@ -74,6 +83,7 @@ __all__ = [
     "primal",
     "problem",
     "subproblem",
+    "step_controller",
     "EvaluatedProblem",
     "ProblemProtocol",
     "Problem",
@@ -82,6 +92,12 @@ __all__ = [
     "secant",
     "types",
     "InitializableModule",
+    "StepResult",
+    "StepController",
+    "LineSearchState",
+    "LineSearch",
+    "ArmijoLineSearch",
+    "TrustRegionManager",
     "LogBarrier",
     "Barrier",
     "EvaluatedBarrier",
