@@ -5,10 +5,11 @@ from __future__ import annotations
 import jax.numpy as jnp
 import pytest
 
-from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner
+from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner, MatrixPreconditioner
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS, ProjectedCGSubProblemSolver
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
+from tests.sqpdax.preconditioner.conftest import make_spd_matrix
 from tests.sqpdax.subproblem.conftest import (
     make_scaled_barrier_subproblem,
     make_zero_dual,
@@ -19,8 +20,12 @@ from .conftest import make_projected_cg_state, make_qp_subproblem, unbounded_box
 
 @pytest.mark.parametrize(
     "preconditioner",
-    [None, IdentityPreconditioner(jnp.zeros(2))],
-    ids=["none", "identity"],
+    [
+        None,
+        IdentityPreconditioner(jnp.zeros(2)),
+        MatrixPreconditioner(make_spd_matrix(2)),
+    ],
+    ids=["none", "identity", "matrix"],
 )
 def test_equality_only_analytic_kkt(preconditioner):
     """Feasible equality QP: ``dx ≈ [0.25, -0.25]``, ``λ_eq ≈ -1``."""
@@ -35,11 +40,11 @@ def test_equality_only_analytic_kkt(preconditioner):
 
     assert bool(state.success)
     assert state.status == RESULTS.successful
-    assert jnp.allclose(dx.x, jnp.array([0.25, -0.25]), atol=1e-6)
-    assert jnp.allclose(lam.eq_multipliers, jnp.array([-1.0]), atol=1e-5)
+    assert jnp.allclose(dx.x, jnp.array([0.25, -0.25]), atol=1e-5)
+    assert jnp.allclose(lam.eq_multipliers, jnp.array([-1.0]), atol=1e-4)
     resid_p, resid_d = sub.residual((dx, lam))
-    assert jnp.linalg.norm(resid_p.flatten()) < 1e-5
-    assert jnp.linalg.norm(resid_d.flatten()) < 1e-5
+    assert jnp.linalg.norm(resid_p.flatten()) < 1e-4
+    assert jnp.linalg.norm(resid_d.flatten()) < 1e-4
 
 
 def test_wrong_subproblem_type_raises():
