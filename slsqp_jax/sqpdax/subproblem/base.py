@@ -1,7 +1,7 @@
 """Abstract matrix-free KKT subproblem shared by SQP step solvers."""
 
 from abc import abstractmethod
-from typing import Generic
+from typing import Any, Generic, TypeVar
 
 import jax
 from equinox import Module
@@ -15,6 +15,7 @@ from ..types import Scalar
 
 __all__ = [
     "SubProblem",
+    "SubProblemType",
 ]
 
 
@@ -388,3 +389,6 @@ class SubProblem(Module, Generic[PrimalType]):
         """
         template = self.lagrangian.ref
         return type(template).from_flat(flat, *template.sizes)
+
+
+SubProblemType = TypeVar("SubProblemType", bound=SubProblem[Any])
