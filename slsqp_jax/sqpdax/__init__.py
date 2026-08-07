@@ -10,6 +10,7 @@ from . import (
     problem,
     registry,
     secant,
+    subproblem,
     types,
 )
 from .active_set import ActiveSet
@@ -38,6 +39,7 @@ from .preconditioner import (
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
 from .secant import LBFGS, CurvatureDiagnostics, Secant
+from .subproblem import ActiveSetSubProblem, ScaledBarrierSubProblem, SubProblem
 from .types import InitializableModule
 
 __all__ = [
@@ -50,6 +52,7 @@ __all__ = [
     "preconditioner",
     "primal",
     "problem",
+    "subproblem",
     "EvaluatedProblem",
     "ProblemProtocol",
     "Problem",
@@ -82,4 +85,7 @@ __all__ = [
     "MatrixPreconditioner",
     "GenericPreconditioner",
     "ActiveSet",
+    "ActiveSetSubProblem",
+    "SubProblem",
+    "ScaledBarrierSubProblem",
 ]
