@@ -34,9 +34,11 @@ from .lagrangian import (
 from .merit import Merit, NormMerit
 from .minimiser import (
     AbstractConstrainedMinimiser,
+    ActiveSetLineSearchMinimiser,
     CommonMinimiser,
     OptimisationContext,
     OptimistixMinimiser,
+    TrustRegionInteriorPointMinimiser,
     as_optimistix_minimiser,
     minimise,
     minimiser_option_keys,
@@ -99,6 +101,8 @@ __all__ = [
     "OptimisationContext",
     "AbstractConstrainedMinimiser",
     "CommonMinimiser",
+    "ActiveSetLineSearchMinimiser",
+    "TrustRegionInteriorPointMinimiser",
     "minimise",
     "OptimistixMinimiser",
     "as_optimistix_minimiser",
