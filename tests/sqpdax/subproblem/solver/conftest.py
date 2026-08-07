@@ -15,6 +15,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     DogLegSolverState,
     ProjectedCGState,
     SteihaugTointCGTangentialStepSolverState,
+    TrustRegionSolverState,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.subproblem.conftest import make_evaluated_lagrangian, make_zero_dual
@@ -103,6 +104,24 @@ def make_active_set_qp_state() -> ActiveSetQPSolverState:
         success=jnp.asarray(False),
         status=RESULTS.successful,
         n_cg_iter=jnp.zeros((), jnp.int32),
+    )
+
+
+def make_trust_region_state(
+    radius: float | Array = 1.0,
+    *,
+    merit_penalty: float | Array = 1.0,
+) -> TrustRegionSolverState:
+    """Cold :class:`TrustRegionSolverState` with the given radius / penalty."""
+    return TrustRegionSolverState(
+        n_iter=jnp.zeros((), jnp.int32),
+        success=jnp.asarray(False),
+        status=RESULTS.successful,
+        radius=jnp.asarray(radius),
+        predicted_reduction=jnp.asarray(0.0),
+        merit_penalty=jnp.asarray(merit_penalty),
+        n_cg_iter=jnp.zeros((), jnp.int32),
+        on_boundary=jnp.asarray(False),
     )
 
 

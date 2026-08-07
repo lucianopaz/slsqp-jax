@@ -331,6 +331,8 @@ class ProjectedCGSubProblemSolver(
 
         # ``n_cg`` counts CG steps that actually ran (the ``do`` branch); once
         # converged/frozen the ``lax.cond`` short-circuits and stops counting.
+        # ``converged_flag`` is True on tol success *or* a residual-floor /
+        # negative-curvature freeze — that is the solver's termination signal.
         init = (
             d0,
             r0,
@@ -339,7 +341,9 @@ class ProjectedCGSubProblemSolver(
             jnp.reshape(rz0 < tol_sq, ()),
             jnp.zeros((), jnp.int32),
         )
-        dx, _, _, final_rz, _, n_cg = jax.lax.fori_loop(0, self.max_iter, cg_body, init)
+        dx, _, _, _, converged_flag, n_cg = jax.lax.fori_loop(
+            0, self.max_iter, cg_body, init
+        )
 
         # Defensively pull the iterate back onto the constraint with one cached
         # back-solve (range-space correction, zero on fixed variables).  The
@@ -378,19 +382,21 @@ class ProjectedCGSubProblemSolver(
         )
 
         # --- carry the solver state: accumulate CG count, classify this solve ---
-        # ``success`` requires a finite result *and* the projected residual to
-        # have reached ``tol``; a non-finite step (e.g. a genuinely inconsistent
-        # active set) is flagged ``singular``, an unconverged-but-finite solve
-        # ``max_steps_reached``.  ``n_iter`` accumulates so a caller looping the
-        # solver over active sets sees the total CG work.
+        # ``success`` follows the CG termination flag (tol hit *or* residual-floor
+        # / negative-curvature freeze). Requiring ``final_rz < tol²`` alone would
+        # reject exact float64 solves whose projected residual bottoms out around
+        # a few units in the last place (~1e-16) while ``tol=1e-10`` demands
+        # ``1e-20``. A non-finite step is ``singular``; exhausting ``max_iter``
+        # without termination is ``max_steps_reached``.
         finite = jnp.all(
             jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(step)])
         )
-        converged_ok = final_rz < tol_sq
-        success = finite & converged_ok
+        success = finite & converged_flag
         status = RESULTS.where(
             finite,
-            RESULTS.where(converged_ok, RESULTS.successful, RESULTS.max_steps_reached),
+            RESULTS.where(
+                converged_flag, RESULTS.successful, RESULTS.max_steps_reached
+            ),
             RESULTS.singular,
         )
         new_state = cast(
