@@ -1,4 +1,5 @@
 from . import (
+    active_set,
     autodiff_utils,
     barrier,
     dual,
@@ -11,6 +12,7 @@ from . import (
     secant,
     types,
 )
+from .active_set import ActiveSet
 from .barrier import (
     AdaptiveBarrierUpdate,
     Barrier,
@@ -39,6 +41,7 @@ from .secant import LBFGS, CurvatureDiagnostics, Secant
 from .types import InitializableModule
 
 __all__ = [
+    "active_set",
     "autodiff_utils",
     "barrier",
     "dual",
@@ -78,4 +81,5 @@ __all__ = [
     "IdentityPreconditioner",
     "MatrixPreconditioner",
     "GenericPreconditioner",
+    "ActiveSet",
 ]
