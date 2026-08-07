@@ -39,7 +39,26 @@ from .preconditioner import (
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
 from .secant import LBFGS, CurvatureDiagnostics, Secant
-from .subproblem import ActiveSetSubProblem, ScaledBarrierSubProblem, SubProblem
+from .subproblem import (
+    RESULTS,
+    ActiveSetQPSolver,
+    ActiveSetQPSolverState,
+    ActiveSetSubProblem,
+    DogLegSolver,
+    DogLegSolverState,
+    GradientProjection,
+    GradientProjectionState,
+    ProjectedCGState,
+    ProjectedCGSubProblemSolver,
+    ScaledBarrierSubProblem,
+    SteihaugTointCGTangentialStepSolver,
+    SteihaugTointCGTangentialStepSolverState,
+    SubProblem,
+    SubproblemContext,
+    SubProblemSolver,
+    SubProblemSolverState,
+    SubProblemSolverStateType,
+)
 from .types import InitializableModule
 
 __all__ = [
@@ -88,4 +107,19 @@ __all__ = [
     "ActiveSetSubProblem",
     "SubProblem",
     "ScaledBarrierSubProblem",
+    "RESULTS",
+    "SubProblemSolverState",
+    "SubProblemSolverStateType",
+    "SubProblemSolver",
+    "SubproblemContext",
+    "ActiveSetQPSolverState",
+    "ActiveSetQPSolver",
+    "DogLegSolverState",
+    "DogLegSolver",
+    "GradientProjectionState",
+    "GradientProjection",
+    "ProjectedCGState",
+    "ProjectedCGSubProblemSolver",
+    "SteihaugTointCGTangentialStepSolverState",
+    "SteihaugTointCGTangentialStepSolver",
 ]
