@@ -20,7 +20,7 @@ __all__ = [
 
 def minimise(
     problem: ProblemProtocol[Any],
-    solver: AbstractConstrainedMinimiser[Any, Any, Any],
+    solver: AbstractConstrainedMinimiser[Any, Any, Any, Any],
     x0: Vector_n,
     *,
     max_steps: int = 256,
@@ -80,7 +80,7 @@ def minimise(
         return solver.step(problem), n + 1
 
     solver, _ = cast(
-        tuple[AbstractConstrainedMinimiser[Any, Any, Any], Any],
+        tuple[AbstractConstrainedMinimiser[Any, Any, Any, Any], Any],
         jax.lax.while_loop(cond, body, (solver, jnp.asarray(0, jnp.int32))),
     )
     done, result = solver.terminate(problem)

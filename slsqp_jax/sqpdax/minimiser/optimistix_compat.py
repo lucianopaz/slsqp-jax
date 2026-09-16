@@ -51,7 +51,9 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
     # with defaults ahead of us in the MRO, so every subclass field needs a
     # default (dataclass field-order rule). Construction always fills these.
     problem: ProblemProtocol[Any] = field(default=cast(Any, None))
-    inner: AbstractConstrainedMinimiser[Any, Any, Any] = field(default=cast(Any, None))
+    inner: AbstractConstrainedMinimiser[Any, Any, Any, Any] = field(
+        default=cast(Any, None)
+    )
     rtol: float = 1e-6
     atol: float = 1e-6
     norm: Callable[[PyTree], Shaped[Array, ""]] = field(
@@ -140,7 +142,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
 
 
 def as_optimistix_minimiser(
-    minimiser: AbstractConstrainedMinimiser[Any, Any, Any],
+    minimiser: AbstractConstrainedMinimiser[Any, Any, Any, Any],
     problem: ProblemProtocol[Any],
 ) -> optx.AbstractMinimiser:
     """Wrap a constrained minimiser for :func:`optimistix.minimise`.

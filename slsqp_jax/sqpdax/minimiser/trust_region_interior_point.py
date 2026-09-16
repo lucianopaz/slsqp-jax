@@ -12,7 +12,6 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool
 
 from ..barrier import Barrier, BarrierUpdate, LogBarrier, MonotoneBarrierUpdate
-from ..barrier.update import _inf_norm
 from ..dual import Dual
 from ..lagrangian import (
     EvaluatedLagrangian,
@@ -23,7 +22,7 @@ from ..lagrangian import (
 from ..merit import NormMerit
 from ..primal import InteriorPointPrimal, Slack
 from ..problem import ProblemProtocol
-from ..step_controller import StepController, TrustRegionManager
+from ..step_controller import StepController, StepResult, TrustRegionManager
 from ..subproblem import ScaledBarrierSubProblem
 from ..subproblem.solver import (
     RESULTS,
@@ -34,15 +33,50 @@ from ..subproblem.solver import (
 )
 from ..types import Scalar, Vector_n
 from .base import CommonMinimiser, OptimisationContext
+from .termination import TerminationFlags, TerminationMetrics
 
 __all__ = [
     "TrustRegionInteriorPointMinimiser",
+    "TrustRegionInteriorPointTerminationMetrics",
 ]
+
+
+class TrustRegionInteriorPointTerminationMetrics(TerminationMetrics):
+    """Termination measurements for :class:`TrustRegionInteriorPointMinimiser`.
+
+    Mirrors the two nested stopping tests of Nocedal & Wright Algorithm 19.4:
+    the inner loop runs until the *barrier* KKT error satisfies
+    ``E(x, s, y, z; μ) ≤ ε_μ``, and the outer loop until the *unperturbed*
+    error satisfies ``E(x, s, y, z; 0) ≤ ε_TOL``. A single residual field
+    cannot express both, which is why this schema is algorithm-specific.
+
+    Attributes
+    ----------
+    barrier_updated
+        ``True`` when the last
+        :class:`~slsqp_jax.sqpdax.barrier.update.BarrierUpdate` judged the
+        barrier subproblem solved and reduced ``μ``. This *is* the inner
+        ``E(·; μ) ≤ ε_μ`` test: the policy owns both the residual and the
+        tolerance (``kappa_eps * μ`` for the monotone schedule), so ``ε_μ``
+        tightens automatically as ``μ`` shrinks.
+    optimality_residual
+        ``E(x, s, y, z; 0)`` from N&W eq. 19.10, compared against ``atol``
+        for the outer test.
+    has_min_steps
+        ``True`` once ``step_count >= min_steps``.
+    """
+
+    barrier_updated: Bool[Array, ""]
+    optimality_residual: Scalar
+    has_min_steps: Bool[Array, ""]
 
 
 class TrustRegionInteriorPointMinimiser(
     CommonMinimiser[
-        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
+        InteriorPointPrimal,
+        ScaledBarrierSubProblem,
+        TrustRegionSolverState,
+        TrustRegionInteriorPointTerminationMetrics,
     ]
 ):
     """Nocedal & Wright (2006) Section 19.5 trust-region interior-point method.
@@ -60,6 +94,13 @@ class TrustRegionInteriorPointMinimiser(
     :class:`~slsqp_jax.sqpdax.primal.InteriorPointPrimal` and picks
     strictly-interior default slack values.
 
+    Termination follows the two nested tests of N&W Algorithm 19.4. The inner
+    one — solve the current barrier subproblem to ``E(x, s, y, z; μ) ≤ ε_μ``
+    — is owned by :attr:`barrier_update` and surfaced as
+    :attr:`barrier_updated`; the outer one compares the unperturbed KKT error
+    ``E(x, s, y, z; 0)`` against ``atol``. There is no relative tolerance, so
+    passing ``rtol`` raises.
+
     Attributes
     ----------
     initial_mu
@@ -73,12 +114,22 @@ class TrustRegionInteriorPointMinimiser(
     primal_dual
         If ``True``, use the primal-dual slack-slack KKT block.
     barrier_update
-        Policy that reduces ``μ`` after each accepted iterate.
+        Policy that reduces ``μ``. Consulted after every outer step, accepted
+        or not: the test it applies is a property of the iterate, not of the
+        step, and on a rejected step the iterate is unchanged.
+    rtol
+        Unused; must be left at its ``NaN`` default. Present only to reject
+        the inherited relative-tolerance knob, which this algorithm's
+        absolute KKT-error test does not implement.
     eta, shrink_threshold, grow_threshold, shrink_factor, grow_factor, max_radius
         Forwarded to :class:`TrustRegionManager`.
     barrier
         Dynamic barrier whose ``weight`` *is* ``μ`` (seeded in
         :meth:`_init_dynamics`).
+    barrier_updated
+        Dynamic flag recording whether the last :attr:`barrier_update` call
+        judged the barrier subproblem solved; read by
+        :meth:`termination_metrics` as the inner stopping test.
     """
 
     initial_mu: float = eqx.field(static=True, default=1.0)
@@ -87,6 +138,10 @@ class TrustRegionInteriorPointMinimiser(
     initial_penalty: float = eqx.field(static=True, default=1.0)
     primal_dual: bool = eqx.field(static=True, default=True)
     barrier_update: BarrierUpdate = eqx.field(default_factory=MonotoneBarrierUpdate)
+    barrier_updated: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    rtol: float = eqx.field(static=True, default=jnp.nan)
     # trust-region acceptance / radius policy (forwarded to TrustRegionManager)
     eta: float = eqx.field(static=True, default=1e-4)
     shrink_threshold: float = eqx.field(static=True, default=0.25)
@@ -96,6 +151,13 @@ class TrustRegionInteriorPointMinimiser(
     max_radius: float = eqx.field(static=True, default=1e10)
     # The barrier is dynamic state: its ``weight`` *is* mu, updated each step.
     barrier: Barrier | None = None
+
+    def __post_init__(self) -> None:
+        if bool(~jnp.isnan(self.rtol)):
+            raise ValueError(
+                "TrustRegionInteriorPointMinimiser does not provide a relative "
+                "tolerance for convergence. Use the absolute tolerance instead."
+            )
 
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
         """Root solver class for ``options['subproblem']`` validation."""
@@ -262,58 +324,138 @@ class TrustRegionInteriorPointMinimiser(
             ),
         )
 
-    def _feasibility_error(
-        self,
-        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
-    ) -> Scalar:
-        """``∞``-norm of the slacked primal residual (``dual_grad`` blocks)."""
-        residual = ctx.lagrangian.dual_grad
-        return jnp.max(
-            jnp.stack(
-                [
-                    _inf_norm(residual.eq_multipliers),
-                    _inf_norm(residual.ineq_multipliers),
-                    _inf_norm(residual.lb_multipliers),
-                    _inf_norm(residual.ub_multipliers),
-                ]
-            )
-        )
-
-    def _extra_optimality(
-        self,
-        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
-    ) -> Scalar:
-        """Complementarity / barrier-weight residual compared against ``atol``."""
-        lag = cast(InteriorPointEvaluatedLagrangian, ctx.lagrangian)
-        barrier = cast(Barrier, self.barrier)
-        comp = self.barrier_update.complementarity(lag)
-        return jnp.maximum(comp, barrier.weight)
-
-    def _termination_diagnostics(
-        self,
-        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
-    ) -> tuple[tuple[Bool[Array, ""], optx.RESULTS], ...]:
-        """Escalate a failed composite-step solve (non-finite → ``singular``)."""
-        assert ctx.solver_state is not None
-        status = optx.RESULTS.promote(ctx.solver_state.status)
-        failed = status != optx.RESULTS.successful
-        return super()._termination_diagnostics(ctx) + ((failed, status),)
-
     def _advance_dynamics(
         self,
         ctx: SubproblemContext[
             InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
         ],
-        x_new: InteriorPointPrimal,
+        result: StepResult[InteriorPointPrimal, TrustRegionSolverState],
         step_dual: Dual,
     ) -> Self:
-        """Reduce ``μ`` from the KKT / complementarity state at the new iterate."""
+        """Reduce ``μ`` from the KKT / complementarity state at the new iterate.
+
+        Also records whether the policy judged the barrier subproblem solved,
+        which :meth:`termination_metrics` reads back as the inner
+        ``E(·; μ) ≤ ε_μ`` test of N&W Algorithm 19.4. That test is evaluated
+        at the iterate, so it runs on rejected steps too — ``result.x`` is
+        then the retained iterate.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        result
+            Outcome of the trust-region controller.
+        step_dual
+            Multipliers committed with ``result.x``.
+
+        Returns
+        -------
+        Self
+            Minimiser with ``barrier`` and ``barrier_updated`` refreshed.
+        """
         # ``ctx.lagrangian`` is the module; re-evaluate at (x_new, step_dual)
         # exactly as ``_update_secant`` does. Complementarity is secant-independent,
         # so using the step's module (pre-update barrier) is correct.
+        x_new = result.x
         lag_module = cast(InteriorPointLagrangian, ctx.lagrangian)
         lagrangian = lag_module(x_new, step_dual)
-        new_barrier = self.barrier_update.update(
+        new_barrier, updated = self.barrier_update.update(
             cast(Barrier, self.barrier), lagrangian
         )
-        return eqx.tree_at(lambda m: m.barrier, self, new_barrier)
+        return eqx.tree_at(
+            lambda m: (m.barrier, m.barrier_updated),
+            self,
+            (new_barrier, updated),
+        )
+
+    def termination_metrics(
+        self, ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState]
+    ) -> TrustRegionInteriorPointTerminationMetrics:
+        """Measure the unperturbed KKT error and the inner-loop state.
+
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+
+        Returns
+        -------
+        TrustRegionInteriorPointTerminationMetrics
+            ``E(x, s, y, z; 0)`` plus the barrier / non-finite / subproblem
+            state the convergence test needs.
+        """
+        primal = ctx.lagrangian.ref
+        lag = cast(InteriorPointEvaluatedLagrangian, ctx.lagrangian)
+
+        # The residual is computed under 0 barrier weight as in algorithm 19.4 of N&W,
+        # and the residual formula is taken from equation 19.10 in N&W.
+        optimality_residual = self.barrier_update.optimality_residual(
+            lag, jnp.asarray(0.0)
+        )
+        tracked = (
+            ctx.lagrangian.value,
+            ctx.lagrangian.x_grad,
+            primal,
+            self.dual,
+            optimality_residual,
+        )
+        nonfinite = jnp.logical_not(
+            jnp.all(
+                jnp.stack(
+                    [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(tracked)]
+                )
+            )
+        )
+        return cast(
+            TrustRegionInteriorPointTerminationMetrics,
+            TrustRegionInteriorPointTerminationMetrics(
+                barrier_updated=self.barrier_updated,
+                optimality_residual=optimality_residual,
+                nonfinite=nonfinite,
+                subproblem_result=optx.RESULTS.promote(
+                    cast(TrustRegionSolverState, ctx.solver_state).status
+                ),
+                has_min_steps=self.step_count >= self.min_steps,
+            ),
+        )
+
+    def termination_flags(
+        self,
+        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
+        metrics: TrustRegionInteriorPointTerminationMetrics,
+    ) -> TerminationFlags:
+        """Require *both* Algorithm 19.4 stopping tests before declaring success.
+
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+        metrics
+            Output of :meth:`termination_metrics`.
+
+        Returns
+        -------
+        TerminationFlags
+            Shared termination decision.
+        """
+        barrier_updated = metrics.barrier_updated
+        acceptable_residual = metrics.optimality_residual <= self.atol
+        nonfinite = metrics.nonfinite
+        fatal = metrics.subproblem_result != optx.RESULTS.successful
+        converged = (
+            barrier_updated
+            & acceptable_residual
+            & metrics.has_min_steps
+            & ~nonfinite
+            & ~fatal
+        )
+        return cast(
+            TerminationFlags,
+            TerminationFlags(
+                converged=converged,
+                nonfinite=nonfinite,
+                fatal=fatal,
+                subproblem_result=metrics.subproblem_result,
+            ),
+        )
