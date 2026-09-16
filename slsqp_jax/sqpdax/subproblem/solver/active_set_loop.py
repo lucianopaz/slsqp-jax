@@ -2,6 +2,7 @@ from typing import Generic, cast
 
 import equinox as eqx
 import jax
+from equinox import tree_at
 from jax import numpy as jnp
 from typing_extensions import TypeVar
 
@@ -213,10 +214,19 @@ class ActiveSetQPSolver(
         )
         return step_f, cast(
             ActiveSetQPSolverState,
-            ActiveSetQPSolverState(
-                n_iter=n_iter_f,
-                n_cg_iter=kkt_state_f.n_iter,
-                success=success,
-                status=status,
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.n_cg_iter,
+                    state.success,
+                    state.status,
+                ),
+                initial_state,
+                (
+                    n_iter_f,
+                    kkt_state_f.n_iter,
+                    success,
+                    status,
+                ),
             ),
         )

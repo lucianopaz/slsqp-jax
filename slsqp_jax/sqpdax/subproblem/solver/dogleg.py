@@ -3,7 +3,7 @@
 from typing import Any, cast
 
 import jax
-from equinox import field
+from equinox import field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Scalar
 
@@ -164,14 +164,26 @@ class DogLegSolver(SubProblemSolver[Primal, SubProblem[Any], DogLegSolverState])
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
         new_state = cast(
             DogLegSolverState,
-            DogLegSolverState(
-                n_iter=initial_state.n_iter + 1,
-                n_cg_iter=initial_state.n_cg_iter,
-                on_boundary=on_boundary,
-                success=finite,
-                status=status,
-                radius=radius,
-                active_bounds=(active_lb, active_ub),
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.n_cg_iter,
+                    state.on_boundary,
+                    state.success,
+                    state.status,
+                    state.radius,
+                    state.active_bounds,
+                ),
+                initial_state,
+                (
+                    initial_state.n_iter + 1,
+                    initial_state.n_cg_iter,
+                    on_boundary,
+                    finite,
+                    status,
+                    radius,
+                    (active_lb, active_ub),
+                ),
             ),
         )
         return step, new_state

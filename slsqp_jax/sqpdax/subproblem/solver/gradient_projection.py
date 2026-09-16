@@ -1,6 +1,7 @@
 from typing import Any, Callable, cast
 
 import jax
+from equinox import tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, Scalar
 
@@ -152,13 +153,24 @@ class GradientProjection(
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
         state = cast(
             GradientProjectionState,
-            GradientProjectionState(
-                n_iter=jnp.asarray(initial_state.n_iter, jnp.int32) + n_seg + n_cg,
-                success=finite,
-                status=status,
-                active_lb=active_lb,
-                active_ub=active_ub,
-                direction=direction,
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.success,
+                    state.status,
+                    state.active_lb,
+                    state.active_ub,
+                    state.direction,
+                ),
+                initial_state,
+                (
+                    initial_state.n_iter + n_seg + n_cg,
+                    finite,
+                    status,
+                    active_lb,
+                    active_ub,
+                    direction,
+                ),
             ),
         )
         return (direction, initial_dual), state

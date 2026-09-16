@@ -1,6 +1,7 @@
 from typing import cast
 
 import jax
+from equinox import tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
@@ -401,10 +402,18 @@ class ProjectedCGSubProblemSolver(
         )
         new_state = cast(
             ProjectedCGState,
-            ProjectedCGState(
-                n_iter=initial_state.n_iter + n_cg,
-                success=success,
-                status=status,
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.success,
+                    state.status,
+                ),
+                initial_state,
+                (
+                    initial_state.n_iter + n_cg,
+                    success,
+                    status,
+                ),
             ),
         )
         return step, new_state

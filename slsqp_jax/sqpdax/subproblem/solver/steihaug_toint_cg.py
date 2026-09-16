@@ -1,7 +1,7 @@
 from typing import cast
 
 import jax
-from equinox import field
+from equinox import field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 
@@ -329,14 +329,26 @@ class SteihaugTointCGTangentialStepSolver(
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
         new_state = cast(
             SteihaugTointCGTangentialStepSolverState,
-            SteihaugTointCGTangentialStepSolverState(
-                n_iter=initial_state.n_iter + 1,
-                n_cg_iter=initial_state.n_cg_iter + n_cg,
-                on_boundary=on_bnd,
-                success=finite,
-                status=status,
-                radius=radius,
-                active_bounds=(active_lb, active_ub),
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.n_cg_iter,
+                    state.on_boundary,
+                    state.success,
+                    state.status,
+                    state.radius,
+                    state.active_bounds,
+                ),
+                initial_state,
+                (
+                    initial_state.n_iter + 1,
+                    initial_state.n_cg_iter + n_cg,
+                    on_bnd,
+                    finite,
+                    status,
+                    radius,
+                    (active_lb, active_ub),
+                ),
             ),
         )
         return step, new_state
