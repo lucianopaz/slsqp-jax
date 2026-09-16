@@ -78,25 +78,40 @@ def test_armijo_step_acceptance(
         assert float(result.merit_val) >= float(ls.merit(x0)) - 1e-12
 
 
-def test_armijo_threads_solver_state():
-    """Line search returns the incoming solver carry unchanged."""
-    ls = make_armijo()
+@pytest.mark.parametrize(
+    ("x0", "direction", "max_steps"),
+    [
+        # Ascent direction: no trial can satisfy Armijo within the budget.
+        (Primal(jnp.ones(2)), Primal(jnp.ones(2)), 20),
+        # Zero budget: the search loop never runs a single trial.
+        (Primal(jnp.ones(2)), Primal(-jnp.ones(2)), 0),
+    ],
+    ids=["ascent", "zero-budget"],
+)
+def test_armijo_rejection_retains_x0(x0, direction, max_steps):
+    """A rejected search returns ``x0`` and the merit *at* ``x0``.
+
+    This is the :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`
+    contract the outer loop relies on: ``_execute_step`` commits ``result.x``
+    unconditionally, so a rejected step must not move the iterate, and
+    ``merit_val`` must describe the point actually returned.
+    """
+    ls = make_armijo(max_steps=max_steps)
     carry = SubProblemSolverState(
         n_iter=jnp.asarray(3, jnp.int32),
         success=jnp.asarray(True),
         status=RESULTS.successful,
     )
-    result = ls.step(Primal(jnp.ones(2)), Primal(-jnp.ones(2)), carry)
-    assert result.solver_state is carry
+    result = ls.step(x0, direction, carry)
 
-
-def test_armijo_exhausted_budget_reports_rejected():
-    """With ``max_steps=0`` the loop never trials and ``accepted`` is False."""
-    ls = make_armijo(max_steps=0)
-    result = ls.step(Primal(jnp.ones(2)), Primal(-jnp.ones(2)))
     assert not bool(result.accepted)
-    # Seeded merit before any trial is +inf.
-    assert jnp.isinf(result.merit_val)
+    assert jnp.allclose(result.x.x, x0.x)
+    # Merit is unchanged by a rejected step, and matches the returned iterate.
+    assert float(result.merit_val) == pytest.approx(float(ls.merit(x0)))
+    assert float(result.merit_val) == pytest.approx(float(ls.merit(result.x)))
+    # The subproblem carry is threaded through by value.
+    assert int(result.solver_state.n_iter) == 3
+    assert bool(result.solver_state.success)
 
 
 def test_armijo_small_alpha_decrease_fallback():
