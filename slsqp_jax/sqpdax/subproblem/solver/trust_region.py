@@ -4,7 +4,7 @@ from typing import cast
 
 import jax
 import lineax as lx
-from equinox import field
+from equinox import field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 from lineax import AbstractLinearOperator, AbstractLinearSolver
@@ -343,15 +343,28 @@ class TrustRegionInteriorPointSolver(
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
         new_state = cast(
             TrustRegionSolverState,
-            TrustRegionSolverState(
-                n_iter=jnp.asarray(initial_state.n_iter, jnp.int32) + 1,
-                success=finite,
-                status=status,
-                radius=radius,
-                predicted_reduction=pred,
-                merit_penalty=nu_new,
-                n_cg_iter=jnp.asarray(initial_state.n_cg_iter, jnp.int32) + n_cg,
-                on_boundary=on_bnd,
+            tree_at(
+                lambda state: (
+                    state.n_iter,
+                    state.success,
+                    state.status,
+                    state.radius,
+                    state.predicted_reduction,
+                    state.merit_penalty,
+                    state.n_cg_iter,
+                    state.on_boundary,
+                ),
+                initial_state,
+                (
+                    initial_state.n_iter + 1,
+                    finite,
+                    status,
+                    radius,
+                    pred,
+                    nu_new,
+                    initial_state.n_cg_iter + n_cg,
+                    on_bnd,
+                ),
             ),
         )
         return step, new_state
