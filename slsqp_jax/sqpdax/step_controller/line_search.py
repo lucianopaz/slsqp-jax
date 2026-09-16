@@ -155,9 +155,11 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         Returns
         -------
         StepResult
-            Trial iterate ``x0 + alpha * direction``, whether
-            :meth:`stop_search` accepted it, merit at that point, and the
-            unchanged ``solver_state``.
+            On acceptance, the trial iterate ``x0 + alpha * direction`` and
+            the merit there. On rejection, ``x0`` and the merit at ``x0``,
+            per the :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`
+            contract. ``solver_state`` is returned with its incoming value in
+            both cases.
 
         Examples
         --------
@@ -216,18 +218,27 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
             ),
         )
         # ``accepted`` records whether we exited via acceptance (True) or budget
-        # exhaustion.  ``solver_state`` is threaded through untouched -- a line
-        # search does not own any persistent subproblem-solver control.
+        # exhaustion.  A rejected search must report ``x0`` and the merit there,
+        # not the last trial, so the outer loop never moves to a point the
+        # search refused.
         accepted = self.stop_search(state)
-        return cast(
-            StepResult[Primal, SubProblemSolverState],
-            StepResult(
+
+        result = jax.lax.cond(
+            accepted,
+            lambda: StepResult(
                 x=state.x,
                 accepted=accepted,
                 merit_val=state.merit_val,
                 solver_state=solver_state,
             ),
+            lambda: StepResult(
+                x=x0,
+                accepted=False,
+                merit_val=merit0_val,
+                solver_state=solver_state,
+            ),
         )
+        return cast(StepResult[Primal, SubProblemSolverState], result)
 
 
 class ArmijoLineSearch(LineSearch):
