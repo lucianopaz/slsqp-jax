@@ -9,13 +9,11 @@ from dataclasses import fields, replace
 from typing import Any, Generic, Self, cast, get_origin, get_type_hints
 
 import equinox as eqx
-import jax
 import optimistix as optx
 from equinox import Module
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Int
 
-from ..barrier.update import _inf_norm
 from ..dual import Dual
 from ..lagrangian import EvaluatedLagrangian, Lagrangian
 from ..primal import Primal, PrimalType
@@ -26,7 +24,12 @@ from ..step_controller import StepController, StepResult
 from ..subproblem.base import SubProblemType
 from ..subproblem.solver import SubProblemSolver, SubProblemSolverStateType
 from ..subproblem.solver.base import SubproblemContext
-from ..types import Scalar, Vector_n
+from ..types import Vector_n
+from .termination import (
+    TerminationFlags,
+    TerminationMetricsType,
+    classify_termination,
+)
 from .utils import minimiser_option_keys, solver_option_keys
 
 __all__ = [
@@ -70,7 +73,10 @@ class OptimisationContext(Module, Generic[PrimalType, SubProblemSolverStateType]
 
 
 class AbstractConstrainedMinimiser(
-    Module, Generic[PrimalType, SubProblemType, SubProblemSolverStateType]
+    Module,
+    Generic[
+        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+    ],
 ):
     """Problem-centric constrained minimiser: fused configuration + running state.
 
@@ -211,8 +217,12 @@ class AbstractConstrainedMinimiser(
 
 
 class CommonMinimiser(
-    AbstractConstrainedMinimiser[PrimalType, SubProblemType, SubProblemSolverStateType],
-    Generic[PrimalType, SubProblemType, SubProblemSolverStateType],
+    AbstractConstrainedMinimiser[
+        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+    ],
+    Generic[
+        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+    ],
 ):
     """Shared ``init`` / ``step`` / ``terminate`` / ``postprocess`` driver.
 
@@ -677,13 +687,22 @@ class CommonMinimiser(
         """
         x_new = result.x
         new_secant = self._update_secant(ctx.lagrangian, x_new, step_dual)
-        advanced = eqx.tree_at(
-            lambda m: (m.iterate, m.dual, m.secant, m.solver_state, m.step_count),
-            self,
-            (x_new, step_dual, new_secant, result.solver_state, self.step_count + 1),
-            is_leaf=lambda z: z is None,
+        advanced = cast(
+            Self,
+            eqx.tree_at(
+                lambda m: (m.iterate, m.dual, m.secant, m.solver_state, m.step_count),
+                self,
+                (
+                    x_new,
+                    step_dual,
+                    new_secant,
+                    result.solver_state,
+                    self.step_count + 1,
+                ),
+                is_leaf=lambda z: z is None,
+            ),
         )
-        return advanced._advance_dynamics(ctx, x_new, step_dual)
+        return advanced._advance_dynamics(ctx, result, step_dual)
 
     def _update_secant(
         self,
@@ -722,7 +741,7 @@ class CommonMinimiser(
     def _advance_dynamics(
         self,
         ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
-        x_new: PrimalType,
+        result: StepResult[PrimalType, SubProblemSolverStateType],
         step_dual: Dual,
     ) -> Self:
         """Phase-4 post-iterate parameter update.
@@ -730,12 +749,19 @@ class CommonMinimiser(
         Default implementations are no-ops (return ``self``). Interior-point
         solvers override to reduce the barrier weight.
 
+        Runs on rejected steps too: ``result.x`` is the retained iterate in
+        that case, and tests evaluated at the iterate (rather than at the
+        step) are still meaningful there. Overrides that must distinguish the
+        two cases should branch on ``result.accepted``.
+
         Parameters
         ----------
         ctx
             Per-step subproblem context.
-        x_new
-            New primal iterate.
+        result
+            Outcome of :meth:`_assess_direction`, carrying the committed
+            iterate ``result.x``, the acceptance flag, and the refreshed
+            solver carry.
         step_dual
             New multipliers.
 
@@ -793,95 +819,16 @@ class CommonMinimiser(
             ),
         )
 
-    @abstractmethod
-    def _feasibility_error(
-        self, ctx: OptimisationContext[PrimalType, SubProblemSolverStateType]
-    ) -> Scalar:
-        """Constraint / bound violation measure compared against ``atol``.
-
-        Parameters
-        ----------
-        ctx
-            Termination context at the current iterate.
-
-        Returns
-        -------
-        Scalar
-            Non-negative feasibility residual.
-        """
-        ...
-
-    def _extra_optimality(
-        self, ctx: OptimisationContext[PrimalType, SubProblemSolverStateType]
-    ) -> Scalar:
-        """Extra optimality residual (e.g. complementarity) vs ``atol``.
-
-        Default ``0`` — solvers with no barrier need nothing extra.
-
-        Parameters
-        ----------
-        ctx
-            Termination context at the current iterate.
-
-        Returns
-        -------
-        Scalar
-            Non-negative extra optimality residual.
-        """
-        return jnp.asarray(0.0)
-
-    def _nonfinite_detected(
-        self, ctx: OptimisationContext[PrimalType, SubProblemSolverStateType]
-    ) -> Bool[Array, ""]:
-        """Whether any tracked quantity is non-finite (NaN / ±Inf).
-
-        Tracks Lagrangian value / gradient and every leaf of the iterate /
-        dual. Once these blow up no further iteration can recover, so
-        :meth:`terminate` should exit immediately.
-
-        Parameters
-        ----------
-        ctx
-            Termination context at the current iterate.
-
-        Returns
-        -------
-        Bool[Array, ""]
-            ``True`` when a non-finite value is detected.
-        """
-        tracked = (ctx.lagrangian.value, ctx.lagrangian.x_grad, self.iterate, self.dual)
-        finite = jnp.all(
-            jnp.stack(
-                [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(tracked)]
-            )
-        )
-        return jnp.logical_not(finite)
-
-    def _termination_diagnostics(
-        self, ctx: OptimisationContext[PrimalType, SubProblemSolverStateType]
-    ) -> tuple[tuple[Bool[Array, ""], optx.RESULTS], ...]:
-        """Ordered ``(fired, result)`` failure diagnostics (highest priority first).
-
-        :meth:`terminate` returns the earliest-fired code. The base supplies
-        the generic non-finite guard; solvers override to prepend/append
-        checks driven by ``ctx.solver_state`` (call ``super()`` and extend).
-
-        Parameters
-        ----------
-        ctx
-            Termination context at the current iterate.
-
-        Returns
-        -------
-        tuple of (Bool, optimistix.RESULTS)
-            Failure predicates with their status codes.
-        """
-        return ((self._nonfinite_detected(ctx), optx.RESULTS.nonfinite),)
-
     def terminate(
         self, problem: ProblemProtocol[PrimalType]
     ) -> tuple[Bool[Array, ""], optx.RESULTS]:
         """Test convergence and failure diagnostics at the current iterate.
+
+        Pure orchestration: the algorithm-specific work lives in
+        :meth:`termination_metrics` and :meth:`termination_flags`, and the
+        mapping from flags to a status code lives in
+        :func:`~slsqp_jax.sqpdax.minimiser.termination.classify_termination`
+        so it stays identical across minimisers.
 
         Parameters
         ----------
@@ -897,30 +844,61 @@ class CommonMinimiser(
             convergence; a failure code when a diagnostic fires).
         """
         ctx = self._optimisation_context(problem)
-        lagrangian = ctx.lagrangian
+        metrics = self.termination_metrics(ctx)
+        flags = self.termination_flags(ctx, metrics)
+        return classify_termination(flags)
 
-        # Convergence: relative stationarity + feasibility + extra optimality.
-        grad_norm = _inf_norm(lagrangian.x_grad)
-        scale = jnp.maximum(jnp.abs(lagrangian.value), 1.0)
-        stationary = grad_norm <= self.rtol * scale
-        feasible = self._feasibility_error(ctx) <= self.atol
-        optimal = self._extra_optimality(ctx) <= self.atol
-        has_min_steps = self.step_count >= self.min_steps
-        converged = stationary & feasible & optimal & has_min_steps
+    @abstractmethod
+    def termination_metrics(
+        self, ctx: OptimisationContext[PrimalType, SubProblemSolverStateType]
+    ) -> TerminationMetricsType:
+        """Measure the quantities this algorithm's convergence test consumes.
 
-        # Failure diagnostics: fold the ordered list so the earliest-listed fired
-        # code wins (apply in reverse -> first entry overwrites last).  ``result``
-        # stays ``successful`` when nothing fires, so a converged run reports
-        # success and a still-running one reports success too (the driver then
-        # maps ``done == False`` to ``nonlinear_max_steps_reached``).
-        result = optx.RESULTS.successful
-        failed = jnp.asarray(False)
-        for fired, code in reversed(self._termination_diagnostics(ctx)):
-            result = optx.RESULTS.where(fired, code, result)
-            failed = failed | fired
+        The returned type is the minimiser's own
+        :class:`~slsqp_jax.sqpdax.minimiser.termination.TerminationMetrics`
+        subclass, so an algorithm needing several residuals or tolerances
+        (inexact SQP, N&W Algorithm 19.4) is not forced into a shared schema.
 
-        done = converged | failed
-        return done, result
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+
+        Returns
+        -------
+        TerminationMetricsType
+            Populated metrics for :meth:`termination_flags`.
+        """
+        ...
+
+    @abstractmethod
+    def termination_flags(
+        self,
+        ctx: OptimisationContext[PrimalType, SubProblemSolverStateType],
+        metrics: TerminationMetricsType,
+    ) -> TerminationFlags:
+        """Reduce this algorithm's metrics to the shared termination booleans.
+
+        This is where the algorithms stop differing:
+        :func:`~slsqp_jax.sqpdax.minimiser.termination.classify_termination`
+        consumes only :class:`~slsqp_jax.sqpdax.minimiser.termination.TerminationFlags`,
+        so the meaning of a returned :class:`optimistix.RESULTS` code is the
+        same for every minimiser.
+
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+        metrics
+            Output of :meth:`termination_metrics` at the same iterate.
+
+        Returns
+        -------
+        TerminationFlags
+            Convergence / non-finite / fatal decision, plus the subproblem
+            status to report if the fatal branch fires.
+        """
+        ...
 
     def postprocess(
         self, problem: ProblemProtocol[PrimalType], result: optx.RESULTS

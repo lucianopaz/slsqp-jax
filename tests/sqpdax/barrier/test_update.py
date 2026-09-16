@@ -126,11 +126,13 @@ def test_monotone_update_reduce_or_hold(
     """Monotone policy reduces ``μ`` only when ``E ≤ kappa_eps * μ``."""
     evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
     policy = MonotoneBarrierUpdate(sigma=sigma, kappa_eps=kappa_eps, mu_min=1e-12)
-    updated = policy.update(barrier, evaluated)
+    updated, was_updated = policy.update(barrier, evaluated)
     if expect_reduce:
+        assert was_updated
         assert jnp.allclose(updated.weight, sigma * mu)
     else:
         # Residual at a generic point is positive, so μ is held.
+        assert not was_updated
         assert policy.optimality_residual(evaluated, mu) > 0
         assert jnp.allclose(updated.weight, mu)
     assert jnp.allclose(barrier.weight, mu)
@@ -140,7 +142,7 @@ def test_monotone_update_respects_mu_min():
     """Reduced ``μ`` is floored at ``mu_min``."""
     evaluated, barrier = make_evaluated_ip_lagrangian(weight=1e-10)
     policy = MonotoneBarrierUpdate(sigma=0.1, kappa_eps=1e12, mu_min=1e-9)
-    updated = policy.update(barrier, evaluated)
+    updated, _ = policy.update(barrier, evaluated)
     assert jnp.allclose(updated.weight, 1e-9)
 
 
@@ -149,7 +151,8 @@ def test_adaptive_update_tracks_complementarity():
     evaluated, barrier = make_evaluated_ip_lagrangian(weight=5.0)
     policy = AdaptiveBarrierUpdate(sigma=0.25, mu_min=1e-12)
     comp = policy.complementarity(evaluated)
-    updated = policy.update(barrier, evaluated)
+    updated, was_updated = policy.update(barrier, evaluated)
+    assert was_updated
     assert jnp.allclose(updated.weight, 0.25 * comp)
     assert jnp.allclose(barrier.weight, 5.0)
 
@@ -175,7 +178,7 @@ def test_adaptive_update_respects_mu_min():
         problem=problem, primal=primal, dual=dual, weight=1.0
     )
     policy = AdaptiveBarrierUpdate(sigma=0.2, mu_min=1e-6)
-    updated = policy.update(barrier, evaluated)
+    updated, _ = policy.update(barrier, evaluated)
     assert jnp.allclose(updated.weight, 1e-6)
 
 
@@ -191,7 +194,7 @@ def test_update_preserves_barrier_masks():
         MonotoneBarrierUpdate(kappa_eps=1e6),
         AdaptiveBarrierUpdate(),
     ):
-        updated = policy.update(barrier, evaluated)
+        updated, _ = policy.update(barrier, evaluated)
         assert isinstance(updated, LogBarrier)
         assert jnp.array_equal(updated.null_lb, barrier.null_lb)
         assert jnp.array_equal(updated.null_ub, barrier.null_ub)

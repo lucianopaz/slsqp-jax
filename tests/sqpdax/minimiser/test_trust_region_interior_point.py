@@ -73,46 +73,46 @@ def test_step_reduces_merit_on_unconstrained():
     )
 
 
-def test_minimise_unconstrained_quadratic():
-    """Owned driver converges the unconstrained quadratic near the origin."""
-    problem = make_unconstrained_quadratic()
+# ``x0`` / ``expected`` are plain lists rather than arrays: parametrize
+# arguments are built at import time, before other conftests may enable x64,
+# so materialising them here would pin float32 into an otherwise float64 run.
+@pytest.mark.parametrize(
+    ("make_problem", "x0", "expected"),
+    [
+        (make_unconstrained_quadratic, [1.0, 1.0], [0.0, 0.0]),
+        (make_equality_quadratic, [0.25, 0.25], [0.5, 0.5]),
+    ],
+    ids=["unconstrained", "equality"],
+)
+@pytest.mark.parametrize("min_steps", [1, 3])
+def test_minimise_converges_successfully(make_problem, x0, expected, min_steps):
+    """The driver reaches the KKT point and reports ``successful``.
+
+    Convergence fires only once the barrier subproblem has been solved to
+    ``kappa_eps * μ`` *and* the unperturbed KKT error ``E(x, s, y, z; 0)``
+    (N&W eq. 19.10) is below ``atol``, so a ``successful`` status here pins
+    both halves of the Algorithm 19.4 stopping test.
+    """
     sol = minimise(
-        problem,
+        make_problem(),
         TrustRegionInteriorPointMinimiser(
-            rtol=1e-3,
-            atol=1e-2,
-            min_steps=1,
+            atol=1e-6,
+            min_steps=min_steps,
             initial_mu=0.1,
             initial_radius=2.0,
         ),
-        jnp.ones(2),
+        jnp.asarray(x0),
         max_steps=40,
-        throw=False,
+        throw=True,
     )
-    assert sol.result in (
-        optx.RESULTS.successful,
-        optx.RESULTS.nonlinear_max_steps_reached,
-    )
-    # Even if the outer loop hits the budget, the iterate should improve.
-    assert jnp.linalg.norm(sol.value) < 1.0
+    assert sol.result == optx.RESULTS.successful
+    assert jnp.allclose(sol.value, jnp.asarray(expected), atol=1e-5)
+    assert int(sol.stats["num_steps"]) >= min_steps
 
 
-def test_minimise_equality_constrained():
-    """Equality-constrained IP run stays finite and reduces infeasibility."""
-    problem = make_equality_quadratic()
-    sol = minimise(
-        problem,
-        TrustRegionInteriorPointMinimiser(
-            rtol=1e-3,
-            atol=1e-2,
-            min_steps=1,
-            initial_mu=0.1,
-            initial_radius=2.0,
-        ),
-        jnp.array([0.25, 0.25]),
-        max_steps=40,
-        throw=False,
-    )
-    assert jnp.all(jnp.isfinite(sol.value))
-    # Soft check: residual of x0+x1-1 should shrink from the start.
-    assert abs(float(sol.value[0] + sol.value[1] - 1.0)) < 0.5
+def test_minimiser_raises_on_rtol():
+    with pytest.raises(
+        ValueError,
+        match="TrustRegionInteriorPointMinimiser does not provide a relative",
+    ):
+        TrustRegionInteriorPointMinimiser(rtol=1e-3)

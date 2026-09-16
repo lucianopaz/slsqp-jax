@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Self, cast
 
 import equinox as eqx
+import jax
 import optimistix as optx
 from jax import numpy as jnp
 from jaxtyping import Array, Bool
@@ -16,7 +17,7 @@ from ..lagrangian import EvaluatedLagrangian, Lagrangian
 from ..merit import NormMerit
 from ..primal import Primal
 from ..problem import ProblemProtocol
-from ..step_controller import ArmijoLineSearch, StepController
+from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
     RESULTS,
@@ -28,14 +29,49 @@ from ..subproblem.solver import (
 )
 from ..types import Scalar
 from .base import CommonMinimiser, OptimisationContext
+from .termination import TerminationFlags, TerminationMetrics
 
 __all__ = [
     "ActiveSetLineSearchMinimiser",
+    "ActiveSetLineSearchTerminationMetrics",
 ]
 
 
+class ActiveSetLineSearchTerminationMetrics(TerminationMetrics):
+    """Termination measurements for :class:`ActiveSetLineSearchMinimiser`.
+
+    Convergence is a *relative* stationarity test plus an absolute
+    feasibility test, so the scale used to relativise the gradient norm is
+    carried alongside it rather than recomputed.
+
+    Attributes
+    ----------
+    stationarity
+        ``‖∇_x L‖_∞`` at the current iterate.
+    stationarity_scale
+        ``max(|L|, 1)``; the minimiser converges when
+        ``stationarity <= rtol * stationarity_scale``.
+    feasibility
+        ``∞``-norm of the equality / inequality / bound violations, compared
+        against ``atol``.
+    has_min_steps
+        ``True`` once ``step_count >= min_steps``, gating convergence so a
+        cold start cannot report success before doing any work.
+    """
+
+    stationarity: Scalar
+    stationarity_scale: Scalar
+    feasibility: Scalar
+    has_min_steps: Bool[Array, ""]
+
+
 class ActiveSetLineSearchMinimiser(
-    CommonMinimiser[Primal, ActiveSetSubProblem, ActiveSetQPSolverState]
+    CommonMinimiser[
+        Primal,
+        ActiveSetSubProblem,
+        ActiveSetQPSolverState,
+        ActiveSetLineSearchTerminationMetrics,
+    ]
 ):
     """SLSQP-style active-set QP subproblem + L1-merit backtracking line search.
 
@@ -199,25 +235,89 @@ class ActiveSetLineSearchMinimiser(
         )
         return jnp.max(jnp.stack([eq_v, ineq_v, lb_v, ub_v]))
 
-    def _termination_diagnostics(
-        self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
-    ) -> tuple[tuple[Bool[Array, ""], optx.RESULTS], ...]:
-        """Escalate a failed QP subproblem solve (e.g. singular KKT).
-
-        ``status`` is a lineax code, so it is promoted to the optimistix
-        enumeration before it reaches ``RESULTS.where``. Init states carry
-        ``successful`` so this never fires at step 0.
-        """
-        assert ctx.solver_state is not None
-        status = optx.RESULTS.promote(ctx.solver_state.status)
-        failed = status != optx.RESULTS.successful
-        return super()._termination_diagnostics(ctx) + ((failed, status),)
-
     def _advance_dynamics(
         self,
         ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState],
-        x_new: Primal,
+        result: StepResult[Primal, ActiveSetQPSolverState],
         step_dual: Dual,
     ) -> Self:
         """No post-iterate dynamics (secant is refreshed in ``_execute_step``)."""
         return self
+
+    def termination_metrics(
+        self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
+    ) -> ActiveSetLineSearchTerminationMetrics:
+        """Measure relative stationarity and absolute feasibility.
+
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+
+        Returns
+        -------
+        ActiveSetLineSearchTerminationMetrics
+            Stationarity, its scale, feasibility, and the shared non-finite /
+            subproblem state.
+        """
+        lagrangian = ctx.lagrangian
+
+        tracked = (ctx.lagrangian.value, ctx.lagrangian.x_grad, self.iterate, self.dual)
+        nonfinite = jnp.logical_not(
+            jnp.all(
+                jnp.stack(
+                    [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(tracked)]
+                )
+            )
+        )
+
+        return cast(
+            ActiveSetLineSearchTerminationMetrics,
+            ActiveSetLineSearchTerminationMetrics(
+                stationarity=_inf_norm(lagrangian.x_grad),
+                stationarity_scale=jnp.maximum(jnp.abs(lagrangian.value), 1.0),
+                feasibility=self._feasibility_error(ctx),
+                nonfinite=nonfinite,
+                subproblem_result=optx.RESULTS.promote(
+                    cast(ActiveSetQPSolverState, ctx.solver_state).status
+                ),
+                has_min_steps=self.step_count >= self.min_steps,
+            ),
+        )
+
+    def termination_flags(
+        self,
+        ctx: OptimisationContext[Primal, ActiveSetQPSolverState],
+        metrics: ActiveSetLineSearchTerminationMetrics,
+    ) -> TerminationFlags:
+        """Converge on ``rtol``-relative stationarity plus ``atol`` feasibility.
+
+        Parameters
+        ----------
+        ctx
+            Termination context at the current iterate.
+        metrics
+            Output of :meth:`termination_metrics`.
+
+        Returns
+        -------
+        TerminationFlags
+            Shared termination decision.
+        """
+        stationary = metrics.stationarity <= self.rtol * metrics.stationarity_scale
+        feasible = metrics.feasibility <= self.atol
+        converged = stationary & feasible & metrics.has_min_steps
+
+        subproblem_failed = metrics.nonfinite | (
+            metrics.subproblem_result != optx.RESULTS.successful
+        )
+
+        return cast(
+            TerminationFlags,
+            TerminationFlags(
+                converged=converged,
+                nonfinite=metrics.nonfinite,
+                fatal=subproblem_failed,
+                subproblem_result=metrics.subproblem_result,
+            ),
+        )

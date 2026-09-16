@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.secant import LBFGS
-
-jax.config.update("jax_enable_x64", True)
 
 
 @pytest.fixture

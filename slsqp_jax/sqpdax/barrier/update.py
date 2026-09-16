@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import equinox as eqx
 from equinox import Module
 from jax import numpy as jnp
-from jaxtyping import Array
+from jaxtyping import Array, Bool
 
 from ..registry import KindRegistryMixin
 from ..types import Scalar
@@ -68,7 +68,7 @@ class BarrierUpdate(KindRegistryMixin, Module):
     @abstractmethod
     def update(
         self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
-    ) -> Barrier:
+    ) -> tuple[Barrier, Bool[Array, ""]]:
         """Return a copy of ``barrier`` with an updated weight.
 
         Parameters
@@ -80,9 +80,14 @@ class BarrierUpdate(KindRegistryMixin, Module):
 
         Returns
         -------
-        Barrier
+        barrier
             Barrier whose ``weight`` may have been reduced (or left
             unchanged). Other fields are preserved.
+        updated
+            Whether the policy reduced ``μ`` on this call. For schedules that
+            wait on a barrier-subproblem tolerance this doubles as the inner
+            ``E(x, s; μ) ≤ ε_μ`` test of N&W Algorithm 19.4, which the
+            interior-point minimiser reads as part of its convergence check.
         """
         ...  # pragma: no cover
 
@@ -186,7 +191,7 @@ class MonotoneBarrierUpdate(BarrierUpdate):
 
     def update(
         self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
-    ) -> Barrier:
+    ) -> tuple[Barrier, Bool[Array, ""]]:
         """Reduce ``μ`` by ``sigma`` when the barrier subproblem is solved.
 
         Parameters
@@ -198,9 +203,13 @@ class MonotoneBarrierUpdate(BarrierUpdate):
 
         Returns
         -------
-        Barrier
+        barrier
             Copy with ``weight = max(sigma * μ, mu_min)`` if
             ``E ≤ kappa_eps * μ``, otherwise the same ``weight``.
+        updated
+            Whether ``E(x, s; μ) ≤ kappa_eps * μ``, i.e. whether the current
+            barrier subproblem counts as solved. Because the tolerance is
+            proportional to ``μ``, it tightens automatically as ``μ`` shrinks.
         """
         mu = barrier.weight
         e_mu = self.optimality_residual(lag, mu)
@@ -210,7 +219,7 @@ class MonotoneBarrierUpdate(BarrierUpdate):
             jnp.maximum(self.sigma * mu, self.mu_min),
             mu,
         )
-        return eqx.tree_at(lambda b: b.weight, barrier, new_mu)
+        return eqx.tree_at(lambda b: b.weight, barrier, new_mu), subproblem_solved
 
 
 class AdaptiveBarrierUpdate(BarrierUpdate):
@@ -235,7 +244,7 @@ class AdaptiveBarrierUpdate(BarrierUpdate):
 
     def update(
         self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
-    ) -> Barrier:
+    ) -> tuple[Barrier, Bool[Array, ""]]:
         """Set ``μ`` from a fraction of current average complementarity.
 
         Parameters
@@ -248,9 +257,14 @@ class AdaptiveBarrierUpdate(BarrierUpdate):
 
         Returns
         -------
-        Barrier
+        barrier
             Copy with ``weight = max(sigma * (sᵀ z / m), mu_min)``.
+        updated
+            Always ``True``: this schedule has no inner loop to wait on, so
+            ``μ`` moves on every call.
         """
         comp = self.complementarity(lag)
         new_mu = jnp.maximum(self.sigma * comp, self.mu_min)
-        return eqx.tree_at(lambda b: b.weight, barrier, new_mu)
+        return eqx.tree_at(lambda b: b.weight, barrier, new_mu), jnp.ones(
+            (), dtype=bool
+        )
