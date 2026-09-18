@@ -3,7 +3,8 @@
 from abc import abstractmethod
 from typing import Generic
 
-from equinox import Module
+from equinox import Module, field
+from jax import numpy as jnp
 from jaxtyping import Array, Bool, Scalar
 
 from ..merit import Merit
@@ -42,6 +43,8 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
     accepted: Bool[Array, ""]
     merit_val: Scalar
     solver_state: SubProblemSolverStateType | None = None
+    step_size: Scalar = field(default_factory=lambda: jnp.asarray(1.0))
+    proposed_step_norm: Scalar = field(default_factory=lambda: jnp.asarray(0.0))
 
 
 class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):

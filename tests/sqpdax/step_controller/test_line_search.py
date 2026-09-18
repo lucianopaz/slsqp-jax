@@ -70,6 +70,8 @@ def test_armijo_step_acceptance(
         assert jnp.allclose(result.x.x, expect_x, atol=1e-6)
     if expect_full_step:
         assert jnp.allclose(result.x.x, x0.x + direction.x, atol=1e-6)
+        assert jnp.allclose(result.step_size, 1.0)
+        assert jnp.allclose(result.proposed_step_norm, jnp.linalg.norm(direction.x))
     if expect_accepted and not expect_full_step:
         # Backtracking must land strictly between x0 and x0 + direction.
         assert not jnp.allclose(result.x.x, x0.x + direction.x, atol=1e-6)
