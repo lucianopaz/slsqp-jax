@@ -67,6 +67,10 @@ def test_trust_region_accept_and_radius(
     else:
         assert jnp.allclose(result.x.x, x0.x, atol=1e-6)
         assert jnp.isclose(result.merit_val, mgr.merit(x0))
+    assert jnp.allclose(result.proposed_step_norm, jnp.linalg.norm(result.x.x - x0.x))
+    assert jnp.allclose(
+        result.step_size, result.accepted.astype(result.step_size.dtype)
+    )
 
     new_radius = float(result.solver_state.radius)
     if radius_mode == "keep":

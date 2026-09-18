@@ -173,6 +173,7 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
             solver_state,
             (new_radius, accepted),
         )
+        proposed_step_norm = jnp.linalg.norm(x_new.x - x0.x)
         return cast(
             StepResult[Primal, TrustRegionSolverState],
             StepResult(
@@ -180,5 +181,7 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
                 accepted=accepted,
                 merit_val=merit_new,
                 solver_state=new_state,
+                step_size=jnp.where(accepted, jnp.asarray(1.0), jnp.asarray(0.0)),
+                proposed_step_norm=proposed_step_norm,
             ),
         )
