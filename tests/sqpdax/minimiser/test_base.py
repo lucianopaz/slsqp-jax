@@ -6,7 +6,6 @@ import warnings
 
 import equinox as eqx
 import jax.numpy as jnp
-import optimistix as optx
 import pytest
 
 from slsqp_jax.sqpdax.minimiser import OptimisationContext
@@ -100,7 +99,7 @@ def test_terminate_and_postprocess_after_progress():
     solver = solver.step(problem)
     done, result = solver.terminate(problem)
     assert bool(done)
-    assert result == optx.RESULTS.successful
+    assert bool(solver.result_adapter.is_successful(result))
     sol = solver.postprocess(problem, result)
     assert jnp.allclose(sol.value, solver.iterate.x)
     assert int(sol.stats["num_steps"]) == int(solver.step_count)
@@ -110,7 +109,9 @@ def test_postprocess_requires_init():
     """``postprocess`` before ``init`` raises ``ValueError``."""
     solver = ActiveSetLineSearchStub()
     with pytest.raises(ValueError, match="iterate is not set"):
-        solver.postprocess(make_unconstrained_quadratic(), optx.RESULTS.successful)
+        solver.postprocess(
+            make_unconstrained_quadratic(), solver.result_adapter.successful
+        )
 
 
 def test_optimisation_context_bundles_evaluated_lagrangian():
@@ -131,7 +132,7 @@ def test_nonfinite_diagnostic_fires():
     bad = eqx.tree_at(lambda m: m.iterate, solver, Primal(jnp.array([jnp.nan, 0.0])))
     done, result = bad.terminate(problem)
     assert bool(done)
-    assert result == optx.RESULTS.nonfinite
+    assert result == solver.result_adapter.nonfinite
 
 
 def test_abstract_validate_options_is_noop():

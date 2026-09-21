@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-import optimistix as optx
 import pytest
 
 from slsqp_jax.sqpdax.minimiser import TrustRegionInteriorPointMinimiser, minimise
@@ -49,7 +48,7 @@ def test_minimise_reports_successful_on_quadratics(
     sol = minimise(
         make_problem(), make_solver(), jnp.asarray(x0), max_steps=40, throw=True
     )
-    assert sol.result == optx.RESULTS.successful
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
     assert jnp.allclose(sol.value, jnp.asarray(expected), atol=1e-4)
     assert int(sol.stats["num_steps"]) >= 1
 
@@ -64,7 +63,7 @@ def test_minimise_throw_false_on_budget_exhaustion():
         max_steps=0,
         throw=False,
     )
-    assert sol.result == optx.RESULTS.nonlinear_max_steps_reached
+    assert sol.result == sol.state.result_adapter.max_steps_reached
 
 
 def test_minimise_throw_true_raises_on_failure():

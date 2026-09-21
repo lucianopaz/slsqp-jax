@@ -20,7 +20,7 @@ __all__ = [
 
 def minimise(
     problem: ProblemProtocol[Any],
-    solver: AbstractConstrainedMinimiser[Any, Any, Any, Any],
+    solver: AbstractConstrainedMinimiser[Any, Any, Any, Any, Any],
     x0: Vector_n,
     *,
     max_steps: int = 256,
@@ -35,8 +35,8 @@ def minimise(
     :meth:`~slsqp_jax.sqpdax.minimiser.base.AbstractConstrainedMinimiser.init`
     seeds the dynamic state. The loop is the classical init /
     while-not-done / postprocess triad, reusing optimistix's
-    :class:`~optimistix.Solution` / ``RESULTS`` so the return value is a
-    drop-in ``optimistix.Solution``.
+    :class:`~optimistix.Solution` container while retaining the concrete
+    minimiser's native fine-grained result.
 
     Parameters
     ----------
@@ -80,16 +80,18 @@ def minimise(
         return solver.step(problem), n + 1
 
     solver, _ = cast(
-        tuple[AbstractConstrainedMinimiser[Any, Any, Any, Any], Any],
+        tuple[AbstractConstrainedMinimiser[Any, Any, Any, Any, Any], Any],
         jax.lax.while_loop(cond, body, (solver, jnp.asarray(0, jnp.int32))),
     )
     done, result = solver.terminate(problem)
-    result = optx.RESULTS.where(done, result, optx.RESULTS.nonlinear_max_steps_reached)
+    result = solver.result_adapter.result_type.where(
+        done, result, solver.result_adapter.max_steps_reached
+    )
     solution = solver.postprocess(problem, result)
     if throw:
         solution = eqx.error_if(
             solution,
-            result != optx.RESULTS.successful,
+            ~solver.result_adapter.is_successful(result),
             "constrained minimise did not converge",
         )
     return solution

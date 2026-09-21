@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-import optimistix as optx
 import pytest
 
 from slsqp_jax.sqpdax.barrier import AdaptiveBarrierUpdate, LogBarrier
@@ -105,7 +104,7 @@ def test_minimise_converges_successfully(make_problem, x0, expected, min_steps):
         max_steps=40,
         throw=True,
     )
-    assert sol.result == optx.RESULTS.successful
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
     assert jnp.allclose(sol.value, jnp.asarray(expected), atol=1e-5)
     assert int(sol.stats["num_steps"]) >= min_steps
 

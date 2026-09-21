@@ -51,7 +51,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
     # with defaults ahead of us in the MRO, so every subclass field needs a
     # default (dataclass field-order rule). Construction always fills these.
     problem: ProblemProtocol[Any] = field(default=cast(Any, None))
-    inner: AbstractConstrainedMinimiser[Any, Any, Any, Any] = field(
+    inner: AbstractConstrainedMinimiser[Any, Any, Any, Any, Any] = field(
         default=cast(Any, None)
     )
     rtol: float = 1e-6
@@ -116,7 +116,8 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         done, result
             Termination flag and status from the inner minimiser.
         """
-        return state.terminate(self.problem)
+        done, native_result = state.terminate(self.problem)
+        return done, state.result_adapter.to_optimistix(native_result)
 
     def postprocess(self, fn, y, aux, args, options, state, tags, result):
         """Forward to ``state.postprocess`` and unpack the solution.
@@ -137,12 +138,20 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         value, aux, stats
             Decision vector, aux, and solution stats.
         """
-        sol = state.postprocess(self.problem, result)
-        return sol.value, aux, sol.stats
+        _, native_result = state.terminate(self.problem)
+        native_result = state.result_adapter.result_type.where(
+            result == optx.RESULTS.nonlinear_max_steps_reached,
+            state.result_adapter.max_steps_reached,
+            native_result,
+        )
+        sol = state.postprocess(self.problem, native_result)
+        stats = dict(sol.stats)
+        stats["sqpdax_result"] = native_result
+        return sol.value, aux, stats
 
 
 def as_optimistix_minimiser(
-    minimiser: AbstractConstrainedMinimiser[Any, Any, Any, Any],
+    minimiser: AbstractConstrainedMinimiser[Any, Any, Any, Any, Any],
     problem: ProblemProtocol[Any],
 ) -> optx.AbstractMinimiser:
     """Wrap a constrained minimiser for :func:`optimistix.minimise`.

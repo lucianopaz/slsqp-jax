@@ -17,11 +17,19 @@ from . import (
     trust_region_interior_point,
     utils,
 )
-from .active_set_linesearch import ActiveSetLineSearchMinimiser
+from .active_set_linesearch import (
+    ACTIVE_SET_LINE_SEARCH_RESULTS,
+    ActiveSetLineSearchMinimiser,
+    ActiveSetLineSearchResultAdapter,
+)
 from .base import AbstractConstrainedMinimiser, CommonMinimiser, OptimisationContext
 from .interface import minimise
 from .optimistix_compat import OptimistixMinimiser, as_optimistix_minimiser
-from .trust_region_interior_point import TrustRegionInteriorPointMinimiser
+from .trust_region_interior_point import (
+    TRUST_REGION_INTERIOR_POINT_RESULTS,
+    TrustRegionInteriorPointMinimiser,
+    TrustRegionInteriorPointResultAdapter,
+)
 from .utils import minimiser_option_keys, solver_option_keys
 
 __all__ = [
@@ -39,6 +47,10 @@ __all__ = [
     "minimise",
     "OptimistixMinimiser",
     "as_optimistix_minimiser",
+    "ACTIVE_SET_LINE_SEARCH_RESULTS",
+    "TRUST_REGION_INTERIOR_POINT_RESULTS",
+    "ActiveSetLineSearchResultAdapter",
+    "TrustRegionInteriorPointResultAdapter",
     "minimiser_option_keys",
     "solver_option_keys",
 ]

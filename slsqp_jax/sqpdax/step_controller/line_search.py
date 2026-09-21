@@ -222,7 +222,7 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         # not the last trial, so the outer loop never moves to a point the
         # search refused.
         accepted = self.stop_search(state)
-        proposed_step_norm = jnp.linalg.norm(state.step.x * state.alpha)
+        proposed_step_norm = jnp.linalg.norm(state.step.x)
 
         result = jax.lax.cond(
             accepted,
