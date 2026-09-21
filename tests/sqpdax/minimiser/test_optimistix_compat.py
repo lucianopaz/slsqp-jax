@@ -6,6 +6,9 @@ import jax.numpy as jnp
 import optimistix as optx
 
 from slsqp_jax.sqpdax.minimiser import as_optimistix_minimiser
+from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
+    ACTIVE_SET_LINE_SEARCH_RESULTS,
+)
 
 from .conftest import ActiveSetLineSearchStub, make_unconstrained_quadratic
 
@@ -33,4 +36,5 @@ def test_as_optimistix_minimiser_runs_through_optimistix():
         has_aux=True,
     )
     assert sol.result == optx.RESULTS.successful
+    assert sol.stats["sqpdax_result"] == ACTIVE_SET_LINE_SEARCH_RESULTS.successful
     assert jnp.allclose(sol.value, 0.0, atol=1e-3)

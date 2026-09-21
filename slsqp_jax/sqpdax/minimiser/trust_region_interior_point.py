@@ -22,10 +22,16 @@ from ..lagrangian import (
 from ..merit import NormMerit
 from ..primal import InteriorPointPrimal, Slack
 from ..problem import ProblemProtocol
+from ..results import (
+    MINIMISER_RESULTS,
+    ResultAdapter,
+)
 from ..step_controller import StepController, StepResult, TrustRegionManager
 from ..subproblem import ScaledBarrierSubProblem
 from ..subproblem.solver import (
-    RESULTS,
+    RESULTS as SUBPROBLEM_RESULTS,
+)
+from ..subproblem.solver import (
     SubproblemContext,
     SubProblemSolver,
     TrustRegionInteriorPointSolver,
@@ -38,10 +44,29 @@ from .termination import TerminationFlags, TerminationMetrics
 __all__ = [
     "TrustRegionInteriorPointMinimiser",
     "TrustRegionInteriorPointTerminationMetrics",
+    "TRUST_REGION_INTERIOR_POINT_RESULTS",
+    "TrustRegionInteriorPointResultAdapter",
 ]
 
 
-class TrustRegionInteriorPointTerminationMetrics(TerminationMetrics):
+class TRUST_REGION_INTERIOR_POINT_RESULTS(
+    MINIMISER_RESULTS  # ty: ignore[subclass-of-final-class]
+):
+    """Fine-grained outcomes for the trust-region interior-point minimiser."""
+
+    subproblem_max_steps = "The trust-region subproblem exhausted its step budget."
+    subproblem_singular = "The trust-region subproblem was singular."
+    subproblem_breakdown = "The trust-region subproblem solver broke down."
+    subproblem_stagnation = "The trust-region subproblem solver stagnated."
+    subproblem_condition_limit = (
+        "The trust-region subproblem exceeded its condition-number limit."
+    )
+    subproblem_nonfinite = "The trust-region subproblem received non-finite input."
+
+
+class TrustRegionInteriorPointTerminationMetrics(
+    TerminationMetrics[TRUST_REGION_INTERIOR_POINT_RESULTS]
+):
     """Termination measurements for :class:`TrustRegionInteriorPointMinimiser`.
 
     Mirrors the two nested stopping tests of Nocedal & Wright Algorithm 19.4:
@@ -71,12 +96,69 @@ class TrustRegionInteriorPointTerminationMetrics(TerminationMetrics):
     has_min_steps: Bool[Array, ""]
 
 
+class TrustRegionInteriorPointResultAdapter(
+    ResultAdapter[TRUST_REGION_INTERIOR_POINT_RESULTS]
+):
+    """Optimistix conversion for trust-region interior-point outcomes."""
+
+    @property
+    def result_type(self) -> type[TRUST_REGION_INTERIOR_POINT_RESULTS]:
+        return TRUST_REGION_INTERIOR_POINT_RESULTS
+
+    def to_optimistix(
+        self, result: TRUST_REGION_INTERIOR_POINT_RESULTS
+    ) -> optx.RESULTS:
+        coarse = optx.RESULTS.nonlinear_divergence
+        mappings = (
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_max_steps,
+                optx.RESULTS.max_steps_reached,
+            ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_singular,
+                optx.RESULTS.singular,
+            ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_breakdown,
+                optx.RESULTS.breakdown,
+            ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_stagnation,
+                optx.RESULTS.stagnation,
+            ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_condition_limit,
+                optx.RESULTS.conlim,
+            ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_nonfinite,
+                optx.RESULTS.nonfinite_input,
+            ),
+        )
+        for native, optimistix in mappings:
+            coarse = optx.RESULTS.where(result == native, optimistix, coarse)
+        coarse = optx.RESULTS.where(
+            result == self.max_steps_reached,
+            optx.RESULTS.nonlinear_max_steps_reached,
+            coarse,
+        )
+        coarse = optx.RESULTS.where(
+            result == self.nonfinite, optx.RESULTS.nonfinite, coarse
+        )
+        return optx.RESULTS.where(
+            (result == self.successful) | (result == self.running),
+            optx.RESULTS.successful,
+            coarse,
+        )
+
+
 class TrustRegionInteriorPointMinimiser(
     CommonMinimiser[
         InteriorPointPrimal,
         ScaledBarrierSubProblem,
         TrustRegionSolverState,
         TrustRegionInteriorPointTerminationMetrics,
+        TRUST_REGION_INTERIOR_POINT_RESULTS,
     ]
 ):
     """Nocedal & Wright (2006) Section 19.5 trust-region interior-point method.
@@ -151,6 +233,14 @@ class TrustRegionInteriorPointMinimiser(
     max_radius: float = eqx.field(static=True, default=1e10)
     # The barrier is dynamic state: its ``weight`` *is* mu, updated each step.
     barrier: Barrier | None = None
+
+    @property
+    def result_adapter(self) -> TrustRegionInteriorPointResultAdapter:
+        """Native trust-region interior-point result policy."""
+        return cast(
+            TrustRegionInteriorPointResultAdapter,
+            TrustRegionInteriorPointResultAdapter(),
+        )
 
     def __post_init__(self) -> None:
         if bool(~jnp.isnan(self.rtol)):
@@ -246,7 +336,7 @@ class TrustRegionInteriorPointMinimiser(
                 n_cg_iter=jnp.asarray(0, jnp.int32),
                 on_boundary=jnp.asarray(False),
                 success=jnp.asarray(False),
-                status=RESULTS.successful,
+                status=SUBPROBLEM_RESULTS.successful,
             ),
         )
 
@@ -407,15 +497,41 @@ class TrustRegionInteriorPointMinimiser(
                 )
             )
         )
+        status = cast(TrustRegionSolverState, ctx.solver_state).status
+        fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_max_steps
+        mappings = (
+            (
+                SUBPROBLEM_RESULTS.singular,
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_singular,
+            ),
+            (
+                SUBPROBLEM_RESULTS.breakdown,
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_breakdown,
+            ),
+            (
+                SUBPROBLEM_RESULTS.stagnation,
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_stagnation,
+            ),
+            (
+                SUBPROBLEM_RESULTS.conlim,
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_condition_limit,
+            ),
+            (
+                SUBPROBLEM_RESULTS.nonfinite_input,
+                TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_nonfinite,
+            ),
+        )
+        for inner, native in mappings:
+            fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.where(
+                status == inner, native, fatal_result
+            )
         return cast(
             TrustRegionInteriorPointTerminationMetrics,
             TrustRegionInteriorPointTerminationMetrics(
                 barrier_updated=self.barrier_updated,
                 optimality_residual=optimality_residual,
                 nonfinite=nonfinite,
-                subproblem_result=optx.RESULTS.promote(
-                    cast(TrustRegionSolverState, ctx.solver_state).status
-                ),
+                fatal_result=fatal_result,
                 has_min_steps=self.step_count >= self.min_steps,
             ),
         )
@@ -424,7 +540,7 @@ class TrustRegionInteriorPointMinimiser(
         self,
         ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
         metrics: TrustRegionInteriorPointTerminationMetrics,
-    ) -> TerminationFlags:
+    ) -> TerminationFlags[TRUST_REGION_INTERIOR_POINT_RESULTS]:
         """Require *both* Algorithm 19.4 stopping tests before declaring success.
 
         Parameters
@@ -442,7 +558,10 @@ class TrustRegionInteriorPointMinimiser(
         barrier_updated = metrics.barrier_updated
         acceptable_residual = metrics.optimality_residual <= self.atol
         nonfinite = metrics.nonfinite
-        fatal = metrics.subproblem_result != optx.RESULTS.successful
+        fatal = (
+            cast(TrustRegionSolverState, ctx.solver_state).status
+            != SUBPROBLEM_RESULTS.successful
+        )
         converged = (
             barrier_updated
             & acceptable_residual
@@ -456,6 +575,6 @@ class TrustRegionInteriorPointMinimiser(
                 converged=converged,
                 nonfinite=nonfinite,
                 fatal=fatal,
-                subproblem_result=metrics.subproblem_result,
+                fatal_result=metrics.fatal_result,
             ),
         )

@@ -17,6 +17,10 @@ from ..lagrangian import EvaluatedLagrangian, Lagrangian
 from ..merit import NormMerit
 from ..primal import Primal
 from ..problem import ProblemProtocol
+from ..results import (
+    MINIMISER_RESULTS,
+    ResultAdapter,
+)
 from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
@@ -29,15 +33,32 @@ from ..subproblem.solver import (
 )
 from ..types import Scalar
 from .base import CommonMinimiser, OptimisationContext
-from .termination import TerminationFlags, TerminationMetrics
+from .termination import TerminationFlags, TerminationMetrics, compute_mu_max
 
 __all__ = [
     "ActiveSetLineSearchMinimiser",
+    "ACTIVE_SET_LINE_SEARCH_RESULTS",
     "ActiveSetLineSearchTerminationMetrics",
+    "ActiveSetLineSearchResultAdapter",
 ]
 
 
-class ActiveSetLineSearchTerminationMetrics(TerminationMetrics):
+class ACTIVE_SET_LINE_SEARCH_RESULTS(
+    MINIMISER_RESULTS  # ty: ignore[subclass-of-final-class]
+):
+    """Fine-grained outcomes for the active-set line-search minimiser."""
+
+    merit_stagnation = "The merit function did not improve over the patience window."
+    line_search_failure = "Consecutive line-search failures exceeded the fatal limit."
+    qp_subproblem_failure = "Consecutive QP failures exceeded the fatal limit."
+    iterate_blowup = "The merit repeatedly diverged; the best iterate was restored."
+    infeasible = "The minimiser stopped at a primally infeasible iterate."
+    infeasible_stationary = "The iterate is stationary but remains primally infeasible."
+
+
+class ActiveSetLineSearchTerminationMetrics(
+    TerminationMetrics[ACTIVE_SET_LINE_SEARCH_RESULTS]
+):
     """Termination measurements for :class:`ActiveSetLineSearchMinimiser`.
 
     Convergence is a *relative* stationarity test plus an absolute
@@ -49,11 +70,15 @@ class ActiveSetLineSearchTerminationMetrics(TerminationMetrics):
     stationarity
         ``‖∇_x L‖_∞`` at the current iterate.
     stationarity_scale
-        ``max(|L|, 1)``; the minimiser converges when
+        ``max(|L|, 1)`` by default, or ``max(μ_max, 1)`` when the filterSQP
+        scale is enabled. The minimiser converges when
         ``stationarity <= rtol * stationarity_scale``.
     feasibility
         ``∞``-norm of the equality / inequality / bound violations, compared
         against ``atol``.
+    kkt_ratio
+        Dimensionless ``stationarity / stationarity_scale`` compared to
+        ``rtol``.
     has_min_steps
         ``True`` once ``step_count >= min_steps``, gating convergence so a
         cold start cannot report success before doing any work.
@@ -62,7 +87,32 @@ class ActiveSetLineSearchTerminationMetrics(TerminationMetrics):
     stationarity: Scalar
     stationarity_scale: Scalar
     feasibility: Scalar
+    kkt_ratio: Scalar
     has_min_steps: Bool[Array, ""]
+
+
+class ActiveSetLineSearchResultAdapter(ResultAdapter[ACTIVE_SET_LINE_SEARCH_RESULTS]):
+    """Optimistix conversion for active-set line-search outcomes."""
+
+    @property
+    def result_type(self) -> type[ACTIVE_SET_LINE_SEARCH_RESULTS]:
+        return ACTIVE_SET_LINE_SEARCH_RESULTS
+
+    def to_optimistix(self, result: ACTIVE_SET_LINE_SEARCH_RESULTS) -> optx.RESULTS:
+        coarse = optx.RESULTS.nonlinear_divergence
+        coarse = optx.RESULTS.where(
+            result == self.max_steps_reached,
+            optx.RESULTS.nonlinear_max_steps_reached,
+            coarse,
+        )
+        coarse = optx.RESULTS.where(
+            result == self.nonfinite, optx.RESULTS.nonfinite, coarse
+        )
+        return optx.RESULTS.where(
+            (result == self.successful) | (result == self.running),
+            optx.RESULTS.successful,
+            coarse,
+        )
 
 
 class ActiveSetLineSearchMinimiser(
@@ -71,6 +121,7 @@ class ActiveSetLineSearchMinimiser(
         ActiveSetSubProblem,
         ActiveSetQPSolverState,
         ActiveSetLineSearchTerminationMetrics,
+        ACTIVE_SET_LINE_SEARCH_RESULTS,
     ]
 ):
     """SLSQP-style active-set QP subproblem + L1-merit backtracking line search.
@@ -107,6 +158,16 @@ class ActiveSetLineSearchMinimiser(
         Geometric backtracking factor.
     line_search_max_steps
         Maximum Armijo trial evaluations per outer step.
+    use_mu_max
+        Use filterSQP's objective/Jacobian/multiplier scale for stationarity.
+    zero_step_patience
+        Consecutive converged zero QP steps required by guarded QP-KKT success.
+    stagnation_tol, stagnation_patience
+        Relative merit-improvement threshold and no-improvement window.
+    divergence_factor, divergence_patience
+        Excess-merit threshold and consecutive count before best-point rollback.
+    qp_failure_patience, ls_failure_patience
+        Failure streak scales; fatal termination occurs at twice each value.
     """
 
     # QP inner solve
@@ -119,6 +180,79 @@ class ActiveSetLineSearchMinimiser(
     armijo_c1: float = eqx.field(static=True, default=1e-4)
     armijo_backtrack: float = eqx.field(static=True, default=0.5)
     line_search_max_steps: int = eqx.field(static=True, default=20)
+    # termination policy
+    use_mu_max: bool = eqx.field(static=True, default=False)
+    zero_step_patience: int = eqx.field(static=True, default=3)
+    stagnation_tol: float = eqx.field(static=True, default=1e-12)
+    stagnation_patience: int = eqx.field(static=True, default=10)
+    divergence_factor: float = eqx.field(static=True, default=10.0)
+    divergence_patience: int = eqx.field(static=True, default=3)
+    qp_failure_patience: int = eqx.field(static=True, default=3)
+    ls_failure_patience: int = eqx.field(static=True, default=3)
+    # termination state
+    best_merit: Scalar = eqx.field(default_factory=lambda: jnp.asarray(jnp.inf))
+    best_iterate: Primal | None = None
+    best_dual: Dual | None = None
+    steps_without_improvement: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    blowup_count: Array = eqx.field(default_factory=lambda: jnp.asarray(0, jnp.int32))
+    consecutive_zero_steps: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    consecutive_qp_failures: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    consecutive_ls_failures: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    qp_optimal: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
+    merit_stagnation: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    iterate_blowup: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    qp_fatal: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
+    ls_fatal: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
+    last_step_size: Scalar = eqx.field(default_factory=lambda: jnp.asarray(0.0))
+    last_ls_success: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+
+    @property
+    def result_adapter(self) -> ActiveSetLineSearchResultAdapter:
+        """Native active-set result policy."""
+        return cast(
+            ActiveSetLineSearchResultAdapter, ActiveSetLineSearchResultAdapter()
+        )
+
+    def _close_init(
+        self,
+        primal: Primal,
+        dual: Dual,
+        solver_state: ActiveSetQPSolverState,
+        problem: ProblemProtocol[Primal],
+    ) -> Self:
+        """Seed secant and best-iterate termination state."""
+        base = super()._close_init(primal, dual, solver_state, problem)
+        merit = cast(
+            NormMerit,
+            NormMerit(
+                problem,
+                barrier=None,
+                problem_weight=jnp.asarray(1.0),
+                feasibility_weight=jnp.asarray(base.penalty_floor),
+                norm=1,
+            ),
+        )
+        initial_merit = merit(primal)
+        return eqx.tree_at(
+            lambda m: (m.best_merit, m.best_iterate, m.best_dual),
+            base,
+            (initial_merit, primal, dual),
+            is_leaf=lambda z: z is None,
+        )
 
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
         """Root solver class for ``options['subproblem']`` validation."""
@@ -223,7 +357,13 @@ class ActiveSetLineSearchMinimiser(
         self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
     ) -> Scalar:
         """``∞``-norm of equality / inequality / bound violations."""
-        lagrangian = ctx.lagrangian
+        return self._feasibility_from_lagrangian(ctx.lagrangian)
+
+    @staticmethod
+    def _feasibility_from_lagrangian(
+        lagrangian: EvaluatedLagrangian[Primal],
+    ) -> Scalar:
+        """Compute primal infeasibility from an evaluated Lagrangian."""
         x = lagrangian.x_ref
         eq_v = _inf_norm(lagrangian.eq_fn_val)
         ineq_v = _inf_norm(jnp.maximum(0.0, lagrangian.ineq_fn_val))
@@ -241,8 +381,121 @@ class ActiveSetLineSearchMinimiser(
         result: StepResult[Primal, ActiveSetQPSolverState],
         step_dual: Dual,
     ) -> Self:
-        """No post-iterate dynamics (secant is refreshed in ``_execute_step``)."""
-        return self
+        """Update progress/failure counters and restore the best point on blow-up."""
+        lagrangian = ctx.lagrangian(result.x, step_dual)
+        feasible = self._feasibility_from_lagrangian(lagrangian) <= self.atol
+        solver_state = cast(ActiveSetQPSolverState, result.solver_state)
+
+        best_merit = self.best_merit
+        merit_scale = jnp.maximum(jnp.abs(best_merit), 1.0)
+        improved = (~jnp.isfinite(best_merit)) | (
+            result.merit_val < best_merit - self.stagnation_tol * merit_scale
+        )
+        new_best_merit = jnp.where(improved, result.merit_val, best_merit)
+        new_best_iterate = jax.tree.map(
+            lambda new, old: jnp.where(improved, new, old),
+            result.x,
+            cast(Primal, self.best_iterate),
+        )
+        new_best_dual = jax.tree.map(
+            lambda new, old: jnp.where(improved, new, old),
+            step_dual,
+            cast(Dual, self.best_dual),
+        )
+        steps_without = jnp.where(improved, 0, self.steps_without_improvement + 1)
+        merit_stagnation = (self.step_count >= self.stagnation_patience) & (
+            steps_without >= self.stagnation_patience
+        )
+
+        blowup_now = (
+            result.merit_val - best_merit > self.divergence_factor * merit_scale
+        ) | ~jnp.isfinite(result.merit_val)
+        blowup_count = jnp.where(blowup_now, self.blowup_count + 1, 0)
+        iterate_blowup = blowup_count >= self.divergence_patience
+
+        zero_step = (
+            solver_state.success
+            & result.accepted
+            & (result.step_size * result.proposed_step_norm < self.atol)
+        )
+        zero_steps = jnp.where(zero_step, self.consecutive_zero_steps + 1, 0)
+        qp_optimal = zero_steps >= self.zero_step_patience
+
+        qp_real_failure = (
+            ~solver_state.success
+            & (solver_state.status != RESULTS.max_steps_reached)
+            & feasible
+        )
+        qp_failures = jnp.where(
+            solver_state.success,
+            0,
+            jnp.where(qp_real_failure, self.consecutive_qp_failures + 1, 0),
+        )
+        ls_failures = jnp.where(
+            result.accepted,
+            0,
+            jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
+        )
+        qp_fatal = qp_failures >= 2 * self.qp_failure_patience
+        ls_fatal = ls_failures >= 2 * self.ls_failure_patience
+
+        updated = eqx.tree_at(
+            lambda m: (
+                m.best_merit,
+                m.best_iterate,
+                m.best_dual,
+                m.steps_without_improvement,
+                m.merit_stagnation,
+                m.blowup_count,
+                m.iterate_blowup,
+                m.consecutive_zero_steps,
+                m.qp_optimal,
+                m.consecutive_qp_failures,
+                m.consecutive_ls_failures,
+                m.qp_fatal,
+                m.ls_fatal,
+                m.last_step_size,
+                m.last_ls_success,
+            ),
+            self,
+            (
+                new_best_merit,
+                new_best_iterate,
+                new_best_dual,
+                steps_without,
+                merit_stagnation,
+                blowup_count,
+                iterate_blowup,
+                zero_steps,
+                qp_optimal,
+                qp_failures,
+                ls_failures,
+                qp_fatal,
+                ls_fatal,
+                result.step_size,
+                result.accepted,
+            ),
+            is_leaf=lambda z: z is None,
+        )
+        return cast(
+            Self,
+            eqx.tree_at(
+                lambda m: (m.iterate, m.dual),
+                updated,
+                (
+                    jax.tree.map(
+                        lambda best, current: jnp.where(iterate_blowup, best, current),
+                        new_best_iterate,
+                        cast(Primal, updated.iterate),
+                    ),
+                    jax.tree.map(
+                        lambda best, current: jnp.where(iterate_blowup, best, current),
+                        new_best_dual,
+                        cast(Dual, updated.dual),
+                    ),
+                ),
+            ),
+        )
 
     def termination_metrics(
         self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
@@ -271,16 +524,21 @@ class ActiveSetLineSearchMinimiser(
             )
         )
 
+        stationarity = _inf_norm(lagrangian.x_grad)
+        stationarity_scale = jnp.where(
+            self.use_mu_max,
+            jnp.maximum(compute_mu_max(lagrangian), 1.0),
+            jnp.maximum(jnp.abs(lagrangian.value), 1.0),
+        )
         return cast(
             ActiveSetLineSearchTerminationMetrics,
             ActiveSetLineSearchTerminationMetrics(
-                stationarity=_inf_norm(lagrangian.x_grad),
-                stationarity_scale=jnp.maximum(jnp.abs(lagrangian.value), 1.0),
+                stationarity=stationarity,
+                stationarity_scale=stationarity_scale,
                 feasibility=self._feasibility_error(ctx),
+                kkt_ratio=stationarity / stationarity_scale,
                 nonfinite=nonfinite,
-                subproblem_result=optx.RESULTS.promote(
-                    cast(ActiveSetQPSolverState, ctx.solver_state).status
-                ),
+                fatal_result=ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
                 has_min_steps=self.step_count >= self.min_steps,
             ),
         )
@@ -289,7 +547,7 @@ class ActiveSetLineSearchMinimiser(
         self,
         ctx: OptimisationContext[Primal, ActiveSetQPSolverState],
         metrics: ActiveSetLineSearchTerminationMetrics,
-    ) -> TerminationFlags:
+    ) -> TerminationFlags[ACTIVE_SET_LINE_SEARCH_RESULTS]:
         """Converge on ``rtol``-relative stationarity plus ``atol`` feasibility.
 
         Parameters
@@ -306,10 +564,49 @@ class ActiveSetLineSearchMinimiser(
         """
         stationary = metrics.stationarity <= self.rtol * metrics.stationarity_scale
         feasible = metrics.feasibility <= self.atol
-        converged = stationary & feasible & metrics.has_min_steps
+        classical = stationary & feasible & metrics.has_min_steps
+        qp_kkt = (
+            self.qp_optimal
+            & feasible
+            & self.last_ls_success
+            & (self.last_step_size >= 1.0 - 1e-6)
+            & metrics.has_min_steps
+        )
+        converged = classical | qp_kkt
 
-        subproblem_failed = metrics.nonfinite | (
-            metrics.subproblem_result != optx.RESULTS.successful
+        infeasible_stationary = stationary & ~feasible & metrics.has_min_steps
+        fatal = (
+            self.merit_stagnation
+            | self.ls_fatal
+            | self.qp_fatal
+            | self.iterate_blowup
+            | infeasible_stationary
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.merit_stagnation
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            self.qp_fatal,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
+            fatal_result,
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            self.ls_fatal,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure,
+            fatal_result,
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            self.iterate_blowup,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.iterate_blowup,
+            fatal_result,
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            fatal & ~feasible,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.infeasible,
+            fatal_result,
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            infeasible_stationary,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.infeasible_stationary,
+            fatal_result,
         )
 
         return cast(
@@ -317,7 +614,44 @@ class ActiveSetLineSearchMinimiser(
             TerminationFlags(
                 converged=converged,
                 nonfinite=metrics.nonfinite,
-                fatal=subproblem_failed,
-                subproblem_result=metrics.subproblem_result,
+                fatal=fatal,
+                fatal_result=fatal_result,
             ),
         )
+
+    def _postprocess_stats(
+        self,
+        problem: ProblemProtocol[Primal],
+        result: ACTIVE_SET_LINE_SEARCH_RESULTS,
+    ) -> dict:
+        """Return active-set termination and final-KKT diagnostics."""
+        ctx = self._optimisation_context(problem)
+        metrics = self.termination_metrics(ctx)
+        lagrangian = ctx.lagrangian
+        dual = cast(Dual, self.dual)
+        solver_state = cast(ActiveSetQPSolverState, self.solver_state)
+        return {
+            "num_steps": self.step_count,
+            "final_objective": lagrangian.fn_val,
+            "final_grad_norm": jnp.linalg.norm(lagrangian.grad_val),
+            "final_lagrangian_grad_norm": jnp.linalg.norm(lagrangian.x_grad),
+            "kkt_scale": metrics.stationarity_scale,
+            "kkt_ratio": metrics.kkt_ratio,
+            "multipliers_eq": dual.eq_multipliers,
+            "multipliers_ineq": dual.ineq_multipliers,
+            "multipliers_lb": dual.lb_multipliers,
+            "multipliers_ub": dual.ub_multipliers,
+            "qp_iterations": solver_state.n_iter,
+            "qp_cg_iterations": solver_state.n_cg_iter,
+            "last_qp_converged": solver_state.success,
+            "last_step_size": self.last_step_size,
+            "steps_without_improvement": self.steps_without_improvement,
+            "blowup_count": self.blowup_count,
+            "consecutive_qp_failures": self.consecutive_qp_failures,
+            "consecutive_ls_failures": self.consecutive_ls_failures,
+            "merit_stagnation": self.merit_stagnation,
+            "qp_fatal": self.qp_fatal,
+            "ls_fatal": self.ls_fatal,
+            "diverging": self.iterate_blowup,
+            "sqpdax_result": result,
+        }

@@ -33,6 +33,8 @@ from .lagrangian import (
 )
 from .merit import Merit, NormMerit
 from .minimiser import (
+    ACTIVE_SET_LINE_SEARCH_RESULTS,
+    TRUST_REGION_INTERIOR_POINT_RESULTS,
     AbstractConstrainedMinimiser,
     ActiveSetLineSearchMinimiser,
     CommonMinimiser,
@@ -52,6 +54,11 @@ from .preconditioner import (
 )
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
+from .results import (
+    MINIMISER_RESULTS,
+    ResultAdapter,
+    is_successful,
+)
 from .secant import LBFGS, CurvatureDiagnostics, Secant
 from .step_controller import (
     ArmijoLineSearch,
@@ -108,6 +115,11 @@ __all__ = [
     "as_optimistix_minimiser",
     "minimiser_option_keys",
     "solver_option_keys",
+    "MINIMISER_RESULTS",
+    "ACTIVE_SET_LINE_SEARCH_RESULTS",
+    "TRUST_REGION_INTERIOR_POINT_RESULTS",
+    "is_successful",
+    "ResultAdapter",
     "EvaluatedProblem",
     "ProblemProtocol",
     "Problem",

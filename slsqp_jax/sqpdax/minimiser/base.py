@@ -19,6 +19,7 @@ from ..lagrangian import EvaluatedLagrangian, Lagrangian
 from ..primal import Primal, PrimalType
 from ..problem import ProblemProtocol
 from ..registry import FrozenDict, static_field_names
+from ..results import ResultAdapter, ResultType
 from ..secant import LBFGS, Secant
 from ..step_controller import StepController, StepResult
 from ..subproblem.base import SubProblemType
@@ -75,7 +76,11 @@ class OptimisationContext(Module, Generic[PrimalType, SubProblemSolverStateType]
 class AbstractConstrainedMinimiser(
     Module,
     Generic[
-        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+        PrimalType,
+        SubProblemType,
+        SubProblemSolverStateType,
+        TerminationMetricsType,
+        ResultType,
     ],
 ):
     """Problem-centric constrained minimiser: fused configuration + running state.
@@ -123,6 +128,12 @@ class AbstractConstrainedMinimiser(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
     options: Mapping[str, Any] = eqx.field(static=True, default_factory=dict)
+
+    @property
+    @abstractmethod
+    def result_adapter(self) -> ResultAdapter[ResultType]:
+        """Native-result construction and Optimistix conversion policy."""
+        ...
 
     def validate_options(self) -> None:
         """Validate ``self.options``.
@@ -177,7 +188,7 @@ class AbstractConstrainedMinimiser(
     @abstractmethod
     def terminate(
         self, problem: ProblemProtocol[PrimalType]
-    ) -> tuple[Bool[Array, ""], optx.RESULTS]:
+    ) -> tuple[Bool[Array, ""], ResultType]:
         """Whether the outer loop should stop, and why.
 
         Parameters
@@ -190,13 +201,13 @@ class AbstractConstrainedMinimiser(
         done
             ``True`` on convergence or a fatal diagnostic.
         result
-            :class:`optimistix.RESULTS` status code.
+            Fine-grained native status code selected by the minimiser.
         """
         ...
 
     @abstractmethod
     def postprocess(
-        self, problem: ProblemProtocol[PrimalType], result: optx.RESULTS
+        self, problem: ProblemProtocol[PrimalType], result: ResultType
     ) -> optx.Solution:
         """Pack the final iterate into an :class:`optimistix.Solution`.
 
@@ -218,10 +229,18 @@ class AbstractConstrainedMinimiser(
 
 class CommonMinimiser(
     AbstractConstrainedMinimiser[
-        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+        PrimalType,
+        SubProblemType,
+        SubProblemSolverStateType,
+        TerminationMetricsType,
+        ResultType,
     ],
     Generic[
-        PrimalType, SubProblemType, SubProblemSolverStateType, TerminationMetricsType
+        PrimalType,
+        SubProblemType,
+        SubProblemSolverStateType,
+        TerminationMetricsType,
+        ResultType,
     ],
 ):
     """Shared ``init`` / ``step`` / ``terminate`` / ``postprocess`` driver.
@@ -519,9 +538,36 @@ class CommonMinimiser(
         primal = base._init_primal(problem, x0)
         dual = base._init_dual(problem)
         solver_state = base._init_solver_state(problem, primal)
+        return base._close_init(primal, dual, solver_state, problem)
+
+    def _close_init(
+        self,
+        primal: PrimalType,
+        dual: Dual,
+        solver_state: SubProblemSolverStateType,
+        problem: ProblemProtocol[PrimalType],
+    ) -> Self:
+        """Close the initialisation phase.
+
+        Parameters
+        ----------
+        primal
+            Initial primal.
+        dual
+            Initial dual.
+        solver_state
+            Initial solver state.
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        Self
+            Copy with ``iterate``, ``dual``, and ``solver_state`` seeded.
+        """
         return eqx.tree_at(
             lambda m: (m.iterate, m.dual, m.solver_state, m.step_count),
-            base,
+            self,
             (primal, dual, solver_state, jnp.asarray(0, jnp.int32)),
             is_leaf=lambda z: z is None,
         )
@@ -821,7 +867,7 @@ class CommonMinimiser(
 
     def terminate(
         self, problem: ProblemProtocol[PrimalType]
-    ) -> tuple[Bool[Array, ""], optx.RESULTS]:
+    ) -> tuple[Bool[Array, ""], ResultType]:
         """Test convergence and failure diagnostics at the current iterate.
 
         Pure orchestration: the algorithm-specific work lives in
@@ -846,7 +892,7 @@ class CommonMinimiser(
         ctx = self._optimisation_context(problem)
         metrics = self.termination_metrics(ctx)
         flags = self.termination_flags(ctx, metrics)
-        return classify_termination(flags)
+        return classify_termination(flags, self.result_adapter)
 
     @abstractmethod
     def termination_metrics(
@@ -876,14 +922,14 @@ class CommonMinimiser(
         self,
         ctx: OptimisationContext[PrimalType, SubProblemSolverStateType],
         metrics: TerminationMetricsType,
-    ) -> TerminationFlags:
+    ) -> TerminationFlags[ResultType]:
         """Reduce this algorithm's metrics to the shared termination booleans.
 
-        This is where the algorithms stop differing:
+        This is where algorithm-specific diagnostics are reduced to the
+        shared flags:
         :func:`~slsqp_jax.sqpdax.minimiser.termination.classify_termination`
-        consumes only :class:`~slsqp_jax.sqpdax.minimiser.termination.TerminationFlags`,
-        so the meaning of a returned :class:`optimistix.RESULTS` code is the
-        same for every minimiser.
+        consumes only :class:`~slsqp_jax.sqpdax.minimiser.termination.TerminationFlags`
+        and the concrete native-result adapter.
 
         Parameters
         ----------
@@ -895,13 +941,19 @@ class CommonMinimiser(
         Returns
         -------
         TerminationFlags
-            Convergence / non-finite / fatal decision, plus the subproblem
-            status to report if the fatal branch fires.
+            Convergence / non-finite / fatal decision, plus the native result
+            to report if the fatal branch fires.
         """
         ...
 
+    def _postprocess_stats(
+        self, problem: ProblemProtocol[PrimalType], result: ResultType
+    ) -> dict[str, Any]:
+        """Build algorithm-specific solution statistics."""
+        return {"num_steps": self.step_count}
+
     def postprocess(
-        self, problem: ProblemProtocol[PrimalType], result: optx.RESULTS
+        self, problem: ProblemProtocol[PrimalType], result: ResultType
     ) -> optx.Solution:
         """Pack ``iterate.x`` into an :class:`optimistix.Solution`.
 
@@ -930,7 +982,7 @@ class CommonMinimiser(
                 value=self.iterate.x,
                 result=result,
                 aux=None,
-                stats={"num_steps": self.step_count},
+                stats=self._postprocess_stats(problem, result),
                 state=self,
             ),
         )

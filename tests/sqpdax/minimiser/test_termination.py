@@ -1,6 +1,8 @@
-"""Unit tests for :mod:`slsqp_jax.sqpdax.minimiser.termination`."""
+"""Tests for native sqpdax termination classification."""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import equinox as eqx
 import jax
@@ -9,16 +11,33 @@ import optimistix as optx
 import pytest
 from jaxtyping import Array, Bool
 
+from slsqp_jax.sqpdax.dual import Dual
+from slsqp_jax.sqpdax.lagrangian import Lagrangian
+from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
+    ACTIVE_SET_LINE_SEARCH_RESULTS,
+    ActiveSetLineSearchResultAdapter,
+)
 from slsqp_jax.sqpdax.minimiser.termination import (
     TerminationFlags,
     TerminationMetrics,
     classify_termination,
+    compute_mu_max,
+)
+from slsqp_jax.sqpdax.minimiser.trust_region_interior_point import (
+    TRUST_REGION_INTERIOR_POINT_RESULTS,
+    TrustRegionInteriorPointResultAdapter,
+)
+from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.results import (
+    is_successful,
 )
 from slsqp_jax.sqpdax.types import Scalar
 
+from .conftest import make_equality_quadratic, make_unconstrained_quadratic
 
-class ExtendedMetrics(TerminationMetrics):
-    """Stand-in for a per-algorithm metrics schema."""
+
+class ExtendedMetrics(TerminationMetrics[ACTIVE_SET_LINE_SEARCH_RESULTS]):
+    """Stand-in for an algorithm-specific metrics schema."""
 
     residual: Scalar
     has_min_steps: Bool[Array, ""]
@@ -29,85 +48,102 @@ def make_flags(
     converged: bool = False,
     nonfinite: bool = False,
     fatal: bool = False,
-    subproblem_result: optx.RESULTS = optx.RESULTS.singular,
-) -> TerminationFlags:
-    """Build :class:`TerminationFlags` from Python booleans."""
+) -> TerminationFlags[ACTIVE_SET_LINE_SEARCH_RESULTS]:
+    """Build active-set flags from Python booleans."""
     return TerminationFlags(
         converged=jnp.asarray(converged),
         nonfinite=jnp.asarray(nonfinite),
         fatal=jnp.asarray(fatal),
-        subproblem_result=subproblem_result,
+        fatal_result=ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
     )
 
 
 @pytest.mark.parametrize(
-    ("converged", "nonfinite", "fatal", "expect_done", "expect_result"),
+    ("converged", "nonfinite", "fatal", "expect_done", "expected_name"),
     [
-        (False, False, False, False, optx.RESULTS.successful),
-        (True, False, False, True, optx.RESULTS.successful),
-        (False, True, False, True, optx.RESULTS.nonfinite),
-        (False, False, True, True, optx.RESULTS.singular),
-        (True, True, False, True, optx.RESULTS.nonfinite),
-        (True, False, True, True, optx.RESULTS.successful),
-        (False, True, True, True, optx.RESULTS.nonfinite),
-        (True, True, True, True, optx.RESULTS.nonfinite),
-    ],
-    ids=[
-        "running",
-        "converged",
-        "nonfinite",
-        "fatal",
-        "nonfinite-beats-converged",
-        "converged-beats-fatal",
-        "nonfinite-beats-fatal",
-        "nonfinite-beats-all",
+        (False, False, False, False, "running"),
+        (True, False, False, True, "successful"),
+        (False, True, False, True, "nonfinite"),
+        (False, False, True, True, "qp_subproblem_failure"),
+        (True, True, True, True, "nonfinite"),
+        (True, False, True, True, "successful"),
     ],
 )
 def test_classify_termination_precedence(
-    converged, nonfinite, fatal, expect_done, expect_result
+    converged, nonfinite, fatal, expect_done, expected_name
 ):
-    """``done`` fires on any flag; ``result`` follows nonfinite > converged > fatal.
-
-    ``subproblem_result`` is a distinctive code (``singular``) so the fatal
-    branch cannot be mistaken for a generic fallback.
-    """
+    """Priority is nonfinite > converged > fatal > running."""
+    adapter = ActiveSetLineSearchResultAdapter()
     done, result = classify_termination(
-        make_flags(converged=converged, nonfinite=nonfinite, fatal=fatal)
+        make_flags(converged=converged, nonfinite=nonfinite, fatal=fatal),
+        adapter,
     )
     assert bool(done) is expect_done
-    assert bool(result == expect_result)
+    assert bool(result == getattr(ACTIVE_SET_LINE_SEARCH_RESULTS, expected_name))
 
 
-@pytest.mark.parametrize(
-    "subproblem_result",
-    [optx.RESULTS.singular, optx.RESULTS.breakdown, optx.RESULTS.stagnation],
-)
-def test_classify_termination_forwards_subproblem_result(subproblem_result):
-    """A fatal outcome reports the subproblem's own code, not a generic one."""
-    done, result = classify_termination(
-        make_flags(fatal=True, subproblem_result=subproblem_result)
+def test_classification_is_generic_across_result_types():
+    """The same classifier accepts a different algorithm result enumeration."""
+    adapter = TrustRegionInteriorPointResultAdapter()
+    flags = TerminationFlags(
+        converged=jnp.asarray(False),
+        nonfinite=jnp.asarray(False),
+        fatal=jnp.asarray(True),
+        fatal_result=TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_singular,
     )
+    done, result = classify_termination(flags, adapter)
     assert bool(done)
-    assert bool(result == subproblem_result)
+    assert bool(result == TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_singular)
 
 
 @pytest.mark.parametrize(
-    "subproblem_result",
-    [optx.RESULTS.singular, optx.RESULTS.breakdown],
+    ("native", "coarse"),
+    [
+        (
+            ACTIVE_SET_LINE_SEARCH_RESULTS.merit_stagnation,
+            optx.RESULTS.nonlinear_divergence,
+        ),
+        (
+            ACTIVE_SET_LINE_SEARCH_RESULTS.max_steps_reached,
+            optx.RESULTS.nonlinear_max_steps_reached,
+        ),
+        (
+            ACTIVE_SET_LINE_SEARCH_RESULTS.nonfinite,
+            optx.RESULTS.nonfinite,
+        ),
+    ],
 )
-@pytest.mark.parametrize("converged", [True, False], ids=["converged", "running"])
-def test_classify_termination_hides_subproblem_result_unless_fatal(
-    subproblem_result, converged
-):
-    """``subproblem_result`` only surfaces through the ``fatal`` branch."""
-    _, result = classify_termination(
-        make_flags(converged=converged, subproblem_result=subproblem_result)
+def test_active_set_adapter_coarsens_only_at_compatibility_boundary(native, coarse):
+    """Fine native reasons have an explicit Optimistix dispatch."""
+    adapter = ActiveSetLineSearchResultAdapter()
+    assert bool(adapter.to_optimistix(native) == coarse)
+
+
+def test_trust_region_adapter_preserves_known_linear_failure():
+    """A native detailed KKT failure maps to its Optimistix counterpart."""
+    adapter = TrustRegionInteriorPointResultAdapter()
+    coarse = adapter.to_optimistix(
+        TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_singular
     )
-    assert bool(result == optx.RESULTS.successful)
+    assert bool(coarse == optx.RESULTS.singular)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ACTIVE_SET_LINE_SEARCH_RESULTS.successful,
+        TRUST_REGION_INTERIOR_POINT_RESULTS.successful,
+        optx.RESULTS.successful,
+    ],
+)
+def test_is_successful_handles_native_and_optimistix_enumerations(result):
+    """Both sqpdax-local and project-public helpers avoid cross-enum equality."""
+    assert bool(is_successful(result))
 
 
 def test_classify_termination_is_jittable():
-    """The classifier traces under ``jit`` with traced (non-static) flags."""
+    """Native result selection traces under JIT."""
+    adapter = ActiveSetLineSearchResultAdapter()
 
     @eqx.filter_jit
     def run(converged, nonfinite, fatal):
@@ -116,51 +152,69 @@ def test_classify_termination_is_jittable():
                 converged=converged,
                 nonfinite=nonfinite,
                 fatal=fatal,
-                subproblem_result=optx.RESULTS.singular,
-            )
+                fatal_result=ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure,
+            ),
+            adapter,
         )
 
     done, result = run(jnp.asarray(False), jnp.asarray(False), jnp.asarray(True))
     assert bool(done)
-    assert bool(result == optx.RESULTS.singular)
+    assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure)
 
 
-@pytest.mark.parametrize(
-    ("instance_factory", "expect_type"),
-    [
-        (lambda: make_flags(converged=True), TerminationFlags),
-        (
-            lambda: ExtendedMetrics(
-                nonfinite=jnp.asarray(False),
-                subproblem_result=optx.RESULTS.successful,
-                residual=jnp.asarray(0.5),
-                has_min_steps=jnp.asarray(True),
-            ),
-            ExtendedMetrics,
+def test_termination_modules_round_trip_as_pytrees():
+    """Generic flags and metrics remain valid JAX pytrees."""
+    values = (
+        make_flags(converged=True),
+        ExtendedMetrics(
+            nonfinite=jnp.asarray(False),
+            fatal_result=ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
+            residual=jnp.asarray(0.5),
+            has_min_steps=jnp.asarray(True),
         ),
-    ],
-    ids=["flags", "metrics"],
-)
-def test_termination_modules_round_trip_as_pytrees(instance_factory, expect_type):
-    """Flags / metrics are Equinox modules usable as ``while_loop`` carries."""
-    instance = instance_factory()
-    leaves, treedef = jax.tree.flatten(instance)
-    assert leaves
-    rebuilt = jax.tree.unflatten(treedef, leaves)
-    assert isinstance(rebuilt, expect_type)
-    assert eqx.tree_equal(rebuilt, instance)
-
-
-def test_termination_metrics_subclass_extends_base_fields():
-    """Subclasses add algorithm-specific fields while keeping the shared two."""
-    metrics = ExtendedMetrics(
-        nonfinite=jnp.asarray(False),
-        subproblem_result=optx.RESULTS.successful,
-        residual=jnp.asarray(1e-9),
-        has_min_steps=jnp.asarray(True),
     )
-    assert isinstance(metrics, TerminationMetrics)
-    assert not bool(metrics.nonfinite)
-    assert bool(metrics.subproblem_result == optx.RESULTS.successful)
-    assert float(metrics.residual) == pytest.approx(1e-9)
-    assert bool(metrics.has_min_steps)
+    for value in values:
+        leaves, treedef = jax.tree.flatten(value)
+        assert leaves
+        assert eqx.tree_equal(jax.tree.unflatten(treedef, leaves), value)
+
+
+def _zero_dual(n: int, meq: int, mineq: int) -> Dual:
+    return Dual(
+        eq_multipliers=jnp.zeros(meq),
+        ineq_multipliers=jnp.zeros(mineq),
+        lb_multipliers=jnp.zeros(n),
+        ub_multipliers=jnp.zeros(n),
+    )
+
+
+def test_compute_mu_max_unconstrained_is_objective_gradient_norm():
+    """With no multipliers, filterSQP scaling is ``‖∇f‖₂``."""
+    problem = make_unconstrained_quadratic()
+    lagrangian = Lagrangian(problem, None)(
+        Primal(jnp.ones(problem.n)),
+        _zero_dual(problem.n, problem.meq, problem.mineq),
+    )
+    assert float(compute_mu_max(lagrangian)) == pytest.approx(jnp.sqrt(8.0))
+
+
+def test_compute_mu_max_uses_constraint_row_norm_times_multiplier():
+    """A general-constraint contribution can dominate the objective."""
+    problem = make_equality_quadratic()
+    dual = _zero_dual(problem.n, problem.meq, problem.mineq)
+    dual = eqx.tree_at(lambda d: d.eq_multipliers, dual, jnp.asarray([3.0]))
+    lagrangian = Lagrangian(problem, None)(Primal(jnp.asarray([0.25, 0.25])), dual)
+    assert float(compute_mu_max(lagrangian)) == pytest.approx(3.0 * jnp.sqrt(2.0))
+
+
+def test_compute_mu_max_uses_only_finite_bound_multipliers():
+    """Finite bounds contribute ``|ν|`` while null-bound slots are ignored."""
+    problem = replace(
+        make_unconstrained_quadratic(),
+        lb=jnp.asarray([0.0, -jnp.inf]),
+        null_lb=jnp.asarray([False, True]),
+    )
+    dual = _zero_dual(problem.n, problem.meq, problem.mineq)
+    dual = eqx.tree_at(lambda d: d.lb_multipliers, dual, jnp.asarray([5.0, 100.0]))
+    lagrangian = Lagrangian(problem, None)(Primal(jnp.ones(problem.n)), dual)
+    assert float(compute_mu_max(lagrangian)) == pytest.approx(5.0)
