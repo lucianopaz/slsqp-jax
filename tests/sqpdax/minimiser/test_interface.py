@@ -46,12 +46,13 @@ def test_minimise_reports_successful_on_quadratics(
     :attr:`optimistix.RESULTS.successful` rather than merely exhausting the
     step budget.
     """
-    sol = minimise(
-        make_problem(), make_solver(), jnp.asarray(x0), max_steps=40, throw=True
-    )
+    problem = make_problem()
+    sol = minimise(problem, make_solver(), jnp.asarray(x0), max_steps=40, throw=True)
     assert bool(sol.state.result_adapter.is_successful(sol.result))
     assert jnp.allclose(sol.value, jnp.asarray(expected), atol=1e-4)
     assert int(sol.stats["num_steps"]) >= 1
+    expected_objective, _ = problem.fn(sol.value)
+    assert jnp.allclose(sol.stats["final_objective"], expected_objective)
 
 
 def test_minimise_throw_false_on_budget_exhaustion():
@@ -68,16 +69,18 @@ def test_minimise_throw_false_on_budget_exhaustion():
 
 
 def test_minimise_forwards_problem_args_and_kwargs():
-    """Solve-time arguments are bound before entering the minimiser stack."""
+    """Solve-time arguments are bound and final objective aux is returned."""
 
     def objective(x, target, *, scale):
-        return scale * jnp.sum((x - target) ** 2)
+        value = scale * jnp.sum((x - target) ** 2)
+        return value, {"target": target, "scale": scale}
 
     problem = build_problem(
         objective,
         n=2,
         autodiff_mode="jax",
         force_hvp_in_jax_mode=True,
+        has_aux=True,
     )
     target = jnp.array([0.25, -0.75])
     sol = minimise(
@@ -90,6 +93,8 @@ def test_minimise_forwards_problem_args_and_kwargs():
     )
 
     assert jnp.allclose(sol.value, target, atol=1e-4)
+    assert jnp.allclose(sol.aux["target"], target)
+    assert sol.aux["scale"] == 2.0
 
 
 def test_minimise_throw_true_raises_on_failure():
