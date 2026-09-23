@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
@@ -32,9 +33,10 @@ def test_lagrangian_value_and_grad_match_formula(meq: int, mineq: int):
     assert evaluated.n == problem.n
     assert evaluated.meq == meq
     assert evaluated.mineq == mineq
+    assert evaluated.aux_val is None
 
     expected_val = (
-        problem.fn(x.x)
+        problem.fn(x.x)[0]
         + dual.eq_multipliers @ problem.eq_fn(x.x)
         + dual.ineq_multipliers @ problem.ineq_fn(x.x)
         + dual.lb_multipliers @ jnp.where(problem.null_lb, 0.0, problem.lb - x.x)
@@ -141,7 +143,9 @@ def test_lagrangian_facades_and_evaluated_api(quadratic_problem: Problem):
     evaluated = lag(x, dual)
 
     assert not evaluated.is_kkt_dual_regularized
-    assert jnp.allclose(lag.objective_fn(x), quadratic_problem.fn(x.x))
+    assert eqx.tree_equal(
+        lag.objective_fn(x), quadratic_problem.fn(x.x), rtol=1e-5, atol=1e-8
+    )
     assert jnp.allclose(lag.objective_grad(x), quadratic_problem.grad(x.x))
 
     primal_g, dual_g = lag.grad(x, dual)

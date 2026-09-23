@@ -9,10 +9,11 @@ from jax import Array
 from slsqp_jax.sqpdax.dual import Dual
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal, Slack
 from slsqp_jax.sqpdax.problem.basic import Problem
+from slsqp_jax.sqpdax.types import Aux
 
 
-def obj(x: Array) -> Array:
-    return jnp.sum(x**2)
+def obj(x: Array) -> tuple[Array, Aux]:
+    return (jnp.sum(x**2), None)
 
 
 def obj_grad(x: Array) -> Array:

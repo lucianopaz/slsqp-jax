@@ -7,7 +7,7 @@ from ..dual import Dual
 from ..primal import InteriorPointPrimal
 from ..problem.basic import ProblemProtocol
 from ..secant import Secant
-from ..types import Scalar, Vector_n
+from ..types import Aux, Scalar, Vector_n
 from .basic import Lagrangian
 from .evaluated import InteriorPointEvaluatedLagrangian
 
@@ -122,7 +122,9 @@ class InteriorPointLagrangian(
             ),
         )
 
-    def objective_fn(self, x: InteriorPointPrimal, *args, **kwargs) -> Scalar:
+    def objective_fn(
+        self, x: InteriorPointPrimal, *args, **kwargs
+    ) -> tuple[Scalar, Aux]:
         """Objective value ``f(x)`` (barrier excluded).
 
         Parameters

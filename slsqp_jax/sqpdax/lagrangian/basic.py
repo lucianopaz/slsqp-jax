@@ -9,7 +9,7 @@ from ..dual import Dual
 from ..primal import PrimalType
 from ..problem.basic import ProblemProtocol
 from ..secant import Secant
-from ..types import Scalar, Vector_n
+from ..types import Aux, Scalar, Vector_n
 from .evaluated import EvaluatedLagrangian, EvaluatedLagrangianType
 
 __all__ = ["Lagrangian"]
@@ -66,7 +66,7 @@ class Lagrangian(Module, Generic[PrimalType, EvaluatedLagrangianType]):
         self.problem = problem
         self.secant = secant
 
-    def objective_fn(self, x: PrimalType, *args, **kwargs) -> Scalar:
+    def objective_fn(self, x: PrimalType, *args, **kwargs) -> tuple[Scalar, Aux]:
         """Objective value ``f(x)`` via the wrapped problem.
 
         Parameters

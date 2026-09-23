@@ -13,6 +13,7 @@ from ..primal import InteriorPointPrimal, Primal, PrimalType, Slack
 from ..problem.basic import EvaluatedProblem
 from ..secant import Secant
 from ..types import (
+    Aux,
     Matrix_meqn,
     Matrix_mineqn,
     Scalar,
@@ -90,6 +91,11 @@ class EvaluatedLagrangian(Module, Generic[PrimalType]):
     def fn_val(self) -> Scalar:
         """Objective value at the reference."""
         return self.evaluated.fn_val
+
+    @property
+    def aux_val(self) -> Aux:
+        """Auxiliary value returned by the objective function at the reference point."""
+        return self.evaluated.aux_val
 
     @property
     def grad_val(self) -> Vector_n:

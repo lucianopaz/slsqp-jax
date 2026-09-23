@@ -7,6 +7,7 @@ from jaxtyping import Array, Bool
 
 from ..primal import PrimalType
 from ..types import (
+    Aux,
     EqConstraintFn,
     EqConstraintHVPFn,
     EqConstraintJacFn,
@@ -69,6 +70,8 @@ class EvaluatedProblem(Module, Generic[PrimalType]):
         Mask of inactive (``-inf``) lower bounds.
     null_ub
         Mask of inactive (``+inf``) upper bounds.
+    aux_val
+        Auxiliary value returned by the objective function.
     """
 
     ref: PrimalType
@@ -85,6 +88,7 @@ class EvaluatedProblem(Module, Generic[PrimalType]):
     ub: Vector_n
     null_lb: Bool[Array, " n"]
     null_ub: Bool[Array, " n"]
+    aux_val: Aux
 
     @property
     def n(self) -> int:
@@ -157,7 +161,11 @@ class Problem(Module):
     Attributes
     ----------
     fn
-        Scalar objective ``f(x, *args, **kwargs)``.
+        Scalar objective ``f(x, *args, **kwargs)`` that returns a tuple of the form
+        ``(scalar, aux)``, where ``scalar`` is the objective value and ``aux`` is
+        any potential auxiliary output produced by the objective function. If the
+        objective does not produce auxiliary values, it should return a tuple of the form
+        ``(scalar, None)``.
     grad
         Objective gradient w.r.t. ``x``.
     hvp
@@ -195,7 +203,7 @@ class Problem(Module):
     >>> from slsqp_jax.sqpdax.primal import Primal
     >>> from slsqp_jax.sqpdax.problem.basic import Problem
     >>> def f(x):
-    ...     return jnp.sum(x**2)
+    ...     return jnp.sum(x**2), None
     >>> def g(x):
     ...     return jnp.zeros((0,), dtype=x.dtype)
     >>> problem = Problem(
@@ -259,7 +267,7 @@ class Problem(Module):
         EvaluatedProblem
             Pointwise values, Jacobians, bounds, and optional QVPs.
         """
-        fn_val = self.fn(x.x, *args, **kwargs)
+        fn_val, aux_val = self.fn(x.x, *args, **kwargs)
         grad_val = self.grad(x.x, *args, **kwargs)
 
         fn_qvp = None
@@ -304,6 +312,7 @@ class Problem(Module):
                 ub=self.ub,
                 null_lb=self.null_lb,
                 null_ub=self.null_ub,
+                aux_val=aux_val,
             ),
         )
 

@@ -1,11 +1,12 @@
 """Factory for assembling a :class:`~slsqp_jax.sqpdax.problem.basic.Problem`."""
 
-from typing import Literal, cast
+from typing import Literal, cast, overload
 
 from jax import numpy as jnp
 
 from ..autodiff_utils import autodiff_wrapper
 from ..types import (
+    Aux,
     EqConstraintFn,
     EqConstraintHVPFn,
     EqConstraintJacFn,
@@ -17,6 +18,8 @@ from ..types import (
     ObjectiveFn,
     ObjectiveGradFn,
     ObjectiveHVPFn,
+    RawObjectiveFn,
+    Scalar,
     Vector_meq,
     Vector_mineq,
     Vector_n,
@@ -24,8 +27,52 @@ from ..types import (
 from .basic import Problem
 
 
+@overload
+def build_problem(
+    fn: RawObjectiveFn,
+    n: int,
+    meq: int,
+    mineq: int,
+    grad: ObjectiveGradFn | None,
+    hvp: ObjectiveHVPFn | None,
+    eq_fn: EqConstraintFn | None,  # g(x) = 0
+    ineq_fn: IneqConstraintFn | None,  # h(x) <= 0
+    eq_fn_jac: EqConstraintJacFn | None,
+    ineq_fn_jac: IneqConstraintJacFn | None,
+    eq_fn_hvp: EqConstraintHVPFn | None,
+    ineq_fn_hvp: IneqConstraintHVPFn | None,
+    lb: Vector_n | None,
+    ub: Vector_n | None,
+    autodiff_mode: Literal["jax", "custom", "none"],
+    force_hvp_in_jax_mode: bool,
+    has_aux: Literal[False],
+) -> Problem: ...
+
+
+@overload
 def build_problem(
     fn: ObjectiveFn,
+    n: int,
+    meq: int,
+    mineq: int,
+    grad: ObjectiveGradFn | None,
+    hvp: ObjectiveHVPFn | None,
+    eq_fn: EqConstraintFn | None,  # g(x) = 0
+    ineq_fn: IneqConstraintFn | None,  # h(x) <= 0
+    eq_fn_jac: EqConstraintJacFn | None,
+    ineq_fn_jac: IneqConstraintJacFn | None,
+    eq_fn_hvp: EqConstraintHVPFn | None,
+    ineq_fn_hvp: IneqConstraintHVPFn | None,
+    lb: Vector_n | None,
+    ub: Vector_n | None,
+    autodiff_mode: Literal["jax", "custom", "none"],
+    force_hvp_in_jax_mode: bool,
+    has_aux: Literal[True],
+) -> Problem: ...
+
+
+def build_problem(
+    fn: RawObjectiveFn | ObjectiveFn,
     n: int,
     meq: int = 0,
     mineq: int = 0,
@@ -41,6 +88,7 @@ def build_problem(
     ub: Vector_n | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "custom",
     force_hvp_in_jax_mode: bool = False,
+    has_aux: bool = False,
 ) -> Problem:
     """Assemble an NLP :class:`~slsqp_jax.sqpdax.problem.basic.Problem`.
 
@@ -105,6 +153,8 @@ def build_problem(
         placeholder is supplied. When ``True``, JAX-mode HVPs are built for
         every wrapped block so :attr:`~slsqp_jax.sqpdax.problem.basic.Problem.has_exact_curvature`
         can be true without user-supplied second-order maps.
+    has_aux
+        Whether the objective function returns auxiliary values.
 
     Returns
     -------
@@ -139,13 +189,23 @@ def build_problem(
     ... )
     >>> problem.n, problem.meq, problem.mineq
     (2, 0, 0)
-    >>> float(problem.fn(jnp.array([1.0, 2.0])))
+    >>> val, aux = problem.fn(jnp.array([1.0, 2.0]))
+    >>> float(val)
     5.0
+    >>> aux is None
+    True
     >>> problem.eq_fn(jnp.array([1.0, 2.0])).shape
     (0,)
     """
-    fn, grad, hvp = autodiff_wrapper(
-        fn, grad, hvp, autodiff_mode, force_hvp_in_jax_mode
+    if not has_aux:
+
+        def _fn(*args, **kwargs) -> tuple[Scalar, Aux]:
+            return cast(RawObjectiveFn, fn)(*args, **kwargs), None
+    else:
+        _fn = cast(ObjectiveFn, fn)
+
+    _fn, grad, hvp = autodiff_wrapper(  # type: ignore
+        _fn, grad, hvp, autodiff_mode, force_hvp_in_jax_mode, has_aux=True
     )
     if eq_fn is not None:
         assert meq is not None and meq > 0, (
@@ -194,6 +254,12 @@ def build_problem(
             "number of inequality constraint functions, mineq"
         )
     else:
+        assert ineq_fn_jac is None, (
+            "Supplied ineq_fn_jac but ineq_fn is None. Please provide an ineq_fn."
+        )
+        assert ineq_fn_hvp is None, (
+            "Supplied ineq_fn_hvp but ineq_fn is None. Please provide an ineq_fn."
+        )
         mineq = 0
 
         def ineq_fn(x: Vector_n, *args, **kwargs) -> Vector_mineq:
@@ -214,7 +280,7 @@ def build_problem(
     return cast(
         Problem,
         Problem(
-            fn=fn,
+            fn=_fn,
             grad=grad,
             hvp=hvp,
             eq_fn=eq_fn,

@@ -79,7 +79,8 @@ def _contract_jac_tangent(jac: Any, x: Any, tangent: Any) -> Array:
 def fn_proxy_autodiff(
     fn: FnCallable,
     fn_jac: GradCallable,
-    fn_hvp: None = None,
+    fn_hvp: None,
+    has_aux: bool,
 ) -> tuple[FnCallable, GradCallable, None]: ...
 
 
@@ -88,6 +89,7 @@ def fn_proxy_autodiff(
     fn: FnCallable,
     fn_jac: GradCallable,
     fn_hvp: HVPCallable,
+    has_aux: bool,
 ) -> tuple[FnCallable, GradCallable, HVPCallable]: ...
 
 
@@ -95,6 +97,7 @@ def fn_proxy_autodiff(
     fn: FnCallable,
     fn_jac: GradCallable,
     fn_hvp: HVPCallable | None = None,
+    has_aux: bool = False,
 ) -> tuple[FnCallable, GradCallable, HVPCallable | None]:
     """Wrap ``fn`` / ``fn_jac`` so JAX AD uses the supplied derivatives.
 
@@ -137,6 +140,9 @@ def fn_proxy_autodiff(
         ``fn_hvp(x, tangent, *args, **kwargs)``, with the same pytree
         structure / shapes as ``fn_jac(x, ...)``. ``tangent`` matches ``x``.
         Returned as-is in the output triple.
+    has_aux: bool
+        Whether ``fn`` returns its scalar value or a tuple ``(y, aux)``.
+        In the latter case, the ``fn_jac`` will operate on ``y`` only.
 
     Returns
     -------
@@ -198,14 +204,30 @@ def fn_proxy_autodiff(
     def wrapped_fn(x: Any, *args: Any, **kwargs: Any) -> Array:
         return fn(x, *args, **kwargs)
 
-    @wrapped_fn.def_jvp
-    def _fn_jvp(
-        primals: tuple[Any, ...], tangents: tuple[Any, ...], **kwargs: Any
-    ) -> tuple[Array, Array]:
-        x, *args = primals
-        tx, *_ = tangents
-        jac = wrapped_jac(x, *args, **kwargs)
-        return wrapped_fn(x, *args, **kwargs), _contract_jac_tangent(jac, x, tx)
+    if not has_aux:
+
+        @wrapped_fn.def_jvp
+        def _fn_jvp(
+            primals: tuple[Any, ...], tangents: tuple[Any, ...], **kwargs: Any
+        ) -> tuple[Any, Any]:
+            x, *args = primals
+            tx, *_ = tangents
+            jac = wrapped_jac(x, *args, **kwargs)
+            return wrapped_fn(x, *args, **kwargs), _contract_jac_tangent(jac, x, tx)
+    else:
+
+        @wrapped_fn.def_jvp
+        def _fn_jvp(
+            primals: tuple[Any, ...], tangents: tuple[Any, ...], **kwargs: Any
+        ) -> tuple[Any, Any]:
+            x, *args = primals
+            tx, *_ = tangents
+            jac = wrapped_jac(x, *args, **kwargs)
+            output = wrapped_fn(x, *args, **kwargs)
+            _, aux = output
+            value_tangent = _contract_jac_tangent(jac, x, tx)
+            aux_tangent = jax.tree.map(lambda _: None, aux)
+            return output, (value_tangent, aux_tangent)
 
     return wrapped_fn, wrapped_jac, fn_hvp  # ty: ignore[invalid-return-type]
 
@@ -216,6 +238,7 @@ def autodiff_wrapper(
     hvp: HVPCallable | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "custom",
     force_hvp_in_jax_mode: bool = False,
+    has_aux: bool = False,
 ) -> tuple[FnCallable, GradCallable, HVPCallable | None]:
     """Resolve ``(fn, grad, hvp)`` according to ``autodiff_mode``.
 
@@ -283,9 +306,17 @@ def autodiff_wrapper(
     [1.0, 0.0]
     """
     if autodiff_mode == "jax":
+        if has_aux:
+
+            def _fn(x: Any, *args: Any, **kwargs: Any) -> Any:
+                return fn(x, *args, **kwargs)[0]
+        else:
+
+            def _fn(x: Any, *args: Any, **kwargs: Any) -> Any:
+                return fn(x, *args, **kwargs)
 
         def _grad(x: Any, *args: Any, **kwargs: Any) -> Any:
-            return eqx.filter_jacrev(lambda z: fn(z, *args, **kwargs))(x)
+            return eqx.filter_jacrev(lambda z: _fn(z, *args, **kwargs))(x)
 
         if hvp is None and not force_hvp_in_jax_mode:
             resolved_hvp: HVPCallable | None = None
@@ -309,7 +340,7 @@ def autodiff_wrapper(
         if grad is None:
             msg = "grad must be provided when autodiff_mode is 'custom'"
             raise ValueError(msg)
-        return fn_proxy_autodiff(fn, grad, hvp)
+        return fn_proxy_autodiff(fn, grad, hvp, has_aux=has_aux)
 
     if autodiff_mode == "none":
         if grad is None:

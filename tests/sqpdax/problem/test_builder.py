@@ -14,10 +14,15 @@ from jax import Array
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.problem.builder import build_problem
+from slsqp_jax.sqpdax.types import Aux
 
 
 def _obj(x: Array) -> Array:
     return jnp.sum(x**2)
+
+
+def _aux_obj(x: Array) -> tuple[Array, Aux]:
+    return jnp.sum(x**2), {"auxiliary": None}
 
 
 def _obj_grad(x: Array) -> Array:
@@ -70,6 +75,7 @@ def _call_build(
     ub: Array | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "none",
     force_hvp_in_jax_mode: bool = False,
+    has_aux: bool = False,
 ) -> Problem:
     return build_problem(
         n=n,
@@ -88,7 +94,16 @@ def _call_build(
         ub=ub,
         autodiff_mode=autodiff_mode,
         force_hvp_in_jax_mode=force_hvp_in_jax_mode,
+        has_aux=has_aux,
     )
+
+
+@pytest.fixture(params=[True, False])
+def obj_fn(request: pytest.FixtureRequest) -> tuple[Callable, bool]:
+    if request.param:
+        return _aux_obj, True
+    else:
+        return _obj, False
 
 
 @pytest.mark.parametrize(
@@ -108,17 +123,21 @@ def test_build_problem_dimensions_and_stubs(
     ineq_fn: Callable | None,
     ineq_fn_jac: Callable | None,
     mineq: int | None,
+    obj_fn: tuple[Callable, bool],
 ):
     """Dimensions match inputs; omitted constraints become empty callables."""
     n = 2
+    fn, has_aux = obj_fn
     problem = _call_build(
         n=n,
         meq=meq,
         mineq=mineq,
+        fn=fn,
         eq_fn=eq_fn,
         eq_fn_jac=eq_fn_jac,
         ineq_fn=ineq_fn,
         ineq_fn_jac=ineq_fn_jac,
+        has_aux=has_aux,
     )
     x = jnp.array([0.5, 0.25])
     expected_meq = 0 if eq_fn is None else meq
@@ -128,7 +147,12 @@ def test_build_problem_dimensions_and_stubs(
     assert problem.n == n
     assert problem.meq == expected_meq
     assert problem.mineq == expected_mineq
-    assert jnp.allclose(problem.fn(x), _obj(x))
+    fn_val, aux_val = problem.fn(x)
+    if not has_aux:
+        assert jnp.allclose(fn_val, _obj(x))
+        assert aux_val is None
+    else:
+        eqx.tree_equal((fn_val, aux_val), _aux_obj(x), rtol=1e-5, atol=1e-8)
     assert jnp.allclose(problem.grad(x), _obj_grad(x))
 
     eq_val = problem.eq_fn(x)
@@ -206,6 +230,7 @@ def test_build_problem_autodiff_modes(
     autodiff_mode: Literal["jax", "custom", "none"],
     with_hvp: bool,
     force_hvp_in_jax_mode: bool,
+    obj_fn: tuple[Callable, bool],
 ):
     """Objective derivatives resolve consistently across autodiff modes."""
     if force_hvp_in_jax_mode and autodiff_mode != "jax":
@@ -217,14 +242,22 @@ def test_build_problem_autodiff_modes(
     # JAX HVP; the callable itself is not returned.
     hvp = _obj_hvp if with_hvp else None
     grad = None if autodiff_mode == "jax" else _obj_grad
+    fn, has_aux = obj_fn
     problem = _call_build(
+        fn=fn,
         grad=grad,
         hvp=hvp,
         autodiff_mode=autodiff_mode,
         force_hvp_in_jax_mode=force_hvp_in_jax_mode,
+        has_aux=has_aux,
     )
 
-    assert jnp.allclose(problem.fn(x), _obj(x))
+    fn_val, aux_val = problem.fn(x)
+    if not has_aux:
+        assert jnp.allclose(fn_val, _obj(x))
+        assert aux_val is None
+    else:
+        assert eqx.tree_equal((fn_val, aux_val), _aux_obj(x), rtol=1e-5, atol=1e-8)
     assert jnp.allclose(problem.grad(x), _obj_grad(x))
 
     if autodiff_mode == "jax":
@@ -246,7 +279,11 @@ def test_build_problem_autodiff_modes(
         assert not problem.has_exact_curvature
 
     if autodiff_mode == "custom":
-        assert jnp.allclose(eqx.filter_grad(problem.fn)(x), _obj_grad(x))
+
+        def _fn(*args, **kwargs):
+            return problem.fn(*args, **kwargs)[0]
+
+        assert jnp.allclose(eqx.filter_grad(_fn)(x), _obj_grad(x))
 
 
 def test_build_problem_jax_mode_builds_constraint_derivatives():

@@ -24,7 +24,7 @@ def _expected_exterior_merit(
     feasibility_weight: float,
 ) -> Array:
     """Closed-form exterior :class:`NormMerit` value at array ``x``."""
-    f = problem.fn(x)
+    f, _ = problem.fn(x)
     eq = problem.eq_fn(x)
     ineq = jnp.concatenate(
         [
@@ -51,7 +51,7 @@ def _expected_interior_merit(
     """Closed-form interior-point :class:`NormMerit` value."""
     x = primal.x
     slack = primal.slack
-    f = problem.fn(x)
+    f, _ = problem.fn(x)
     eq = problem.eq_fn(x)
     ineq = jnp.concatenate(
         [
@@ -207,7 +207,7 @@ def test_norm_merit_exterior_grad_at_feasible_point():
             problem_weight=problem_weight,
             feasibility_weight=1.0,
         ),
-        problem_weight * problem.fn(primal.x),
+        problem_weight * problem.fn(primal.x)[0],
     )
     grad = eqx.filter_grad(merit)(primal)
     assert jnp.allclose(grad.x, problem_weight * problem.grad(primal.x))
@@ -230,7 +230,7 @@ def test_norm_merit_respects_null_bounds():
     # Explicit check: upper violation on x[1] only (x[1]-1 = 1).
     assert jnp.allclose(
         got,
-        problem.fn(x)
+        problem.fn(x)[0]
         + jnp.linalg.norm(problem.eq_fn(x), ord=1)
         + jnp.sum(jnp.maximum(0.0, problem.ineq_fn(x)))
         + 1.0,  # x[1] - ub[1]
@@ -269,4 +269,4 @@ def test_norm_merit_empty_constraints():
         feasibility_weight=jnp.asarray(5.0),
     )
     p = Primal(x=jnp.array([1.0, -2.0]))
-    assert jnp.allclose(merit(p), 2.0 * problem.fn(p.x))
+    assert jnp.allclose(merit(p), 2.0 * problem.fn(p.x)[0])
