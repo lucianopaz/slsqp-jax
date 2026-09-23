@@ -2,6 +2,7 @@ from . import (
     active_set,
     autodiff_utils,
     barrier,
+    compat,
     dual,
     lagrangian,
     merit,
@@ -23,6 +24,13 @@ from .barrier import (
     EvaluatedBarrier,
     LogBarrier,
     MonotoneBarrierUpdate,
+)
+from .compat import (
+    ParsedConstraints,
+    build_problem_from_scipy_specification,
+    minimise_and_return_scipy_result,
+    minimize_like_scipy,
+    parse_constraints,
 )
 from .dual import Dual
 from .lagrangian import (
@@ -96,6 +104,7 @@ __all__ = [
     "active_set",
     "autodiff_utils",
     "barrier",
+    "compat",
     "dual",
     "lagrangian",
     "merit",
@@ -124,6 +133,11 @@ __all__ = [
     "ProblemProtocol",
     "Problem",
     "build_problem",
+    "ParsedConstraints",
+    "parse_constraints",
+    "build_problem_from_scipy_specification",
+    "minimise_and_return_scipy_result",
+    "minimize_like_scipy",
     "registry",
     "secant",
     "types",

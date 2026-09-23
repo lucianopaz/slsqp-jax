@@ -42,16 +42,17 @@ def test_as_optimistix_minimiser_runs_through_optimistix():
 
 
 def test_optimistix_minimiser_forwards_args_to_problem():
-    """Optimistix's args PyTree becomes one positional problem argument."""
+    """Optimistix args reach the problem and its final aux reaches the solution."""
 
     def objective(x, target):
-        return jnp.sum((x - target) ** 2)
+        return jnp.sum((x - target) ** 2), {"target": target}
 
     problem = build_problem(
         objective,
         n=2,
         autodiff_mode="jax",
         force_hvp_in_jax_mode=True,
+        has_aux=True,
     )
     adapter = as_optimistix_minimiser(
         ActiveSetLineSearchStub(rtol=1e-5, atol=1e-5, min_steps=1),
@@ -74,3 +75,4 @@ def test_optimistix_minimiser_forwards_args_to_problem():
 
     assert sol.result == optx.RESULTS.successful
     assert jnp.allclose(sol.value, target, atol=1e-4)
+    assert jnp.allclose(sol.aux["target"], target)

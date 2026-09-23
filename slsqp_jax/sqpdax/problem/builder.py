@@ -71,6 +71,28 @@ def build_problem(
 ) -> Problem: ...
 
 
+@overload
+def build_problem(
+    fn: RawObjectiveFn | ObjectiveFn,
+    n: int,
+    meq: int,
+    mineq: int,
+    grad: ObjectiveGradFn | None,
+    hvp: ObjectiveHVPFn | None,
+    eq_fn: EqConstraintFn | None,
+    ineq_fn: IneqConstraintFn | None,
+    eq_fn_jac: EqConstraintJacFn | None,
+    ineq_fn_jac: IneqConstraintJacFn | None,
+    eq_fn_hvp: EqConstraintHVPFn | None,
+    ineq_fn_hvp: IneqConstraintHVPFn | None,
+    lb: Vector_n | None,
+    ub: Vector_n | None,
+    autodiff_mode: Literal["jax", "custom", "none"],
+    force_hvp_in_jax_mode: bool,
+    has_aux: bool,
+) -> Problem: ...
+
+
 def build_problem(
     fn: RawObjectiveFn | ObjectiveFn,
     n: int,

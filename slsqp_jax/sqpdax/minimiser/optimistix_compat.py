@@ -137,7 +137,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         fn, y, args, options, tags
             Ignored.
         aux
-            Returned unchanged.
+            Ignored; the attached problem's final auxiliary value is returned.
         state
             Final inner minimiser instance.
         result
@@ -158,7 +158,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         sol = state.postprocess(problem, native_result)
         stats = dict(sol.stats)
         stats["sqpdax_result"] = native_result
-        return sol.value, aux, stats
+        return sol.value, sol.aux, stats
 
 
 def as_optimistix_minimiser(

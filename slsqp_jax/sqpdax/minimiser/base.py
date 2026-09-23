@@ -960,14 +960,17 @@ class CommonMinimiser(
         Parameters
         ----------
         problem
-            NLP being minimised (unused; kept for the abstract interface).
+            NLP being minimised; its objective is evaluated at the final
+            iterate to populate :attr:`optimistix.Solution.aux`.
         result
             Final status code.
 
         Returns
         -------
         optimistix.Solution
-            ``value`` is the decision vector; ``stats`` carries ``num_steps``.
+            ``value`` is the decision vector; ``aux`` and
+            ``stats["final_objective"]`` come from the objective at that
+            vector.
 
         Raises
         ------
@@ -976,13 +979,16 @@ class CommonMinimiser(
         """
         if self.iterate is None:
             raise ValueError("iterate is not set")
+        objective_value, aux = problem.fn(self.iterate.x)
+        stats = self._postprocess_stats(problem, result)
+        stats.setdefault("final_objective", objective_value)
         return cast(
             optx.Solution,
             optx.Solution(
                 value=self.iterate.x,
                 result=result,
-                aux=None,
-                stats=self._postprocess_stats(problem, result),
+                aux=aux,
+                stats=stats,
                 state=self,
             ),
         )
