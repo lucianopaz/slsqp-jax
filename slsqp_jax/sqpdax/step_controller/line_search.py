@@ -169,10 +169,9 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         >>> from slsqp_jax.sqpdax.problem import build_problem
         >>> from slsqp_jax.sqpdax.step_controller import ArmijoLineSearch
         >>> problem = build_problem(
-        ...     n=2, meq=None, mineq=None,
-        ...     fn=lambda x: jnp.sum(x**2), grad=lambda x: 2 * x, hvp=None,
-        ...     eq_fn=None, ineq_fn=None, eq_fn_jac=None, ineq_fn_jac=None,
-        ...     eq_fn_hvp=None, ineq_fn_hvp=None, lb=None, ub=None,
+        ...     n=2,
+        ...     fn=lambda x: jnp.sum(x**2),
+        ...     grad=lambda x: 2 * x,
         ... )
         >>> ls = ArmijoLineSearch(merit=NormMerit(problem=problem))
         >>> result = ls.step(Primal(jnp.ones(2)), Primal(-jnp.ones(2)))
