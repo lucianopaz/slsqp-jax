@@ -55,8 +55,8 @@ def _ineq_hvp(x: Array, v: Array) -> Array:
 def _call_build(
     *,
     n: int = 2,
-    meq: int | None = None,
-    mineq: int | None = None,
+    meq: int = 0,
+    mineq: int = 0,
     fn: Callable = _obj,
     grad: Callable | None = _obj_grad,
     hvp: Callable | None = None,

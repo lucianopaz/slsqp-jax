@@ -104,10 +104,9 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
         >>> from slsqp_jax.sqpdax.step_controller import TrustRegionManager
         >>> from slsqp_jax.sqpdax.subproblem.solver import RESULTS, TrustRegionSolverState
         >>> problem = build_problem(
-        ...     n=2, meq=None, mineq=None,
-        ...     fn=lambda x: jnp.sum(x**2), grad=lambda x: 2 * x, hvp=None,
-        ...     eq_fn=None, ineq_fn=None, eq_fn_jac=None, ineq_fn_jac=None,
-        ...     eq_fn_hvp=None, ineq_fn_hvp=None, lb=None, ub=None,
+        ...     n=2,
+        ...     fn=lambda x: jnp.sum(x**2),
+        ...     grad=lambda x: 2 * x,
         ... )
         >>> mgr = TrustRegionManager(merit=NormMerit(problem=problem))
         >>> state = TrustRegionSolverState(

@@ -25,20 +25,20 @@ from .basic import Problem
 
 
 def build_problem(
-    n: int,
-    meq: int | None,
-    mineq: int | None,
     fn: ObjectiveFn,
-    grad: ObjectiveGradFn,
-    hvp: ObjectiveHVPFn | None,
-    eq_fn: EqConstraintFn | None,  # g(x) = 0
-    ineq_fn: IneqConstraintFn | None,  # h(x) <= 0
-    eq_fn_jac: EqConstraintJacFn | None,
-    ineq_fn_jac: IneqConstraintJacFn | None,
-    eq_fn_hvp: EqConstraintHVPFn | None,
-    ineq_fn_hvp: IneqConstraintHVPFn | None,
-    lb: Vector_n | None,
-    ub: Vector_n | None,
+    n: int,
+    meq: int = 0,
+    mineq: int = 0,
+    grad: ObjectiveGradFn | None = None,
+    hvp: ObjectiveHVPFn | None = None,
+    eq_fn: EqConstraintFn | None = None,  # g(x) = 0
+    ineq_fn: IneqConstraintFn | None = None,  # h(x) <= 0
+    eq_fn_jac: EqConstraintJacFn | None = None,
+    ineq_fn_jac: IneqConstraintJacFn | None = None,
+    eq_fn_hvp: EqConstraintHVPFn | None = None,
+    ineq_fn_hvp: IneqConstraintHVPFn | None = None,
+    lb: Vector_n | None = None,
+    ub: Vector_n | None = None,
     autodiff_mode: Literal["jax", "custom", "none"] = "custom",
     force_hvp_in_jax_mode: bool = False,
 ) -> Problem:
@@ -57,17 +57,17 @@ def build_problem(
 
     Parameters
     ----------
+    fn
+        Scalar objective ``fn(x, *args, **kwargs)``.
     n
         Number of decision variables.
     meq
-        Number of equality constraints. Required (must not be ``None``) when
+        Number of equality constraints. Must be positive when
         ``eq_fn`` is given; ignored and forced to ``0`` when ``eq_fn`` is
         ``None``.
     mineq
-        Number of inequality constraints. Required when ``ineq_fn`` is given;
+        Number of inequality constraints. Must be positive when ``ineq_fn`` is given;
         forced to ``0`` when ``ineq_fn`` is ``None``.
-    fn
-        Scalar objective ``fn(x, *args, **kwargs)``.
     grad
         Gradient of ``fn`` w.r.t. ``x``. Required when ``autodiff_mode`` is
         ``"custom"`` or ``"none"``; ignored when ``autodiff_mode="jax"``.
@@ -133,19 +133,8 @@ def build_problem(
     ...     return 2 * x
     >>> problem = build_problem(
     ...     n=2,
-    ...     meq=None,
-    ...     mineq=None,
     ...     fn=f,
     ...     grad=f_grad,
-    ...     hvp=None,
-    ...     eq_fn=None,
-    ...     ineq_fn=None,
-    ...     eq_fn_jac=None,
-    ...     ineq_fn_jac=None,
-    ...     eq_fn_hvp=None,
-    ...     ineq_fn_hvp=None,
-    ...     lb=None,
-    ...     ub=None,
     ...     autodiff_mode="none",
     ... )
     >>> problem.n, problem.meq, problem.mineq
@@ -159,17 +148,23 @@ def build_problem(
         fn, grad, hvp, autodiff_mode, force_hvp_in_jax_mode
     )
     if eq_fn is not None:
+        assert meq is not None and meq > 0, (
+            "When equality constraints are given, you must also specify the "
+            "number of equality constraint functions, meq > 0"
+        )
         try:
             eq_fn, eq_fn_jac, eq_fn_hvp = autodiff_wrapper(
                 eq_fn, eq_fn_jac, eq_fn_hvp, autodiff_mode, force_hvp_in_jax_mode
             )
         except ValueError as e:
             raise ValueError("Failed to autodiff equality constraint: " + str(e)) from e
-        assert meq is not None, (
-            "When equality constraints are given, you must also specify the "
-            "number of equality constraint functions, meq"
-        )
     else:
+        assert eq_fn_jac is None, (
+            "Supplied eq_fn_jac but eq_fn is None. Please provide an eq_fn."
+        )
+        assert eq_fn_hvp is None, (
+            "Supplied eq_fn_hvp but eq_fn is None. Please provide an eq_fn."
+        )
         meq = 0
 
         def eq_fn(x: Vector_n, *args, **kwargs) -> Vector_meq:
