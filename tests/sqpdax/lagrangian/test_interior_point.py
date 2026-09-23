@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
@@ -33,7 +34,7 @@ def test_interior_point_lagrangian_value_includes_barrier(primal_dual: bool):
     barrier_val = barrier(x.slack).fn_val
     # Manual NLP Lagrangian with slack-augmented inequalities / bounds.
     nlp_val = (
-        problem.fn(x.x)
+        problem.fn(x.x)[0]
         + dual.eq_multipliers @ problem.eq_fn(x.x)
         + dual.ineq_multipliers @ (problem.ineq_fn(x.x) + x.slack.s)
         + dual.lb_multipliers
@@ -204,7 +205,9 @@ def test_interior_point_facades_and_grads(quadratic_problem: Problem):
     )
     evaluated = lag(x, dual)
 
-    assert jnp.allclose(lag.objective_fn(x), quadratic_problem.fn(x.x))
+    assert eqx.tree_equal(
+        lag.objective_fn(x), quadratic_problem.fn(x.x), rtol=1e-5, atol=1e-8
+    )
     assert jnp.allclose(lag.objective_grad(x), quadratic_problem.grad(x.x))
     assert jnp.allclose(lag.x_grad(x, dual), evaluated.x_grad)
     assert jnp.allclose(evaluated.x_grad, lag.primal_grad(x, dual).x)

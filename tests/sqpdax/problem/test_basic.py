@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 from jax import Array
 
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import EvaluatedProblem, Problem, ProblemProtocol
+from slsqp_jax.sqpdax.types import Aux
 
 
-def _obj(x: Array, a: Array = jnp.asarray(1.0), *, b: float = 1.0) -> Array:
-    return a * b * jnp.sum(x**2)
+def _obj(x: Array, a: Array = jnp.asarray(1.0), *, b: float = 1.0) -> tuple[Array, Aux]:
+    return a * b * jnp.sum(x**2), {"a": a, "b": b, "auxiliary": None}
 
 
 def _obj_grad(x: Array, a: Array = jnp.asarray(1.0), *, b: float = 1.0) -> Array:
@@ -151,7 +153,9 @@ def test_problem_call_values_and_qvps(
     assert evaluated.n == n
     assert evaluated.meq == meq
     assert evaluated.mineq == mineq
-    assert jnp.allclose(evaluated.fn_val, _obj(x.x))
+    assert eqx.tree_equal(
+        (evaluated.fn_val, evaluated.aux_val), _obj(x.x), rtol=1e-5, atol=1e-8
+    )
     assert jnp.allclose(evaluated.grad_val, _obj_grad(x.x))
     assert jnp.allclose(evaluated.eq_fn_val, eq_fn(x.x))
     assert jnp.allclose(evaluated.eq_fn_jac_val, eq_jac(x.x))
@@ -185,7 +189,7 @@ def test_problem_call_forwards_args_kwargs():
     evaluated = problem(x, a, b=3.0)
     v = jnp.array([0.25, -0.5])
 
-    assert jnp.allclose(evaluated.fn_val, _obj(x.x, a, b=3.0))
+    assert jnp.allclose(evaluated.fn_val, _obj(x.x, a, b=3.0)[0])
     assert jnp.allclose(evaluated.grad_val, _obj_grad(x.x, a, b=3.0))
     assert jnp.allclose(evaluated.eq_fn_val, _eq(x.x, a, b=3.0))
     assert jnp.allclose(evaluated.eq_fn_jac_val, _eq_jac(x.x, a, b=3.0))
@@ -248,6 +252,7 @@ def test_evaluated_problem_has_exact_curvature(
         ub=jnp.full((n,), jnp.inf),
         null_lb=jnp.array([True, True]),
         null_ub=jnp.array([True, True]),
+        aux_val=None,
     )
     assert evaluated.n == n
     assert evaluated.meq == meq

@@ -1,10 +1,11 @@
 from dataclasses import replace
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 
 from equinox import Module
 from jaxtyping import Array, Float
 
 __all__ = [
+    "Aux",
     "Scalar",
     "Vector_n",
     "Vector_meq",
@@ -12,6 +13,7 @@ __all__ = [
     "Matrix_meqn",
     "Matrix_mineqn",
     "InitializableModule",
+    "RawObjectiveFn",
     "ObjectiveFn",
     "ObjectiveGradFn",
     "ObjectiveHVPFn",
@@ -22,6 +24,8 @@ __all__ = [
     "IneqConstraintJacFn",
     "IneqConstraintHVPFn",
 ]
+
+Aux = Any
 
 Scalar = Float[Array, ""]
 Vector_n = Float[Array, " n"]
@@ -79,8 +83,12 @@ class InitializableModule(Module):
         return replace(self, **keyvals)
 
 
-class ObjectiveFn(Protocol):
+class RawObjectiveFn(Protocol):
     def __call__(self, x: Vector_n, *args, **kwargs) -> Scalar: ...
+
+
+class ObjectiveFn(Protocol):
+    def __call__(self, x: Vector_n, *args, **kwargs) -> tuple[Scalar, Aux]: ...
 
 
 class ObjectiveGradFn(Protocol):

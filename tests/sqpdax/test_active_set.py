@@ -11,10 +11,11 @@ from slsqp_jax.sqpdax.dual import Dual
 from slsqp_jax.sqpdax.lagrangian.basic import Lagrangian
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import Problem
+from slsqp_jax.sqpdax.types import Aux
 
 
-def _obj(x: Array) -> Array:
-    return jnp.sum(x**2)
+def _obj(x: Array) -> tuple[Array, Aux]:
+    return jnp.sum(x**2), None
 
 
 def _obj_grad(x: Array) -> Array:
