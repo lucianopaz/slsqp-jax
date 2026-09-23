@@ -1,6 +1,7 @@
 """NLP problem containers: unevaluated callables and pointwise evaluations."""
 
-from typing import Callable, Generic, Protocol, cast, runtime_checkable
+from collections.abc import Mapping
+from typing import Any, Callable, Generic, Protocol, cast, runtime_checkable
 
 from equinox import Module, field
 from jaxtyping import Array, Bool
@@ -29,6 +30,7 @@ __all__ = [
     "EvaluatedProblem",
     "ProblemProtocol",
     "Problem",
+    "bind_problem_args",
 ]
 
 
@@ -324,3 +326,96 @@ class Problem(Module):
             and self.eq_fn_hvp is not None
             and self.ineq_fn_hvp is not None
         )
+
+
+def bind_problem_args(
+    problem: ProblemProtocol,
+    args: tuple[Any, ...] = (),
+    kwargs: Mapping[str, Any] | None = None,
+) -> Problem:
+    """Bind solve-time arguments to every callable in an NLP problem.
+
+    The returned problem has the same bounds and dimensions as ``problem``,
+    while each of its nine static callables accepts only the decision point
+    (and, for HVPs, the tangent). This lets solver internals keep using
+    ``problem(x)`` and ``problem.fn(x)`` without threading solve-time
+    arguments through every minimiser method.
+
+    Parameters
+    ----------
+    problem
+        Problem whose callables accept additional solve-time arguments.
+    args
+        Positional arguments to append after the decision point and optional
+        HVP tangent.
+    kwargs
+        Keyword arguments forwarded to every problem callable.
+
+    Returns
+    -------
+    Problem
+        A problem with solve-time arguments bound into its static callables.
+    """
+    args = tuple(args)
+    kwargs = {} if kwargs is None else dict(kwargs)
+
+    def fn(x):
+        return problem.fn(x, *args, **kwargs)
+
+    def grad(x):
+        return problem.grad(x, *args, **kwargs)
+
+    original_hvp = problem.hvp
+    hvp = None
+    if original_hvp is not None:
+
+        def hvp(x, tangent):
+            return original_hvp(x, tangent, *args, **kwargs)
+
+    def eq_fn(x):
+        return problem.eq_fn(x, *args, **kwargs)
+
+    def eq_fn_jac(x):
+        return problem.eq_fn_jac(x, *args, **kwargs)
+
+    original_eq_fn_hvp = problem.eq_fn_hvp
+    eq_fn_hvp = None
+    if original_eq_fn_hvp is not None:
+
+        def eq_fn_hvp(x, tangent):
+            return original_eq_fn_hvp(x, tangent, *args, **kwargs)
+
+    def ineq_fn(x):
+        return problem.ineq_fn(x, *args, **kwargs)
+
+    def ineq_fn_jac(x):
+        return problem.ineq_fn_jac(x, *args, **kwargs)
+
+    original_ineq_fn_hvp = problem.ineq_fn_hvp
+    ineq_fn_hvp = None
+    if original_ineq_fn_hvp is not None:
+
+        def ineq_fn_hvp(x, tangent):
+            return original_ineq_fn_hvp(x, tangent, *args, **kwargs)
+
+    return cast(
+        Problem,
+        Problem(
+            fn=fn,
+            grad=grad,
+            hvp=hvp,
+            eq_fn=eq_fn,
+            ineq_fn=ineq_fn,
+            eq_fn_jac=eq_fn_jac,
+            ineq_fn_jac=ineq_fn_jac,
+            eq_fn_hvp=eq_fn_hvp,
+            ineq_fn_hvp=ineq_fn_hvp,
+            lb=problem.lb,
+            ub=problem.ub,
+            null_lb=problem.null_lb,
+            null_ub=problem.null_ub,
+            n=problem.n,
+            meq=problem.meq,
+            mineq=problem.mineq,
+        ),
+    )

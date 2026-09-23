@@ -10,7 +10,7 @@ from equinox import field
 from jax import Array
 from jaxtyping import PyTree, Shaped
 
-from ..problem import ProblemProtocol
+from ..problem import ProblemProtocol, bind_problem_args
 from .base import AbstractConstrainedMinimiser
 
 __all__ = [
@@ -24,8 +24,9 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
 
     ``optimistix`` threads its own ``state`` object through ``init`` /
     ``step`` / ``terminate`` / ``postprocess``; here that state *is* our
-    constrained-minimiser instance (fused config + state), and ``fn`` /
-    ``args`` are ignored because the problem is carried on the adapter.
+    constrained-minimiser instance (fused config + state), and ``fn`` is
+    ignored because the problem is carried on the adapter. Optimistix's
+    solve-time ``args`` PyTree is bound as one positional problem argument.
     ``init`` receives the raw ``y`` (a
     :data:`~slsqp_jax.sqpdax.types.Vector_n`) and delegates the
     :class:`~slsqp_jax.sqpdax.primal.Primal` / slack construction to
@@ -60,13 +61,20 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         static=True, default=optx.max_norm
     )
 
+    def _problem_with_args(self, args):
+        if args is None:
+            return self.problem
+        return bind_problem_args(self.problem, (args,))
+
     def init(self, fn, y, args, options, f_struct, aux_struct, tags):
         """Delegate to ``inner.init(problem, y, options)``.
 
         Parameters
         ----------
-        fn, args, f_struct, aux_struct, tags
+        fn, f_struct, aux_struct, tags
             Ignored (problem is carried on the adapter).
+        args
+            Optimistix solve-time arguments, bound to the problem callables.
         y
             Decision-variable starting point.
         options
@@ -77,15 +85,17 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         AbstractConstrainedMinimiser
             Initialised inner state.
         """
-        return self.inner.init(self.problem, y, options)
+        return self.inner.init(self._problem_with_args(args), y, options)
 
     def step(self, fn, y, args, options, state, tags):
         """Take one inner step and return ``(y_new, state_new, aux)``.
 
         Parameters
         ----------
-        fn, y, args, options, tags
+        fn, y, options, tags
             Ignored (``y`` is read from ``state.iterate``).
+        args
+            Optimistix solve-time arguments, bound to the problem callables.
         state
             Current inner minimiser instance.
 
@@ -98,7 +108,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         aux
             Always ``None``.
         """
-        new = state.step(self.problem)
+        new = state.step(self._problem_with_args(args))
         return new.iterate.x, new, None
 
     def terminate(self, fn, y, args, options, state, tags):
@@ -116,7 +126,7 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         done, result
             Termination flag and status from the inner minimiser.
         """
-        done, native_result = state.terminate(self.problem)
+        done, native_result = state.terminate(self._problem_with_args(args))
         return done, state.result_adapter.to_optimistix(native_result)
 
     def postprocess(self, fn, y, aux, args, options, state, tags, result):
@@ -138,13 +148,14 @@ class OptimistixMinimiser(optx.AbstractMinimiser):
         value, aux, stats
             Decision vector, aux, and solution stats.
         """
-        _, native_result = state.terminate(self.problem)
+        problem = self._problem_with_args(args)
+        _, native_result = state.terminate(problem)
         native_result = state.result_adapter.result_type.where(
             result == optx.RESULTS.nonlinear_max_steps_reached,
             state.result_adapter.max_steps_reached,
             native_result,
         )
-        sol = state.postprocess(self.problem, native_result)
+        sol = state.postprocess(problem, native_result)
         stats = dict(sol.stats)
         stats["sqpdax_result"] = native_result
         return sol.value, aux, stats
