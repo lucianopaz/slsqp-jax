@@ -64,6 +64,20 @@ def test_dict_constraint_rejects_unknown_type() -> None:
         parse_constraints({"type": "bad", "fun": lambda x: x[0]}, jnp.ones(1))
 
 
+@pytest.mark.parametrize(
+    ("constraint", "missing"),
+    [
+        ({"fun": lambda x: x[0]}, "type"),
+        ({"type": "eq"}, "fun"),
+    ],
+)
+def test_dict_constraint_rejects_missing_required_keys(
+    constraint: dict, missing: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"missing '{missing}'"):
+        parse_constraints(constraint, jnp.ones(1))
+
+
 def test_mixed_tuple_accepts_all_constraint_types() -> None:
     constraints = (
         {"type": "eq", "fun": lambda x: x[0]},
@@ -237,11 +251,48 @@ def test_bounds_reject_wrong_length() -> None:
         _convert_bounds([(0.0, 1.0), (0.0, 1.0)], 1)
 
 
+def test_bounds_reject_nonbroadcastable_bounds_object() -> None:
+    with pytest.raises(ValueError, match="cannot be broadcast to 2 variables"):
+        _convert_bounds(Bounds([0.0, 1.0, 2.0], np.inf), 2)
+
+
+@pytest.mark.parametrize("entry", [None, (0.0,), (0.0, 1.0, 2.0)])
+def test_bounds_reject_malformed_entries(entry) -> None:
+    with pytest.raises(ValueError, match=r"entry 0 must be a \(lower, upper\) pair"):
+        _convert_bounds([entry], 1)
+
+
 def test_constraint_bounds_are_also_validated_at_conversion_boundary() -> None:
     with pytest.raises(ValueError, match="LinearConstraint"):
         parse_constraints(LinearConstraint([[1.0]], 2.0, 1.0), jnp.ones(1))
     with pytest.raises(ValueError, match="NonlinearConstraint"):
         parse_constraints(NonlinearConstraint(lambda x: x, np.nan, 1.0), jnp.ones(1))
+
+
+@pytest.mark.parametrize("constraint_type", ["linear", "nonlinear"])
+def test_constraint_bounds_reject_nonbroadcastable_shapes(
+    constraint_type: str,
+) -> None:
+    if constraint_type == "linear":
+        constraint = LinearConstraint([[1.0], [2.0]], 0.0, np.inf)
+    else:
+        constraint = NonlinearConstraint(
+            lambda x: jnp.array([x[0], 2 * x[0]]), 0.0, np.inf
+        )
+    constraint.lb = np.array([0.0, 1.0, 2.0])
+    with pytest.raises(ValueError, match="cannot be broadcast to 2 rows"):
+        parse_constraints(constraint, jnp.ones(1))
+
+
+@pytest.mark.parametrize("constraints", [1, "eq", object()])
+def test_constraints_reject_unsupported_container_types(constraints) -> None:
+    with pytest.raises(TypeError, match="Unsupported constraints type"):
+        parse_constraints(constraints, jnp.ones(1))
+
+
+def test_constraints_reject_unsupported_members() -> None:
+    with pytest.raises(TypeError, match="Unsupported constraint object type"):
+        parse_constraints([object()], jnp.ones(1))
 
 
 def test_minimize_supports_callable_jac_hessp_and_args() -> None:
