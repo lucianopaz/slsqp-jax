@@ -10,7 +10,12 @@ import pytest
 from jax import Array
 
 from slsqp_jax.sqpdax.primal import Primal
-from slsqp_jax.sqpdax.problem.basic import EvaluatedProblem, Problem, ProblemProtocol
+from slsqp_jax.sqpdax.problem.basic import (
+    EvaluatedProblem,
+    Problem,
+    ProblemProtocol,
+    bind_problem_args,
+)
 from slsqp_jax.sqpdax.types import Aux
 
 
@@ -197,6 +202,39 @@ def test_problem_call_forwards_args_kwargs():
     assert jnp.allclose(evaluated.ineq_fn_jac_val, _ineq_jac(x.x, a, b=3.0))
     assert evaluated.fn_qvp is not None
     assert jnp.allclose(evaluated.fn_qvp(v), _obj_hvp(x.x, v, a, b=3.0))
+
+
+def test_bind_problem_args_binds_all_callables():
+    """The bound adapter exposes argument-free values, derivatives, and HVPs."""
+    problem = _make_problem()
+    a = jnp.asarray(2.0)
+    bound = bind_problem_args(problem, (a,), {"b": 3.0})
+    x = Primal(x=jnp.array([0.5, 0.25]))
+    v = jnp.array([0.25, -0.5])
+
+    expected = problem(x, a, b=3.0)
+    actual = bound(x)
+    assert jnp.allclose(actual.fn_val, expected.fn_val)
+    assert jnp.allclose(actual.grad_val, expected.grad_val)
+    assert jnp.allclose(actual.eq_fn_val, expected.eq_fn_val)
+    assert jnp.allclose(actual.eq_fn_jac_val, expected.eq_fn_jac_val)
+    assert jnp.allclose(actual.ineq_fn_val, expected.ineq_fn_val)
+    assert jnp.allclose(actual.ineq_fn_jac_val, expected.ineq_fn_jac_val)
+    assert eqx.tree_equal(actual.aux_val, expected.aux_val)
+    assert jnp.allclose(bound.fn(x.x)[0], problem.fn(x.x, a, b=3.0)[0])
+    assert jnp.allclose(bound.grad(x.x), problem.grad(x.x, a, b=3.0))
+    assert bound.hvp is not None
+    assert jnp.allclose(bound.hvp(x.x, v), problem.hvp(x.x, v, a, b=3.0))
+    assert jnp.allclose(bound.eq_fn(x.x), problem.eq_fn(x.x, a, b=3.0))
+    assert jnp.allclose(bound.eq_fn_jac(x.x), problem.eq_fn_jac(x.x, a, b=3.0))
+    assert bound.eq_fn_hvp is not None
+    assert jnp.allclose(bound.eq_fn_hvp(x.x, v), problem.eq_fn_hvp(x.x, v, a, b=3.0))
+    assert jnp.allclose(bound.ineq_fn(x.x), problem.ineq_fn(x.x, a, b=3.0))
+    assert jnp.allclose(bound.ineq_fn_jac(x.x), problem.ineq_fn_jac(x.x, a, b=3.0))
+    assert bound.ineq_fn_hvp is not None
+    assert jnp.allclose(
+        bound.ineq_fn_hvp(x.x, v), problem.ineq_fn_hvp(x.x, v, a, b=3.0)
+    )
 
 
 @pytest.mark.parametrize(

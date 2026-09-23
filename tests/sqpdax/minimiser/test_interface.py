@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.minimiser import TrustRegionInteriorPointMinimiser, minimise
+from slsqp_jax.sqpdax.problem import build_problem
 
 from .conftest import (
     ActiveSetLineSearchStub,
@@ -64,6 +65,31 @@ def test_minimise_throw_false_on_budget_exhaustion():
         throw=False,
     )
     assert sol.result == sol.state.result_adapter.max_steps_reached
+
+
+def test_minimise_forwards_problem_args_and_kwargs():
+    """Solve-time arguments are bound before entering the minimiser stack."""
+
+    def objective(x, target, *, scale):
+        return scale * jnp.sum((x - target) ** 2)
+
+    problem = build_problem(
+        objective,
+        n=2,
+        autodiff_mode="jax",
+        force_hvp_in_jax_mode=True,
+    )
+    target = jnp.array([0.25, -0.75])
+    sol = minimise(
+        problem,
+        ActiveSetLineSearchStub(rtol=1e-5, atol=1e-5, min_steps=1),
+        jnp.ones(2),
+        problem_args=(target,),
+        problem_kwargs={"scale": 2.0},
+        max_steps=40,
+    )
+
+    assert jnp.allclose(sol.value, target, atol=1e-4)
 
 
 def test_minimise_throw_true_raises_on_failure():

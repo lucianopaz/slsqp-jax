@@ -9,7 +9,7 @@ import jax
 import optimistix as optx
 from jax import numpy as jnp
 
-from ..problem import ProblemProtocol
+from ..problem import ProblemProtocol, bind_problem_args
 from ..types import Vector_n
 from .base import AbstractConstrainedMinimiser
 
@@ -26,6 +26,8 @@ def minimise(
     max_steps: int = 256,
     throw: bool = True,
     options: dict | None = None,
+    problem_args: tuple[Any, ...] = (),
+    problem_kwargs: dict[str, Any] | None = None,
 ) -> optx.Solution:
     """Owned driver mirroring ``optimistix.minimise`` for the constrained base.
 
@@ -55,6 +57,10 @@ def minimise(
     options
         Optional ``{"minimiser": {...}, "subproblem": {...}}`` bag
         forwarded to :meth:`init`.
+    problem_args
+        Additional positional arguments forwarded to the problem.
+    problem_kwargs
+        Additional keyword arguments forwarded to the problem.
 
     Returns
     -------
@@ -68,6 +74,7 @@ def minimise(
     passed here as configured instances; see the unit tests for a
     minimal end-to-end stub.
     """
+    problem = bind_problem_args(problem, problem_args, problem_kwargs)
     solver = solver.init(problem, x0, options)
 
     def cond(carry):
