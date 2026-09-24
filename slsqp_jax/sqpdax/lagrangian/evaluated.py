@@ -476,7 +476,11 @@ class InteriorPointEvaluatedLagrangian(EvaluatedLagrangian[InteriorPointPrimal])
     barrier
         Barrier evaluation at the current slacks.
     dual_kkt_regularization
-        Nonnegative dual-dual regularization on equality rows.
+        Nonnegative dual-dual regularization ``δ`` on equality rows
+        (``-δ I`` in :meth:`kkt_mvp_dual_dual`). Consumed only by
+        full-space KKT solvers; the composite-step
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.trust_region.TrustRegionInteriorPointSolver`
+        raises when it is non-zero.
     primal_dual
         Select the primal-dual slack-slack KKT block when ``True``.
     """
