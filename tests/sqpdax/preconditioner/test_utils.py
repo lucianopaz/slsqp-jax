@@ -9,9 +9,11 @@ import pytest
 from jax import Array
 from lineax import FunctionLinearOperator, symmetric_tag
 
+from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner
 from slsqp_jax.sqpdax.preconditioner.utils import (
     linear_adjoint,
     preconditioner_from_secant,
+    woodbury_preconditioner,
 )
 from slsqp_jax.sqpdax.secant import LBFGS
 
@@ -107,6 +109,60 @@ def test_preconditioner_from_secant_maps(inverse_as_forward: bool, with_pairs: b
     assert jnp.allclose(prec.pullback(v), prec.pushforward(v))
     assert jnp.allclose(prec.invert_transpose(v), prec.invert(v))
     assert jnp.allclose(prec.invert(prec.pushforward(v)), v, atol=1e-5)
+
+
+def _dense_from_map(fn, n: int, dtype) -> Array:
+    return jax.vmap(fn)(jnp.eye(n, dtype=dtype)).T
+
+
+@pytest.mark.parametrize("mu", [0.05, 1.0])
+@pytest.mark.parametrize("base_kind", ["identity", "lbfgs"])
+def test_woodbury_preconditioner_matches_dense(base_kind: str, mu: float):
+    """``M̃ = M + AᵀA/μ`` and ``M̃⁻¹`` agree with dense algebra; adjoints symmetric."""
+    n = 4
+    dtype = jnp.result_type(float)
+    if base_kind == "identity":
+        base = IdentityPreconditioner(jnp.zeros((n,), dtype))
+    else:
+        secant = _lbfgs_with_pairs(
+            n,
+            [
+                (jnp.array([0.5, -0.2, 0.1, 0.3]), jnp.array([0.4, -0.1, 0.2, 0.25])),
+                (
+                    jnp.array([-0.1, 0.3, -0.2, 0.1]),
+                    jnp.array([-0.05, 0.2, -0.15, 0.08]),
+                ),
+            ],
+        )
+        base = preconditioner_from_secant(
+            secant, n=n, dtype=dtype, inverse_as_forward=False
+        )
+    A = jnp.array([[1.0, 1.0, 0.0, 0.0], [0.0, 1.0, -1.0, 2.0]], dtype)
+    pre = woodbury_preconditioner(base, A, mu)
+
+    M = _dense_from_map(base.pushforward, n, dtype)
+    M_tilde = M + A.T @ A / mu
+    v = jnp.linspace(-1.0, 1.0, n).astype(dtype)
+    # float32-friendly tolerances (the sqpdax suite runs without x64).
+    assert jnp.allclose(pre.pushforward(v), M_tilde @ v, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(
+        pre.invert(v), jnp.linalg.solve(M_tilde, v), rtol=1e-3, atol=1e-4
+    )
+    assert jnp.allclose(pre.invert(pre.pushforward(v)), v, rtol=1e-3, atol=1e-4)
+    assert jnp.allclose(pre.pullback(v), pre.pushforward(v))
+    assert jnp.allclose(pre.invert_transpose(v), pre.invert(v))
+    # Structures are the decision-variable space.
+    assert pre.input_structure.shape == (n,)
+    assert pre.output_structure.shape == (n,)
+    # Jittable (captured arrays are pytree leaves after closure conversion).
+    assert jnp.allclose(eqx.filter_jit(pre.invert)(v), pre.invert(v))
+
+
+def test_woodbury_preconditioner_no_rows_returns_base():
+    """With ``m == 0`` the base preconditioner is returned untouched."""
+    base = IdentityPreconditioner(jnp.zeros((3,)))
+    A = jnp.zeros((0, 3))
+    assert woodbury_preconditioner(base, A, 0.1) is base
 
 
 def test_preconditioner_from_secant_jittable():

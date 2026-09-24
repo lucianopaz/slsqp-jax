@@ -8,15 +8,18 @@ from typing import cast
 import jax
 from jax import Array
 from jax import numpy as jnp
+from jax.scipy.linalg import cho_factor, cho_solve
 from jaxtyping import Float
 from lineax import FunctionLinearOperator, symmetric_tag
 
 from ..secant.base import Secant
-from .base import GenericPreconditioner
+from ..types import Scalar
+from .base import GenericPreconditioner, Preconditioner
 
 __all__ = [
     "linear_adjoint",
     "preconditioner_from_secant",
+    "woodbury_preconditioner",
 ]
 
 
@@ -153,5 +156,85 @@ def preconditioner_from_secant(
             pullback=pullback,
             invert=invert,
             invert_transpose=invert_transpose,
+        ),
+    )
+
+
+def woodbury_preconditioner(
+    base: Preconditioner,
+    A: Float[Array, " m n"],
+    mu: Scalar | float,
+) -> Preconditioner:
+    """Low-rank update ``M̃ = M + (1/μ) Aᵀ A`` with a Woodbury inverse.
+
+    Wraps a symmetric positive-definite ``base`` preconditioner ``M`` (with
+    a cheap ``invert`` ``H = M⁻¹``) into the preconditioner of the
+    stabilised Hessian used by proximal SQP,
+
+    ```
+    M̃ v      = M v + (1/μ) Aᵀ (A v)
+    M̃⁻¹ v    = H v − (H Aᵀ) (μ I + A H Aᵀ)⁻¹ A (H v)
+    ```
+
+    The ``m × m`` matrix ``μ I + A H Aᵀ`` is symmetric positive definite for
+    ``μ > 0`` and is Cholesky-factorised once; ``H Aᵀ`` is formed by applying
+    ``base.invert`` to each row of ``A``. Both maps are symmetric, so the
+    adjoints reuse the same callables.
+
+    Parameters
+    ----------
+    base
+        SPD preconditioner whose ``invert`` is cheap (e.g. the output of
+        :func:`preconditioner_from_secant` with ``inverse_as_forward=False``).
+    A
+        Constraint Jacobian of shape ``(m, n)``.
+    mu
+        Positive proximal parameter ``μ``.
+
+    Returns
+    -------
+    Preconditioner
+        ``base`` unchanged when ``m == 0``; otherwise a
+        :class:`~slsqp_jax.sqpdax.preconditioner.base.GenericPreconditioner`
+        for ``M̃``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner
+    >>> from slsqp_jax.sqpdax.preconditioner.utils import woodbury_preconditioner
+    >>> A = jnp.array([[1.0, 1.0]])
+    >>> pre = woodbury_preconditioner(IdentityPreconditioner(jnp.zeros(2)), A, 0.5)
+    >>> v = jnp.array([1.0, -3.0])
+    >>> bool(jnp.allclose(pre.invert(pre.pushforward(v)), v))
+    True
+    """
+    m, n = A.shape
+    if m == 0:
+        return base
+    dtype = A.dtype
+    mu = jnp.asarray(mu, dtype)
+    # H Aᵀ as an (m, n) array of rows ``H aᵢ`` (H symmetric ⇒ rows of (H Aᵀ)ᵀ).
+    HAt_rows = jax.vmap(base.invert)(A)  # (m, n)
+    S = mu * jnp.eye(m, dtype=dtype) + A @ HAt_rows.T  # μ I + A H Aᵀ, SPD
+    chol = cho_factor(S, lower=True)
+
+    def pushforward(v: Float[Array, " n"]) -> Float[Array, " n"]:
+        return base.pushforward(v) + (A.T @ (A @ v)) / mu
+
+    def invert(v: Float[Array, " n"]) -> Float[Array, " n"]:
+        Hv = base.invert(v)
+        return Hv - HAt_rows.T @ cho_solve(chol, A @ Hv)
+
+    structure = jax.ShapeDtypeStruct(shape=(n,), dtype=dtype)
+    return cast(
+        Preconditioner,
+        GenericPreconditioner(
+            input_structure=structure,
+            output_structure=structure,
+            pushforward=pushforward,
+            pullback=pushforward,
+            invert=invert,
+            invert_transpose=invert,
         ),
     )
