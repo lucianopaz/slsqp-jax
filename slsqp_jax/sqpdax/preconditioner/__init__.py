@@ -13,7 +13,11 @@ from .base import (
     MatrixPreconditioner,
     Preconditioner,
 )
-from .utils import linear_adjoint, preconditioner_from_secant
+from .utils import (
+    linear_adjoint,
+    preconditioner_from_secant,
+    woodbury_preconditioner,
+)
 
 __all__ = [
     "base",
@@ -25,4 +29,5 @@ __all__ = [
     "GenericPreconditioner",
     "linear_adjoint",
     "preconditioner_from_secant",
+    "woodbury_preconditioner",
 ]
