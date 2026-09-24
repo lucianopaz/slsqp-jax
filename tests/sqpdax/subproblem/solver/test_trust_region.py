@@ -109,6 +109,21 @@ def test_active_set_subproblem_raises():
         solver.solve(sub, warm, make_trust_region_state(1.0))
 
 
+@pytest.mark.parametrize("reg", [0.0, 0.1], ids=["unregularised", "regularised"])
+def test_dual_regularised_subproblem_is_rejected(reg: float):
+    """The composite step ignores the dual-dual block, so ``δ > 0`` must raise."""
+    sub = make_scaled_barrier_subproblem(dual_kkt_regularization=reg)
+    solver = TrustRegionInteriorPointSolver()
+    warm = _zero_warm(sub)
+    state = make_trust_region_state(1.0)
+    if reg > 0.0:
+        with pytest.raises(ValueError, match="dual_kkt_regularization"):
+            solver.solve(sub, warm, state)
+    else:
+        (_, _), new_state = solver.solve(sub, warm, state)
+        assert bool(new_state.success)
+
+
 def test_exports_roundtrip():
     """Public re-exports resolve from solver / subproblem / sqpdax packages."""
     from slsqp_jax import sqpdax

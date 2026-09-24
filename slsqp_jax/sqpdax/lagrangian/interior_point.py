@@ -37,8 +37,14 @@ class InteriorPointLagrangian(
     barrier
         Unevaluated barrier (weight / null masks) applied to slacks.
     dual_kkt_regularization
-        Nonnegative dual-dual regularization added to equality rows of the
-        KKT operator (see Nocedal & Wright §19.3).
+        Nonnegative dual-dual regularization ``δ`` added to equality rows of
+        the KKT operator (see Nocedal & Wright §19.3). Together with the
+        ``-δ λ_k`` shift in
+        :meth:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem.kkt_rhs`
+        this yields the proximal row ``Â p - δ (λ - λ_k) = -c``. The block is
+        consumed only by full-space KKT solvers;
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.trust_region.TrustRegionInteriorPointSolver`
+        rejects regularised subproblems because its composite step ignores it.
     primal_dual
         If ``True``, use the primal-dual slack-slack block
         (``Λ S^{-1}`` for the log barrier) instead of the pure primal

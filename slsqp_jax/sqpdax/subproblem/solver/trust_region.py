@@ -151,11 +151,24 @@ class TrustRegionInteriorPointSolver(
         ------
         TypeError
             If ``subproblem`` is not a ``ScaledBarrierSubProblem``.
+        ValueError
+            If ``subproblem.is_kkt_dual_regularized`` is true. The
+            composite-step (Byrd-Omojokun) decomposition solves the
+            unregularised system ``Â p = -ĉ`` and never applies the dual-dual
+            block, so a regularised subproblem would report a ``residual``
+            that disagrees with the computed step.
         """
         if not isinstance(subproblem, ScaledBarrierSubProblem):
             raise TypeError(
                 "subproblem must be a ScaledBarrierSubProblem. Got "
                 f"{type(subproblem)} instead."
+            )
+        if subproblem.is_kkt_dual_regularized:
+            raise ValueError(
+                "TrustRegionInteriorPointSolver solves the unregularised KKT system "
+                "and ignores the dual-dual block; set dual_kkt_regularization=0 on "
+                "the InteriorPointLagrangian (the block is consumed only by "
+                "full-space KKT solvers)."
             )
         lag = subproblem.lagrangian
         n, meq, mineq = lag.n, lag.meq, lag.mineq
