@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Generic, Self, cast
 
 import equinox as eqx
@@ -11,6 +13,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool
 
 from ..active_set import ActiveSet
+from ..active_set_prediction import LPECAPredictor
 from ..barrier.update import _inf_norm
 from ..dual import Dual
 from ..lagrangian import EvaluatedLagrangian, Lagrangian
@@ -30,6 +33,7 @@ from ..subproblem.solver import (
     ActiveSetQPSolverState,
     ActiveSetStateType,
     ProjectedCGSubProblemSolver,
+    SingleExchangeWorkingSetPolicy,
     SubproblemContext,
     SubProblemSolver,
     ThresholdWorkingSetPolicy,
@@ -160,6 +164,22 @@ class ActiveSetLineSearchMinimiser(
         (see :attr:`ActiveSetQPSolver.warm_start`). Off by default: a cold
         start is more robust when the active set changes a lot between
         outer iterations.
+    qp_single_exchange
+        Use the classical one-at-a-time exchange
+        (:class:`~slsqp_jax.sqpdax.subproblem.solver.working_set_policy.SingleExchangeWorkingSetPolicy`)
+        instead of the all-at-once threshold refresh. Slower per QP but
+        immune to inconsistent working sets. Off by default.
+    active_set_predictor
+        :class:`~slsqp_jax.sqpdax.active_set_prediction.LPECAPredictor`
+        seeding the QP working set from the LPEC-A identification test.
+        Disabled by default (``method="expand"``); configure it through
+        ``options['minimiser']['active_set_predictor']``, e.g.
+        ``{"method": "lpeca", "warmup_steps": 2}``. In ``"lpeca"`` mode the
+        working-set policy's EXPAND ramp is forced off.
+    n_lpeca_bypassed, n_lpeca_capped, n_lpeca_bounds_prefixed
+        Cumulative predictor diagnostics: steps whose prediction was
+        discarded (trust gate or warm-up), steps where the rank cap
+        truncated it, and bounds seeded into the working set.
     penalty_floor
         Lower bound on the L1 merit penalty ``ρ``.
     penalty_factor
@@ -186,6 +206,11 @@ class ActiveSetLineSearchMinimiser(
     qp_tol: float | None = eqx.field(static=True, default=None)
     qp_max_iter: int = eqx.field(static=True, default=20)
     qp_warm_start: bool = eqx.field(static=True, default=False)
+    qp_single_exchange: bool = eqx.field(static=True, default=False)
+    # LPEC-A working-set prediction (all-static module; see _parse_options).
+    active_set_predictor: LPECAPredictor = eqx.field(
+        static=True, default_factory=LPECAPredictor
+    )
     # L1-merit penalty schedule: rho = max(penalty_floor, penalty_factor * ||lambda||_inf)
     penalty_floor: float = eqx.field(static=True, default=1.0)
     penalty_factor: float = eqx.field(static=True, default=2.0)
@@ -232,6 +257,31 @@ class ActiveSetLineSearchMinimiser(
     last_ls_success: Bool[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(False)
     )
+    # LPEC-A diagnostics
+    n_lpeca_bypassed: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    n_lpeca_capped: Array = eqx.field(default_factory=lambda: jnp.asarray(0, jnp.int32))
+    n_lpeca_bounds_prefixed: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+
+    def _parse_options(self, options: dict | None) -> Self:
+        """Freeze options and configure ``active_set_predictor`` from a nested mapping.
+
+        ``options['minimiser']['active_set_predictor']`` may be either an
+        :class:`~slsqp_jax.sqpdax.active_set_prediction.LPECAPredictor`
+        (installed as is) or a mapping of its fields, applied on top of the
+        current predictor through
+        :meth:`~slsqp_jax.sqpdax.types.InitializableModule.init`.
+        """
+        base = super()._parse_options(options)
+        spec = base.options.get("minimiser", {}).get("active_set_predictor")
+        if isinstance(spec, Mapping):
+            base = replace(
+                base, active_set_predictor=self.active_set_predictor.init(**spec)
+            )
+        return base
 
     @property
     def result_adapter(self) -> ActiveSetLineSearchResultAdapter:
@@ -353,15 +403,118 @@ class ActiveSetLineSearchMinimiser(
     def _make_working_set_policy(self) -> ThresholdWorkingSetPolicy:
         """Default working-set policy carrying ``qp_tol`` / ``qp_max_iter``.
 
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.working_set_policy.SingleExchangeWorkingSetPolicy`
+        when ``qp_single_exchange`` is set, otherwise the all-at-once
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.working_set_policy.ThresholdWorkingSetPolicy`.
         Further knobs (EXPAND ramp, drop floor, anti-cycling) are applied on
         top through ``options['subproblem']['working_set_policy']``.
         """
+        policy_cls = (
+            SingleExchangeWorkingSetPolicy
+            if self.qp_single_exchange
+            else ThresholdWorkingSetPolicy
+        )
         return cast(
             ThresholdWorkingSetPolicy,
-            ThresholdWorkingSetPolicy(
-                tol=self.effective_qp_tol, max_iter=self.qp_max_iter
+            policy_cls(tol=self.effective_qp_tol, max_iter=self.qp_max_iter),
+        )
+
+    def _configured_qp_solver(
+        self, problem: ProblemProtocol[Primal], dtype: jnp.dtype
+    ) -> ActiveSetQPSolver[Any, ActiveSetStateType]:
+        """Default QP solver with ``options['subproblem']`` applied.
+
+        In ``"lpeca"`` prediction mode the EXPAND ramp of a
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.working_set_policy.ThresholdWorkingSetPolicy`
+        is forced off afterwards (the predicted set replaces the tolerance
+        ramp as the anti-zigzag device), regardless of user options.
+        """
+        solver = self._make_qp_solver(problem, dtype)
+        sub_opts = dict(self.options.get("subproblem", {}))
+        if sub_opts:
+            solver = solver.init(**sub_opts)
+        policy = solver.working_set_policy
+        if self.active_set_predictor.disables_expand and isinstance(
+            policy, ThresholdWorkingSetPolicy
+        ):
+            solver = eqx.tree_at(
+                lambda s: s.working_set_policy,
+                solver,
+                replace(policy, expand_factor=0.0),
+            )
+        return solver
+
+    def _seed_predicted_active_set(self, problem: ProblemProtocol[Primal]) -> Self:
+        """Write the LPEC-A prediction into the carried QP state and count it.
+
+        No-op when the predictor is disabled. Otherwise the Lagrangian is
+        evaluated at the current ``(iterate, dual)``, the predicted set is
+        OR-ed with the carried working set when ``qp_warm_start`` is set
+        (otherwise it replaces it and the carried multipliers are re-synced
+        to ``dual``, so the first KKT solve is warm-started exactly as a cold
+        solve would be), and the ``n_lpeca_*`` counters are advanced.
+        :meth:`_init_subproblem` then forces the solver's ``warm_start`` on so
+        the seed is consumed.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        Self
+            Minimiser with ``solver_state`` seeded and the counters updated.
+        """
+        predictor = self.active_set_predictor
+        if not predictor.enabled:
+            return self
+        dual = cast(Dual, self.dual)
+        state = cast(ActiveSetStateType, self.solver_state)
+        prediction = predictor.predict(
+            self._evaluated_lagrangian(problem), self.step_count
+        )
+        seed = prediction.active_set
+        seed_dual = state.dual
+        if self.qp_warm_start:
+            seed = jax.tree.map(jnp.logical_or, seed, state.active_set)
+        else:
+            seed_dual = dual
+        state = eqx.tree_at(lambda s: (s.active_set, s.dual), state, (seed, seed_dual))
+        return cast(
+            Self,
+            eqx.tree_at(
+                lambda m: (
+                    m.solver_state,
+                    m.n_lpeca_bypassed,
+                    m.n_lpeca_capped,
+                    m.n_lpeca_bounds_prefixed,
+                ),
+                self,
+                (
+                    state,
+                    self.n_lpeca_bypassed + (~prediction.valid).astype(jnp.int32),
+                    self.n_lpeca_capped + prediction.capped.astype(jnp.int32),
+                    self.n_lpeca_bounds_prefixed + prediction.n_bounds_prefixed,
+                ),
             ),
         )
+
+    def step(self, problem: ProblemProtocol[Primal]) -> Self:
+        """Seed the QP carry from the LPEC-A prediction, then run the shared step.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        Self
+            Updated minimiser after the controlled step.
+        """
+        seeded = self._seed_predicted_active_set(problem)
+        return CommonMinimiser.step(seeded, problem)
 
     def _init_subproblem(
         self, problem: ProblemProtocol[Primal]
@@ -371,7 +524,8 @@ class ActiveSetLineSearchMinimiser(
         The Lagrangian is evaluated at a *zero* dual so the QP recovers the
         full multiplier ``λ_{k+1}``. The subproblem's own working set is
         empty; the QP solver builds its initial set from the current point
-        (and from the carried state when ``qp_warm_start`` is set).
+        and from the carried state when ``qp_warm_start`` is set or the
+        LPEC-A predictor has seeded it (see :meth:`_seed_predicted_active_set`).
         """
         iterate = cast(Primal, self.iterate)
         dual = cast(Dual, self.dual)
@@ -381,10 +535,9 @@ class ActiveSetLineSearchMinimiser(
         # Zero-dual eval => QP returns the *full* multiplier lambda_{k+1}.
         qp_lag = lag_module(iterate, self._init_dual(problem))
 
-        solver = self._make_qp_solver(problem, dtype)
-        sub_opts = dict(self.options.get("subproblem", {}))
-        if sub_opts:
-            solver = solver.init(**sub_opts)
+        solver = self._configured_qp_solver(problem, dtype)
+        if self.active_set_predictor.enabled:
+            solver = solver.init(warm_start=True)
         return cast(
             SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
             SubproblemContext(
@@ -777,6 +930,9 @@ class ActiveSetLineSearchMinimiser(
             "qp_result": solver_state.qp_result,
             "qp_final_working_tol": solver_state.final_working_tol,
             "n_qp_anti_cycling": solver_state.n_anti_cycling,
+            "n_lpeca_bypassed": self.n_lpeca_bypassed,
+            "n_lpeca_capped": self.n_lpeca_capped,
+            "n_lpeca_bounds_prefixed": self.n_lpeca_bounds_prefixed,
             "last_step_size": self.last_step_size,
             "steps_without_improvement": self.steps_without_improvement,
             "blowup_count": self.blowup_count,
