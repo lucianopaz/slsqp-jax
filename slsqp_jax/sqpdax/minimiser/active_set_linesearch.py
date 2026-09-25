@@ -24,6 +24,7 @@ from ..results import (
 from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
+    ACTIVE_SET_QP_RESULTS,
     RESULTS,
     ActiveSetQPSolver,
     ActiveSetQPSolverState,
@@ -148,8 +149,16 @@ class ActiveSetLineSearchMinimiser(
     ----------
     qp_tol
         Fixed add/drop threshold for the active-set QP working-set update.
+        ``None`` (default) uses the outer feasibility tolerance ``atol`` so
+        the QP declares a constraint active / violated on the same scale at
+        which the outer loop declares the iterate feasible.
     qp_max_iter
-        Maximum outer working-set iterations of the QP solver.
+        Maximum working-set iterations per QP solve.
+    qp_warm_start
+        Seed each QP with the previous QP's working set and multipliers
+        (see :attr:`ActiveSetQPSolver.warm_start`). Off by default: a cold
+        start is more robust when the active set changes a lot between
+        outer iterations.
     penalty_floor
         Lower bound on the L1 merit penalty ``ρ``.
     penalty_factor
@@ -173,8 +182,9 @@ class ActiveSetLineSearchMinimiser(
     """
 
     # QP inner solve
-    qp_tol: float = eqx.field(static=True, default=1e-8)
+    qp_tol: float | None = eqx.field(static=True, default=None)
     qp_max_iter: int = eqx.field(static=True, default=20)
+    qp_warm_start: bool = eqx.field(static=True, default=False)
     # L1-merit penalty schedule: rho = max(penalty_floor, penalty_factor * ||lambda||_inf)
     penalty_floor: float = eqx.field(static=True, default=1.0)
     penalty_factor: float = eqx.field(static=True, default=2.0)
@@ -260,6 +270,23 @@ class ActiveSetLineSearchMinimiser(
         """Root solver class for ``options['subproblem']`` validation."""
         return ActiveSetQPSolver
 
+    @property
+    def effective_qp_tol(self) -> float:
+        """Working-set tolerance handed to the QP solver (``qp_tol`` or ``atol``)."""
+        return self.atol if self.qp_tol is None else self.qp_tol
+
+    def _empty_active_set(self, problem: ProblemProtocol[Primal]) -> ActiveSet:
+        """All-inactive working set sized for ``problem``."""
+        return cast(
+            ActiveSet,
+            ActiveSet(
+                meq=problem.meq,
+                active_inequalities=jnp.zeros((problem.mineq,), bool),
+                active_lb=jnp.zeros((problem.n,), bool),
+                active_ub=jnp.zeros((problem.n,), bool),
+            ),
+        )
+
     def _init_solver_state(
         self, problem: ProblemProtocol[Primal], primal: Primal
     ) -> ActiveSetStateType:
@@ -273,8 +300,13 @@ class ActiveSetLineSearchMinimiser(
             ActiveSetQPSolverState(
                 n_iter=jnp.asarray(0, jnp.int32),
                 n_cg_iter=jnp.asarray(0, jnp.int32),
+                last_n_iter=jnp.asarray(0, jnp.int32),
+                last_n_cg_iter=jnp.asarray(0, jnp.int32),
                 success=jnp.asarray(False),
                 status=RESULTS.successful,
+                qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
+                active_set=self._empty_active_set(problem),
+                dual=self._init_dual(problem),
             ),
         )
 
@@ -310,8 +342,9 @@ class ActiveSetLineSearchMinimiser(
             ActiveSetQPSolver[Any, ActiveSetStateType],
             ActiveSetQPSolver(
                 subproblem_solver=ProjectedCGSubProblemSolver(),
-                tol=self.qp_tol,
+                tol=self.effective_qp_tol,
                 max_iter=self.qp_max_iter,
+                warm_start=self.qp_warm_start,
             ),
         )
 
@@ -321,11 +354,13 @@ class ActiveSetLineSearchMinimiser(
         """Build an active-set QP context at the current iterate.
 
         The Lagrangian is evaluated at a *zero* dual so the QP recovers the
-        full multiplier ``λ_{k+1}``. The working set starts empty (cold).
+        full multiplier ``λ_{k+1}``. The subproblem's own working set is
+        empty; the QP solver builds its initial set from the current point
+        (and from the carried state when ``qp_warm_start`` is set).
         """
         iterate = cast(Primal, self.iterate)
         dual = cast(Dual, self.dual)
-        n, meq, mineq = problem.n, problem.meq, problem.mineq
+        n = problem.n
         dtype = iterate.x.dtype
         lag_module = self._lagrangian_module(problem)
         # Zero-dual eval => QP returns the *full* multiplier lambda_{k+1}.
@@ -335,18 +370,12 @@ class ActiveSetLineSearchMinimiser(
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
-        empty_active = ActiveSet(
-            meq=meq,
-            active_inequalities=jnp.zeros((mineq,), bool),
-            active_lb=jnp.zeros((n,), bool),
-            active_ub=jnp.zeros((n,), bool),
-        )
         return cast(
             SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
             SubproblemContext(
                 problem=problem,
                 lagrangian=lag_module,
-                subproblem=ActiveSetSubProblem(qp_lag, empty_active),
+                subproblem=ActiveSetSubProblem(qp_lag, self._empty_active_set(problem)),
                 solver=solver,
                 warm=(Primal(jnp.zeros((n,), dtype)), dual),
                 state=cast(ActiveSetStateType, self.solver_state),
@@ -451,10 +480,14 @@ class ActiveSetLineSearchMinimiser(
         # A non-finite QP direction is rejected by the line search without
         # moving; it can never become a useful step, so count it as a real QP
         # failure regardless of feasibility (the solver itself reports it as
-        # ``max_steps_reached`` because a NaN residual never converges).
+        # ``max_iter_reached`` because a NaN residual never converges). Budget
+        # exhaustion — of the working-set loop or of the inner CG — is *not*
+        # a failure: the partial step is still usable and the next outer
+        # iterate refreshes the set. Only a structural KKT failure (singular /
+        # breakdown) counts.
         qp_nonfinite = ~jnp.isfinite(result.proposed_step_norm)
         qp_real_failure = (
-            ~solver_state.success
+            (solver_state.qp_result == ACTIVE_SET_QP_RESULTS.kkt_solver_failure)
             & (solver_state.status != RESULTS.max_steps_reached)
             & feasible
         ) | qp_nonfinite
@@ -505,10 +538,37 @@ class ActiveSetLineSearchMinimiser(
             ),
             is_leaf=lambda z: z is None,
         )
+        rolled_dual = cast(
+            Dual,
+            jax.tree.map(
+                lambda best, current: jnp.where(iterate_blowup, best, current),
+                new_best_dual,
+                cast(Dual, updated.dual),
+            ),
+        )
+        # After a rollback the carried QP working set / multipliers describe
+        # the abandoned iterate: drop the set (the next solve falls back to a
+        # cold start) and re-sync the multipliers to the restored dual.
+        rolled_state = cast(ActiveSetStateType, updated.solver_state)
+        rolled_state = eqx.tree_at(
+            lambda s: (s.active_set, s.dual),
+            rolled_state,
+            (
+                jax.tree.map(
+                    lambda mask: jnp.where(iterate_blowup, False, mask),
+                    rolled_state.active_set,
+                ),
+                jax.tree.map(
+                    lambda best, current: jnp.where(iterate_blowup, best, current),
+                    rolled_dual,
+                    rolled_state.dual,
+                ),
+            ),
+        )
         return cast(
             Self,
             eqx.tree_at(
-                lambda m: (m.iterate, m.dual),
+                lambda m: (m.iterate, m.dual, m.solver_state),
                 updated,
                 (
                     jax.tree.map(
@@ -516,11 +576,8 @@ class ActiveSetLineSearchMinimiser(
                         new_best_iterate,
                         cast(Primal, updated.iterate),
                     ),
-                    jax.tree.map(
-                        lambda best, current: jnp.where(iterate_blowup, best, current),
-                        new_best_dual,
-                        cast(Dual, updated.dual),
-                    ),
+                    rolled_dual,
+                    rolled_state,
                 ),
             ),
         )
@@ -697,9 +754,12 @@ class ActiveSetLineSearchMinimiser(
             "multipliers_ineq": dual.ineq_multipliers,
             "multipliers_lb": dual.lb_multipliers,
             "multipliers_ub": dual.ub_multipliers,
-            "qp_iterations": solver_state.n_iter,
-            "qp_cg_iterations": solver_state.n_cg_iter,
+            "qp_iterations": solver_state.last_n_iter,
+            "qp_cg_iterations": solver_state.last_n_cg_iter,
+            "total_qp_iterations": solver_state.n_iter,
+            "total_qp_cg_iterations": solver_state.n_cg_iter,
             "last_qp_converged": solver_state.success,
+            "qp_result": solver_state.qp_result,
             "last_step_size": self.last_step_size,
             "steps_without_improvement": self.steps_without_improvement,
             "blowup_count": self.blowup_count,

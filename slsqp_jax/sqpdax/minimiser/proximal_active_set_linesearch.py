@@ -16,6 +16,7 @@ from ..problem import ProblemProtocol
 from ..step_controller import StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
+    ACTIVE_SET_QP_RESULTS,
     RESULTS,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
@@ -112,8 +113,9 @@ class ProximalActiveSetLineSearchMinimiser(
                 subproblem_solver=ProjectedCGSubProblemSolver(
                     preconditioner=preconditioner
                 ),
-                tol=self.qp_tol,
+                tol=self.effective_qp_tol,
                 max_iter=self.qp_max_iter,
+                warm_start=self.qp_warm_start,
             ),
         )
 
@@ -128,8 +130,13 @@ class ProximalActiveSetLineSearchMinimiser(
             ProximalActiveSetQPSolverState(
                 n_iter=jnp.asarray(0, jnp.int32),
                 n_cg_iter=jnp.asarray(0, jnp.int32),
+                last_n_iter=jnp.asarray(0, jnp.int32),
+                last_n_cg_iter=jnp.asarray(0, jnp.int32),
                 success=jnp.asarray(False),
                 status=RESULTS.successful,
+                qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
+                active_set=self._empty_active_set(problem),
+                dual=self._init_dual(problem),
                 kkt_residual=jnp.asarray(jnp.inf, dtype),
                 mu=jnp.asarray(solver.mu_max, dtype),
                 eq_center=jnp.zeros((problem.meq,), dtype),

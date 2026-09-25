@@ -5,16 +5,21 @@ from __future__ import annotations
 from dataclasses import replace
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import pytest
 
-from slsqp_jax.sqpdax.minimiser import ActiveSetLineSearchMinimiser, minimise
+from slsqp_jax.sqpdax.minimiser import (
+    ActiveSetLineSearchMinimiser,
+    ProximalActiveSetLineSearchMinimiser,
+    minimise,
+)
 from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
     ACTIVE_SET_LINE_SEARCH_RESULTS,
 )
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.step_controller import StepResult
-from slsqp_jax.sqpdax.subproblem.solver import RESULTS
+from slsqp_jax.sqpdax.subproblem.solver import ACTIVE_SET_QP_RESULTS, RESULTS
 
 from .conftest import make_equality_quadratic, make_unconstrained_quadratic
 
@@ -76,6 +81,40 @@ def test_init_accepts_option_bag(options):
         # Exercise the ``subproblem`` option path inside ``_init_subproblem``.
         solver = solver.step(problem)
         assert int(solver.step_count) == 1
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+@pytest.mark.parametrize(
+    ("qp_tol", "atol", "expected_tol"),
+    [(None, 1e-4, 1e-4), (1e-7, 1e-4, 1e-7)],
+    ids=["routed-from-atol", "explicit"],
+)
+@pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
+def test_qp_solver_receives_tolerance_and_warm_start_flag(
+    minimiser_cls, qp_tol, atol, expected_tol, qp_warm_start
+):
+    """``qp_tol=None`` falls back to ``atol``; ``qp_warm_start`` reaches the solver."""
+    problem = make_equality_quadratic()
+    solver = minimiser_cls(
+        qp_tol=qp_tol, atol=atol, qp_warm_start=qp_warm_start, min_steps=1
+    ).init(problem, jnp.zeros(2))
+    assert solver.effective_qp_tol == expected_tol
+    ctx = solver._init_subproblem(problem)
+    assert ctx.solver.tol == expected_tol
+    assert ctx.solver.warm_start is qp_warm_start
+    # The carried working set / dual are sized for the problem and cold.
+    state = solver.solver_state
+    assert state.active_set.active_lb.shape == (2,)
+    assert not jnp.any(state.active_set.active_lb)
+    assert state.dual.eq_multipliers.shape == (1,)
+    # A full step still runs end-to-end with the carry threaded through.
+    stepped = solver.step(problem)
+    assert int(stepped.solver_state.last_n_iter) >= 1
+    assert int(stepped.solver_state.n_iter) == int(stepped.solver_state.last_n_iter)
 
 
 def test_guarded_qp_kkt_success_after_repeated_full_zero_steps():
@@ -146,10 +185,19 @@ def _execute_synthetic_step(
 ):
     """Exercise phase four with a controlled line-search/QP outcome."""
     ctx = solver._init_subproblem(problem)
+    qp_result = ACTIVE_SET_QP_RESULTS.where(
+        jnp.asarray(qp_success),
+        ACTIVE_SET_QP_RESULTS.working_set_converged,
+        ACTIVE_SET_QP_RESULTS.where(
+            qp_status == RESULTS.max_steps_reached,
+            ACTIVE_SET_QP_RESULTS.max_iter_reached,
+            ACTIVE_SET_QP_RESULTS.kkt_solver_failure,
+        ),
+    )
     state = eqx.tree_at(
-        lambda s: (s.success, s.status),
+        lambda s: (s.success, s.status, s.qp_result),
         solver.solver_state,
-        (jnp.asarray(qp_success), qp_status),
+        (jnp.asarray(qp_success), qp_status, qp_result),
     )
     result = StepResult(
         x=Primal(jnp.asarray(x)),
@@ -283,6 +331,16 @@ def test_merit_blowup_restores_best_iterate(bad_merit):
         stagnation_patience=100,
     ).init(problem, jnp.ones(2))
     best_x = solver.iterate.x
+    best_dual = solver.dual
+    # Pretend the (abandoned) QPs left a non-trivial working set / dual behind.
+    solver = eqx.tree_at(
+        lambda m: (m.solver_state.active_set.active_lb, m.solver_state.dual),
+        solver,
+        (
+            jnp.array([True, False]),
+            jax.tree.map(lambda leaf: leaf + 5.0, best_dual),
+        ),
+    )
     for _ in range(2):
         solver = _execute_synthetic_step(
             solver,
@@ -297,6 +355,12 @@ def test_merit_blowup_restores_best_iterate(bad_merit):
     assert bool(done)
     assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.iterate_blowup)
     assert jnp.allclose(solver.iterate.x, best_x)
+    # The rollback also drops the carried QP working set and re-syncs its dual.
+    assert not jnp.any(solver.solver_state.active_set.active_lb)
+    for carried, best in zip(
+        jax.tree.leaves(solver.solver_state.dual), jax.tree.leaves(best_dual)
+    ):
+        assert jnp.array_equal(carried, best)
 
 
 def test_tiny_line_search_step_cannot_trigger_qp_kkt_success():
@@ -347,12 +411,21 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         "multipliers_ub",
         "qp_iterations",
         "qp_cg_iterations",
+        "total_qp_iterations",
+        "total_qp_cg_iterations",
+        "qp_result",
         "last_step_size",
         "consecutive_qp_failures",
         "consecutive_ls_failures",
         "sqpdax_result",
     }
     assert expected <= set(sol.stats)
+    # Per-QP counts never exceed the totals over the nonlinear solve.
+    assert 0 < int(sol.stats["qp_iterations"]) <= int(sol.stats["total_qp_iterations"])
+    assert int(sol.stats["qp_cg_iterations"]) <= int(
+        sol.stats["total_qp_cg_iterations"]
+    )
+    assert bool(sol.stats["qp_result"] == ACTIVE_SET_QP_RESULTS.working_set_converged)
     metrics = sol.state.termination_metrics(sol.state._optimisation_context(problem))
     assert float(sol.stats["kkt_ratio"]) == pytest.approx(
         float(metrics.stationarity) / float(sol.stats["kkt_scale"])
