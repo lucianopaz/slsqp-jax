@@ -440,16 +440,17 @@ class ActiveSetLineSearchMinimiser(
         zero_steps = jnp.where(zero_step, self.consecutive_zero_steps + 1, 0)
         qp_optimal = zero_steps >= self.zero_step_patience
 
+        # A non-finite QP direction is rejected by the line search without
+        # moving; it can never become a useful step, so count it as a real QP
+        # failure regardless of feasibility (the solver itself reports it as
+        # ``max_steps_reached`` because a NaN residual never converges).
+        qp_nonfinite = ~jnp.isfinite(result.proposed_step_norm)
         qp_real_failure = (
             ~solver_state.success
             & (solver_state.status != RESULTS.max_steps_reached)
             & feasible
-        )
-        qp_failures = jnp.where(
-            solver_state.success,
-            0,
-            jnp.where(qp_real_failure, self.consecutive_qp_failures + 1, 0),
-        )
+        ) | qp_nonfinite
+        qp_failures = jnp.where(qp_real_failure, self.consecutive_qp_failures + 1, 0)
         ls_failures = jnp.where(
             result.accepted,
             0,

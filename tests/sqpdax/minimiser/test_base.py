@@ -5,12 +5,18 @@ from __future__ import annotations
 import warnings
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import pytest
 
-from slsqp_jax.sqpdax.minimiser import OptimisationContext
+from slsqp_jax.sqpdax.minimiser import (
+    ActiveSetLineSearchMinimiser,
+    OptimisationContext,
+    TrustRegionInteriorPointMinimiser,
+)
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.registry import FrozenDict
+from slsqp_jax.sqpdax.step_controller import StepResult
 from tests.sqpdax.lagrangian.conftest import make_problem
 from tests.sqpdax.subproblem.solver.conftest import unbounded_box
 
@@ -159,6 +165,45 @@ def test_nested_subproblem_option_validation_warns():
         )
     messages = " ".join(str(w.message) for w in caught)
     assert "unknown subproblem option 'not_a_pcg_field'" in messages
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, TrustRegionInteriorPointMinimiser],
+    ids=["active-set", "interior-point"],
+)
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+@pytest.mark.parametrize("fill", [1.0, jnp.nan], ids=["finite", "nan"])
+def test_execute_step_commits_dual_iff_finite(minimiser_cls, accepted, fill):
+    """The multiplier estimate is committed iff finite, whatever the primal did.
+
+    The estimate is a function of the current iterate, so a rejected primal
+    step still refreshes ``λ`` (this is how a wrong dual is corrected at a
+    primal-stationary point). A non-finite proposal, however, must never
+    leak in: it would make the next termination check report ``nonfinite``
+    even though the iterate never moved.
+    """
+    problem = make_problem(n=2, meq=1, mineq=2, with_curvature=True)
+    solver = minimiser_cls().init(problem, jnp.asarray([0.5, 0.5]))
+    ctx = solver._init_subproblem(problem)
+    old_dual = solver.dual
+    step_dual = jax.tree.map(lambda d: d + fill, old_dual)
+    result = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(0.0),
+        solver_state=solver.solver_state,
+        step_size=jnp.asarray(1.0 if accepted else 0.0),
+        proposed_step_norm=jnp.asarray(1.0),
+    )
+
+    advanced = solver._execute_step(ctx, step_dual, result)
+
+    expected = step_dual if jnp.isfinite(fill) else old_dual
+    for got, want in zip(jax.tree.leaves(advanced.dual), jax.tree.leaves(expected)):
+        assert jnp.array_equal(got, want)
+    assert all(jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(advanced.dual))
+    assert int(advanced.step_count) == 1
 
 
 def test_step_updates_secant_on_inexact_problem():

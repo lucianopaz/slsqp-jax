@@ -9,6 +9,7 @@ from dataclasses import fields, replace
 from typing import Any, Generic, Self, cast, get_origin, get_type_hints
 
 import equinox as eqx
+import jax
 import optimistix as optx
 from equinox import Module
 from jax import numpy as jnp
@@ -717,12 +718,23 @@ class CommonMinimiser(
     ) -> Self:
         """Commit the controlled step and refresh secant / dynamics.
 
+        The multiplier estimate ``step_dual`` is a function of the *current*
+        iterate (a KKT / least-squares / proximal-point estimate), so it is
+        committed independently of whether the primal step was accepted —
+        this is what lets the interior-point and proximal loops correct a
+        wrong ``λ`` at a primal-stationary point through rejected steps. The
+        only exception is a non-finite estimate (e.g. from a NaN subproblem
+        direction, which the step controller refuses): committing it would
+        make the next termination check report ``nonfinite`` even though the
+        iterate never moved, so the previous multipliers are kept instead and
+        the failure is left to the subproblem-failure counters.
+
         Parameters
         ----------
         ctx
             Per-step subproblem context (provides the unevaluated Lagrangian).
         step_dual
-            Multipliers committed with the new iterate.
+            Multipliers proposed by the subproblem; committed when finite.
         result
             Outcome of :meth:`_assess_direction`.
 
@@ -732,7 +744,20 @@ class CommonMinimiser(
             Minimiser after :meth:`_advance_dynamics`.
         """
         x_new = result.x
-        new_secant = self._update_secant(ctx.lagrangian, x_new, step_dual)
+        dual_finite = jnp.all(
+            jnp.stack(
+                [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(step_dual)]
+            )
+        )
+        committed_dual = cast(
+            Dual,
+            jax.tree.map(
+                lambda new, old: jnp.where(dual_finite, new, old),
+                step_dual,
+                cast(Dual, self.dual),
+            ),
+        )
+        new_secant = self._update_secant(ctx.lagrangian, x_new, committed_dual)
         advanced = cast(
             Self,
             eqx.tree_at(
@@ -740,7 +765,7 @@ class CommonMinimiser(
                 self,
                 (
                     x_new,
-                    step_dual,
+                    committed_dual,
                     new_secant,
                     result.solver_state,
                     self.step_count + 1,
@@ -748,7 +773,7 @@ class CommonMinimiser(
                 is_leaf=lambda z: z is None,
             ),
         )
-        return advanced._advance_dynamics(ctx, result, step_dual)
+        return advanced._advance_dynamics(ctx, result, committed_dual)
 
     def _update_secant(
         self,
@@ -765,7 +790,8 @@ class CommonMinimiser(
         x_new
             Accepted (or retained) primal after the controlled step.
         step_dual
-            Multipliers shared at both secant endpoints (N&W §18.3).
+            Multipliers shared at both secant endpoints (N&W §18.3); the
+            committed dual (the previous one if the proposal was non-finite).
 
         Returns
         -------
@@ -809,7 +835,8 @@ class CommonMinimiser(
             iterate ``result.x``, the acceptance flag, and the refreshed
             solver carry.
         step_dual
-            New multipliers.
+            Committed multipliers: the subproblem's estimate when finite, the
+            previous ones otherwise.
 
         Returns
         -------

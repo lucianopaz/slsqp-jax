@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import jax
 import jax.numpy as jnp
 import pytest
 
+from slsqp_jax.sqpdax.merit import NormMerit
 from slsqp_jax.sqpdax.primal import Primal
-from slsqp_jax.sqpdax.step_controller import LineSearchState
+from slsqp_jax.sqpdax.step_controller import ArmijoLineSearch, LineSearchState
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS, SubProblemSolverState
+from tests.sqpdax.lagrangian.conftest import obj
 
-from .conftest import make_armijo
+from .conftest import make_armijo, make_unconstrained_quadratic
 
 
 def test_line_search_state_x_scales_step():
@@ -87,8 +92,11 @@ def test_armijo_step_acceptance(
         (Primal(jnp.ones(2)), Primal(jnp.ones(2)), 20),
         # Zero budget: the search loop never runs a single trial.
         (Primal(jnp.ones(2)), Primal(-jnp.ones(2)), 0),
+        # Non-finite directions are rejected up front.
+        (Primal(jnp.ones(2)), Primal(jnp.array([jnp.nan, -1.0])), 20),
+        (Primal(jnp.ones(2)), Primal(jnp.array([-1.0, -jnp.inf])), 20),
     ],
-    ids=["ascent", "zero-budget"],
+    ids=["ascent", "zero-budget", "nan-direction", "inf-direction"],
 )
 def test_armijo_rejection_retains_x0(x0, direction, max_steps):
     """A rejected search returns ``x0`` and the merit *at* ``x0``.
@@ -96,7 +104,8 @@ def test_armijo_rejection_retains_x0(x0, direction, max_steps):
     This is the :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`
     contract the outer loop relies on: ``_execute_step`` commits ``result.x``
     unconditionally, so a rejected step must not move the iterate, and
-    ``merit_val`` must describe the point actually returned.
+    ``merit_val`` must describe the point actually returned. This holds for
+    a non-finite direction as well, whose merit at every trial would be NaN.
     """
     ls = make_armijo(max_steps=max_steps)
     carry = SubProblemSolverState(
@@ -114,6 +123,58 @@ def test_armijo_rejection_retains_x0(x0, direction, max_steps):
     # The subproblem carry is threaded through by value.
     assert int(result.solver_state.n_iter) == 3
     assert bool(result.solver_state.success)
+    assert jnp.all(jnp.isfinite(result.x.x))
+    assert jnp.isfinite(result.merit_val)
+
+
+def _counting_armijo(*, max_steps: int):
+    """Armijo search whose merit records every evaluation at run time."""
+    calls: list[int] = []
+
+    def counting_obj(x):
+        jax.debug.callback(lambda: calls.append(1))
+        return obj(x)
+
+    problem = replace(make_unconstrained_quadratic(), fn=counting_obj)
+    ls = ArmijoLineSearch(
+        merit=NormMerit(problem=problem),
+        max_steps=max_steps,
+        backtrack=jnp.asarray(0.5),
+    )
+    return ls, calls
+
+
+def _merit_evaluations(ls, calls, x0, direction) -> int:
+    """Run one search and return the number of merit evaluations it made."""
+    calls.clear()
+    result = ls.step(x0, direction)
+    jax.effects_barrier()
+    assert not bool(result.accepted)
+    return len(calls)
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [jnp.array([jnp.nan, -1.0]), jnp.array([-jnp.inf, -1.0])],
+    ids=["nan", "inf"],
+)
+def test_nonfinite_direction_skips_trial_evaluations(direction):
+    """A non-finite direction exits before a single trial merit is evaluated.
+
+    The number of merit calls equals that of a zero-budget search on a finite
+    direction (only the ``x0`` evaluation), whereas an ascent direction on
+    the same budget burns every trial.
+    """
+    x0 = Primal(jnp.ones(2))
+    ls, calls = _counting_armijo(max_steps=8)
+    baseline_ls, baseline_calls = _counting_armijo(max_steps=0)
+
+    baseline = _merit_evaluations(baseline_ls, baseline_calls, x0, Primal(-x0.x))
+    nonfinite = _merit_evaluations(ls, calls, x0, Primal(direction))
+    ascent = _merit_evaluations(ls, calls, x0, Primal(x0.x))
+
+    assert nonfinite == baseline
+    assert ascent == baseline + ls.max_steps
 
 
 def test_armijo_small_alpha_decrease_fallback():
