@@ -10,6 +10,7 @@ from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
+    ACTIVE_SET_QP_RESULTS,
     RESULTS,
     ActiveSetQPSolverState,
     DogLegSolverState,
@@ -98,19 +99,43 @@ def make_steihaug_state(
     )
 
 
-def make_active_set_qp_state() -> ActiveSetQPSolverState:
-    """Cold :class:`ActiveSetQPSolverState`."""
-    return ActiveSetQPSolverState(
+def make_empty_active_set(n: int = 2, meq: int = 0, mineq: int = 0) -> ActiveSet:
+    """All-inactive :class:`ActiveSet` for the given sizes."""
+    return ActiveSet(
+        meq=meq,
+        active_inequalities=jnp.zeros((mineq,), bool),
+        active_lb=jnp.zeros((n,), bool),
+        active_ub=jnp.zeros((n,), bool),
+    )
+
+
+def _cold_active_set_fields(n: int, meq: int, mineq: int) -> dict:
+    """Shared cold fields of the active-set QP carries."""
+    return dict(
         n_iter=jnp.zeros((), jnp.int32),
         success=jnp.asarray(False),
         status=RESULTS.successful,
         n_cg_iter=jnp.zeros((), jnp.int32),
+        last_n_iter=jnp.zeros((), jnp.int32),
+        last_n_cg_iter=jnp.zeros((), jnp.int32),
+        qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
+        active_set=make_empty_active_set(n, meq, mineq),
+        dual=make_zero_dual(n, meq, mineq),
     )
+
+
+def make_active_set_qp_state(
+    n: int = 2, meq: int = 0, mineq: int = 0
+) -> ActiveSetQPSolverState:
+    """Cold :class:`ActiveSetQPSolverState` sized for ``(n, meq, mineq)``."""
+    return ActiveSetQPSolverState(**_cold_active_set_fields(n, meq, mineq))
 
 
 def make_proximal_state(
     meq: int,
     *,
+    n: int = 2,
+    mineq: int = 0,
     kkt_residual: float | Array = jnp.inf,
     eq_center: Array | None = None,
 ) -> ProximalActiveSetQPSolverState:
@@ -118,10 +143,7 @@ def make_proximal_state(
     if eq_center is None:
         eq_center = jnp.zeros((meq,))
     return ProximalActiveSetQPSolverState(
-        n_iter=jnp.zeros((), jnp.int32),
-        success=jnp.asarray(False),
-        status=RESULTS.successful,
-        n_cg_iter=jnp.zeros((), jnp.int32),
+        **_cold_active_set_fields(n, meq, mineq),
         kkt_residual=jnp.asarray(kkt_residual, dtype=float),
         mu=jnp.asarray(0.0),
         eq_center=jnp.asarray(eq_center),

@@ -78,6 +78,7 @@ from .step_controller import (
     TrustRegionManager,
 )
 from .subproblem import (
+    ACTIVE_SET_QP_RESULTS,
     RESULTS,
     ActiveSetQPSolver,
     ActiveSetQPSolverState,
@@ -186,6 +187,7 @@ __all__ = [
     "SubProblemSolverStateType",
     "SubProblemSolver",
     "SubproblemContext",
+    "ACTIVE_SET_QP_RESULTS",
     "ActiveSetQPSolverState",
     "ActiveSetQPSolver",
     "DogLegSolverState",

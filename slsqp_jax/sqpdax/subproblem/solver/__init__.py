@@ -29,6 +29,7 @@ from . import (
     trust_region,
 )
 from .active_set_loop import (
+    ACTIVE_SET_QP_RESULTS,
     ActiveSetQPSolver,
     ActiveSetQPSolverState,
     ActiveSetStateType,
@@ -72,6 +73,7 @@ __all__ = [
     "SubProblemSolverStateType",
     "SubProblemSolver",
     "SubproblemContext",
+    "ACTIVE_SET_QP_RESULTS",
     "ActiveSetQPSolverState",
     "ActiveSetStateType",
     "KKTSolverStateType",
