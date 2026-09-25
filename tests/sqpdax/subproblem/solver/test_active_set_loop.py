@@ -14,8 +14,10 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ActiveSetQPSolver,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
+    SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
 )
+from tests.sqpdax.conftest import make_shifted_box_quadratic
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.subproblem.conftest import make_zero_dual
 
@@ -251,3 +253,48 @@ def test_anti_cycling_guard_stops_a_cycling_working_set(
         assert not jnp.any(state.active_set.active_lb)
         _, again = solver.solve(sub, warm, state)
         assert int(again.n_anti_cycling) == 2
+
+
+@pytest.mark.parametrize(
+    ("solver_cls", "make_state"),
+    [
+        (ActiveSetQPSolver, lambda: make_active_set_qp_state(n=3, mineq=1)),
+        (ProximalActiveSetQPSolver, lambda: make_proximal_state(0, n=3, mineq=1)),
+    ],
+    ids=["plain", "proximal"],
+)
+def test_single_exchange_survives_an_inconsistent_all_at_once_refresh(
+    solver_cls, make_state
+):
+    """Three mutually inconsistent violations: exchange one row at a time.
+
+    At the unconstrained minimiser ``ub₀``, ``lb₁`` and ``h`` are all
+    violated but cannot hold together. The all-at-once refresh adds the three
+    of them and the KKT solve has no solution; the single exchange adds ``h``,
+    then ``lb₁``, and converges to the true QP solution in three iterations.
+    """
+    problem, x_star, dual_star = make_shifted_box_quadratic(3, c0=1.5)
+    primal = Primal(jnp.array([0.5, 0.5, 0.5]))
+    sub = make_qp_subproblem(problem=problem, primal=primal)
+    warm = (Primal(jnp.zeros(3)), make_zero_dual(3, 0, 1))
+
+    solver = solver_cls(
+        working_set_policy=SingleExchangeWorkingSetPolicy(tol=1e-8, max_iter=10)
+    )
+    (dx, lam), state = solver.solve(sub, warm, make_state())
+    assert bool(state.success)
+    assert bool(state.qp_result == ACTIVE_SET_QP_RESULTS.working_set_converged)
+    assert int(state.last_n_iter) == 3
+    assert jnp.allclose(primal.x + dx.x, x_star, atol=1e-5)
+    assert jnp.allclose(lam.ineq_multipliers, dual_star.ineq_multipliers, atol=1e-4)
+    assert jnp.allclose(lam.lb_multipliers, dual_star.lb_multipliers, atol=1e-4)
+    assert jnp.array_equal(state.active_set.active_inequalities, jnp.array([True]))
+    assert jnp.array_equal(state.active_set.active_lb, jnp.array([False, True, False]))
+    assert not jnp.any(state.active_set.active_ub)
+
+    # The all-at-once refresh cannot solve the same QP.
+    default = solver_cls(
+        working_set_policy=ThresholdWorkingSetPolicy(tol=1e-8, max_iter=10)
+    )
+    (dx_default, _), _ = default.solve(sub, warm, make_state())
+    assert not jnp.allclose(primal.x + dx_default.x, x_star, atol=1e-3)

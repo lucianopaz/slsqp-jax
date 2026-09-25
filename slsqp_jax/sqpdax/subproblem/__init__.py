@@ -31,6 +31,7 @@ from .solver import (
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
     ProximalActiveSetQPSolverState,
+    SingleExchangeWorkingSetPolicy,
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
     SubproblemContext,
@@ -76,5 +77,6 @@ __all__ = [
     "TrustRegionInteriorPointSolver",
     "WorkingSetPolicyState",
     "WorkingSetPolicy",
+    "SingleExchangeWorkingSetPolicy",
     "ThresholdWorkingSetPolicy",
 ]

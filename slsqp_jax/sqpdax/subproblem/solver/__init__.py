@@ -60,6 +60,7 @@ from .trust_region import (
     TrustRegionStateType,
 )
 from .working_set_policy import (
+    SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
     WorkingSetPolicy,
     WorkingSetPolicyState,
@@ -100,5 +101,6 @@ __all__ = [
     "TrustRegionInteriorPointSolver",
     "WorkingSetPolicyState",
     "WorkingSetPolicy",
+    "SingleExchangeWorkingSetPolicy",
     "ThresholdWorkingSetPolicy",
 ]

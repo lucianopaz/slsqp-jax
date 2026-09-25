@@ -26,6 +26,7 @@ __all__ = [
     "WorkingSetPolicyState",
     "WorkingSetPolicy",
     "ThresholdWorkingSetPolicy",
+    "SingleExchangeWorkingSetPolicy",
 ]
 
 
@@ -355,3 +356,107 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
             ),
         )
         return next_set, new_state, cycled
+
+
+class SingleExchangeWorkingSetPolicy(ThresholdWorkingSetPolicy):
+    """Classical one-at-a-time exchange: add *or* drop a single row per iteration.
+
+    Same tolerances, EXPAND ramp, drop floor and cycle guard as
+    :class:`ThresholdWorkingSetPolicy`, but the proposal changes the working
+    set by at most one row:
+
+    1. if any inactive inequality / bound is violated by more than
+       ``working_tol`` at the computed step, **add the most violated one**;
+    2. otherwise, if any active row has a multiplier below
+       ``-max(working_tol, drop_floor)``, **drop the most negative one**;
+    3. otherwise return ``current`` (the loop's convergence test fires).
+
+    Adding one row at a time keeps the working set consistent: the
+    all-at-once refresh can add several mutually incompatible rows in one go
+    (e.g. two bounds and an inequality that cannot hold simultaneously),
+    after which the KKT system has no solution. The price is one KKT solve
+    per exchanged row.
+
+    Examples
+    --------
+    >>> from slsqp_jax.sqpdax.subproblem.solver import (
+    ...     ActiveSetQPSolver,
+    ...     SingleExchangeWorkingSetPolicy,
+    ... )
+    >>> solver = ActiveSetQPSolver(
+    ...     working_set_policy=SingleExchangeWorkingSetPolicy(max_iter=30)
+    ... )
+    >>> solver.max_iter
+    30
+    """
+
+    def propose(
+        self,
+        lag: EvaluatedLagrangian[Primal],
+        step: tuple[Primal, Dual],
+        current: ActiveSet,
+        working_tol: Scalar,
+    ) -> ActiveSet:
+        """Exchange at most one row of ``current`` at ``working_tol``.
+
+        Parameters
+        ----------
+        lag
+            Unmasked Lagrangian evaluation defining the QP.
+        step
+            Primal step and multipliers solved on ``current``.
+        current
+            Working set the step was solved on.
+        working_tol
+            Add tolerance; the drop tolerance is ``max(working_tol, drop_floor)``.
+
+        Returns
+        -------
+        ActiveSet
+            ``current`` with one row added, one row dropped, or unchanged.
+        """
+        drop_tol = jnp.maximum(
+            working_tol, jnp.asarray(self.drop_floor, working_tol.dtype)
+        )
+        n, mineq = lag.n, lag.mineq
+        dx = step[0].x
+        x_new = lag.ref.x + dx
+
+        # Stack general inequalities, lower and upper bounds into one vector.
+        values = jnp.concatenate(
+            [
+                lag.ineq_fn_val + lag.ineq_fn_jac_val @ dx,
+                jnp.where(lag.null_lb, -jnp.inf, lag.lb - x_new),
+                jnp.where(lag.null_ub, -jnp.inf, x_new - lag.ub),
+            ]
+        )
+        multipliers = jnp.concatenate(
+            [
+                step[1].ineq_multipliers,
+                step[1].lb_multipliers,
+                step[1].ub_multipliers,
+            ]
+        )
+        active = jnp.concatenate(
+            [current.active_inequalities, current.active_lb, current.active_ub]
+        )
+
+        violated = ~active & (values > working_tol)
+        add_idx = jnp.argmax(jnp.where(violated, values, -jnp.inf))
+        negative = active & (multipliers < -drop_tol)
+        drop_idx = jnp.argmin(jnp.where(negative, multipliers, jnp.inf))
+
+        next_active = jnp.where(
+            jnp.any(violated),
+            active.at[add_idx].set(True),
+            jnp.where(jnp.any(negative), active.at[drop_idx].set(False), active),
+        )
+        return cast(
+            ActiveSet,
+            ActiveSet(
+                meq=current.meq,
+                active_inequalities=next_active[:mineq],
+                active_lb=next_active[mineq : mineq + n],
+                active_ub=next_active[mineq + n :],
+            ),
+        )

@@ -10,6 +10,7 @@ from slsqp_jax.sqpdax.active_set import ActiveSet
 from slsqp_jax.sqpdax.dual import Dual
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.subproblem.solver import (
+    SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
     WorkingSetPolicyState,
 )
@@ -206,3 +207,72 @@ def test_state_is_a_plain_pytree_of_arrays():
     assert isinstance(state, WorkingSetPolicyState)
     assert float(state.ramp_increment) == pytest.approx(TOL / 5)
     assert int(state.cycle_count) == 0
+
+
+def _mask_count(active: ActiveSet) -> int:
+    return int(
+        jnp.sum(active.active_inequalities)
+        + jnp.sum(active.active_lb)
+        + jnp.sum(active.active_ub)
+    )
+
+
+@pytest.mark.parametrize(
+    ("current", "step", "expected"),
+    [
+        # Both inequalities violated (row 1 more): only row 1 is added.
+        (_active(), _step([2.0, -3.0]), _active(ineq=(False, True))),
+        # Inequality row 0 and lb₀ violated; the bound violation is larger.
+        (
+            _active(),
+            _step([-5.0, 0.0], ineq=(0.0, 0.0)),
+            _active(lb=(True, False)),
+        ),
+        # Nothing violated, two negative multipliers: drop only the most negative.
+        (
+            _active(ineq=(True, True)),
+            _step([0.0, 0.0], ineq=(-1.0, -3.0)),
+            _active(ineq=(True, False)),
+        ),
+        # A violation takes priority over a negative multiplier.
+        (
+            _active(ineq=(True, False)),
+            _step([0.0, -1.0], ineq=(-1.0, 0.0)),
+            _active(ineq=(True, True)),
+        ),
+        # Fixed point: feasible step, non-negative multipliers.
+        (
+            _active(ineq=(True, False)),
+            _step([0.0, 0.0], ineq=(1.0, 0.0)),
+            _active(ineq=(True, False)),
+        ),
+    ],
+    ids=["add-most-violated", "add-bound", "drop-most-negative", "add-first", "fixed"],
+)
+def test_single_exchange_changes_at_most_one_row(current, step, expected):
+    """One-at-a-time exchange: add the worst violation, else drop the worst multiplier."""
+    lag = _lagrangian(bounded=True)
+    policy = SingleExchangeWorkingSetPolicy(tol=TOL)
+    next_set, _, cycled = policy.update(lag, step, current, policy.init_state(current))
+    assert bool(eqx.tree_equal(next_set, expected))
+    assert abs(_mask_count(next_set) - _mask_count(current)) <= 1
+    assert not bool(cycled)
+
+
+def test_single_exchange_inherits_ramp_and_cycle_guard():
+    """The subclass reuses the threshold policy's carry, ramp and detector."""
+    lag = _lagrangian(bounded=False)
+    policy = SingleExchangeWorkingSetPolicy(
+        tol=TOL, max_iter=4, expand_factor=1.0, ping_pong_threshold=1
+    )
+    set_a = _active(ineq=(True, False))
+    set_b = _active()
+    state = policy.init_state(set_a)
+    # A -> B (drop row 0) -> A (add row 0) is a detected 2-cycle.
+    next_set, state, cycled = policy.update(
+        lag, _step([0.0, 0.0], ineq=(-1.0, 0.0)), set_a, state
+    )
+    assert bool(eqx.tree_equal(next_set, set_b)) and not bool(cycled)
+    assert float(state.working_tol) == pytest.approx(TOL * 1.25)
+    next_set, state, cycled = policy.update(lag, _step([2.0, 0.0]), set_b, state)
+    assert bool(eqx.tree_equal(next_set, set_a)) and bool(cycled)
