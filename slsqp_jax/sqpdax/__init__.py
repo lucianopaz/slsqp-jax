@@ -1,5 +1,6 @@
 from . import (
     active_set,
+    active_set_prediction,
     autodiff_utils,
     barrier,
     compat,
@@ -17,6 +18,7 @@ from . import (
     types,
 )
 from .active_set import ActiveSet
+from .active_set_prediction import LPECAPrediction, LPECAPredictor, solve_lpeca_lp
 from .barrier import (
     AdaptiveBarrierUpdate,
     Barrier,
@@ -93,6 +95,7 @@ from .subproblem import (
     ProximalActiveSetQPSolverState,
     ProximalActiveSetSubProblem,
     ScaledBarrierSubProblem,
+    SingleExchangeWorkingSetPolicy,
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
     SubProblem,
@@ -110,6 +113,7 @@ from .types import InitializableModule
 
 __all__ = [
     "active_set",
+    "active_set_prediction",
     "autodiff_utils",
     "barrier",
     "compat",
@@ -181,6 +185,9 @@ __all__ = [
     "MatrixPreconditioner",
     "GenericPreconditioner",
     "ActiveSet",
+    "LPECAPrediction",
+    "LPECAPredictor",
+    "solve_lpeca_lp",
     "ActiveSetSubProblem",
     "ProximalActiveSetSubProblem",
     "SubProblem",
@@ -207,5 +214,6 @@ __all__ = [
     "TrustRegionInteriorPointSolver",
     "WorkingSetPolicyState",
     "WorkingSetPolicy",
+    "SingleExchangeWorkingSetPolicy",
     "ThresholdWorkingSetPolicy",
 ]

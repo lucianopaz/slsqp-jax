@@ -92,11 +92,9 @@ class ProximalActiveSetLineSearchMinimiser(
         self, problem: ProblemProtocol[Primal], dtype: jnp.dtype
     ) -> ProximalActiveSetQPSolver:
         """Default proximal solver with ``options['subproblem']`` applied."""
-        solver = self._make_qp_solver(problem, dtype)
-        sub_opts = dict(self.options.get("subproblem", {}))
-        if sub_opts:
-            solver = solver.init(**sub_opts)
-        return solver
+        return cast(
+            ProximalActiveSetQPSolver, super()._configured_qp_solver(problem, dtype)
+        )
 
     def _make_qp_solver(
         self, problem: ProblemProtocol[Primal], dtype: jnp.dtype

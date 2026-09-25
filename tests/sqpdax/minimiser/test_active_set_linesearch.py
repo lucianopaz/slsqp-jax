@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from slsqp_jax.sqpdax.active_set_prediction import LPECAPredictor
 from slsqp_jax.sqpdax.minimiser import (
     ActiveSetLineSearchMinimiser,
     ProximalActiveSetLineSearchMinimiser,
@@ -19,8 +20,14 @@ from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
 )
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.step_controller import StepResult
-from slsqp_jax.sqpdax.subproblem.solver import ACTIVE_SET_QP_RESULTS, RESULTS
+from slsqp_jax.sqpdax.subproblem.solver import (
+    ACTIVE_SET_QP_RESULTS,
+    RESULTS,
+    SingleExchangeWorkingSetPolicy,
+    ThresholdWorkingSetPolicy,
+)
 
+from ..conftest import make_shifted_box_quadratic
 from .conftest import make_equality_quadratic, make_unconstrained_quadratic
 
 
@@ -123,6 +130,7 @@ def test_qp_solver_receives_tolerance_and_warm_start_flag(
     assert ctx.solver.working_set_policy.tol == expected_tol
     assert ctx.solver.max_iter == solver.qp_max_iter
     assert ctx.solver.warm_start is qp_warm_start
+    assert type(ctx.solver.working_set_policy) is ThresholdWorkingSetPolicy
     # The carried working set / dual are sized for the problem and cold.
     state = solver.solver_state
     assert state.active_set.active_lb.shape == (2,)
@@ -433,6 +441,9 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         "qp_result",
         "qp_final_working_tol",
         "n_qp_anti_cycling",
+        "n_lpeca_bypassed",
+        "n_lpeca_capped",
+        "n_lpeca_bounds_prefixed",
         "last_step_size",
         "consecutive_qp_failures",
         "consecutive_ls_failures",
@@ -447,7 +458,167 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
     assert bool(sol.stats["qp_result"] == ACTIVE_SET_QP_RESULTS.working_set_converged)
     assert float(sol.stats["qp_final_working_tol"]) == pytest.approx(1e-5)
     assert int(sol.stats["n_qp_anti_cycling"]) == 0
+    # Predictor off by default: no LPEC-A activity is recorded.
+    assert sol.state.active_set_predictor.method == "expand"
+    assert int(sol.stats["n_lpeca_bypassed"]) == 0
+    assert int(sol.stats["n_lpeca_bounds_prefixed"]) == 0
     metrics = sol.state.termination_metrics(sol.state._optimisation_context(problem))
     assert float(sol.stats["kkt_ratio"]) == pytest.approx(
         float(metrics.stationarity) / float(sol.stats["kkt_scale"])
     )
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+@pytest.mark.parametrize("method", ["expand", "lpeca_init", "lpeca"])
+def test_active_set_prediction_modes_reach_the_same_solution(minimiser_cls, method):
+    """All predictor modes solve the box / inequality quadratic; stats reflect them."""
+    problem, x_star, dual_star = make_shifted_box_quadratic()
+    sol = minimise(
+        problem,
+        minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=2),
+        jnp.array([0.5, 0.5, 0.5]),
+        max_steps=40,
+        throw=False,
+        options={
+            "minimiser": {"active_set_predictor": {"method": method, "warmup_steps": 0}}
+        },
+    )
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, x_star, atol=1e-4)
+    assert jnp.allclose(
+        sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
+    )
+    assert sol.state.active_set_predictor.method == method
+    n_steps = int(sol.stats["num_steps"])
+    assert n_steps >= 2
+    if method == "expand":
+        assert int(sol.stats["n_lpeca_bypassed"]) == 0
+        assert int(sol.stats["n_lpeca_bounds_prefixed"]) == 0
+    else:
+        # Far from the solution the trust gate bypasses the first prediction;
+        # once the iterate sits at ``x*`` with exact multipliers the active
+        # bound is seeded on every remaining step.
+        assert int(sol.stats["n_lpeca_bypassed"]) == 1
+        assert int(sol.stats["n_lpeca_bounds_prefixed"]) == n_steps - 1
+        assert int(sol.stats["n_lpeca_capped"]) == 0
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+@pytest.mark.parametrize(
+    ("method", "expected_expand"),
+    [("expand", 1.0), ("lpeca_init", 1.0), ("lpeca", 0.0)],
+)
+@pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
+def test_prediction_seeds_the_qp_carry_and_lpeca_disables_expand(
+    minimiser_cls, method, expected_expand, qp_warm_start
+):
+    """Enabled prediction is written into the carried QP state with the seed forced on."""
+    problem, x_star, dual_star = make_shifted_box_quadratic()
+    predictor = LPECAPredictor(method=method, warmup_steps=0)
+    solver = minimiser_cls(
+        rtol=1e-6, atol=1e-6, qp_warm_start=qp_warm_start, min_steps=1
+    ).init(
+        problem,
+        x_star,
+        options={
+            "minimiser": {"active_set_predictor": predictor},
+            "subproblem": {"working_set_policy": {"expand_factor": 1.0}},
+        },
+    )
+    assert solver.active_set_predictor is predictor
+    # Exact multipliers make the KKT point exact, so the prediction is the
+    # true active set. Pretend the carried state holds a stale bound too.
+    solver = eqx.tree_at(lambda m: m.dual, solver, dual_star)
+    stale = eqx.tree_at(
+        lambda s: s.active_set.active_ub,
+        solver.solver_state,
+        jnp.array([False, False, True]),
+    )
+    solver = eqx.tree_at(lambda m: m.solver_state, solver, stale)
+
+    seeded = solver._seed_predicted_active_set(problem)
+    ctx = seeded._init_subproblem(problem)
+    assert ctx.solver.working_set_policy.expand_factor == expected_expand
+    seed = seeded.solver_state.active_set
+    if method == "expand":
+        assert seeded is solver
+        assert ctx.solver.warm_start is qp_warm_start
+        assert jnp.array_equal(seed.active_ub, stale.active_set.active_ub)
+    else:
+        assert ctx.solver.warm_start is True
+        assert bool(eqx.tree_equal(ctx.state.active_set, seed))
+        assert jnp.array_equal(seed.active_inequalities, jnp.array([True]))
+        assert jnp.array_equal(seed.active_lb, jnp.array([False, True, False]))
+        # The stale carried bound survives only when warm starts are requested.
+        assert bool(seed.active_ub[2]) is qp_warm_start
+        if not qp_warm_start:
+            assert jnp.array_equal(
+                seeded.solver_state.dual.lb_multipliers, dual_star.lb_multipliers
+            )
+        # Counters are advanced by the seeding itself (valid, uncapped, one bound).
+        assert int(seeded.n_lpeca_bypassed) == 0
+        assert int(seeded.n_lpeca_capped) == 0
+        assert int(seeded.n_lpeca_bounds_prefixed) == 1
+    # The seeded solve returns the KKT point immediately.
+    stepped = solver.step(problem)
+    assert jnp.allclose(stepped.iterate.x, x_star, atol=1e-6)
+    if method != "expand":
+        assert int(stepped.n_lpeca_bounds_prefixed) == 1
+        assert int(stepped.n_lpeca_bypassed) == 0
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+@pytest.mark.parametrize("via_options", [False, True], ids=["field", "options"])
+def test_single_exchange_solves_the_inconsistent_refresh_problem(
+    minimiser_cls, via_options
+):
+    """``qp_single_exchange`` swaps the policy class and keeps the ``qp_tol`` routing."""
+    problem, x_star, dual_star = make_shifted_box_quadratic(c0=1.5)
+    kwargs = dict(rtol=1e-6, atol=1e-6, min_steps=1, qp_tol=1e-7)
+    options = None
+    if via_options:
+        options = {"minimiser": {"qp_single_exchange": True}}
+    else:
+        kwargs["qp_single_exchange"] = True
+    solver = minimiser_cls(**kwargs).init(problem, jnp.array([0.5, 0.5, 0.5]), options)
+    assert solver.qp_single_exchange is True
+    policy = solver._init_subproblem(problem).solver.working_set_policy
+    assert type(policy) is SingleExchangeWorkingSetPolicy
+    assert policy.tol == 1e-7
+    assert policy.max_iter == solver.qp_max_iter
+
+    sol = minimise(
+        problem,
+        minimiser_cls(**kwargs),
+        jnp.array([0.5, 0.5, 0.5]),
+        max_steps=40,
+        throw=False,
+        options=options,
+    )
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, x_star, atol=1e-4)
+    assert jnp.allclose(
+        sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
+    )
+
+    # The default all-at-once refresh stalls on this problem.
+    default = minimise(
+        problem,
+        minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=1),
+        jnp.array([0.5, 0.5, 0.5]),
+        max_steps=40,
+        throw=False,
+    )
+    assert not bool(default.state.result_adapter.is_successful(default.result))
