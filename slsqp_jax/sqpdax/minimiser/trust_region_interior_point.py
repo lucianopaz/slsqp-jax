@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Self, cast
+from typing import Generic, Self, cast
 
 import equinox as eqx
 import jax
@@ -36,6 +36,7 @@ from ..subproblem.solver import (
     SubProblemSolver,
     TrustRegionInteriorPointSolver,
     TrustRegionSolverState,
+    TrustRegionStateType,
 )
 from ..types import Scalar, Vector_n
 from .base import CommonMinimiser, OptimisationContext
@@ -156,10 +157,11 @@ class TrustRegionInteriorPointMinimiser(
     CommonMinimiser[
         InteriorPointPrimal,
         ScaledBarrierSubProblem,
-        TrustRegionSolverState,
+        TrustRegionStateType,
         TrustRegionInteriorPointTerminationMetrics,
         TRUST_REGION_INTERIOR_POINT_RESULTS,
-    ]
+    ],
+    Generic[TrustRegionStateType],
 ):
     """Nocedal & Wright (2006) Section 19.5 trust-region interior-point method.
 
@@ -324,10 +326,14 @@ class TrustRegionInteriorPointMinimiser(
         self,
         problem: ProblemProtocol[InteriorPointPrimal],
         primal: InteriorPointPrimal,
-    ) -> TrustRegionSolverState:
-        """Cold trust-region carry with :attr:`initial_radius` / :attr:`initial_penalty`."""
+    ) -> TrustRegionStateType:
+        """Cold trust-region carry with :attr:`initial_radius` / :attr:`initial_penalty`.
+
+        Subclasses binding a richer ``TrustRegionStateType`` must override
+        this to build their own carry.
+        """
         return cast(
-            TrustRegionSolverState,
+            TrustRegionStateType,
             TrustRegionSolverState(
                 n_iter=jnp.asarray(0, jnp.int32),
                 radius=jnp.asarray(self.initial_radius),
@@ -354,24 +360,46 @@ class TrustRegionInteriorPointMinimiser(
             ),
         )
 
+    def _make_subproblem_solver(
+        self, problem: ProblemProtocol[InteriorPointPrimal]
+    ) -> TrustRegionInteriorPointSolver[TrustRegionStateType]:
+        """Construct the default composite-step solver before ``options['subproblem']`` is applied.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        TrustRegionInteriorPointSolver
+            Default solver. Its state type matches ``TrustRegionStateType``;
+            subclasses binding a richer state must return a solver that
+            consumes / produces it.
+        """
+        return cast(
+            TrustRegionInteriorPointSolver[TrustRegionStateType],
+            TrustRegionInteriorPointSolver(),
+        )
+
     def _init_subproblem(
         self, problem: ProblemProtocol[InteriorPointPrimal]
     ) -> SubproblemContext[
-        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
+        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
     ]:
         """Build a scaled-barrier trust-region context at the current ``(x, s)``."""
         iterate = cast(InteriorPointPrimal, self.iterate)
         dual = cast(Dual, self.dual)
         lag_module = cast(InteriorPointLagrangian, self._lagrangian_module(problem))
         lag = lag_module(iterate, dual)
-        solver = cast(TrustRegionInteriorPointSolver, TrustRegionInteriorPointSolver())
+        solver = self._make_subproblem_solver(problem)
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
         zero_warm = cast(InteriorPointPrimal, jax.tree.map(jnp.zeros_like, iterate))
         return cast(
             SubproblemContext[
-                InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
+                InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
             ],
             SubproblemContext(
                 problem=problem,
@@ -379,18 +407,18 @@ class TrustRegionInteriorPointMinimiser(
                 subproblem=ScaledBarrierSubProblem(lag),
                 solver=solver,
                 warm=(zero_warm, dual),
-                state=cast(TrustRegionSolverState, self.solver_state),
+                state=cast(TrustRegionStateType, self.solver_state),
             ),
         )
 
     def _step_controller(
         self,
         ctx: SubproblemContext[
-            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
+            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
         ],
         step_dual: Dual,
-        solver_state: TrustRegionSolverState,
-    ) -> StepController[InteriorPointPrimal, TrustRegionSolverState]:
+        solver_state: TrustRegionStateType,
+    ) -> StepController[InteriorPointPrimal, TrustRegionStateType]:
         """Trust-region manager whose merit penalty matches the solver's ``ν``."""
         nu = solver_state.merit_penalty
         merit = NormMerit(
@@ -402,7 +430,7 @@ class TrustRegionInteriorPointMinimiser(
             norm=2,
         )
         return cast(
-            StepController[InteriorPointPrimal, TrustRegionSolverState],
+            StepController[InteriorPointPrimal, TrustRegionStateType],
             TrustRegionManager(
                 merit=merit,
                 eta=self.eta,
@@ -417,9 +445,9 @@ class TrustRegionInteriorPointMinimiser(
     def _advance_dynamics(
         self,
         ctx: SubproblemContext[
-            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
+            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
         ],
-        result: StepResult[InteriorPointPrimal, TrustRegionSolverState],
+        result: StepResult[InteriorPointPrimal, TrustRegionStateType],
         step_dual: Dual,
     ) -> Self:
         """Reduce ``μ`` from the KKT / complementarity state at the new iterate.
@@ -460,7 +488,7 @@ class TrustRegionInteriorPointMinimiser(
         )
 
     def termination_metrics(
-        self, ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState]
+        self, ctx: OptimisationContext[InteriorPointPrimal, TrustRegionStateType]
     ) -> TrustRegionInteriorPointTerminationMetrics:
         """Measure the unperturbed KKT error and the inner-loop state.
 
@@ -497,7 +525,7 @@ class TrustRegionInteriorPointMinimiser(
                 )
             )
         )
-        status = cast(TrustRegionSolverState, ctx.solver_state).status
+        status = cast(TrustRegionStateType, ctx.solver_state).status
         fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_max_steps
         mappings = (
             (
@@ -538,7 +566,7 @@ class TrustRegionInteriorPointMinimiser(
 
     def termination_flags(
         self,
-        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionSolverState],
+        ctx: OptimisationContext[InteriorPointPrimal, TrustRegionStateType],
         metrics: TrustRegionInteriorPointTerminationMetrics,
     ) -> TerminationFlags[TRUST_REGION_INTERIOR_POINT_RESULTS]:
         """Require *both* Algorithm 19.4 stopping tests before declaring success.
@@ -559,7 +587,7 @@ class TrustRegionInteriorPointMinimiser(
         acceptable_residual = metrics.optimality_residual <= self.atol
         nonfinite = metrics.nonfinite
         fatal = (
-            cast(TrustRegionSolverState, ctx.solver_state).status
+            cast(TrustRegionStateType, ctx.solver_state).status
             != SUBPROBLEM_RESULTS.successful
         )
         converged = (
