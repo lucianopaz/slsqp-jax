@@ -82,6 +82,8 @@ def test_equality_only_solves_stabilised_kkt(
     A, c = lag.eq_fn_jac_val, lag.eq_fn_val
     assert jnp.allclose(A @ d.x - mu * (lam.eq_multipliers - eq_center), -c, atol=1e-4)
     assert jnp.allclose(state.eq_center, lam.eq_multipliers)
+    # The carried dual reflects the *recovered* equality multipliers.
+    assert jnp.allclose(state.dual.eq_multipliers, lam.eq_multipliers)
     if eq_center_from_exact:
         # Centred at the exact multipliers the stabilised step *is* the SQP step.
         assert jnp.allclose(d.x, d_pcg.x, atol=1e-4)
