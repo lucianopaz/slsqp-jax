@@ -170,6 +170,38 @@ class ScaledBarrierSubProblem(SubProblem[InteriorPointPrimal]):
         """Dual residual of the interior-point Lagrangian."""
         return self.lagrangian.dual_grad
 
+    def kkt_rhs(self) -> tuple[InteriorPointPrimal, Dual]:
+        """Right-hand side ``(-g, -c)`` with the dual regularisation centred at ``λ_k``.
+
+        Returns
+        -------
+        tuple of InteriorPointPrimal and Dual
+            Negated primal gradient and negated dual gradient; when
+            :attr:`is_kkt_dual_regularized` is set the equality rows carry
+            the extra shift ``-δ λ_k``.
+
+        Notes
+        -----
+        The step's dual block is the *full* multiplier estimate, so with the
+        dual-dual block ``-δ I`` alone the regularised row would read
+        ``Â p - δ λ = -c`` and shrink ``λ`` toward zero. Shifting the
+        right-hand side by ``-δ λ_k`` (``λ_k`` the multipliers the Lagrangian
+        was evaluated at) turns it into ``Â p - δ (λ - λ_k) = -c``, the
+        proximal / stabilised-SQP form (Ipopt's ``δ_c`` acts on the
+        increment in the same way). :meth:`dual_grad` is left untouched so
+        the normal-step solvers still see the plain residual ``c``.
+        """
+        primal_rhs, dual_rhs = super().kkt_rhs()
+        if not self.is_kkt_dual_regularized:
+            return primal_rhs, dual_rhs
+        lag = self.lagrangian
+        shift = lag.dual_kkt_regularization * lag.dual.eq_multipliers
+        return primal_rhs, eqx.tree_at(
+            lambda d: d.eq_multipliers,
+            dual_rhs,
+            dual_rhs.eq_multipliers - shift,
+        )
+
     def _to_ball_scale(
         self, step: tuple[InteriorPointPrimal, Dual]
     ) -> tuple[InteriorPointPrimal, Dual]:

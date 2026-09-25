@@ -94,6 +94,42 @@ def test_dual_regularization_flag_and_operator(reg: float):
         assert jnp.allclose(dual_dual.flatten(), 0.0)
 
 
+@pytest.mark.parametrize("reg", [0.0, 0.1])
+def test_dual_regularization_rhs_is_centred_at_current_multipliers(reg: float):
+    """``kkt_rhs`` shifts the eq rows by ``-δ λ_k``; ``dual_grad`` is untouched."""
+    sub = make_scaled_barrier_subproblem(dual_kkt_regularization=reg)
+    lag = sub.lagrangian
+    ref = make_scaled_barrier_subproblem(dual_kkt_regularization=0.0)
+
+    rhs_p, rhs_d = sub.kkt_rhs()
+    ref_p, ref_d = ref.kkt_rhs()
+    assert jnp.allclose(rhs_p.flatten(), ref_p.flatten())
+    assert jnp.allclose(
+        rhs_d.eq_multipliers,
+        -lag.dual_grad.eq_multipliers - reg * lag.dual.eq_multipliers,
+    )
+    assert jnp.allclose(rhs_d.ineq_multipliers, ref_d.ineq_multipliers)
+    assert jnp.allclose(rhs_d.lb_multipliers, ref_d.lb_multipliers)
+    assert jnp.allclose(rhs_d.ub_multipliers, ref_d.ub_multipliers)
+    assert jnp.allclose(sub.dual_grad().flatten(), ref.dual_grad().flatten())
+
+    # A step whose dual equals the current multipliers and whose primal solves
+    # the unregularised eq row has zero eq residual: Â p - δ(λ - λ_k) + c = 0.
+    step = make_ip_step(lag.n, lag.mineq, lag.meq)
+    A_eq = lag.eq_fn_jac_val
+    x_sol = jnp.linalg.lstsq(A_eq, -lag.eq_fn_val)[0]
+    primal = InteriorPointPrimal(
+        x=x_sol,
+        slack=Slack(
+            s=jnp.zeros_like(step[0].slack.s),
+            s_lb=jnp.zeros_like(step[0].slack.s_lb),
+            s_ub=jnp.zeros_like(step[0].slack.s_ub),
+        ),
+    )
+    _, res_d = sub.residual((primal, lag.dual))
+    assert jnp.allclose(res_d.eq_multipliers, 0.0, atol=1e-10)
+
+
 def test_primal_grad_is_objective_and_minus_mu():
     """``primal_grad`` is ``∇f`` in ``x`` and ``-μ`` on active slacks."""
     weight = 0.5
