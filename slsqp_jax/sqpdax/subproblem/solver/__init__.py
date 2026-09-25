@@ -28,7 +28,12 @@ from . import (
     steihaug_toint_cg,
     trust_region,
 )
-from .active_set_loop import ActiveSetQPSolver, ActiveSetQPSolverState
+from .active_set_loop import (
+    ActiveSetQPSolver,
+    ActiveSetQPSolverState,
+    ActiveSetStateType,
+    KKTSolverStateType,
+)
 from .base import (
     RESULTS,
     SubproblemContext,
@@ -64,6 +69,8 @@ __all__ = [
     "SubProblemSolver",
     "SubproblemContext",
     "ActiveSetQPSolverState",
+    "ActiveSetStateType",
+    "KKTSolverStateType",
     "ActiveSetQPSolver",
     "DogLegSolverState",
     "DogLegSolver",
