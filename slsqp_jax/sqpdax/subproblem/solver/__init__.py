@@ -52,7 +52,11 @@ from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
 )
-from .trust_region import TrustRegionInteriorPointSolver, TrustRegionSolverState
+from .trust_region import (
+    TrustRegionInteriorPointSolver,
+    TrustRegionSolverState,
+    TrustRegionStateType,
+)
 
 __all__ = [
     "active_set_loop",
@@ -83,5 +87,6 @@ __all__ = [
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
+    "TrustRegionStateType",
     "TrustRegionInteriorPointSolver",
 ]

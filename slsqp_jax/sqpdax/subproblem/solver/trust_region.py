@@ -1,6 +1,6 @@
 """Composite-step trust-region interior-point subproblem solver (N&W §19.5)."""
 
-from typing import cast
+from typing import Generic, cast
 
 import jax
 import lineax as lx
@@ -8,6 +8,7 @@ from equinox import field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 from lineax import AbstractLinearOperator, AbstractLinearSolver
+from typing_extensions import TypeVar
 
 from ...dual import Dual
 from ...primal import InteriorPointPrimal, Slack
@@ -22,6 +23,7 @@ from .steihaug_toint_cg import (
 
 __all__ = [
     "TrustRegionSolverState",
+    "TrustRegionStateType",
     "TrustRegionInteriorPointSolver",
 ]
 
@@ -56,10 +58,21 @@ class TrustRegionSolverState(SubProblemSolverState):
     on_boundary: Bool[Array, ""]
 
 
+# Solver carry; defaulted so bare ``TrustRegionInteriorPointSolver`` keeps
+# meaning ``TrustRegionInteriorPointSolver[TrustRegionSolverState]`` while
+# subclasses can bind a richer carry and specialise ``solve`` without casts.
+TrustRegionStateType = TypeVar(
+    "TrustRegionStateType",
+    bound=TrustRegionSolverState,
+    default=TrustRegionSolverState,
+)
+
+
 class TrustRegionInteriorPointSolver(
     SubProblemSolver[
-        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionSolverState
-    ]
+        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
+    ],
+    Generic[TrustRegionStateType],
 ):
     """Composite-step trust-region interior-point solver (N&W Algorithms 19.3 / 19.4).
 
@@ -123,8 +136,8 @@ class TrustRegionInteriorPointSolver(
         self,
         subproblem: ScaledBarrierSubProblem,
         x0: tuple[InteriorPointPrimal, Dual],
-        initial_state: TrustRegionSolverState,
-    ) -> tuple[tuple[InteriorPointPrimal, Dual], TrustRegionSolverState]:
+        initial_state: TrustRegionStateType,
+    ) -> tuple[tuple[InteriorPointPrimal, Dual], TrustRegionStateType]:
         """Compute the composite trust-region step at ``initial_state.radius``.
 
         Parameters
@@ -144,8 +157,9 @@ class TrustRegionInteriorPointSolver(
         step
             Native-scale ``(p_x, p_s)`` primal step and recovered multipliers.
         state
-            Updated :class:`TrustRegionSolverState` with ``predicted_reduction``,
-            ``merit_penalty``, boundary / success flags, and CG count.
+            ``initial_state`` with ``predicted_reduction``, ``merit_penalty``,
+            boundary / success flags, and CG count refreshed (same type as
+            the input).
 
         Raises
         ------
@@ -355,7 +369,7 @@ class TrustRegionInteriorPointSolver(
         )
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
         new_state = cast(
-            TrustRegionSolverState,
+            TrustRegionStateType,
             tree_at(
                 lambda state: (
                     state.n_iter,
