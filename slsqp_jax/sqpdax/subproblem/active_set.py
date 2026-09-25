@@ -1,5 +1,7 @@
 """Active-set QP subproblem restricted to a working set."""
 
+from typing import Self
+
 import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
@@ -54,6 +56,27 @@ class ActiveSetSubProblem(SubProblem[Primal]):
         self.lagrangian = lagrangian
         self.L_k = active_set.mask_lagrangian(lagrangian)
         self.active_set = active_set
+
+    def with_active_set(self, active_set: ActiveSet) -> Self:
+        """Rebuild the subproblem on the same Lagrangian with a new working set.
+
+        Parameters
+        ----------
+        active_set
+            Working-set masks for the rebuilt subproblem.
+
+        Returns
+        -------
+        Self
+            New instance of the same class sharing :attr:`lagrangian`.
+
+        Notes
+        -----
+        The active-set loop refreshes the working set every iteration; this
+        hook lets subclasses carrying extra parameters (e.g. proximal
+        stabilisation) survive the refresh by overriding it.
+        """
+        return type(self)(self.lagrangian, active_set)
 
     @property
     def x_k(self) -> Primal:
