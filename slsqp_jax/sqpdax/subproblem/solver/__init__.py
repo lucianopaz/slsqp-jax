@@ -6,6 +6,8 @@ Public leaf solvers:
   — null-space projected CG for a fixed active set.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.active_set_loop.ActiveSetQPSolver`
   — primal-dual active-set loop around an inner KKT solver.
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.proximal_active_set_loop.ProximalActiveSetQPSolver`
+  — stabilised-SQP (proximal equality) variant of the active-set loop.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.gradient_projection.GradientProjection`
   — bound-constrained Cauchy / subspace step (N&W §16.7).
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolver`
@@ -22,6 +24,7 @@ from . import (
     dogleg,
     gradient_projection,
     projected_cg,
+    proximal_active_set_loop,
     steihaug_toint_cg,
     trust_region,
 )
@@ -36,6 +39,10 @@ from .base import (
 from .dogleg import DogLegSolver, DogLegSolverState
 from .gradient_projection import GradientProjection, GradientProjectionState
 from .projected_cg import ProjectedCGState, ProjectedCGSubProblemSolver
+from .proximal_active_set_loop import (
+    ProximalActiveSetQPSolver,
+    ProximalActiveSetQPSolverState,
+)
 from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
@@ -48,6 +55,7 @@ __all__ = [
     "dogleg",
     "gradient_projection",
     "projected_cg",
+    "proximal_active_set_loop",
     "steihaug_toint_cg",
     "trust_region",
     "RESULTS",
@@ -63,6 +71,8 @@ __all__ = [
     "GradientProjection",
     "ProjectedCGState",
     "ProjectedCGSubProblemSolver",
+    "ProximalActiveSetQPSolverState",
+    "ProximalActiveSetQPSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
