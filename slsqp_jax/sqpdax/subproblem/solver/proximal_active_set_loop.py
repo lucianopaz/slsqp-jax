@@ -194,5 +194,7 @@ class ProximalActiveSetQPSolver(
         step, state = super().solve(prox, x0, initial_state)
         lam_eq = prox.recover_eq_multipliers(step[0].x)
         step = (step[0], tree_at(lambda d: d.eq_multipliers, step[1], lam_eq))
-        new_state = tree_at(lambda s: (s.mu, s.eq_center), state, (mu, lam_eq))
+        new_state = tree_at(
+            lambda s: (s.mu, s.eq_center, s.dual), state, (mu, lam_eq, step[1])
+        )
         return step, new_state
