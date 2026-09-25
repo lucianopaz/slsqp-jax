@@ -32,6 +32,7 @@ from ..subproblem.solver import (
     ProjectedCGSubProblemSolver,
     SubproblemContext,
     SubProblemSolver,
+    ThresholdWorkingSetPolicy,
 )
 from ..types import Scalar
 from .base import CommonMinimiser, OptimisationContext
@@ -307,6 +308,8 @@ class ActiveSetLineSearchMinimiser(
                 qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
                 active_set=self._empty_active_set(problem),
                 dual=self._init_dual(problem),
+                final_working_tol=jnp.asarray(self.effective_qp_tol, primal.x.dtype),
+                n_anti_cycling=jnp.asarray(0, jnp.int32),
             ),
         )
 
@@ -342,9 +345,21 @@ class ActiveSetLineSearchMinimiser(
             ActiveSetQPSolver[Any, ActiveSetStateType],
             ActiveSetQPSolver(
                 subproblem_solver=ProjectedCGSubProblemSolver(),
-                tol=self.effective_qp_tol,
-                max_iter=self.qp_max_iter,
+                working_set_policy=self._make_working_set_policy(),
                 warm_start=self.qp_warm_start,
+            ),
+        )
+
+    def _make_working_set_policy(self) -> ThresholdWorkingSetPolicy:
+        """Default working-set policy carrying ``qp_tol`` / ``qp_max_iter``.
+
+        Further knobs (EXPAND ramp, drop floor, anti-cycling) are applied on
+        top through ``options['subproblem']['working_set_policy']``.
+        """
+        return cast(
+            ThresholdWorkingSetPolicy,
+            ThresholdWorkingSetPolicy(
+                tol=self.effective_qp_tol, max_iter=self.qp_max_iter
             ),
         )
 
@@ -760,6 +775,8 @@ class ActiveSetLineSearchMinimiser(
             "total_qp_cg_iterations": solver_state.n_cg_iter,
             "last_qp_converged": solver_state.success,
             "qp_result": solver_state.qp_result,
+            "qp_final_working_tol": solver_state.final_working_tol,
+            "n_qp_anti_cycling": solver_state.n_anti_cycling,
             "last_step_size": self.last_step_size,
             "steps_without_improvement": self.steps_without_improvement,
             "blowup_count": self.blowup_count,

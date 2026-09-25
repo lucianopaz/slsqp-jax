@@ -27,6 +27,7 @@ from . import (
     proximal_active_set_loop,
     steihaug_toint_cg,
     trust_region,
+    working_set_policy,
 )
 from .active_set_loop import (
     ACTIVE_SET_QP_RESULTS,
@@ -58,6 +59,11 @@ from .trust_region import (
     TrustRegionSolverState,
     TrustRegionStateType,
 )
+from .working_set_policy import (
+    ThresholdWorkingSetPolicy,
+    WorkingSetPolicy,
+    WorkingSetPolicyState,
+)
 
 __all__ = [
     "active_set_loop",
@@ -68,6 +74,7 @@ __all__ = [
     "proximal_active_set_loop",
     "steihaug_toint_cg",
     "trust_region",
+    "working_set_policy",
     "RESULTS",
     "SubProblemSolverState",
     "SubProblemSolverStateType",
@@ -91,4 +98,7 @@ __all__ = [
     "TrustRegionSolverState",
     "TrustRegionStateType",
     "TrustRegionInteriorPointSolver",
+    "WorkingSetPolicyState",
+    "WorkingSetPolicy",
+    "ThresholdWorkingSetPolicy",
 ]

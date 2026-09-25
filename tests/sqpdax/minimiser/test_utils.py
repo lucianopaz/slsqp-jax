@@ -29,4 +29,6 @@ def test_solver_option_keys_exclude_lagrangian():
     # Nested ActiveSetQPSolver still exposes its own fields.
     as_keys = solver_option_keys(ActiveSetQPSolver)
     assert "subproblem_solver" in as_keys
-    assert "tol" in as_keys
+    assert "working_set_policy" in as_keys
+    # ``tol`` / ``max_iter`` live on the policy, not the loop.
+    assert "tol" not in as_keys

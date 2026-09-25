@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
@@ -12,6 +13,8 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     ActiveSetQPSolver,
     ProjectedCGSubProblemSolver,
+    ProximalActiveSetQPSolver,
+    ThresholdWorkingSetPolicy,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.subproblem.conftest import make_zero_dual
@@ -19,9 +22,25 @@ from tests.sqpdax.subproblem.conftest import make_zero_dual
 from .conftest import (
     make_active_set_qp_state,
     make_projected_cg_state,
+    make_proximal_state,
     make_qp_subproblem,
     unbounded_box,
 )
+
+
+class FlipLowerBoundPolicy(ThresholdWorkingSetPolicy):
+    """Proposal that toggles ``lb₀`` every iteration: a guaranteed 2-cycle.
+
+    Only :meth:`propose` is overridden, so the cycle runs through the real
+    set-level detector of :class:`ThresholdWorkingSetPolicy`.
+    """
+
+    def propose(self, lag, step, current, working_tol):
+        return eqx.tree_at(
+            lambda s: s.active_lb,
+            current,
+            current.active_lb.at[0].set(~current.active_lb[0]),
+        )
 
 
 def make_bound_hit_qp():
@@ -88,20 +107,20 @@ def test_equality_matches_bare_projected_cg():
     ("solver_kwargs", "expected_result", "expected_status", "expected_success"),
     [
         (
-            {"max_iter": 5},
+            {"working_set_policy": ThresholdWorkingSetPolicy(max_iter=5)},
             ACTIVE_SET_QP_RESULTS.working_set_converged,
             RESULTS.successful,
             True,
         ),
         (
-            {"max_iter": 1},
+            {"working_set_policy": ThresholdWorkingSetPolicy(max_iter=1)},
             ACTIVE_SET_QP_RESULTS.max_iter_reached,
             RESULTS.max_steps_reached,
             False,
         ),
         (
             {
-                "max_iter": 5,
+                "working_set_policy": ThresholdWorkingSetPolicy(max_iter=5),
                 "subproblem_solver": ProjectedCGSubProblemSolver(max_iter=0),
             },
             ACTIVE_SET_QP_RESULTS.kkt_solver_failure,
@@ -127,7 +146,8 @@ def test_qp_result_distinguishes_termination_reasons(
 def test_iteration_budget_is_per_solve_and_totals_accumulate():
     """A carry that already spent ``max_iter`` iterations does not starve the next solve."""
     sub, primal, warm = make_bound_hit_qp()
-    solver = ActiveSetQPSolver(max_iter=2)
+    solver = ActiveSetQPSolver().init(working_set_policy={"max_iter": 2})
+    assert solver.max_iter == 2
 
     (dx1, _), s1 = solver.solve(sub, warm, make_active_set_qp_state())
     (dx2, _), s2 = solver.solve(sub, warm, s1)
@@ -165,3 +185,69 @@ def test_warm_start_reuses_carried_working_set(warm_start: bool):
     assert bool(s2.success)
     assert jnp.allclose(dx2.x, dx1.x, atol=1e-6)
     assert jnp.allclose(primal.x + dx2.x, jnp.array([0.5, 0.0]), atol=1e-5)
+
+
+@pytest.mark.parametrize(("expand_factor", "max_iter"), [(0.0, 4), (1.0, 4), (3.0, 6)])
+def test_expand_ramp_is_reported_on_the_state(expand_factor, max_iter):
+    """Two working-set iterations leave ``tol (1 + 2 expand_factor / max_iter)``."""
+    sub, primal, warm = make_bound_hit_qp()
+    tol = 1e-6
+    solver = ActiveSetQPSolver(
+        working_set_policy=ThresholdWorkingSetPolicy(
+            tol=tol, max_iter=max_iter, expand_factor=expand_factor
+        ),
+    )
+    assert solver.tol == tol
+    (dx, _), state = solver.solve(sub, warm, make_active_set_qp_state())
+    assert bool(state.success)
+    assert int(state.last_n_iter) == 2
+    assert float(state.final_working_tol) == pytest.approx(
+        tol * (1.0 + 2.0 * expand_factor / max_iter), rel=1e-5
+    )
+    assert int(state.n_anti_cycling) == 0
+    assert jnp.allclose(primal.x + dx.x, jnp.array([0.5, 0.0]), atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("solver_cls", "make_state"),
+    [
+        (ActiveSetQPSolver, lambda: make_active_set_qp_state()),
+        (ProximalActiveSetQPSolver, lambda: make_proximal_state(0)),
+    ],
+    ids=["plain", "proximal"],
+)
+@pytest.mark.parametrize(
+    "ping_pong_threshold", [None, 2], ids=["guard-off", "threshold-2"]
+)
+def test_anti_cycling_guard_stops_a_cycling_working_set(
+    solver_cls, make_state, ping_pong_threshold
+):
+    """A 2-cycle ends in ``anti_cycling`` (guard on) or ``max_iter_reached`` (off)."""
+    problem = make_problem(meq=0, mineq=0, lb=jnp.zeros(2), ub=jnp.ones(2))
+    sub = make_qp_subproblem(problem=problem, primal=make_primal(n=2))
+    warm = (Primal(jnp.zeros(2)), make_zero_dual(2, 0, 0))
+    max_iter = 10
+    solver = solver_cls(
+        working_set_policy=FlipLowerBoundPolicy(
+            max_iter=max_iter, ping_pong_threshold=ping_pong_threshold
+        ),
+    )
+
+    (dx, _), state = solver.solve(sub, warm, make_state())
+    assert jnp.all(jnp.isfinite(dx.x))
+    assert not bool(state.success)
+    assert state.status == RESULTS.max_steps_reached
+    if ping_pong_threshold is None:
+        assert bool(state.qp_result == ACTIVE_SET_QP_RESULTS.max_iter_reached)
+        assert int(state.last_n_iter) == max_iter
+        assert int(state.n_anti_cycling) == 0
+    else:
+        # ∅ -> {lb₀} (new), -> ∅ (revisit 1), -> {lb₀} (revisit 2: fires).
+        assert bool(state.qp_result == ACTIVE_SET_QP_RESULTS.anti_cycling)
+        assert int(state.last_n_iter) == 3
+        assert int(state.n_anti_cycling) == 1
+        # The carried set is the one the returned step was solved on (∅),
+        # not the rejected cycling proposal.
+        assert not jnp.any(state.active_set.active_lb)
+        _, again = solver.solve(sub, warm, state)
+        assert int(again.n_anti_cycling) == 2

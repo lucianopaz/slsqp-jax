@@ -368,7 +368,7 @@ def test_minimize_forwards_native_nested_options() -> None:
             "maxiter": 20,
             "minimiser": {"atol": 2e-6, "secant_memory": 4},
             "subproblem": {
-                "tol": 3e-9,
+                "working_set_policy": {"tol": 3e-9},
                 "subproblem_solver": {"max_iter": 7},
             },
         },
