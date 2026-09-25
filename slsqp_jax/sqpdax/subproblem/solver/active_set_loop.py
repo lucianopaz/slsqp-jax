@@ -172,10 +172,7 @@ class ActiveSetQPSolver(
             warm: tuple[Primal, Dual],
             kkt_state: KKTSolverStateType,
         ) -> tuple[tuple[Primal, Dual], KKTSolverStateType]:
-            subproblem_k = cast(
-                ActiveSetSubProblem,
-                ActiveSetSubProblem(subproblem.lagrangian, active_set),
-            )
+            subproblem_k = subproblem.with_active_set(active_set)
             return self.subproblem_solver.solve(subproblem_k, warm, kkt_state)
 
         def cond_fn(carry):
