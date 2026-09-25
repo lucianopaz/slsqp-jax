@@ -159,7 +159,9 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
             the merit there. On rejection, ``x0`` and the merit at ``x0``,
             per the :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`
             contract. ``solver_state`` is returned with its incoming value in
-            both cases.
+            both cases. A non-finite ``direction`` is rejected without
+            evaluating any trial; non-finite merits at individual trial
+            points are simply not accepted and backtracking continues.
 
         Examples
         --------
@@ -181,12 +183,13 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         0.0...
         """
         merit0_val, merit0_grad = eqx.filter_value_and_grad(self.merit)(x0)
+        merit0_grad_dot_step = jnp.inner(merit0_grad.flatten(), direction.flatten())
         state = LineSearchState(
             x0=x0,
             step=direction,
             merit0_val=merit0_val,
             merit0_grad=merit0_grad,
-            merit0_grad_dot_step=jnp.inner(merit0_grad.flatten(), direction.flatten()),
+            merit0_grad_dot_step=merit0_grad_dot_step,
             # No trial evaluated yet: seed with +inf so the loop always runs at
             # least once and stop_search cannot spuriously accept at init (e.g.
             # for a non-descent direction, where merit0_grad_dot_step > 0 would
@@ -194,6 +197,16 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
             merit_val=jnp.asarray(jnp.inf, merit0_val.dtype),
             merit_grad=merit0_grad,
         )
+
+        # A non-finite direction (or directional derivative) can never be
+        # accepted: skip the trial loop entirely instead of burning the budget
+        # on NaN merits. With ``merit_val`` seeded at +inf, ``stop_search`` on
+        # the untouched state is False, so the search reports a rejection.
+        direction_finite = jnp.all(
+            jnp.stack(
+                [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(direction)]
+            )
+        ) & jnp.isfinite(merit0_grad_dot_step)
 
         def body_fun(state):
             new_state = self.trial(state)
@@ -203,9 +216,10 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
             return new_state
 
         def cond_fun(state):
-            return jnp.logical_and(
-                jnp.logical_not(self.stop_search(state)),
-                state.iteration < self.max_steps,
+            return (
+                direction_finite
+                & jnp.logical_not(self.stop_search(state))
+                & (state.iteration < self.max_steps)
             )
 
         state = cast(

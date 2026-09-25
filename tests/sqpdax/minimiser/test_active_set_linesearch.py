@@ -196,6 +196,82 @@ def test_failure_counters_wait_for_fatal_threshold(kind, expected):
     assert bool(result == expected)
 
 
+@pytest.mark.parametrize(
+    ("proposed_step_norm", "expect_fatal"),
+    [(jnp.nan, True), (jnp.inf, True), (1.0, False)],
+    ids=["nan-direction", "inf-direction", "finite-unconverged"],
+)
+def test_nonfinite_qp_direction_counts_as_qp_failure(proposed_step_norm, expect_fatal):
+    """A rejected non-finite QP direction is a real QP failure.
+
+    The QP solver reports a NaN residual as ``max_steps_reached``, which is
+    otherwise (correctly) not counted as a failure; a non-finite direction
+    must still drive ``qp_subproblem_failure`` because retrying at the same
+    ``(x, λ)`` reproduces it.
+    """
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        rtol=-1.0,
+        qp_failure_patience=1,
+        ls_failure_patience=100,
+        stagnation_patience=100,
+    ).init(problem, jnp.ones(2))
+    for _ in range(2):
+        solver = _execute_synthetic_step(
+            solver,
+            problem,
+            accepted=False,
+            qp_success=False,
+            qp_status=RESULTS.max_steps_reached,
+            x=solver.iterate.x,
+            merit=float(solver.best_merit),
+            proposed_step_norm=proposed_step_norm,
+        )
+    done, result = solver.terminate(problem)
+    assert bool(done) is expect_fatal
+    assert bool(solver.qp_fatal) is expect_fatal
+    if expect_fatal:
+        assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure)
+    else:
+        assert int(solver.consecutive_qp_failures) == 0
+
+
+def test_nan_curvature_terminates_with_qp_failure_without_moving():
+    """End-to-end: a NaN QP direction never moves ``(x, λ)`` and exits cleanly.
+
+    A NaN Hessian-vector product poisons the CG direction only; the objective,
+    gradient and constraints stay finite so the termination check does not
+    see it directly. The line search must reject without trials, the dual
+    must stay at its previous (finite) value, and the run must end with
+    ``qp_subproblem_failure`` rather than ``nonfinite``.
+    """
+    problem = replace(
+        make_unconstrained_quadratic(),
+        hvp=lambda x, v: jnp.full_like(v, jnp.nan),
+    )
+    x0 = jnp.ones(2)
+    sol = minimise(
+        problem,
+        ActiveSetLineSearchMinimiser(qp_failure_patience=1, min_steps=1),
+        x0,
+        max_steps=20,
+        throw=False,
+    )
+    assert bool(
+        sol.stats["sqpdax_result"]
+        == ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure
+    )
+    assert jnp.array_equal(sol.value, x0)
+    for key in (
+        "multipliers_eq",
+        "multipliers_ineq",
+        "multipliers_lb",
+        "multipliers_ub",
+    ):
+        assert jnp.all(jnp.isfinite(sol.stats[key]))
+    assert int(sol.stats["consecutive_qp_failures"]) == 2
+
+
 @pytest.mark.parametrize("bad_merit", [100.0, jnp.inf], ids=["growth", "nonfinite"])
 def test_merit_blowup_restores_best_iterate(bad_merit):
     """Repeated excessive merit growth rolls back and reports iterate blow-up."""
