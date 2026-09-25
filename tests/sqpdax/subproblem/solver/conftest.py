@@ -14,6 +14,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ActiveSetQPSolverState,
     DogLegSolverState,
     ProjectedCGState,
+    ProximalActiveSetQPSolverState,
     SteihaugTointCGTangentialStepSolverState,
     TrustRegionSolverState,
 )
@@ -104,6 +105,26 @@ def make_active_set_qp_state() -> ActiveSetQPSolverState:
         success=jnp.asarray(False),
         status=RESULTS.successful,
         n_cg_iter=jnp.zeros((), jnp.int32),
+    )
+
+
+def make_proximal_state(
+    meq: int,
+    *,
+    kkt_residual: float | Array = jnp.inf,
+    eq_center: Array | None = None,
+) -> ProximalActiveSetQPSolverState:
+    """Cold :class:`ProximalActiveSetQPSolverState` with the given residual / centre."""
+    if eq_center is None:
+        eq_center = jnp.zeros((meq,))
+    return ProximalActiveSetQPSolverState(
+        n_iter=jnp.zeros((), jnp.int32),
+        success=jnp.asarray(False),
+        status=RESULTS.successful,
+        n_cg_iter=jnp.zeros((), jnp.int32),
+        kkt_residual=jnp.asarray(kkt_residual, dtype=float),
+        mu=jnp.asarray(0.0),
+        eq_center=jnp.asarray(eq_center),
     )
 
 
