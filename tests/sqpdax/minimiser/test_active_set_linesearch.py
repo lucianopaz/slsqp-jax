@@ -67,9 +67,18 @@ def test_minimise_equality_constrained():
     "options",
     [
         None,
-        {"minimiser": {"qp_tol": 1e-7}, "subproblem": {"tol": 1e-7}},
+        {
+            "minimiser": {"qp_tol": 1e-7},
+            "subproblem": {"working_set_policy": {"tol": 1e-9}},
+        },
+        {
+            "minimiser": {"qp_tol": 1e-7},
+            "subproblem": {
+                "working_set_policy": {"expand_factor": 1.0, "ping_pong_threshold": 3}
+            },
+        },
     ],
-    ids=["default", "with-options"],
+    ids=["default", "with-options", "with-policy-options"],
 )
 def test_init_accepts_option_bag(options):
     """Recognised minimiser / subproblem options are applied without error."""
@@ -78,6 +87,12 @@ def test_init_accepts_option_bag(options):
     assert solver.iterate is not None
     if options is not None:
         assert solver.qp_tol == 1e-7
+        policy = solver._init_subproblem(problem).solver.working_set_policy
+        policy_opts = options["subproblem"]["working_set_policy"]
+        # A nested ``tol`` overrides the minimiser's ``qp_tol`` routing.
+        assert policy.tol == policy_opts.get("tol", 1e-7)
+        assert policy.expand_factor == policy_opts.get("expand_factor", 0.0)
+        assert policy.ping_pong_threshold == policy_opts.get("ping_pong_threshold")
         # Exercise the ``subproblem`` option path inside ``_init_subproblem``.
         solver = solver.step(problem)
         assert int(solver.step_count) == 1
@@ -105,6 +120,8 @@ def test_qp_solver_receives_tolerance_and_warm_start_flag(
     assert solver.effective_qp_tol == expected_tol
     ctx = solver._init_subproblem(problem)
     assert ctx.solver.tol == expected_tol
+    assert ctx.solver.working_set_policy.tol == expected_tol
+    assert ctx.solver.max_iter == solver.qp_max_iter
     assert ctx.solver.warm_start is qp_warm_start
     # The carried working set / dual are sized for the problem and cold.
     state = solver.solver_state
@@ -414,6 +431,8 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         "total_qp_iterations",
         "total_qp_cg_iterations",
         "qp_result",
+        "qp_final_working_tol",
+        "n_qp_anti_cycling",
         "last_step_size",
         "consecutive_qp_failures",
         "consecutive_ls_failures",
@@ -426,6 +445,8 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         sol.stats["total_qp_cg_iterations"]
     )
     assert bool(sol.stats["qp_result"] == ACTIVE_SET_QP_RESULTS.working_set_converged)
+    assert float(sol.stats["qp_final_working_tol"]) == pytest.approx(1e-5)
+    assert int(sol.stats["n_qp_anti_cycling"]) == 0
     metrics = sol.state.termination_metrics(sol.state._optimisation_context(problem))
     assert float(sol.stats["kkt_ratio"]) == pytest.approx(
         float(metrics.stationarity) / float(sol.stats["kkt_scale"])

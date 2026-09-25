@@ -113,8 +113,7 @@ class ProximalActiveSetLineSearchMinimiser(
                 subproblem_solver=ProjectedCGSubProblemSolver(
                     preconditioner=preconditioner
                 ),
-                tol=self.effective_qp_tol,
-                max_iter=self.qp_max_iter,
+                working_set_policy=self._make_working_set_policy(),
                 warm_start=self.qp_warm_start,
             ),
         )
@@ -137,6 +136,8 @@ class ProximalActiveSetLineSearchMinimiser(
                 qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
                 active_set=self._empty_active_set(problem),
                 dual=self._init_dual(problem),
+                final_working_tol=jnp.asarray(self.effective_qp_tol, dtype),
+                n_anti_cycling=jnp.asarray(0, jnp.int32),
                 kkt_residual=jnp.asarray(jnp.inf, dtype),
                 mu=jnp.asarray(solver.mu_max, dtype),
                 eq_center=jnp.zeros((problem.meq,), dtype),

@@ -100,8 +100,11 @@ from .subproblem import (
     SubProblemSolver,
     SubProblemSolverState,
     SubProblemSolverStateType,
+    ThresholdWorkingSetPolicy,
     TrustRegionInteriorPointSolver,
     TrustRegionSolverState,
+    WorkingSetPolicy,
+    WorkingSetPolicyState,
 )
 from .types import InitializableModule
 
@@ -202,4 +205,7 @@ __all__ = [
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
     "TrustRegionInteriorPointSolver",
+    "WorkingSetPolicyState",
+    "WorkingSetPolicy",
+    "ThresholdWorkingSetPolicy",
 ]

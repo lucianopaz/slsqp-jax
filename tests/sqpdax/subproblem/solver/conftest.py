@@ -121,6 +121,8 @@ def _cold_active_set_fields(n: int, meq: int, mineq: int) -> dict:
         qp_result=ACTIVE_SET_QP_RESULTS.working_set_converged,
         active_set=make_empty_active_set(n, meq, mineq),
         dual=make_zero_dual(n, meq, mineq),
+        final_working_tol=jnp.asarray(0.0),
+        n_anti_cycling=jnp.zeros((), jnp.int32),
     )
 
 

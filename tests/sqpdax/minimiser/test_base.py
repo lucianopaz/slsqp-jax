@@ -60,7 +60,10 @@ def test_validate_options_warns_on_unknown_keys():
             options={
                 "bogus": {},
                 "minimiser": {"not_a_field": 1.0},
-                "subproblem": {"not_a_solver_field": 0.0, "tol": 1e-7},
+                "subproblem": {
+                    "not_a_solver_field": 0.0,
+                    "working_set_policy": {"tol": 1e-7},
+                },
             },
         )
     messages = " ".join(str(w.message) for w in caught)

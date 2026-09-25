@@ -37,8 +37,11 @@ from .solver import (
     SubProblemSolver,
     SubProblemSolverState,
     SubProblemSolverStateType,
+    ThresholdWorkingSetPolicy,
     TrustRegionInteriorPointSolver,
     TrustRegionSolverState,
+    WorkingSetPolicy,
+    WorkingSetPolicyState,
 )
 
 __all__ = [
@@ -71,4 +74,7 @@ __all__ = [
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
     "TrustRegionInteriorPointSolver",
+    "WorkingSetPolicyState",
+    "WorkingSetPolicy",
+    "ThresholdWorkingSetPolicy",
 ]
