@@ -14,6 +14,7 @@ from . import (
     base,
     interface,
     optimistix_compat,
+    proximal_active_set_linesearch,
     trust_region_interior_point,
     utils,
 )
@@ -25,6 +26,7 @@ from .active_set_linesearch import (
 from .base import AbstractConstrainedMinimiser, CommonMinimiser, OptimisationContext
 from .interface import minimise
 from .optimistix_compat import OptimistixMinimiser, as_optimistix_minimiser
+from .proximal_active_set_linesearch import ProximalActiveSetLineSearchMinimiser
 from .trust_region_interior_point import (
     TRUST_REGION_INTERIOR_POINT_RESULTS,
     TrustRegionInteriorPointMinimiser,
@@ -38,11 +40,13 @@ __all__ = [
     "optimistix_compat",
     "utils",
     "active_set_linesearch",
+    "proximal_active_set_linesearch",
     "trust_region_interior_point",
     "OptimisationContext",
     "AbstractConstrainedMinimiser",
     "CommonMinimiser",
     "ActiveSetLineSearchMinimiser",
+    "ProximalActiveSetLineSearchMinimiser",
     "TrustRegionInteriorPointMinimiser",
     "minimise",
     "OptimistixMinimiser",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Self, cast
+from typing import Any, Generic, Self, cast
 
 import equinox as eqx
 import jax
@@ -27,6 +27,7 @@ from ..subproblem.solver import (
     RESULTS,
     ActiveSetQPSolver,
     ActiveSetQPSolverState,
+    ActiveSetStateType,
     ProjectedCGSubProblemSolver,
     SubproblemContext,
     SubProblemSolver,
@@ -119,10 +120,11 @@ class ActiveSetLineSearchMinimiser(
     CommonMinimiser[
         Primal,
         ActiveSetSubProblem,
-        ActiveSetQPSolverState,
+        ActiveSetStateType,
         ActiveSetLineSearchTerminationMetrics,
         ACTIVE_SET_LINE_SEARCH_RESULTS,
-    ]
+    ],
+    Generic[ActiveSetStateType],
 ):
     """SLSQP-style active-set QP subproblem + L1-merit backtracking line search.
 
@@ -231,7 +233,7 @@ class ActiveSetLineSearchMinimiser(
         self,
         primal: Primal,
         dual: Dual,
-        solver_state: ActiveSetQPSolverState,
+        solver_state: ActiveSetStateType,
         problem: ProblemProtocol[Primal],
     ) -> Self:
         """Seed secant and best-iterate termination state."""
@@ -260,10 +262,14 @@ class ActiveSetLineSearchMinimiser(
 
     def _init_solver_state(
         self, problem: ProblemProtocol[Primal], primal: Primal
-    ) -> ActiveSetQPSolverState:
-        """Cold :class:`ActiveSetQPSolverState` for the first outer step."""
+    ) -> ActiveSetStateType:
+        """Cold :class:`ActiveSetQPSolverState` for the first outer step.
+
+        Subclasses binding a richer ``ActiveSetStateType`` must override this
+        to build their own carry.
+        """
         return cast(
-            ActiveSetQPSolverState,
+            ActiveSetStateType,
             ActiveSetQPSolverState(
                 n_iter=jnp.asarray(0, jnp.int32),
                 n_cg_iter=jnp.asarray(0, jnp.int32),
@@ -283,7 +289,7 @@ class ActiveSetLineSearchMinimiser(
 
     def _make_qp_solver(
         self, problem: ProblemProtocol[Primal], dtype: jnp.dtype
-    ) -> ActiveSetQPSolver:
+    ) -> ActiveSetQPSolver[Any, ActiveSetStateType]:
         """Construct the default QP solver before ``options['subproblem']`` is applied.
 
         Parameters
@@ -296,10 +302,12 @@ class ActiveSetLineSearchMinimiser(
         Returns
         -------
         ActiveSetQPSolver
-            Active-set loop around an unpreconditioned projected CG.
+            Active-set loop around an unpreconditioned projected CG. Its
+            state type matches ``ActiveSetStateType``; subclasses binding a
+            richer state must return a solver that consumes / produces it.
         """
         return cast(
-            ActiveSetQPSolver,
+            ActiveSetQPSolver[Any, ActiveSetStateType],
             ActiveSetQPSolver(
                 subproblem_solver=ProjectedCGSubProblemSolver(),
                 tol=self.qp_tol,
@@ -309,7 +317,7 @@ class ActiveSetLineSearchMinimiser(
 
     def _init_subproblem(
         self, problem: ProblemProtocol[Primal]
-    ) -> SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState]:
+    ) -> SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType]:
         """Build an active-set QP context at the current iterate.
 
         The Lagrangian is evaluated at a *zero* dual so the QP recovers the
@@ -334,23 +342,23 @@ class ActiveSetLineSearchMinimiser(
             active_ub=jnp.zeros((n,), bool),
         )
         return cast(
-            SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState],
+            SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
             SubproblemContext(
                 problem=problem,
                 lagrangian=lag_module,
                 subproblem=ActiveSetSubProblem(qp_lag, empty_active),
                 solver=solver,
                 warm=(Primal(jnp.zeros((n,), dtype)), dual),
-                state=cast(ActiveSetQPSolverState, self.solver_state),
+                state=cast(ActiveSetStateType, self.solver_state),
             ),
         )
 
     def _step_controller(
         self,
-        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState],
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
         step_dual: Dual,
-        solver_state: ActiveSetQPSolverState,
-    ) -> StepController[Primal, ActiveSetQPSolverState]:
+        solver_state: ActiveSetStateType,
+    ) -> StepController[Primal, ActiveSetStateType]:
         """Armijo line search on an L1 merit with multiplier-based penalty."""
         rho = jnp.maximum(
             self.penalty_floor, self.penalty_factor * _inf_norm(step_dual.flatten())
@@ -363,7 +371,7 @@ class ActiveSetLineSearchMinimiser(
             norm=1,
         )
         return cast(
-            StepController[Primal, ActiveSetQPSolverState],
+            StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
                 merit=merit,
                 max_steps=self.line_search_max_steps,
@@ -373,7 +381,7 @@ class ActiveSetLineSearchMinimiser(
         )
 
     def _feasibility_error(
-        self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
+        self, ctx: OptimisationContext[Primal, ActiveSetStateType]
     ) -> Scalar:
         """``∞``-norm of equality / inequality / bound violations."""
         return self._feasibility_from_lagrangian(ctx.lagrangian)
@@ -396,14 +404,14 @@ class ActiveSetLineSearchMinimiser(
 
     def _advance_dynamics(
         self,
-        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState],
-        result: StepResult[Primal, ActiveSetQPSolverState],
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        result: StepResult[Primal, ActiveSetStateType],
         step_dual: Dual,
     ) -> Self:
         """Update progress/failure counters and restore the best point on blow-up."""
         lagrangian = ctx.lagrangian(result.x, step_dual)
         feasible = self._feasibility_from_lagrangian(lagrangian) <= self.atol
-        solver_state = cast(ActiveSetQPSolverState, result.solver_state)
+        solver_state = cast(ActiveSetStateType, result.solver_state)
 
         best_merit = self.best_merit
         merit_scale = jnp.maximum(jnp.abs(best_merit), 1.0)
@@ -518,7 +526,7 @@ class ActiveSetLineSearchMinimiser(
         )
 
     def termination_metrics(
-        self, ctx: OptimisationContext[Primal, ActiveSetQPSolverState]
+        self, ctx: OptimisationContext[Primal, ActiveSetStateType]
     ) -> ActiveSetLineSearchTerminationMetrics:
         """Measure relative stationarity and absolute feasibility.
 
@@ -591,7 +599,7 @@ class ActiveSetLineSearchMinimiser(
 
     def termination_flags(
         self,
-        ctx: OptimisationContext[Primal, ActiveSetQPSolverState],
+        ctx: OptimisationContext[Primal, ActiveSetStateType],
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> TerminationFlags[ACTIVE_SET_LINE_SEARCH_RESULTS]:
         """Converge on ``rtol``-relative stationarity plus ``atol`` feasibility.
@@ -677,7 +685,7 @@ class ActiveSetLineSearchMinimiser(
         metrics = self.termination_metrics(ctx)
         lagrangian = ctx.lagrangian
         dual = cast(Dual, self.dual)
-        solver_state = cast(ActiveSetQPSolverState, self.solver_state)
+        solver_state = cast(ActiveSetStateType, self.solver_state)
         return {
             "num_steps": self.step_count,
             "final_objective": lagrangian.fn_val,

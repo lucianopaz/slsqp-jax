@@ -6,13 +6,17 @@ package can drive. Concrete subclasses attach method-specific geometry:
 
 * :class:`~slsqp_jax.sqpdax.subproblem.active_set.ActiveSetSubProblem` —
   equality / inequality / bound QP restricted to a working set.
+* :class:`~slsqp_jax.sqpdax.subproblem.proximal.ProximalActiveSetSubProblem`
+  — working-set QP with equalities eliminated through a proximal
+  (stabilised-SQP) term.
 * :class:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem`
   — primal-dual interior-point Newton system in scaled slack coordinates.
 """
 
-from . import active_set, base, scaled_barrier, solver
+from . import active_set, base, proximal, scaled_barrier, solver
 from .active_set import ActiveSetSubProblem
 from .base import SubProblem
+from .proximal import ProximalActiveSetSubProblem
 from .scaled_barrier import ScaledBarrierSubProblem
 from .solver import (
     RESULTS,
@@ -24,6 +28,8 @@ from .solver import (
     GradientProjectionState,
     ProjectedCGState,
     ProjectedCGSubProblemSolver,
+    ProximalActiveSetQPSolver,
+    ProximalActiveSetQPSolverState,
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
     SubproblemContext,
@@ -37,9 +43,11 @@ from .solver import (
 __all__ = [
     "active_set",
     "base",
+    "proximal",
     "scaled_barrier",
     "solver",
     "ActiveSetSubProblem",
+    "ProximalActiveSetSubProblem",
     "SubProblem",
     "ScaledBarrierSubProblem",
     "RESULTS",
@@ -55,6 +63,8 @@ __all__ = [
     "GradientProjection",
     "ProjectedCGState",
     "ProjectedCGSubProblemSolver",
+    "ProximalActiveSetQPSolverState",
+    "ProximalActiveSetQPSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
