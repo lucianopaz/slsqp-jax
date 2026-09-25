@@ -281,6 +281,32 @@ class ActiveSetLineSearchMinimiser(
             Lagrangian(problem, self.secant),
         )
 
+    def _make_qp_solver(
+        self, problem: ProblemProtocol[Primal], dtype: jnp.dtype
+    ) -> ActiveSetQPSolver:
+        """Construct the default QP solver before ``options['subproblem']`` is applied.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised (for sizes).
+        dtype
+            Floating dtype of the iterate.
+
+        Returns
+        -------
+        ActiveSetQPSolver
+            Active-set loop around an unpreconditioned projected CG.
+        """
+        return cast(
+            ActiveSetQPSolver,
+            ActiveSetQPSolver(
+                subproblem_solver=ProjectedCGSubProblemSolver(),
+                tol=self.qp_tol,
+                max_iter=self.qp_max_iter,
+            ),
+        )
+
     def _init_subproblem(
         self, problem: ProblemProtocol[Primal]
     ) -> SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetQPSolverState]:
@@ -297,14 +323,7 @@ class ActiveSetLineSearchMinimiser(
         # Zero-dual eval => QP returns the *full* multiplier lambda_{k+1}.
         qp_lag = lag_module(iterate, self._init_dual(problem))
 
-        solver = cast(
-            ActiveSetQPSolver,
-            ActiveSetQPSolver(
-                subproblem_solver=ProjectedCGSubProblemSolver(),
-                tol=self.qp_tol,
-                max_iter=self.qp_max_iter,
-            ),
-        )
+        solver = self._make_qp_solver(problem, dtype)
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
@@ -543,6 +562,32 @@ class ActiveSetLineSearchMinimiser(
             ),
         )
 
+    def _infeasible_stationary(
+        self,
+        metrics: ActiveSetLineSearchTerminationMetrics,
+        stationary: Bool[Array, ""],
+        feasible: Bool[Array, ""],
+    ) -> Bool[Array, ""]:
+        """Detect a stationary but primally infeasible iterate (fatal).
+
+        Parameters
+        ----------
+        metrics
+            Output of :meth:`termination_metrics`.
+        stationary
+            Relative stationarity test outcome.
+        feasible
+            Absolute feasibility test outcome.
+
+        Returns
+        -------
+        Bool[Array, ""]
+            ``True`` when the iterate is stationary, infeasible and the
+            minimum step count has been reached. Subclasses whose QP step
+            does not enforce ``A d = -c`` (proximal variants) override this.
+        """
+        return stationary & ~feasible & metrics.has_min_steps
+
     def termination_flags(
         self,
         ctx: OptimisationContext[Primal, ActiveSetQPSolverState],
@@ -574,7 +619,9 @@ class ActiveSetLineSearchMinimiser(
         )
         converged = classical | qp_kkt
 
-        infeasible_stationary = stationary & ~feasible & metrics.has_min_steps
+        infeasible_stationary = self._infeasible_stationary(
+            metrics, stationary, feasible
+        )
         fatal = (
             self.merit_stagnation
             | self.ls_fatal
