@@ -38,9 +38,17 @@ class ActiveSetQPSolverState(SubProblemSolverState):
     n_cg_iter: int
 
 
+# Outer QP-loop state; defaulted so bare ``ActiveSetQPSolver`` keeps meaning
+# ``ActiveSetQPSolver[ProjectedCGState, ActiveSetQPSolverState]`` while
+# subclasses can bind a richer carry and specialise ``solve`` without casts.
+ActiveSetStateType = TypeVar(
+    "ActiveSetStateType", bound=ActiveSetQPSolverState, default=ActiveSetQPSolverState
+)
+
+
 class ActiveSetQPSolver(
-    SubProblemSolver[Primal, ActiveSetSubProblem, ActiveSetQPSolverState],
-    Generic[KKTSolverStateType],
+    SubProblemSolver[Primal, ActiveSetSubProblem, ActiveSetStateType],
+    Generic[KKTSolverStateType, ActiveSetStateType],
 ):
     """Minimal primal-dual active-set QP solver.
 
@@ -81,12 +89,34 @@ class ActiveSetQPSolver(
         Primal, ActiveSetSubProblem, KKTSolverStateType
     ] = eqx.field(default_factory=ProjectedCGSubProblemSolver)
 
+    def _kkt_solver(
+        self, subproblem: ActiveSetSubProblem
+    ) -> SubProblemSolver[Primal, ActiveSetSubProblem, KKTSolverStateType]:
+        """Inner KKT solver used for every working set of one :meth:`solve`.
+
+        Called once per solve, outside the working-set loop, so subclasses
+        may derive a per-solve variant of :attr:`subproblem_solver` (e.g.
+        re-wrap its preconditioner around data carried by ``subproblem``)
+        without rebuilding it for each working-set refresh.
+
+        Parameters
+        ----------
+        subproblem
+            The QP handed to :meth:`solve` (after any subclass preprocessing).
+
+        Returns
+        -------
+        SubProblemSolver
+            :attr:`subproblem_solver` unchanged by default.
+        """
+        return self.subproblem_solver
+
     def solve(
         self,
         subproblem: ActiveSetSubProblem,
         x0: tuple[Primal, Dual],
-        initial_state: ActiveSetQPSolverState,
-    ) -> tuple[tuple[Primal, Dual], ActiveSetQPSolverState]:
+        initial_state: ActiveSetStateType,
+    ) -> tuple[tuple[Primal, Dual], ActiveSetStateType]:
         """Solve the inequality / bound QP by an active-set loop.
 
         Parameters
@@ -106,9 +136,10 @@ class ActiveSetQPSolver(
         step
             Primal-dual QP solution.
         state
-            Updated :class:`ActiveSetQPSolverState` (outer / CG counts,
-            success, status).
+            ``initial_state`` with the outer / CG counts, success and status
+            refreshed (same type as the input).
         """
+        inner = self._kkt_solver(subproblem)
         lag = subproblem.lagrangian
         x = lag.ref.x
         tol = jnp.asarray(self.tol, x.dtype)
@@ -161,7 +192,7 @@ class ActiveSetQPSolver(
             ),
         )
 
-        kkt_state0 = self.subproblem_solver.solver_state_class(
+        kkt_state0 = inner.solver_state_class(
             n_iter=jnp.asarray(initial_state.n_cg_iter, jnp.int32),
             success=jnp.asarray(False),
             status=RESULTS.successful,
@@ -173,7 +204,7 @@ class ActiveSetQPSolver(
             kkt_state: KKTSolverStateType,
         ) -> tuple[tuple[Primal, Dual], KKTSolverStateType]:
             subproblem_k = subproblem.with_active_set(active_set)
-            return self.subproblem_solver.solve(subproblem_k, warm, kkt_state)
+            return inner.solve(subproblem_k, warm, kkt_state)
 
         def cond_fn(carry):
             _active, _step, _kkt_state, n_iter, changed = carry
@@ -210,7 +241,7 @@ class ActiveSetQPSolver(
             kkt_state_f.status,
         )
         return step_f, cast(
-            ActiveSetQPSolverState,
+            ActiveSetStateType,
             tree_at(
                 lambda state: (
                     state.n_iter,
