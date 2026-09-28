@@ -1,7 +1,7 @@
 """Abstract matrix-free KKT subproblem shared by SQP step solvers."""
 
 from abc import abstractmethod
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 import jax
 from equinox import Module
@@ -154,6 +154,52 @@ class SubProblem(Module, Generic[PrimalType]):
         """
         return False
 
+    @property
+    def is_kkt_dual_increment(self) -> bool:
+        """Whether the dual block of a KKT solution is an increment ``Δλ``.
+
+        Nocedal & Wright §18.1 give two equivalent forms of the Newton-KKT
+        system. In the *Newton view* (eq. 18.6) the right-hand side is the
+        Lagrangian gradient ``-∇_x L(x_k, λ_k)`` and the dual block of the
+        solution is the increment ``p_λ``, so ``λ_{k+1} = λ_k + p_λ``. In the
+        *SQP view* (eq. 18.9) the right-hand side is the objective gradient
+        ``-∇f_k`` and the dual block is ``λ_{k+1}`` itself. Both are valid;
+        each subproblem declares which one its :meth:`kkt_rhs` encodes so
+        that :meth:`to_native_step` can hand the minimiser an absolute
+        multiplier either way, and so that solvers whose logic interprets
+        the sign or magnitude of the dual block (working-set drop tests,
+        dual-feasibility safeguards) can refuse the increment view early.
+
+        Returns
+        -------
+        bool
+            ``False`` (SQP view) by default; Newton-view subclasses override.
+        """
+        return False
+
+    def free_subspace(self) -> tuple[Bool[Array, " n"], Float[Array, " n"]]:
+        """Decision-variable coordinates that are free, and the fixed values.
+
+        Returns
+        -------
+        free_mask
+            ``True`` where the ``x`` step is an unknown of the KKT system.
+        fixed_values
+            Prescribed step on the fixed coordinates (zeros where free).
+
+        Notes
+        -----
+        The geometry lives in the column space of
+        :meth:`nonbound_constraint_jac` (the ``x`` block, not slacks), which
+        is what range-/null-space projectors act on. Default geometry has no
+        fixed coordinates. Working-set subproblems override this to pin the
+        variables sitting on an active bound so null-space solvers only
+        iterate on the remaining ones.
+        """
+        A = self.nonbound_constraint_jac()
+        n = A.shape[1]
+        return jnp.ones((n,), dtype=bool), jnp.zeros((n,), A.dtype)
+
     @abstractmethod
     def nonbound_constraint_jac(self) -> Float[Array, " meq+mineq n"]:
         """Stacked equality and inequality Jacobians (no bound rows).
@@ -163,6 +209,19 @@ class SubProblem(Module, Generic[PrimalType]):
         jax.Array
             Matrix of shape ``(meq + mineq, n)``.
         """
+
+    def active_constraint_rows(self) -> Bool[Array, " meq+mineq"]:
+        """Rows of :meth:`nonbound_constraint_jac` that are constraints of the QP.
+
+        Returns
+        -------
+        jax.Array
+            Boolean mask of length ``meq + mineq``; every row by default.
+            Working-set subproblems mark inactive inequalities ``False`` so
+            projectors and multiplier recovery skip their (zeroed) rows.
+        """
+        m = self.nonbound_constraint_jac().shape[0]
+        return jnp.ones((m,), dtype=bool)
 
     def kkt_operator(self, step: tuple[PrimalType, Dual]) -> tuple[PrimalType, Dual]:
         """Assemble the saddle-point operator ``K z``.
@@ -295,20 +354,31 @@ class SubProblem(Module, Generic[PrimalType]):
         return jnp.linalg.norm(step[0].flatten())
 
     def to_native_step(self, step: tuple[PrimalType, Dual]) -> tuple[PrimalType, Dual]:
-        """Map a solver step into native (unscaled) primal-dual coordinates.
+        """Map a solver step into native primal-dual coordinates.
+
+        This is the single place where the dual convention declared by
+        :attr:`is_kkt_dual_increment` is resolved: the minimiser calls it once
+        on whatever the subproblem solver returned and commits the result, so
+        solvers never add ``λ_k`` themselves.
 
         Parameters
         ----------
         step
-            Step in the geometry used by the trust-region / line-search
-            solver.
+            ``(primal_step, dual)`` as returned by the subproblem solver, in
+            the geometry used by the trust-region / line-search solver.
 
         Returns
         -------
         tuple of PrimalType and Dual
-            Identity by default; scaled subclasses unscale here.
+            ``(primal_step, λ_{k+1})``. The primal block is returned as is
+            (scaled subclasses unscale here); the dual block is returned as
+            is in the SQP view and shifted by ``lagrangian.dual`` in the
+            Newton view.
         """
-        return step
+        primal, dual = step
+        if self.is_kkt_dual_increment:
+            dual = cast(Dual, jax.tree.map(jnp.add, self.lagrangian.dual, dual))
+        return primal, dual
 
     def primal_box(self) -> tuple[Float[Array, " n_p"], Float[Array, " n_p"]]:
         """Componentwise ``(lower, upper)`` for the primal step in ``flatten()`` order.

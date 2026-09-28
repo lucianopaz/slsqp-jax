@@ -48,7 +48,7 @@ def _make_proximal(
 def test_stabilised_operator_and_gradient(
     meq: int, active_inequalities, active_lb, active_ub
 ):
-    """HVP / gradient are the masked ones plus the proximal terms; eq rows vanish."""
+    """HVP / gradient are the parent's plus the proximal terms; eq rows vanish."""
     lag, _active, plain, prox = _make_proximal(
         meq=meq,
         active_inequalities=active_inequalities,
@@ -74,13 +74,13 @@ def test_stabilised_operator_and_gradient(
         prox.dual_grad().ineq_multipliers, plain.dual_grad().ineq_multipliers
     )
 
-    # Stabilised HVP: masked HVP + (1/μ) Aᵀ A v.
-    expected_hvp = prox.L_k.kkt_mvp_primal(step).x + (A.T @ (A @ v)) / mu
+    # Stabilised HVP: unmasked Lagrangian HVP + (1/μ) Aᵀ A v.
+    expected_hvp = lag.kkt_mvp_primal(step).x + (A.T @ (A @ v)) / mu
     assert jnp.allclose(prox.kkt_mvp_primal(step).x, expected_hvp)
     assert jnp.allclose(prox.stabilisation_hvp(v), (A.T @ (A @ v)) / mu)
 
-    # Stabilised gradient: masked gradient + Aᵀ (λ_k + c/μ).
-    expected_grad = prox.L_k.primal_grad.x + A.T @ (prox.eq_center + c / mu)
+    # Stabilised gradient: objective gradient + Aᵀ (λ_k + c/μ) (SQP view).
+    expected_grad = lag.grad_val + A.T @ (prox.eq_center + c / mu)
     assert jnp.allclose(prox.primal_grad().x, expected_grad)
 
     # Full product / residual routed through the stabilised blocks.
