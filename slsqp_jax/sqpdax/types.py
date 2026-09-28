@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Protocol, Self
 
@@ -49,10 +50,10 @@ class InitializableModule(Module):
         """Return a copy of this module with selected fields replaced.
 
         Keyword arguments must name existing fields of ``self``. For a
-        field whose current value is an :class:`InitializableModule`, the
-        corresponding value must be a mapping of keyword arguments that is
-        forwarded to that field's :meth:`init`. All other fields are
-        replaced wholesale with the provided value.
+        field whose current value is an :class:`InitializableModule`, a
+        mapping value is forwarded as keyword arguments to that field's
+        :meth:`init`; any other value (e.g. a different module instance)
+        replaces the field wholesale, as for all other fields.
 
         Fields may be updated whether their current value is ``None`` or
         already set. The original module is left unchanged; replacement
@@ -71,13 +72,11 @@ class InitializableModule(Module):
             A new module of the same type with the requested fields
             updated.
         """
-        nested_initializable_fields = {
-            k for k in kwargs if isinstance(getattr(self, k), InitializableModule)
-        }
         keyvals = {}
         for key, val in kwargs.items():
-            if key in nested_initializable_fields:
-                keyvals[key] = getattr(self, key).init(**val)
+            current = getattr(self, key)
+            if isinstance(current, InitializableModule) and isinstance(val, Mapping):
+                keyvals[key] = current.init(**val)
             else:
                 keyvals[key] = val
         return replace(self, **keyvals)

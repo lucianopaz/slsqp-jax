@@ -216,3 +216,14 @@ def test_init_does_not_treat_plain_modules_as_nested():
     assert eqx.tree_equal(result.plain, replacement)
     assert result.plain.value == 42
     assert holder.plain.value is None
+
+
+def test_init_replaces_a_nested_module_wholesale_when_given_an_instance(
+    nested: Nested,
+):
+    """A module instance (not a mapping) swaps the nested field outright."""
+    replacement = Leaf(value=7)
+    result = nested.init(leaf=replacement)
+    assert result.leaf is replacement
+    # A mapping still recurses into the (new) nested module.
+    assert result.init(leaf={"value": 9}).leaf.value == 9

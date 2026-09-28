@@ -22,7 +22,10 @@ Shared infrastructure:
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.Projector` /
   :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.ProjectionContext`
   — null-space projector, particular solution and range-space solves for a
-  working set (pluggable backend for the null-space solvers).
+  working set (pluggable backend for the null-space solvers:
+  :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.SVDProjector` direct,
+  :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.CraigProjector`
+  matrix-free).
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
   — strategies returning a subproblem's dual for a primal step
   (KKT-consistent or Hessian-free least squares, optional safeguards).
@@ -69,6 +72,8 @@ from .multiplier_recovery import (
 )
 from .projected_cg import ProjectedCGState, ProjectedCGSubProblemSolver
 from .projector import (
+    CraigProjectionContext,
+    CraigProjector,
     ProjectionContext,
     Projector,
     SVDProjectionContext,
@@ -128,6 +133,8 @@ __all__ = [
     "Projector",
     "SVDProjectionContext",
     "SVDProjector",
+    "CraigProjectionContext",
+    "CraigProjector",
     "Safeguard",
     "ClampSafeguard",
     "BarrierSafeguard",

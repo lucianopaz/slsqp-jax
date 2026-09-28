@@ -26,6 +26,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     KKT_SOLVER_RESULTS,
     RESULTS,
     ClampSafeguard,
+    CraigProjector,
     LeastSquaresMultiplierRecovery,
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
@@ -476,6 +477,36 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
     assert float(sol.stats["kkt_ratio"]) == pytest.approx(
         float(metrics.stationarity) / float(sol.stats["kkt_scale"])
     )
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+def test_projector_option_selects_the_craig_backend(minimiser_cls):
+    """``options['subproblem']['subproblem_solver']['projector']`` swaps the backend."""
+    problem, x_star, dual_star = make_shifted_box_quadratic()
+    projector = CraigProjector(max_iter=50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sol = minimise(
+            problem,
+            minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=2),
+            jnp.array([0.5, 0.5, 0.5]),
+            max_steps=40,
+            throw=False,
+            options={"subproblem": {"subproblem_solver": {"projector": projector}}},
+        )
+    ctx = sol.state._init_subproblem(problem)
+    assert isinstance(ctx.solver.subproblem_solver.projector, CraigProjector)
+    assert ctx.solver.subproblem_solver.projector.max_iter == 50
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, x_star, atol=1e-4)
+    assert jnp.allclose(
+        sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
+    )
+    assert bool(sol.stats["kkt_reason"] == KKT_SOLVER_RESULTS.converged)
 
 
 @pytest.mark.parametrize(

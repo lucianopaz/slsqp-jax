@@ -17,10 +17,11 @@ fixed by an active bound are eliminated rather than kept as rows.
 """
 
 from abc import abstractmethod
+from collections.abc import Callable
 from typing import cast
 
 import jax
-from equinox import Module, field
+from equinox import Module, field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
@@ -33,6 +34,8 @@ __all__ = [
     "Projector",
     "SVDProjectionContext",
     "SVDProjector",
+    "CraigProjectionContext",
+    "CraigProjector",
 ]
 
 
@@ -396,4 +399,382 @@ class SVDProjector(Projector):
                 inv_s2=inv_s2,
                 AMAt_pinv=AMAt_pinv,
             ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# CRAIG (Golub–Kahan bidiagonalisation) backend
+# ---------------------------------------------------------------------------
+
+
+def _craig_solve(
+    A: Float[Array, "m n"],
+    rhs: Float[Array, " m"],
+    *,
+    rtol: float,
+    atol: float,
+    max_iter: int,
+    breakdown_tol: float,
+) -> tuple[Float[Array, " n"], Bool[Array, ""], Int[Array, ""]]:
+    """Minimum-norm solution of ``A x = rhs`` by CRAIG (Paige & Saunders 1982).
+
+    Golub–Kahan bidiagonalisation needs only ``A v`` / ``Aᵀ u`` products and
+    never forms ``A Aᵀ``. Convergence is ``‖A x − rhs‖ < max(atol, rtol ‖rhs‖)``;
+    a bidiagonal coefficient below ``breakdown_tol`` signals rank deficiency
+    (or a right-hand side outside ``range(A)``) and stops the recurrence at
+    the last safe iterate.
+
+    Parameters
+    ----------
+    A
+        Matrix ``(m, n)``.
+    rhs
+        Right-hand side of length ``m``.
+    rtol, atol
+        Relative / absolute residual tolerances.
+    max_iter
+        Total bidiagonalisation budget (``>= 1``; the first step is always
+        taken).
+    breakdown_tol
+        Absolute floor on ``α_k`` / ``β_k``.
+
+    Returns
+    -------
+    x
+        Best iterate (min-norm solution when converged; zero when ``rhs``
+        is orthogonal to ``range(A)``).
+    converged
+        ``True`` iff the residual met the tolerance without breakdown.
+    n_iter
+        Bidiagonalisation steps taken.
+    """
+    dtype = rhs.dtype
+    tiny = jnp.asarray(1e-30, dtype)
+    beta1 = jnp.linalg.norm(rhs)
+    beta1_safe = jnp.maximum(beta1, tiny)
+    threshold = jnp.maximum(jnp.asarray(atol, dtype), rtol * beta1)
+    u1 = rhs / beta1_safe
+
+    Atu1 = A.T @ u1
+    alpha1 = jnp.linalg.norm(Atu1)
+    # The bidiagonal coefficients are ``O(‖A‖)``; a coefficient at roundoff
+    # level relative to that scale is a breakdown whatever the absolute
+    # ``breakdown_tol`` says (which matters in float32).
+    a_scale = jnp.linalg.norm(A, ord="fro")
+    breakdown_floor = jnp.maximum(
+        jnp.asarray(breakdown_tol, dtype), 10 * jnp.finfo(dtype).eps * a_scale
+    )
+    alpha_breakdown1 = alpha1 < breakdown_floor
+    v1 = Atu1 / jnp.maximum(alpha1, tiny)
+    s1 = beta1 / jnp.maximum(alpha1, tiny)
+    # ``α₁ ≈ 0`` with ``β₁ ≠ 0`` means ``rhs ⟂ range(A)``: the least-squares
+    # solution is zero.
+    x1 = jnp.where(alpha_breakdown1, jnp.zeros_like(v1), s1 * v1)
+
+    u_hat = A @ v1 - alpha1 * u1
+    beta2 = jnp.linalg.norm(u_hat)
+    u2 = u_hat / jnp.maximum(beta2, tiny)
+
+    trivial = beta1 < threshold  # zero right-hand side: x = 0 is exact
+    residual1 = jnp.abs(beta2 * s1)
+    converged1 = trivial | (residual1 < threshold)
+    breakdown1 = alpha_breakdown1 & ~trivial
+
+    init = (
+        x1,
+        s1,
+        u2,
+        v1,
+        beta2,
+        residual1,
+        converged1 | breakdown1,
+        breakdown1,
+        jnp.asarray(1, jnp.int32),
+    )
+
+    def body(_, carry):
+        x, s, u, v, beta, residual, done, breakdown, k = carry
+
+        def step(c):
+            x, s, u, v, beta, _residual, _done, breakdown, k = c
+            v_hat = A.T @ u - beta * v
+            v_hat = v_hat - jnp.dot(v, v_hat) * v  # local reorthogonalisation
+            alpha_new = jnp.linalg.norm(v_hat)
+            alpha_bad = alpha_new < breakdown_floor
+            v_new = v_hat / jnp.maximum(alpha_new, tiny)
+            s_new = -beta * s / jnp.maximum(alpha_new, tiny)
+            x_new = jnp.where(alpha_bad, x, x + s_new * v_new)
+
+            u_hat = A @ v_new - alpha_new * u
+            u_hat = u_hat - jnp.dot(u, u_hat) * u
+            beta_new = jnp.linalg.norm(u_hat)
+            beta_bad = beta_new < breakdown_floor
+            u_new = u_hat / jnp.maximum(beta_new, tiny)
+
+            residual_new = jnp.abs(beta_new * s_new)
+            conv = residual_new < threshold
+            broke = alpha_bad | beta_bad
+            return (
+                x_new,
+                s_new,
+                u_new,
+                v_new,
+                beta_new,
+                residual_new,
+                conv | broke,
+                breakdown | (broke & ~conv),
+                k + 1,
+            )
+
+        return jax.lax.cond(jnp.reshape(done, ()), lambda c: c, step, carry)
+
+    # The initialisation above is bidiagonalisation step 1.
+    x, _, _, _, _, _, _, breakdown, n_iter = jax.lax.fori_loop(
+        0, max(max_iter - 1, 0), body, init
+    )
+    # Judge convergence on the true residual: the recurrence estimate
+    # ``|β_{k+1} s_k|`` also vanishes when the Krylov space is exhausted on an
+    # inconsistent system (rank-deficient ``A``), which is not a solution.
+    residual = jnp.linalg.norm(A @ x - rhs)
+    converged = (residual < threshold) & ~breakdown
+    return x, converged, n_iter
+
+
+def _cg_spd_solve(
+    apply: Callable[[Float[Array, " m"]], Float[Array, " m"]],
+    rhs: Float[Array, " m"],
+    *,
+    rtol: float,
+    atol: float,
+    max_iter: int,
+) -> Float[Array, " m"]:
+    """Plain CG for an SPD operator, stopping at ``‖r‖ < max(atol, rtol ‖rhs‖)``.
+
+    Parameters
+    ----------
+    apply
+        SPD operator ``v ↦ N v``.
+    rhs
+        Right-hand side.
+    rtol, atol
+        Residual tolerances.
+    max_iter
+        Iteration budget.
+
+    Returns
+    -------
+    jax.Array
+        Approximate solution of ``N x = rhs`` (zero when ``rhs = 0``).
+    """
+    dtype = rhs.dtype
+    tol_sq = jnp.square(
+        jnp.maximum(jnp.asarray(atol, dtype), rtol * jnp.linalg.norm(rhs))
+    )
+    r0 = rhs
+    rr0 = jnp.dot(r0, r0)
+    init = (jnp.zeros_like(rhs), r0, r0, rr0, jnp.reshape(rr0 < tol_sq, ()))
+
+    eps = jnp.finfo(dtype).eps
+
+    def body(_, carry):
+        def step(c):
+            x, r, p, rr, _ = c
+            Np = apply(p)
+            pNp = jnp.dot(p, Np)
+            # A singular (PSD) operator with a right-hand side partly outside
+            # its range makes ``pᵀNp → 0`` once the range is exhausted; freeze
+            # on the last iterate instead of taking the spurious huge step.
+            freeze = pNp <= eps * jnp.dot(p, p)
+            alpha = rr / jnp.maximum(pNp, jnp.asarray(1e-30, dtype))
+            x_new = x + alpha * p
+            r_new = r - alpha * Np
+            rr_new = jnp.dot(r_new, r_new)
+            beta = rr_new / jnp.maximum(rr, jnp.asarray(1e-30, dtype))
+            return (
+                jnp.where(freeze, x, x_new),
+                jnp.where(freeze, r, r_new),
+                jnp.where(freeze, p, r_new + beta * p),
+                jnp.where(freeze, rr, rr_new),
+                freeze | (rr_new < tol_sq),
+            )
+
+        return jax.lax.cond(carry[-1], lambda c: c, step, carry)
+
+    x, _, _, _, _ = jax.lax.fori_loop(0, max_iter, body, init)
+    return x
+
+
+class CraigProjectionContext(ProjectionContext):
+    """Matrix-free :class:`ProjectionContext` (Golub–Kahan CRAIG + CG).
+
+    Without a preconditioner, :meth:`project` and :meth:`particular_solution`
+    run CRAIG on ``A_work`` (min-norm solves, no ``A Aᵀ`` formed). The
+    range-space solves :meth:`solve_normal` /
+    :meth:`solve_preconditioned_normal` run CG on ``A_work M⁻¹ A_workᵀ``
+    regularised to the identity on inactive rows so the operator stays SPD
+    at fixed shape; with a preconditioner the inherited ``M``-metric
+    projection formulas use those solves.
+
+    Non-finite values (e.g. a breakdown on a rank-deficient working set
+    that CRAIG could not step over) are propagated, never replaced by an
+    identity projection.
+
+    Attributes
+    ----------
+    rtol, atol
+        CRAIG residual tolerances.
+    max_iter
+        CRAIG bidiagonalisation budget per solve.
+    breakdown_tol
+        Absolute floor on the bidiagonal coefficients.
+    normal_rtol, normal_atol, normal_max_iter
+        CG tolerances / budget for the range-space solves.
+    """
+
+    rtol: float = field(static=True)
+    atol: float = field(static=True)
+    max_iter: int = field(static=True)
+    breakdown_tol: float = field(static=True)
+    normal_rtol: float = field(static=True)
+    normal_atol: float = field(static=True)
+    normal_max_iter: int = field(static=True)
+
+    def _craig(self, rhs: Float[Array, " m"]) -> Float[Array, " n"]:
+        x, _, _ = _craig_solve(
+            self.A_work,
+            rhs,
+            rtol=self.rtol,
+            atol=self.atol,
+            max_iter=self.max_iter,
+            breakdown_tol=self.breakdown_tol,
+        )
+        return x
+
+    def _normal_operator(
+        self, preconditioned: bool
+    ) -> Callable[[Float[Array, " m"]], Float[Array, " m"]]:
+        A_work = self.A_work
+        reg = jnp.where(self.active_rows, 0.0, 1.0).astype(A_work.dtype)
+        if preconditioned:
+
+            def apply(v):
+                return A_work @ self.apply_Minv(A_work.T @ v) + reg * v
+
+        else:
+
+            def apply(v):
+                return A_work @ (A_work.T @ v) + reg * v
+
+        return apply
+
+    def _cg_normal(self, rhs: Float[Array, " m"], preconditioned: bool):
+        sol = _cg_spd_solve(
+            self._normal_operator(preconditioned),
+            rhs,
+            rtol=self.normal_rtol,
+            atol=self.normal_atol,
+            max_iter=self.normal_max_iter,
+        )
+        return jnp.where(self.active_rows, sol, 0.0)
+
+    def solve_normal(self, rhs: Float[Array, " m"]) -> Float[Array, " m"]:
+        """CG on ``A_work A_workᵀ`` (identity on inactive rows)."""
+        return self._cg_normal(rhs, preconditioned=False)
+
+    def solve_preconditioned_normal(
+        self, rhs: Float[Array, " m"]
+    ) -> Float[Array, " m"]:
+        """CG on ``A_work M⁻¹ A_workᵀ`` (falls back to :meth:`solve_normal`)."""
+        if not self.is_preconditioned:
+            return self.solve_normal(rhs)
+        return self._cg_normal(rhs, preconditioned=True)
+
+    def project(self, v: Vector_n) -> Vector_n:
+        """CRAIG null-space projection ``v − A_workᵀ (A_work A_workᵀ)⁺ A_work v``.
+
+        Falls back to the inherited ``M``-metric formula when preconditioned.
+        """
+        if self.is_preconditioned:
+            return super().project(v)
+        v_work = self.free_f * v
+        return v_work - self._craig(self.A_work @ v_work)
+
+    def particular_solution(self, b: Float[Array, " m"]) -> Vector_n:
+        """Min-norm ``A_work d = b_eff`` by CRAIG, plus the fixed step."""
+        if self.is_preconditioned:
+            return super().particular_solution(b)
+        return self._craig(self.effective_rhs(b)) + self.d_fixed
+
+
+class CraigProjector(Projector):
+    """Iterative projector: CRAIG on ``A_work`` and CG on the normal equations.
+
+    Suited to large ``n`` where the thin SVD of :class:`SVDProjector` is too
+    expensive; every operation is a sequence of ``A_work`` / ``A_workᵀ``
+    products. :meth:`build` runs the particular-solution CRAIG once and
+    reports its convergence flag / iteration count on the context (and so
+    on the inner :class:`~slsqp_jax.sqpdax.subproblem.solver.base.KKTSolverState`).
+
+    Attributes
+    ----------
+    rtol, atol
+        CRAIG residual tolerances ``‖A x − b‖ < max(atol, rtol ‖b‖)``. The
+        absolute floor keeps near-KKT iterates (``‖b‖ ~ eps``) from chasing
+        a relative target below machine precision.
+    max_iter
+        CRAIG bidiagonalisation budget.
+    breakdown_tol
+        Absolute floor on the bidiagonal coefficients.
+    normal_rtol, normal_atol, normal_max_iter
+        CG tolerances / budget for the range-space solves.
+    """
+
+    rtol: float = field(static=True, default=1e-10)
+    atol: float = field(static=True, default=1e-12)
+    max_iter: int = field(static=True, default=200)
+    breakdown_tol: float = field(static=True, default=1e-14)
+    normal_rtol: float = field(static=True, default=1e-12)
+    normal_atol: float = field(static=True, default=1e-12)
+    normal_max_iter: int = field(static=True, default=200)
+
+    def build(
+        self, subproblem: SubProblem, preconditioner: Preconditioner | None = None
+    ) -> CraigProjectionContext:
+        """See :meth:`Projector.build`."""
+        A, A_work, active_rows, free_mask, d_fixed = self.working_geometry(subproblem)
+        ctx = cast(
+            CraigProjectionContext,
+            CraigProjectionContext(
+                A=A,
+                A_work=A_work,
+                active_rows=active_rows,
+                free_mask=free_mask,
+                d_fixed=d_fixed,
+                preconditioner=preconditioner,
+                converged=jnp.asarray(True),
+                n_iter=jnp.asarray(0, jnp.int32),
+                rtol=self.rtol,
+                atol=self.atol,
+                max_iter=self.max_iter,
+                breakdown_tol=self.breakdown_tol,
+                normal_rtol=self.normal_rtol,
+                normal_atol=self.normal_atol,
+                normal_max_iter=self.normal_max_iter,
+            ),
+        )
+        # Probe the particular solution on the subproblem's own right-hand
+        # side so a breakdown on this working set is reported to the caller.
+        _, dual_rhs = subproblem.kkt_rhs()
+        b = jnp.concatenate([dual_rhs.eq_multipliers, dual_rhs.ineq_multipliers])
+        _, converged, n_iter = _craig_solve(
+            A_work,
+            ctx.effective_rhs(b),
+            rtol=self.rtol,
+            atol=self.atol,
+            max_iter=self.max_iter,
+            breakdown_tol=self.breakdown_tol,
+        )
+        return cast(
+            CraigProjectionContext,
+            tree_at(lambda c: (c.converged, c.n_iter), ctx, (converged, n_iter)),
         )
