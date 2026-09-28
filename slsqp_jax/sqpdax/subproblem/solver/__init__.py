@@ -4,6 +4,9 @@ Public leaf solvers:
 
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.projected_cg.ProjectedCGSubProblemSolver`
   — null-space projected CG for a fixed active set.
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.minres_qlp.MinresQLPSubProblemSolver`
+  — preconditioned MINRES-QLP on the full saddle-point operator of a fixed
+  active set.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.active_set_loop.ActiveSetQPSolver`
   — primal-dual active-set loop around an inner KKT solver.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.proximal_active_set_loop.ProximalActiveSetQPSolver`
@@ -36,6 +39,7 @@ from . import (
     base,
     dogleg,
     gradient_projection,
+    minres_qlp,
     multiplier_recovery,
     projected_cg,
     projector,
@@ -62,6 +66,7 @@ from .base import (
 )
 from .dogleg import DogLegSolver, DogLegSolverState
 from .gradient_projection import GradientProjection, GradientProjectionState
+from .minres_qlp import MinresQLPState, MinresQLPSubProblemSolver
 from .multiplier_recovery import (
     BarrierSafeguard,
     ClampSafeguard,
@@ -104,6 +109,7 @@ __all__ = [
     "base",
     "dogleg",
     "gradient_projection",
+    "minres_qlp",
     "multiplier_recovery",
     "projected_cg",
     "projector",
@@ -129,6 +135,8 @@ __all__ = [
     "GradientProjection",
     "ProjectedCGState",
     "ProjectedCGSubProblemSolver",
+    "MinresQLPState",
+    "MinresQLPSubProblemSolver",
     "ProjectionContext",
     "Projector",
     "SVDProjectionContext",

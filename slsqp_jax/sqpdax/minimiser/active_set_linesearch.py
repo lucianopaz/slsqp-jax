@@ -658,8 +658,11 @@ class ActiveSetLineSearchMinimiser(
         # ``max_iter_reached`` because a NaN residual never converges). Budget
         # exhaustion — of the working-set loop or of the inner CG — is *not*
         # a failure: the partial step is still usable and the next outer
-        # iterate refreshes the set. Only a structural KKT failure (singular /
-        # breakdown) counts.
+        # iterate refreshes the set. Only a structural KKT failure counts:
+        # ``singular`` / ``breakdown``, or ``stagnation`` — the inner solver's
+        # feasibility projection bottomed out above its target (a
+        # ``KKT_SOLVER_RESULTS.residual_floor`` from MINRES-QLP), so the step
+        # does not satisfy the working set.
         qp_nonfinite = ~jnp.isfinite(result.proposed_step_norm)
         qp_real_failure = (
             (solver_state.qp_result == ACTIVE_SET_QP_RESULTS.kkt_solver_failure)
