@@ -16,6 +16,13 @@ Public leaf solvers:
   — Steihaug–Toint tangential step on a scaled barrier QP.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.trust_region.TrustRegionInteriorPointSolver`
   — composite-step trust-region interior-point orchestrator (N&W §19.5).
+
+Shared infrastructure:
+
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.Projector` /
+  :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.ProjectionContext`
+  — null-space projector, particular solution and range-space solves for a
+  working set (pluggable backend for the null-space solvers).
 """
 
 from . import (
@@ -24,6 +31,7 @@ from . import (
     dogleg,
     gradient_projection,
     projected_cg,
+    projector,
     proximal_active_set_loop,
     steihaug_toint_cg,
     trust_region,
@@ -37,7 +45,9 @@ from .active_set_loop import (
     KKTSolverStateType,
 )
 from .base import (
+    KKT_SOLVER_RESULTS,
     RESULTS,
+    KKTSolverState,
     SubproblemContext,
     SubProblemSolver,
     SubProblemSolverState,
@@ -46,6 +56,12 @@ from .base import (
 from .dogleg import DogLegSolver, DogLegSolverState
 from .gradient_projection import GradientProjection, GradientProjectionState
 from .projected_cg import ProjectedCGState, ProjectedCGSubProblemSolver
+from .projector import (
+    ProjectionContext,
+    Projector,
+    SVDProjectionContext,
+    SVDProjector,
+)
 from .proximal_active_set_loop import (
     ProximalActiveSetQPSolver,
     ProximalActiveSetQPSolverState,
@@ -72,11 +88,14 @@ __all__ = [
     "dogleg",
     "gradient_projection",
     "projected_cg",
+    "projector",
     "proximal_active_set_loop",
     "steihaug_toint_cg",
     "trust_region",
     "working_set_policy",
     "RESULTS",
+    "KKT_SOLVER_RESULTS",
+    "KKTSolverState",
     "SubProblemSolverState",
     "SubProblemSolverStateType",
     "SubProblemSolver",
@@ -92,6 +111,10 @@ __all__ = [
     "GradientProjection",
     "ProjectedCGState",
     "ProjectedCGSubProblemSolver",
+    "ProjectionContext",
+    "Projector",
+    "SVDProjectionContext",
+    "SVDProjector",
     "ProximalActiveSetQPSolverState",
     "ProximalActiveSetQPSolver",
     "SteihaugTointCGTangentialStepSolverState",

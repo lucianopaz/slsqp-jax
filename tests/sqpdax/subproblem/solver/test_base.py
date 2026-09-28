@@ -5,6 +5,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from slsqp_jax.sqpdax.subproblem.solver import (
+    KKT_SOLVER_RESULTS,
     RESULTS,
     DogLegSolverState,
     ProjectedCGState,
@@ -19,11 +20,7 @@ def test_requires_secant_false_on_projected_cg():
 
 def test_concrete_solver_states_construct():
     """Concrete carry types accept the documented required fields."""
-    pcg = ProjectedCGState(
-        n_iter=jnp.asarray(0, jnp.int32),
-        success=jnp.asarray(False),
-        status=RESULTS.successful,
-    )
+    pcg = ProjectedCGState.cold(jnp.float32)
     dogleg = DogLegSolverState(
         n_iter=jnp.asarray(0, jnp.int32),
         success=jnp.asarray(False),
@@ -34,5 +31,9 @@ def test_concrete_solver_states_construct():
         active_bounds=None,
     )
     assert pcg.status == RESULTS.successful
+    assert pcg.reason == KKT_SOLVER_RESULTS.converged
+    assert pcg.feasibility_residual.dtype == jnp.float32
+    assert bool(jnp.isinf(pcg.projected_grad_norm))
+    assert not bool(pcg.nonfinite)
     assert dogleg.radius.shape == ()
     assert dogleg.active_bounds is None

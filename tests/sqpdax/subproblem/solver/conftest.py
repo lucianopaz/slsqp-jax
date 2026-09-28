@@ -11,6 +11,7 @@ from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
+    KKT_SOLVER_RESULTS,
     RESULTS,
     ActiveSetQPSolverState,
     DogLegSolverState,
@@ -58,11 +59,7 @@ def make_qp_subproblem(
 
 def make_projected_cg_state() -> ProjectedCGState:
     """Cold :class:`ProjectedCGState`."""
-    return ProjectedCGState(
-        n_iter=jnp.zeros((), jnp.int32),
-        success=jnp.asarray(False),
-        status=RESULTS.successful,
-    )
+    return ProjectedCGState.cold(jnp.zeros(()).dtype)
 
 
 def make_dogleg_state(
@@ -123,6 +120,9 @@ def _cold_active_set_fields(n: int, meq: int, mineq: int) -> dict:
         dual=make_zero_dual(n, meq, mineq),
         final_working_tol=jnp.asarray(0.0),
         n_anti_cycling=jnp.zeros((), jnp.int32),
+        last_kkt_feasibility_residual=jnp.asarray(0.0),
+        last_kkt_n_refinements=jnp.zeros((), jnp.int32),
+        last_kkt_reason=KKT_SOLVER_RESULTS.converged,
     )
 
 

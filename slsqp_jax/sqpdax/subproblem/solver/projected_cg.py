@@ -1,25 +1,28 @@
 from typing import cast
 
 import jax
-from equinox import tree_at
+from equinox import field, tree_at
 from jax import numpy as jnp
-from jaxtyping import Array, Float
 
 from ...dual import Dual
-from ...preconditioner import IdentityPreconditioner, Preconditioner
+from ...preconditioner import Preconditioner
 from ...primal import Primal
 from ...types import Vector_n
 from ..active_set import ActiveSetSubProblem
-from .base import RESULTS, SubProblemSolver, SubProblemSolverState
+from .base import KKT_SOLVER_RESULTS, RESULTS, KKTSolverState, SubProblemSolver
+from .projector import Projector, SVDProjector
 
 
-class ProjectedCGState(SubProblemSolverState):
+class ProjectedCGState(KKTSolverState):
     """Carry for a single projected-CG KKT solve.
 
-    Inherits ``n_iter`` / ``success`` / ``status`` from
-    :class:`~slsqp_jax.sqpdax.subproblem.solver.base.SubProblemSolverState`.
+    Inherits the standardised fields of
+    :class:`~slsqp_jax.sqpdax.subproblem.solver.base.KKTSolverState`.
     ``n_iter`` accumulates CG iterations across calls so an outer active-set
-    loop can report total inner work.
+    loop can report total inner work; ``projected_grad_norm`` is the
+    ``M``-norm of the projected residual the CG stopped at and
+    ``feasibility_residual`` the working-constraint residual of the returned
+    (range-space corrected) step.
     """
 
 
@@ -47,10 +50,10 @@ class ProjectedCGSubProblemSolver(
       forces ``dx_i = lb_i - x_i`` (resp. ``ub_i - x_i``). Targets are read
       from the bound rows of ``sol``. Fixed variables drop out; the rest are
       *free*. Lower bounds win ties (``lb == ub``).
-    * **Projector.** Null / range bases are never formed. An SVD of the
-      active general Jacobian yields the Moore–Penrose solve of
-      ``A Aᵀ x = b``, so ``P(v) = v - Aᵀ (A Aᵀ)⁺ A v``. Singular values
-      below ``rcond · max(s)`` are dropped (rank-revealing; handles LICQ
+    * **Projector.** Null / range bases are never formed. The pluggable
+      ``projector`` supplies the range-space solve ``(A Aᵀ)⁺`` so that
+      ``P(v) = v - Aᵀ (A Aᵀ)⁺ A v``; the default SVD backend drops singular
+      values below ``rcond · max(s)`` (rank-revealing; handles LICQ
       violations and zero rows from inactive inequalities).
     * **Preconditioning (optional).** ``preconditioner`` supplies ``M⁻¹``
       (SPD reduced-Hessian approximation, N&W eq. 16.26), upgrading the
@@ -72,11 +75,14 @@ class ProjectedCGSubProblemSolver(
         Absolute projected-residual tolerance.
     cg_regularization
         Scale-invariant floor for the curvature check ``pᵀ H p``.
-    rcond
-        Relative singular-value floor for the pseudoinverse. ``None`` uses
-        ``eps * max(A_work.shape)`` (numpy ``pinv`` convention).
     preconditioner
         Optional SPD reduced-Hessian preconditioner ``M``.
+    projector
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.Projector`
+        backend building the per-working-set
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.ProjectionContext`
+        (default :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.SVDProjector`;
+        its ``rcond`` is configured through it).
     """
 
     solver_state_class: type[ProjectedCGState] = ProjectedCGState
@@ -84,15 +90,14 @@ class ProjectedCGSubProblemSolver(
     max_iter: int = 100
     tol: float = 1e-10
     cg_regularization: float = 1e-6
-    # Relative singular-value floor for the pseudoinverse rank cut. ``None``
-    # falls back to ``eps * max(A_work.shape)`` (numpy ``pinv`` convention).
-    rcond: float | None = None
     # Preconditioner ``M`` for the reduced Hessian (N&W eq. 16.26).  ``invert``
     # supplies ``M⁻¹``.  ``None`` is the identity (unpreconditioned Algorithm
-    # 16.2, ``H = I``) and recovers the plain projector below exactly.  A supplied
+    # 16.2, ``H = I``) and recovers the plain projector exactly.  A supplied
     # preconditioner turns the projector into the constraint preconditioner
     # (eq. 16.33).  Must be SPD for CG.
     preconditioner: Preconditioner | None = None
+    # Range-space backend building the ``ProjectionContext`` per working set.
+    projector: Projector = field(default_factory=SVDProjector)
 
     def solve(
         self,
@@ -130,39 +135,33 @@ class ProjectedCGSubProblemSolver(
                 "subproblem must be an ActiveSetSubProblem. Got "
                 f"{type(subproblem)} instead."
             )
-        # ``A`` is the masked Jacobian exposed alongside the masked operator, so
-        # inactive inequality rows are already zeroed.
         # N&W Ch. 16 ``A``: the constraint matrix of the QP
-        # ``min ½ dᵀG d + cᵀd  s.t.  A d = b`` (eq. 16.3).
-        A = subproblem.L_k.nonbound_constraint_jac
+        # ``min ½ dᵀG d + cᵀd  s.t.  A d = b`` (eq. 16.3), read through the
+        # projection context (inactive rows and fixed columns zeroed).
         n = subproblem.lagrangian.n
         meq = subproblem.lagrangian.meq
         mineq = subproblem.lagrangian.mineq
-        m_gen = meq + mineq
-        dtype = A.dtype
+        dtype = subproblem.lagrangian.ref.x.dtype
+        active_set = subproblem.active_set
+        active_lb = active_set.active_lb
 
-        # --- unpack the right-hand side (sol = -∇L) ---
+        # --- unpack the right-hand side (sol = -∇f, -c) ---
         _sol_primal, sol_dual = subproblem.kkt_rhs()
-        sol_primal = _sol_primal.x  # -∇_x L; note ``g0 = -sol_primal`` is N&W ``c``
+        sol_primal = _sol_primal.x  # -∇f; note ``g0 = -sol_primal`` is N&W ``c``
         b_gen = jnp.concatenate(
             [sol_dual.eq_multipliers, sol_dual.ineq_multipliers]
         )  # -c_general (eq block then ineq block); N&W ``b`` in ``A d = b``
-        sol_lb = sol_dual.lb_multipliers  # x - lb on active lb rows, else 0
-        sol_ub = sol_dual.ub_multipliers  # ub - x on active ub rows, else 0
 
-        # --- active bounds fix variables (lower bound wins ties) ---
-        active_set = subproblem.active_set
-        active_lb = active_set.active_lb
-        active_ub = active_set.active_ub
-        fix_lb = active_lb
-        fix_ub = active_ub & (~active_lb)
-        free_f = (~(fix_lb | fix_ub)).astype(dtype)
-        d_fixed = jnp.where(
-            fix_lb, -sol_lb, jnp.where(fix_ub, sol_ub, jnp.zeros((n,), dtype))
-        )
-
-        # Equality rows are always active; inequality rows follow the active set.
-        active_gen = active_set.active_gen
+        # --- working-set geometry and range-space solves (N&W §16.3) ---
+        # Active bounds fix variables (lower bound wins ties); the projector
+        # acts on the free columns of the active general rows.
+        ctx = self.projector.build(subproblem, self.preconditioner)
+        free_f = ctx.free_f
+        fix_lb = active_set.active_lb
+        fix_ub = active_set.active_ub & (~active_lb)
+        active_gen = ctx.active_rows
+        A = ctx.A
+        A_work = ctx.A_work
 
         # --- Lagrangian Hessian operator (matrix-free, HVP only) ---
         zero_dual = cast(
@@ -189,74 +188,14 @@ class ProjectedCGSubProblemSolver(
             # free variables left after active-bound fixing.
             return free_f * H(free_f * v)
 
-        # --- null-space projector for the (free) general constraints ---
-        # ``A_work`` masks out the fixed columns; inactive inequality rows are
-        # already zeroed upstream.  A thin SVD reduces it once and gives the
-        # Moore-Penrose pseudoinverse of ``A Aᵀ`` for free: with
-        # ``A_work = U diag(s) Vᵀ`` we have ``(A_work A_workᵀ)⁺ = U
-        # diag(pinv(s²)) Uᵀ``.  The rank cut is taken on ``s`` at full precision
-        # (not on the squared ``s²``), and exactly-zero rows fall out on their
-        # own (``s_i = 0`` -> ``0``), so no inactive-row ridge is needed.
-        A_work = A * free_f[None, :]  # drop fixed columns
-        U, s, _ = jnp.linalg.svd(A_work, full_matrices=False)
-        eps = jnp.finfo(dtype).eps
-        rcond = self.rcond if self.rcond is not None else eps * max(A_work.shape)
-        # ``initial=0`` keeps ``m_gen == 0`` (bound-only QPs) well-defined.
-        keep = s > rcond * jnp.max(s, initial=jnp.asarray(0.0, dtype))
-        # Guard the reciprocal so the masked-out (tiny / zero) singular values
-        # never form a ``1/0`` intermediate that could poison later AD.
-        inv_s2 = jnp.where(keep, 1.0 / jnp.square(jnp.where(keep, s, 1.0)), 0.0)
-
-        def solve_AAt(rhs: Float[Array, " m_gen"]) -> Float[Array, " m_gen"]:
-            # Applies ``(A Aᵀ)⁺`` — N&W's ``(A Aᵀ)⁻¹`` (eq. 16.31), generalised
-            # to the pseudoinverse for rank-deficient ``A`` (§16.8).
-            return U @ (inv_s2 * (U.T @ rhs))
-
-        # --- (optional) preconditioner: constraint preconditioner, N&W eq. 16.33 ---
-        # ``preconditioner`` supplies ``M⁻¹`` through ``invert``.  With ``M = I``
-        # (the default) ``apply_Minv`` is the identity on the free subspace and
-        # ``solve_pcaat`` is the plain ``(A Aᵀ)⁺`` above, so ``project`` collapses
-        # *exactly* to the orthogonal projector ``P_I``.  With a real ``M`` the
-        # projector becomes ``P = M⁻¹ - M⁻¹Aᵀ(A M⁻¹Aᵀ)⁻¹ A M⁻¹`` — Algorithm 16.2
-        # in its preconditioned form (H = M).  Note ``solve_AAt`` (plain SVD) is
-        # kept for the 2-norm multiplier recovery / feasibility correction below,
-        # which are preconditioner-independent.
-        pre = self.preconditioner
-        if pre is None or isinstance(pre, IdentityPreconditioner):
-
-            def apply_Minv(v: Vector_n) -> Vector_n:
-                return free_f * v
-
-            solve_pcaat = solve_AAt
-        else:
-
-            def apply_Minv(v: Vector_n) -> Vector_n:
-                return free_f * pre.invert(free_f * v)
-
-            # Form the tiny ``m_gen × m_gen`` matrix ``A M⁻¹ Aᵀ`` by applying
-            # ``M⁻¹`` to each row of ``A_work`` (a column of ``A_workᵀ``).  Zero
-            # rows (inactive inequalities) stay zero and are handled by the same
-            # ``pinv`` rank cut as the plain path.
-            AMi = jax.vmap(apply_Minv)(A_work)  # (m_gen, n): ``(M⁻¹ aᵢ)``
-            AMAt = A_work @ AMi.T  # (m_gen, m_gen)
-            AMAt_pinv = jnp.linalg.pinv(AMAt, rcond=rcond)
-
-            def solve_pcaat(rhs: Float[Array, " m_gen"]) -> Float[Array, " m_gen"]:
-                return AMAt_pinv @ rhs
-
-        # N&W projector (eq. 16.30 for ``M = I``; eq. 16.33 otherwise): maps into
-        # ``null(A)`` and, in the ``M``-inner product, onto ``span(Z)``.
-        def project(v: Vector_n) -> Vector_n:
-            mv = apply_Minv(v)
-            return mv - apply_Minv(A_work.T @ solve_pcaat(A_work @ mv))
+        project = ctx.project
+        solve_AAt = ctx.solve_normal
 
         # --- particular solution: A_work d_p_free = b_gen - A d_fixed ---
-        # N&W ``b`` (adjusted for the fixed variables) in ``A d = b``.
-        b_eff = jnp.where(active_gen, b_gen - A @ d_fixed, jnp.zeros((m_gen,), dtype))
         # N&W range-space / ``Y``-space particular solution: the minimum-``M``-norm
         # ``x = M⁻¹Aᵀ(A M⁻¹Aᵀ)⁻¹b`` (§16.3, the initial point satisfying
         # ``A x = b``; collapses to ``Aᵀ(AAᵀ)⁻¹b`` when ``M = I``).
-        d_p = apply_Minv(A_work.T @ solve_pcaat(b_eff)) + d_fixed
+        d_p = ctx.particular_solution(b_gen)
 
         g0 = (
             -sol_primal
@@ -342,15 +281,19 @@ class ProjectedCGSubProblemSolver(
             jnp.reshape(rz0 < tol_sq, ()),
             jnp.zeros((), jnp.int32),
         )
-        dx, _, _, _, converged_flag, n_cg = jax.lax.fori_loop(
+        dx, _, _, rz_f, converged_flag, n_cg = jax.lax.fori_loop(
             0, self.max_iter, cg_body, init
         )
+        # ``rz`` is a squared ``M``-norm; roundoff can drive it slightly
+        # negative once CG hits its floor, so clamp before the tolerance test.
+        rz_f = jnp.maximum(rz_f, 0.0)
+        hit_tol = rz_f < tol_sq
 
         # Defensively pull the iterate back onto the constraint with one cached
         # back-solve (range-space correction, zero on fixed variables).  The
         # projector is exact, so this only mops up floating-point drift in
         # ``A_work dx = b_eff`` accumulated over the CG iterations.
-        dx = dx - A_work.T @ solve_AAt(A_work @ dx - b_eff)
+        dx = ctx.feasibility_correction(dx, b_gen)
 
         # --- multiplier recovery ---
         # N&W ``λ*`` (eq. 16.20) via the normal equations (eq. 16.31 form):
@@ -392,14 +335,34 @@ class ProjectedCGSubProblemSolver(
         finite = jnp.all(
             jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(step)])
         )
-        success = finite & converged_flag
+        success = finite & converged_flag & ctx.converged
         status = RESULTS.where(
             finite,
             RESULTS.where(
-                converged_flag, RESULTS.successful, RESULTS.max_steps_reached
+                converged_flag & ctx.converged,
+                RESULTS.successful,
+                RESULTS.max_steps_reached,
             ),
             RESULTS.singular,
         )
+        reason = KKT_SOLVER_RESULTS.where(
+            finite,
+            KKT_SOLVER_RESULTS.where(
+                ctx.converged,
+                KKT_SOLVER_RESULTS.where(
+                    hit_tol,
+                    KKT_SOLVER_RESULTS.converged,
+                    KKT_SOLVER_RESULTS.where(
+                        converged_flag,
+                        KKT_SOLVER_RESULTS.residual_floor,
+                        KKT_SOLVER_RESULTS.max_iter_reached,
+                    ),
+                ),
+                KKT_SOLVER_RESULTS.projector_failure,
+            ),
+            KKT_SOLVER_RESULTS.nonfinite,
+        )
+        res_dtype = initial_state.feasibility_residual.dtype
         new_state = cast(
             ProjectedCGState,
             tree_at(
@@ -407,12 +370,22 @@ class ProjectedCGSubProblemSolver(
                     state.n_iter,
                     state.success,
                     state.status,
+                    state.feasibility_residual,
+                    state.n_refinements,
+                    state.projected_grad_norm,
+                    state.reason,
+                    state.nonfinite,
                 ),
                 initial_state,
                 (
-                    initial_state.n_iter + n_cg,
+                    initial_state.n_iter + n_cg + ctx.n_iter,
                     success,
                     status,
+                    ctx.feasibility_residual(dx, b_gen).astype(res_dtype),
+                    jnp.asarray(0, jnp.int32),
+                    jnp.sqrt(rz_f).astype(res_dtype),
+                    reason,
+                    jnp.logical_not(finite),
                 ),
             ),
         )

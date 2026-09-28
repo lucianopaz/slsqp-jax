@@ -1,9 +1,12 @@
 """Abstract subproblem-solver interface and per-step context carrier."""
 
 from abc import abstractmethod
-from typing import Generic, TypeVar
+from typing import Generic, Self, TypeVar
 
-from equinox import Module, field
+from equinox import Enumeration, Module, field
+from jax import numpy as jnp
+from jax.typing import DTypeLike
+from jaxtyping import Array, Bool, Int
 from lineax._solution import RESULTS
 
 from ...dual import Dual
@@ -11,11 +14,13 @@ from ...lagrangian.basic import Lagrangian
 from ...lagrangian.evaluated import EvaluatedLagrangian
 from ...primal import PrimalType
 from ...problem import ProblemProtocol
-from ...types import InitializableModule
+from ...types import InitializableModule, Scalar
 from ..base import SubProblemType
 
 __all__ = [
     "RESULTS",
+    "KKT_SOLVER_RESULTS",
+    "KKTSolverState",
     "SubProblemSolverState",
     "SubProblemSolverStateType",
     "SubProblemSolver",
@@ -50,6 +55,87 @@ SubProblemSolverStateType = TypeVar(
 )
 
 
+class KKT_SOLVER_RESULTS(Enumeration):
+    """Why an inner (fixed working set) KKT solve stopped.
+
+    Finer than the shared :class:`~lineax.RESULTS` code: a null-space CG
+    that froze on its roundoff floor and one that met its tolerance are
+    both usable steps but different diagnostics, and a projector that failed
+    to build is different from a KKT iteration that ran out of budget.
+    """
+
+    converged = "The KKT solve met its tolerance."
+    residual_floor = (
+        "The residual stopped decreasing before the tolerance was met "
+        "(roundoff floor or negative-curvature freeze); the best iterate is "
+        "returned."
+    )
+    max_iter_reached = "The KKT iteration budget was exhausted."
+    projector_failure = "The projector's own linear solves did not converge."
+    nonfinite = "The solve produced non-finite values."
+
+
+class KKTSolverState(SubProblemSolverState):
+    """Standardised carry for the inner KKT solvers of an active-set loop.
+
+    Outer loops seed it with :meth:`cold` so the carry dtype matches the
+    iterate whatever the inner solver is.
+
+    Attributes
+    ----------
+    feasibility_residual
+        ``‖A_work d − b‖`` of the returned step over the working constraints.
+        Structurally ``0`` (up to roundoff) for null-space solvers; the floor
+        of the post-solve feasibility projection for full-KKT solvers.
+    n_refinements
+        Iterative-refinement rounds actually applied to the step
+        (``0`` for null-space solvers).
+    projected_grad_norm
+        Norm of the projected gradient the solver stopped at (the inexact
+        stationarity proxy of Heinkenschloss & Ridzal 2014); ``inf`` when the
+        solver does not produce it.
+    reason
+        :class:`KKT_SOLVER_RESULTS` code for the most recent solve.
+    nonfinite
+        ``True`` when the returned step or multipliers contain non-finite
+        values.
+    """
+
+    feasibility_residual: Scalar
+    n_refinements: Int[Array, ""]
+    projected_grad_norm: Scalar
+    reason: KKT_SOLVER_RESULTS
+    nonfinite: Bool[Array, ""]
+
+    @classmethod
+    def cold(cls, dtype: DTypeLike) -> Self:
+        """Zero-iteration carry with residual fields in ``dtype``.
+
+        Parameters
+        ----------
+        dtype
+            Floating dtype of the iterate (fixes the carry dtype for
+            ``while_loop`` stability).
+
+        Returns
+        -------
+        Self
+            Cold state: ``n_iter = 0``, ``success = False``,
+            ``status = successful``, zero residual, ``inf`` projected
+            gradient, ``reason = converged``, ``nonfinite = False``.
+        """
+        return cls(
+            n_iter=jnp.asarray(0, jnp.int32),
+            success=jnp.asarray(False),
+            status=RESULTS.successful,
+            feasibility_residual=jnp.asarray(0.0, dtype),
+            n_refinements=jnp.asarray(0, jnp.int32),
+            projected_grad_norm=jnp.asarray(jnp.inf, dtype),
+            reason=KKT_SOLVER_RESULTS.converged,
+            nonfinite=jnp.asarray(False),
+        )
+
+
 class SubProblemSolver(
     InitializableModule, Generic[PrimalType, SubProblemType, SubProblemSolverStateType]
 ):
@@ -78,6 +164,18 @@ class SubProblemSolver(
     ) -> tuple[tuple[PrimalType, Dual], SubProblemSolverStateType]:
         """Compute a primal-dual step for ``subproblem``.
 
+        The dual block is returned *in the subproblem's own convention*: the
+        multiplier ``λ_{k+1}`` when the subproblem encodes the SQP view
+        (Nocedal & Wright eq. 18.9) or the increment ``Δλ`` when it encodes
+        the Newton view (eq. 18.6), as declared by
+        :attr:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.is_kkt_dual_increment`.
+        Solvers must not add ``λ_k`` themselves; the minimiser resolves the
+        convention once through
+        :meth:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.to_native_step`.
+        Solvers whose logic interprets the dual block (sign tests, clamps)
+        should reject increment-view subproblems with a ``TypeError`` at trace
+        time.
+
         Parameters
         ----------
         subproblem
@@ -92,7 +190,7 @@ class SubProblemSolver(
         Returns
         -------
         step
-            Updated ``(primal_step, dual)``.
+            Updated ``(primal_step, dual)`` in the subproblem's convention.
         state
             Refreshed solver carry.
         """

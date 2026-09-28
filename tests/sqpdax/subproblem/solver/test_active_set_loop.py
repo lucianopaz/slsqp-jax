@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
     RESULTS,
@@ -61,6 +62,26 @@ def make_bound_hit_qp():
     return sub, primal, warm
 
 
+class NewtonViewQP(ActiveSetSubProblem):
+    """Working-set QP declaring the Newton view (dual block is ``Δλ``)."""
+
+    @property
+    def is_kkt_dual_increment(self) -> bool:
+        return True
+
+
+def test_rejects_newton_view_subproblems_at_trace_time():
+    """The working-set sign tests need ``λ_{k+1}``; a ``Δλ`` QP is refused."""
+    sub = make_qp_subproblem()
+    newton = NewtonViewQP(sub.lagrangian, sub.active_set)
+    warm = (Primal(jnp.zeros(sub.n)), make_zero_dual(sub.n, sub.meq, sub.mineq))
+    solver = ActiveSetQPSolver()
+    with pytest.raises(TypeError, match="SQP-view multipliers"):
+        solver.solve(newton, warm, make_active_set_qp_state(sub.n, sub.meq, sub.mineq))
+    # The SQP-view original is accepted by the same call.
+    solver.solve(sub, warm, make_active_set_qp_state(sub.n, sub.meq, sub.mineq))
+
+
 def test_bound_constrained_quadratic_to_origin():
     """Bound-constrained ``min ‖x‖²`` on ``[0, 1]²`` recovers ``x + dx ≈ 0``."""
     n = 2
@@ -92,7 +113,7 @@ def test_equality_matches_bare_projected_cg():
     sub = make_qp_subproblem(problem=problem, primal=primal)
     warm = (Primal(jnp.zeros(n)), make_zero_dual(n, 1, 0))
 
-    (dx_pcg, _), _ = ProjectedCGSubProblemSolver().solve(
+    (dx_pcg, _), pcg_state = ProjectedCGSubProblemSolver().solve(
         sub, warm, make_projected_cg_state()
     )
     (dx_as, _), state = ActiveSetQPSolver().solve(
@@ -103,6 +124,13 @@ def test_equality_matches_bare_projected_cg():
     assert state.status == RESULTS.successful
     assert jnp.all(jnp.isfinite(dx_as.x))
     assert jnp.allclose(dx_as.x, dx_pcg.x, atol=1e-6)
+    # The inner KKT diagnostics of the final working set are forwarded.
+    assert state.last_kkt_reason == pcg_state.reason
+    assert int(state.last_kkt_n_refinements) == int(pcg_state.n_refinements)
+    assert jnp.isclose(
+        state.last_kkt_feasibility_residual, pcg_state.feasibility_residual
+    )
+    assert state.last_kkt_feasibility_residual.dtype == primal.x.dtype
 
 
 @pytest.mark.parametrize(
