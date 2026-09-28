@@ -11,6 +11,7 @@ from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.subproblem.solver import (
     KKT_SOLVER_RESULTS,
     RESULTS,
+    CraigProjector,
     KKTSolverState,
     ProjectedCGSubProblemSolver,
     SVDProjector,
@@ -158,3 +159,44 @@ def test_kkt_state_classifies_the_solve(solver_kwargs, x_shift, reason, status):
     # Inner projector work is folded into the iteration count.
     n_inner = 3 if isinstance(solver.projector, _FailingProjector) else 0
     assert int(state.n_iter) >= n_inner
+
+
+@pytest.mark.parametrize(
+    "preconditioner",
+    [None, MatrixPreconditioner(make_spd_matrix(2))],
+    ids=["none", "matrix"],
+)
+def test_craig_projector_reproduces_the_svd_step(preconditioner):
+    """The matrix-free projector gives the same KKT step and multipliers."""
+    n = 2
+    lb = jnp.array([0.0, -jnp.inf])
+    problem = make_problem(meq=1, mineq=0, lb=lb, ub=jnp.full(n, jnp.inf))
+    sub = make_qp_subproblem(
+        problem=problem, primal=make_primal(n=n), active_lb=(True, False)
+    )
+    warm = (Primal(jnp.zeros(n)), make_zero_dual(n, 1, 0))
+    svd_solver = ProjectedCGSubProblemSolver(preconditioner=preconditioner)
+    craig_solver = ProjectedCGSubProblemSolver(
+        preconditioner=preconditioner, projector=CraigProjector()
+    )
+    (dx_s, lam_s), st_s = svd_solver.solve(sub, warm, make_projected_cg_state())
+    (dx_c, lam_c), st_c = craig_solver.solve(sub, warm, make_projected_cg_state())
+
+    assert jnp.allclose(dx_c.x, dx_s.x, atol=1e-5)
+    assert jnp.allclose(lam_c.flatten(), lam_s.flatten(), atol=1e-4)
+    assert bool(st_c.success)
+    assert st_c.reason == st_s.reason
+    # CRAIG's bidiagonalisation steps are folded into the iteration count.
+    assert int(st_c.n_iter) > int(st_s.n_iter)
+
+
+def test_craig_breakdown_is_reported_as_projector_failure():
+    """Parallel working rows: CRAIG cannot converge and the state says so."""
+    sub = make_qp_subproblem(active_inequalities=(False, True), active_lb=(True, False))
+    warm = (Primal(jnp.zeros(2)), make_zero_dual(2, 1, 2))
+    solver = ProjectedCGSubProblemSolver(projector=CraigProjector())
+    (dx, _), state = solver.solve(sub, warm, make_projected_cg_state())
+    assert state.reason == KKT_SOLVER_RESULTS.projector_failure
+    assert not bool(state.success)
+    assert state.status == RESULTS.max_steps_reached
+    assert jnp.all(jnp.isfinite(dx.x))

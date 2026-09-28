@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner, MatrixPreconditioner
 from slsqp_jax.sqpdax.subproblem.base import SubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
+    CraigProjectionContext,
+    CraigProjector,
     Projector,
     SVDProjectionContext,
     SVDProjector,
@@ -163,3 +166,108 @@ def test_preconditioned_normal_solve_reduces_to_plain_without_m():
     rhs = jnp.array([0.3, -0.2, 0.9])
     assert jnp.allclose(ctx.solve_preconditioned_normal(rhs), ctx.solve_normal(rhs))
     assert jnp.allclose(ctx.apply_Minv(rhs[:2]), rhs[:2])
+
+
+# ---------------------------------------------------------------------------
+# CRAIG backend
+# ---------------------------------------------------------------------------
+
+
+def _active_set_bound_full_rank() -> SubProblem:
+    # ``x0`` pinned at its lower bound with only the equality active:
+    # ``A_work = [[0, 1]]`` has full row rank.
+    return make_qp_subproblem(active_lb=(True, False))
+
+
+FULL_RANK = {
+    "active-set-free": _active_set_free,
+    "active-set-bound": _active_set_bound_full_rank,
+}
+RANK_DEFICIENT = {
+    "active-set-parallel-rows": _active_set_with_bounds,
+    "scaled-barrier-overdetermined": lambda: make_scaled_barrier_subproblem(),
+}
+
+
+@pytest.mark.parametrize(
+    "make_pre", PRECONDITIONERS.values(), ids=PRECONDITIONERS.keys()
+)
+@pytest.mark.parametrize("make_sub", FULL_RANK.values(), ids=FULL_RANK.keys())
+def test_craig_matches_svd_on_full_rank_working_sets(make_sub, make_pre):
+    """Matrix-free CRAIG / CG reproduce the direct SVD context."""
+    sub = make_sub()
+    pre = make_pre()
+    craig = CraigProjector().build(sub, pre)
+    svd = SVDProjector().build(sub, pre)
+    assert isinstance(craig, CraigProjectionContext)
+    assert bool(craig.converged)
+    assert 1 <= int(craig.n_iter) <= int(jnp.sum(craig.active_rows))
+
+    v = jnp.array([0.7, -1.3])
+    b = _rhs(sub)
+    assert jnp.allclose(craig.project(v), svd.project(v), atol=1e-5)
+    assert jnp.allclose(
+        craig.particular_solution(b), svd.particular_solution(b), atol=1e-5
+    )
+    # Range-space solves on right-hand sides in the range of ``A_work``.
+    rhs = craig.A_work @ v
+    assert jnp.allclose(craig.solve_normal(rhs), svd.solve_normal(rhs), atol=1e-5)
+    rhs_m = craig.A_work @ craig.apply_Minv(v)
+    assert jnp.allclose(
+        craig.solve_preconditioned_normal(rhs_m),
+        svd.solve_preconditioned_normal(rhs_m),
+        atol=1e-4,
+    )
+    d = craig.particular_solution(b) + 0.5 * craig.free_f
+    assert jnp.allclose(
+        craig.feasibility_correction(d, b), svd.feasibility_correction(d, b), atol=1e-5
+    )
+    assert (
+        float(craig.feasibility_residual(craig.feasibility_correction(d, b), b)) < 1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "make_pre", PRECONDITIONERS.values(), ids=PRECONDITIONERS.keys()
+)
+@pytest.mark.parametrize("make_sub", RANK_DEFICIENT.values(), ids=RANK_DEFICIENT.keys())
+def test_craig_reports_breakdown_on_rank_deficient_rows(make_sub, make_pre):
+    """Inconsistent working rows: ``converged`` is False, outputs stay finite."""
+    sub = make_sub()
+    pre = make_pre()
+    craig = CraigProjector().build(sub, pre)
+    svd = SVDProjector().build(sub, pre)
+    assert not bool(craig.converged)
+    assert int(craig.n_iter) >= 1
+    v = jnp.array([0.7, -1.3])
+    b = _rhs(sub)
+    for out in (craig.project(v), craig.particular_solution(b), craig.solve_normal(b)):
+        assert jnp.all(jnp.isfinite(out))
+    # The projection only needs consistent right-hand sides and still agrees.
+    assert jnp.allclose(craig.project(v), svd.project(v), atol=1e-5)
+    assert jnp.allclose(craig.A_work @ craig.project(v), 0.0, atol=1e-5)
+
+
+def test_craig_tolerances_and_budget_are_honoured():
+    """Budget caps the residual; the absolute floor decides ``converged``."""
+    sub = _active_set_free()
+    b = _rhs(sub)
+    tight = CraigProjector(max_iter=1).build(sub)
+    loose = CraigProjector(max_iter=1, atol=2.0).build(sub)
+    full = CraigProjector().build(sub)
+    r_tight = float(tight.feasibility_residual(tight.particular_solution(b), b))
+    r_full = float(full.feasibility_residual(full.particular_solution(b), b))
+    assert int(tight.n_iter) == 1 and int(full.n_iter) == 2
+    assert r_full < 1e-5 < r_tight < 2.0
+    assert not bool(tight.converged)
+    assert bool(loose.converged)
+    # A relative tolerance scales with ``‖b‖``.
+    rel = CraigProjector(max_iter=1, rtol=10.0, atol=0.0).build(sub)
+    assert bool(rel.converged)
+    # Zero right-hand side: exact at zero iterations of the recurrence body.
+    sub0 = eqx.tree_at(lambda s: s.lagrangian.evaluated.eq_fn_val, sub, jnp.zeros((1,)))
+    sub0 = eqx.tree_at(lambda s: s.L_k.evaluated.eq_fn_val, sub0, jnp.zeros((1,)))
+    sub0 = eqx.tree_at(lambda s: s.L_k.evaluated.ineq_fn_val, sub0, jnp.zeros((2,)))
+    ctx0 = CraigProjector().build(sub0)
+    assert bool(ctx0.converged)
+    assert jnp.array_equal(ctx0.particular_solution(_rhs(sub0)), jnp.zeros(2))
