@@ -17,6 +17,7 @@ from ..step_controller import StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
+    KKT_SOLVER_RESULTS,
     RESULTS,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
@@ -50,9 +51,9 @@ class ProximalActiveSetLineSearchMinimiser(
     res_k = max(‖∇_x L(x_k, λ_k)‖_∞, feasibility_∞(x_k))
     ```
 
-    is computed here from the cached zero-dual evaluation with the current
-    multipliers swapped in (no extra problem evaluation) and written into the
-    solver state before each solve. The multiplier centre ``λ_k`` lives on the
+    is read off the QP Lagrangian evaluated at the current multipliers (no
+    extra problem evaluation) and written into the solver state before each
+    solve. The multiplier centre ``λ_k`` lives on the
     solver state, is warm-started from the previous solve, and is re-synced to
     the committed dual after a best-iterate rollback.
 
@@ -136,6 +137,9 @@ class ProximalActiveSetLineSearchMinimiser(
                 dual=self._init_dual(problem),
                 final_working_tol=jnp.asarray(self.effective_qp_tol, dtype),
                 n_anti_cycling=jnp.asarray(0, jnp.int32),
+                last_kkt_feasibility_residual=jnp.asarray(0.0, dtype),
+                last_kkt_n_refinements=jnp.asarray(0, jnp.int32),
+                last_kkt_reason=KKT_SOLVER_RESULTS.converged,
                 kkt_residual=jnp.asarray(jnp.inf, dtype),
                 mu=jnp.asarray(solver.mu_max, dtype),
                 eq_center=jnp.zeros((problem.meq,), dtype),
@@ -147,10 +151,9 @@ class ProximalActiveSetLineSearchMinimiser(
     ) -> SubproblemContext[Primal, ActiveSetSubProblem, ProximalActiveSetQPSolverState]:
         """Active-set context with the outer KKT residual written into the state."""
         ctx = super()._init_subproblem(problem)
-        dual = cast(Dual, self.dual)
-        # The QP Lagrangian is evaluated at zero dual; swap the current
-        # multipliers in to measure the NLP stationarity without re-evaluating.
-        lag_k = eqx.tree_at(lambda lag: lag.dual, ctx.subproblem.lagrangian, dual)
+        # The QP Lagrangian is already evaluated at the current multipliers,
+        # so the NLP stationarity is read off it without re-evaluating.
+        lag_k = ctx.subproblem.lagrangian
         residual = jnp.maximum(
             _inf_norm(lag_k.x_grad), self._feasibility_from_lagrangian(lag_k)
         )

@@ -22,6 +22,7 @@ from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
+    KKT_SOLVER_RESULTS,
     RESULTS,
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
@@ -441,6 +442,9 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         "qp_result",
         "qp_final_working_tol",
         "n_qp_anti_cycling",
+        "kkt_feasibility_residual",
+        "kkt_n_refinements",
+        "kkt_reason",
         "n_lpeca_bypassed",
         "n_lpeca_capped",
         "n_lpeca_bounds_prefixed",
@@ -458,6 +462,9 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
     assert bool(sol.stats["qp_result"] == ACTIVE_SET_QP_RESULTS.working_set_converged)
     assert float(sol.stats["qp_final_working_tol"]) == pytest.approx(1e-5)
     assert int(sol.stats["n_qp_anti_cycling"]) == 0
+    assert bool(sol.stats["kkt_reason"] == KKT_SOLVER_RESULTS.converged)
+    assert int(sol.stats["kkt_n_refinements"]) == 0
+    assert float(sol.stats["kkt_feasibility_residual"]) < 1e-6
     # Predictor off by default: no LPEC-A activity is recorded.
     assert sol.state.active_set_predictor.method == "expand"
     assert int(sol.stats["n_lpeca_bypassed"]) == 0

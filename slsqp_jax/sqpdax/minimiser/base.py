@@ -637,6 +637,12 @@ class CommonMinimiser(
     ) -> tuple[PrimalType, Dual, SubProblemSolverStateType]:
         """Call the subproblem solver for a primal-dual direction.
 
+        The solver's answer is passed through
+        :meth:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.to_native_step`,
+        which resolves the subproblem's dual convention
+        (:attr:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.is_kkt_dual_increment`)
+        so ``step_dual`` is always the absolute multiplier ``λ_{k+1}`` to commit.
+
         Parameters
         ----------
         ctx
@@ -647,13 +653,14 @@ class CommonMinimiser(
         step_primal
             Proposed primal step.
         step_dual
-            Updated (or recovered) multipliers.
+            Absolute multipliers ``λ_{k+1}`` (updated or recovered).
         state
             Refreshed solver carry.
         """
-        (step_primal, step_dual), state = ctx.solver.solve(
+        step, state = ctx.solver.solve(
             subproblem=ctx.subproblem, x0=ctx.warm, initial_state=ctx.state
         )
+        step_primal, step_dual = ctx.subproblem.to_native_step(step)
         return step_primal, step_dual, state
 
     def _assess_direction(
