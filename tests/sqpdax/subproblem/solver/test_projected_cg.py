@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
@@ -177,8 +178,18 @@ def test_craig_projector_reproduces_the_svd_step(preconditioner):
     assert jnp.allclose(lam_c.flatten(), lam_s.flatten(), atol=1e-4)
     assert bool(st_c.success)
     assert st_c.reason == st_s.reason
-    # CRAIG's bidiagonalisation steps are folded into the iteration count.
-    assert int(st_c.n_iter) > int(st_s.n_iter)
+    # CRAIG's bidiagonalisation steps are folded into the iteration count on
+    # top of the carried count and the CG steps. The SVD run is not a valid
+    # baseline: how many roundoff-floor CG iterations run before the freeze
+    # fires varies across XLA builds.
+    ctx = craig_solver.projector.build(sub, preconditioner)
+    assert int(ctx.n_iter) >= 1
+    assert int(st_c.n_iter) >= int(ctx.n_iter)
+    carried = eqx.tree_at(
+        lambda s: s.n_iter, make_projected_cg_state(), jnp.asarray(10, jnp.int32)
+    )
+    _, st_carried = craig_solver.solve(sub, warm, carried)
+    assert int(st_carried.n_iter) == int(st_c.n_iter) + 10
 
 
 def test_craig_breakdown_is_reported_as_projector_failure():
