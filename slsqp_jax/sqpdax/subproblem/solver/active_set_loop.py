@@ -19,6 +19,7 @@ from .base import (
     SubProblemSolver,
     SubProblemSolverState,
 )
+from .multiplier_recovery import MultiplierRecovery
 from .projected_cg import ProjectedCGState, ProjectedCGSubProblemSolver
 from .working_set_policy import ThresholdWorkingSetPolicy, WorkingSetPolicy
 
@@ -165,6 +166,14 @@ class ActiveSetQPSolver(
         the base tolerance and the iteration budget.
     subproblem_solver
         Inner KKT solver for each fixed working set.
+    multiplier_recovery
+        Optional
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
+        applied once after the loop to the *returned* dual (e.g. a
+        Hessian-free least-squares estimate with a clamp). The loop itself
+        keeps consuming the inner solver's KKT-consistent multipliers for
+        its sign tests, and ``state.dual`` (warm start) stays ``λ_QP``.
+        ``None`` (default) returns the inner solver's dual unchanged.
     """
 
     # Outer QP-loop state (this solver); distinct from ``KKTSolverStateType``.
@@ -176,6 +185,7 @@ class ActiveSetQPSolver(
     subproblem_solver: SubProblemSolver[
         Primal, ActiveSetSubProblem, KKTSolverStateType
     ] = eqx.field(default_factory=ProjectedCGSubProblemSolver)
+    multiplier_recovery: MultiplierRecovery | None = None
 
     @property
     def tol(self) -> float:
@@ -238,11 +248,14 @@ class ActiveSetQPSolver(
         Returns
         -------
         step
-            Primal-dual QP solution.
+            Primal-dual QP solution. The dual block is the inner solver's
+            KKT multipliers, or their :attr:`multiplier_recovery` replacement
+            when one is configured.
         state
             ``initial_state`` with the counters, ``success`` / ``status``,
             ``qp_result``, and the final ``active_set`` / ``dual`` refreshed
-            (same type as the input).
+            (same type as the input). ``dual`` is always the loop's own
+            ``λ_QP``.
 
         Raises
         ------
@@ -349,6 +362,14 @@ class ActiveSetQPSolver(
         ) = jax.lax.while_loop(cond_fn, body_fn, init_carry)
         step_f = cast(tuple[Primal, Dual], step_f)
         kkt_state_f = cast(KKTSolverStateType, kkt_state_f)
+        # Optional post-loop dual replacement on the working set the step was
+        # solved on; the loop's ``λ_QP`` stays on the state for warm starts.
+        step_out = step_f
+        if self.multiplier_recovery is not None:
+            dual_out = self.multiplier_recovery.recover(
+                subproblem.with_active_set(cast(ActiveSet, solved_f)), None, step_f[0]
+            )
+            step_out = (step_f[0], dual_out)
         # Pin the counter dtypes: the outer minimiser threads this state
         # through its own ``while_loop``, whose carry must be dtype-stable
         # whether or not x64 is enabled.
@@ -390,7 +411,7 @@ class ActiveSetQPSolver(
                 next_f,
             ),
         )
-        return step_f, cast(
+        return step_out, cast(
             ActiveSetStateType,
             tree_at(
                 lambda state: (
