@@ -4,6 +4,7 @@ import equinox as eqx
 import jax
 from equinox import Enumeration, tree_at
 from jax import numpy as jnp
+from jaxtyping import Array, Int
 from typing_extensions import TypeVar
 
 from ...active_set import ActiveSet
@@ -12,7 +13,9 @@ from ...primal import Primal
 from ...types import Scalar
 from ..active_set import ActiveSetSubProblem
 from .base import (
+    KKT_SOLVER_RESULTS,
     RESULTS,
+    KKTSolverState,
     SubProblemSolver,
     SubProblemSolverState,
 )
@@ -30,7 +33,7 @@ __all__ = [
 # Inner KKT-solver state; defaults to projected CG so bare ``ActiveSetQPSolver``
 # matches ``default_factory=ProjectedCGSubProblemSolver``.
 KKTSolverStateType = TypeVar(
-    "KKTSolverStateType", bound=SubProblemSolverState, default=ProjectedCGState
+    "KKTSolverStateType", bound=KKTSolverState, default=ProjectedCGState
 )
 
 
@@ -79,6 +82,14 @@ class ActiveSetQPSolverState(SubProblemSolverState):
         stopped (equals ``tol`` unless an EXPAND ramp is active).
     n_anti_cycling
         Total number of solves stopped by the anti-cycling guard.
+    last_kkt_feasibility_residual
+        ``feasibility_residual`` reported by the inner KKT solver on the
+        final working set of the most recent solve.
+    last_kkt_n_refinements
+        ``n_refinements`` reported by the inner KKT solver on that solve.
+    last_kkt_reason
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.base.KKT_SOLVER_RESULTS`
+        code reported by the inner KKT solver on that solve.
     """
 
     n_cg_iter: int
@@ -89,6 +100,9 @@ class ActiveSetQPSolverState(SubProblemSolverState):
     dual: Dual
     final_working_tol: Scalar
     n_anti_cycling: int
+    last_kkt_feasibility_residual: Scalar
+    last_kkt_n_refinements: Int[Array, ""]
+    last_kkt_reason: KKT_SOLVER_RESULTS
 
 
 # Outer QP-loop state; defaulted so bare ``ActiveSetQPSolver`` keeps meaning
@@ -229,7 +243,21 @@ class ActiveSetQPSolver(
             ``initial_state`` with the counters, ``success`` / ``status``,
             ``qp_result``, and the final ``active_set`` / ``dual`` refreshed
             (same type as the input).
+
+        Raises
+        ------
+        TypeError
+            If ``subproblem.is_kkt_dual_increment`` is true. The working-set
+            policy's drop test is a sign test on the QP multipliers and is
+            undefined on a ``Δλ`` block, so the active-set loop requires a
+            SQP-view subproblem (Nocedal & Wright eq. 18.11).
         """
+        if subproblem.is_kkt_dual_increment:
+            raise TypeError(
+                "ActiveSetQPSolver requires SQP-view multipliers (the dual block "
+                "must be λ_{k+1}, not an increment): the working-set sign tests "
+                "are undefined on a Δλ block."
+            )
         inner = self._kkt_solver(subproblem)
         policy = self.working_set_policy
         lag = subproblem.lagrangian
@@ -265,11 +293,7 @@ class ActiveSetQPSolver(
 
         # Per-solve budget: the inner counter starts from zero so the
         # cumulative ``n_cg_iter`` on the carry never starves a later solve.
-        kkt_state0 = inner.solver_state_class(
-            n_iter=0,
-            success=jnp.asarray(False),
-            status=RESULTS.successful,
-        )
+        kkt_state0 = inner.solver_state_class.cold(x.dtype)
 
         def run_kkt(
             active_set: ActiveSet,
@@ -381,6 +405,9 @@ class ActiveSetQPSolver(
                     state.dual,
                     state.final_working_tol,
                     state.n_anti_cycling,
+                    state.last_kkt_feasibility_residual,
+                    state.last_kkt_n_refinements,
+                    state.last_kkt_reason,
                 ),
                 initial_state,
                 (
@@ -396,6 +423,9 @@ class ActiveSetQPSolver(
                     jnp.asarray(policy_state_f.working_tol, x.dtype),
                     jnp.asarray(initial_state.n_anti_cycling, jnp.int32)
                     + cycled_f.astype(jnp.int32),
+                    jnp.asarray(kkt_state_f.feasibility_residual, x.dtype),
+                    jnp.asarray(kkt_state_f.n_refinements, jnp.int32),
+                    kkt_state_f.reason,
                 ),
             ),
         )
