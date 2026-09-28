@@ -10,6 +10,7 @@ from ...primal import Primal
 from ...types import Vector_n
 from ..active_set import ActiveSetSubProblem
 from .base import KKT_SOLVER_RESULTS, RESULTS, KKTSolverState, SubProblemSolver
+from .multiplier_recovery import KKTMultiplierRecovery, MultiplierRecovery
 from .projector import Projector, SVDProjector
 
 
@@ -61,9 +62,10 @@ class ProjectedCGSubProblemSolver(
       the identity.
     * **CG** runs in that null space against the Lagrangian Hessian via
       ``kkt_mvp_primal``, warm-started from ``x0``.
-    * **Multipliers** are recovered from the stationarity residual (general
-      multipliers by a normal-equation solve with one refinement round;
-      bound multipliers from the residual on fixed variables).
+    * **Multipliers** are recovered by :attr:`multiplier_recovery` from the
+      stationarity residual (default: general multipliers by the projector's
+      normal-equation solve with one refinement round; bound multipliers
+      from the residual on fixed variables).
 
     Attributes
     ----------
@@ -83,6 +85,11 @@ class ProjectedCGSubProblemSolver(
         :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.ProjectionContext`
         (default :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.SVDProjector`;
         its ``rcond`` is configured through it).
+    multiplier_recovery
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
+        producing the dual block from the CG step (default
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.KKTMultiplierRecovery`,
+        which keeps the working-set sign tests KKT-consistent).
     """
 
     solver_state_class: type[ProjectedCGState] = ProjectedCGState
@@ -98,6 +105,9 @@ class ProjectedCGSubProblemSolver(
     preconditioner: Preconditioner | None = None
     # Range-space backend building the ``ProjectionContext`` per working set.
     projector: Projector = field(default_factory=SVDProjector)
+    multiplier_recovery: MultiplierRecovery = field(
+        default_factory=KKTMultiplierRecovery
+    )
 
     def solve(
         self,
@@ -142,8 +152,6 @@ class ProjectedCGSubProblemSolver(
         meq = subproblem.lagrangian.meq
         mineq = subproblem.lagrangian.mineq
         dtype = subproblem.lagrangian.ref.x.dtype
-        active_set = subproblem.active_set
-        active_lb = active_set.active_lb
 
         # --- unpack the right-hand side (sol = -∇f, -c) ---
         _sol_primal, sol_dual = subproblem.kkt_rhs()
@@ -157,11 +165,6 @@ class ProjectedCGSubProblemSolver(
         # acts on the free columns of the active general rows.
         ctx = self.projector.build(subproblem, self.preconditioner)
         free_f = ctx.free_f
-        fix_lb = active_set.active_lb
-        fix_ub = active_set.active_ub & (~active_lb)
-        active_gen = ctx.active_rows
-        A = ctx.A
-        A_work = ctx.A_work
 
         # --- Lagrangian Hessian operator (matrix-free, HVP only) ---
         zero_dual = cast(
@@ -189,7 +192,6 @@ class ProjectedCGSubProblemSolver(
             return free_f * H(free_f * v)
 
         project = ctx.project
-        solve_AAt = ctx.solve_normal
 
         # --- particular solution: A_work d_p_free = b_gen - A d_fixed ---
         # N&W range-space / ``Y``-space particular solution: the minimum-``M``-norm
@@ -296,33 +298,13 @@ class ProjectedCGSubProblemSolver(
         dx = ctx.feasibility_correction(dx, b_gen)
 
         # --- multiplier recovery ---
-        # N&W ``λ*`` (eq. 16.20) via the normal equations (eq. 16.31 form):
-        # ``λ_g = (AAᵀ)⁻¹ A · resid`` with ``resid = -(G d + c)`` on free vars.
-        Hdx = H(dx)
-        resid_primal = sol_primal - Hdx  # want Aᵀ λ_g ≈ this on the free variables
-        lam_g = jnp.where(active_gen, solve_AAt(A_work @ (free_f * resid_primal)), 0.0)
-        # one round of iterative refinement to clean up conditioning roundoff
-        # (N&W §16.3 closing remark: iterative refinement recommended here).
-        r_ref = free_f * (resid_primal - A.T @ lam_g)
-        lam_g = jnp.where(active_gen, lam_g + solve_AAt(A_work @ r_ref), 0.0)
-
-        # Bound multipliers close the primal stationarity residual on fixed vars
-        # (the active-bound components of N&W eq. 16.37a — the KKT stationarity).
-        resid_full = Hdx + A.T @ lam_g - sol_primal
-        lam_lb = jnp.where(fix_lb, resid_full, jnp.zeros((n,), dtype))
-        lam_ub = jnp.where(fix_ub, -resid_full, jnp.zeros((n,), dtype))
-
+        # N&W ``λ*`` (eq. 16.20) via the projector's range-space solve; the
+        # strategy also closes the bound block on the fixed variables (the
+        # active-bound components of N&W eq. 16.37a).
+        primal_dx = cast(Primal, Primal(dx))
         step = (
-            cast(Primal, Primal(dx)),
-            cast(
-                Dual,
-                Dual(
-                    eq_multipliers=lam_g[:meq],
-                    ineq_multipliers=lam_g[meq:],
-                    lb_multipliers=lam_lb,
-                    ub_multipliers=lam_ub,
-                ),
-            ),
+            primal_dx,
+            self.multiplier_recovery.recover(subproblem, ctx, primal_dx),
         )
 
         # --- carry the solver state: accumulate CG count, classify this solve ---

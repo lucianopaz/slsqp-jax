@@ -13,6 +13,8 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
     RESULTS,
     ActiveSetQPSolver,
+    ClampSafeguard,
+    LeastSquaresMultiplierRecovery,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
     SingleExchangeWorkingSetPolicy,
@@ -326,3 +328,55 @@ def test_single_exchange_survives_an_inconsistent_all_at_once_refresh(
     )
     (dx_default, _), _ = default.solve(sub, warm, make_state())
     assert not jnp.allclose(primal.x + dx_default.x, x_star, atol=1e-3)
+
+
+@pytest.mark.parametrize("safeguard", [None, ClampSafeguard()], ids=["raw", "clamped"])
+def test_post_loop_multiplier_recovery_replaces_the_returned_dual_only(safeguard):
+    """The recovery rewrites the returned dual; ``state.dual`` keeps ``λ_QP``."""
+    sub, primal, warm = make_bound_hit_qp()
+    plain = ActiveSetQPSolver()
+    recovering = ActiveSetQPSolver(
+        multiplier_recovery=LeastSquaresMultiplierRecovery(safeguard=safeguard)
+    )
+    (dx_p, dual_p), s_p = plain.solve(sub, warm, make_active_set_qp_state())
+    (dx_r, dual_r), s_r = recovering.solve(sub, warm, make_active_set_qp_state())
+
+    assert jnp.allclose(dx_r.x, dx_p.x)
+    assert bool(s_r.success) and int(s_r.last_n_iter) == int(s_p.last_n_iter)
+    # The loop's own multipliers are unchanged on the carry (warm start / policy).
+    assert jnp.array_equal(s_r.dual.flatten(), s_p.dual.flatten())
+    assert jnp.array_equal(s_r.dual.flatten(), dual_p.flatten())
+    # The returned dual is the Hessian-free LS estimate on the solved working set:
+    # ``min ‖Aᵀλ + ∇f‖`` with only ``lb₀`` active gives ``λ_lb₀ = ∇f₀ = 2 x₀``.
+    expected = LeastSquaresMultiplierRecovery(safeguard=safeguard).recover(
+        sub.with_active_set(s_r.active_set), None, dx_r
+    )
+    assert jnp.allclose(dual_r.flatten(), expected.flatten(), atol=1e-6)
+    assert jnp.isclose(dual_r.lb_multipliers[0], 2.0 * primal.x[0], atol=1e-5)
+    assert not jnp.allclose(dual_r.flatten(), dual_p.flatten(), atol=1e-6)
+    if safeguard is not None:
+        assert jnp.all(dual_r.lb_multipliers >= 0)
+        assert jnp.all(dual_r.ub_multipliers >= 0)
+
+
+def test_proximal_loop_keeps_its_equality_block_after_recovery():
+    """Post-loop recovery composes with the proximal equality-multiplier update."""
+    problem = make_problem()
+    sub = make_qp_subproblem(problem=problem, primal=make_primal(n=problem.n))
+    warm = (Primal(jnp.zeros(problem.n)), make_zero_dual(problem.n, 1, 2))
+    state0 = make_proximal_state(1, kkt_residual=1e-3, eq_center=jnp.asarray([0.2]))
+    plain = ProximalActiveSetQPSolver()
+    recovering = ProximalActiveSetQPSolver(
+        multiplier_recovery=LeastSquaresMultiplierRecovery(safeguard=ClampSafeguard())
+    )
+    (d_p, lam_p), s_p = plain.solve(sub, warm, state0)
+    (d_r, lam_r), s_r = recovering.solve(sub, warm, state0)
+
+    assert jnp.allclose(d_r.x, d_p.x, atol=1e-6)
+    # Equality block comes from the proximal update in both cases.
+    assert jnp.allclose(lam_r.eq_multipliers, lam_p.eq_multipliers, atol=1e-6)
+    assert jnp.allclose(s_r.eq_center, lam_r.eq_multipliers)
+    # Inequality / bound blocks are the (clamped) LS estimate.
+    assert jnp.all(lam_r.ineq_multipliers >= 0)
+    assert jnp.all(lam_r.lb_multipliers >= 0)
+    assert jnp.all(lam_r.ub_multipliers >= 0)

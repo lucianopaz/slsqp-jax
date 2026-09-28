@@ -23,6 +23,9 @@ Shared infrastructure:
   :class:`~slsqp_jax.sqpdax.subproblem.solver.projector.ProjectionContext`
   — null-space projector, particular solution and range-space solves for a
   working set (pluggable backend for the null-space solvers).
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
+  — strategies returning a subproblem's dual for a primal step
+  (KKT-consistent or Hessian-free least squares, optional safeguards).
 """
 
 from . import (
@@ -30,6 +33,7 @@ from . import (
     base,
     dogleg,
     gradient_projection,
+    multiplier_recovery,
     projected_cg,
     projector,
     proximal_active_set_loop,
@@ -55,6 +59,14 @@ from .base import (
 )
 from .dogleg import DogLegSolver, DogLegSolverState
 from .gradient_projection import GradientProjection, GradientProjectionState
+from .multiplier_recovery import (
+    BarrierSafeguard,
+    ClampSafeguard,
+    KKTMultiplierRecovery,
+    LeastSquaresMultiplierRecovery,
+    MultiplierRecovery,
+    Safeguard,
+)
 from .projected_cg import ProjectedCGState, ProjectedCGSubProblemSolver
 from .projector import (
     ProjectionContext,
@@ -87,6 +99,7 @@ __all__ = [
     "base",
     "dogleg",
     "gradient_projection",
+    "multiplier_recovery",
     "projected_cg",
     "projector",
     "proximal_active_set_loop",
@@ -115,6 +128,12 @@ __all__ = [
     "Projector",
     "SVDProjectionContext",
     "SVDProjector",
+    "Safeguard",
+    "ClampSafeguard",
+    "BarrierSafeguard",
+    "MultiplierRecovery",
+    "KKTMultiplierRecovery",
+    "LeastSquaresMultiplierRecovery",
     "ProximalActiveSetQPSolverState",
     "ProximalActiveSetQPSolver",
     "SteihaugTointCGTangentialStepSolverState",

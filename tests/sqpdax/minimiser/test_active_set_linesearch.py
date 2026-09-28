@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 
 import equinox as eqx
@@ -24,6 +25,8 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
     KKT_SOLVER_RESULTS,
     RESULTS,
+    ClampSafeguard,
+    LeastSquaresMultiplierRecovery,
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
 )
@@ -473,6 +476,41 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
     assert float(sol.stats["kkt_ratio"]) == pytest.approx(
         float(metrics.stationarity) / float(sol.stats["kkt_scale"])
     )
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+def test_multiplier_recovery_option_is_wired_into_the_qp_solver(minimiser_cls):
+    """``options['subproblem']['multiplier_recovery']`` selects the post-loop recovery."""
+    problem, x_star, dual_star = make_shifted_box_quadratic()
+    recovery = LeastSquaresMultiplierRecovery(safeguard=ClampSafeguard())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sol = minimise(
+            problem,
+            minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=2),
+            jnp.array([0.5, 0.5, 0.5]),
+            max_steps=40,
+            throw=False,
+            options={"subproblem": {"multiplier_recovery": recovery}},
+        )
+    ctx = sol.state._init_subproblem(problem)
+    assert eqx.tree_equal(ctx.solver.multiplier_recovery, recovery)
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, x_star, atol=1e-4)
+    # The committed multipliers are the Hessian-free LS estimate at the
+    # solution, which coincides with the exact ones on this quadratic.
+    assert jnp.allclose(
+        sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
+    )
+    assert jnp.allclose(
+        sol.stats["multipliers_lb"], dual_star.lb_multipliers, atol=1e-3
+    )
+    assert jnp.all(sol.stats["multipliers_ineq"] >= 0)
+    assert jnp.all(sol.stats["multipliers_lb"] >= 0)
 
 
 @pytest.mark.parametrize(
