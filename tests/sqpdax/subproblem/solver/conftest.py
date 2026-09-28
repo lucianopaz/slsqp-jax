@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 from jax import Array
 
@@ -15,9 +16,11 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     ActiveSetQPSolverState,
     DogLegSolverState,
+    MinresQLPState,
     ProjectedCGState,
     ProximalActiveSetQPSolverState,
     SteihaugTointCGTangentialStepSolverState,
+    SVDProjector,
     TrustRegionSolverState,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
@@ -60,6 +63,23 @@ def make_qp_subproblem(
 def make_projected_cg_state() -> ProjectedCGState:
     """Cold :class:`ProjectedCGState`."""
     return ProjectedCGState.cold(jnp.zeros(()).dtype)
+
+
+def make_minres_qlp_state() -> MinresQLPState:
+    """Cold :class:`MinresQLPState`."""
+    return MinresQLPState.cold(jnp.zeros(()).dtype)
+
+
+class FailingProjector(SVDProjector):
+    """SVD projector that reports its (fictitious) inner solve as failed."""
+
+    def build(self, subproblem, preconditioner=None):
+        ctx = super().build(subproblem, preconditioner)
+        return eqx.tree_at(
+            lambda c: (c.converged, c.n_iter),
+            ctx,
+            (jnp.asarray(False), jnp.asarray(3, jnp.int32)),
+        )
 
 
 def make_dogleg_state(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
@@ -14,7 +13,6 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     CraigProjector,
     KKTSolverState,
     ProjectedCGSubProblemSolver,
-    SVDProjector,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.preconditioner.conftest import make_spd_matrix
@@ -23,7 +21,12 @@ from tests.sqpdax.subproblem.conftest import (
     make_zero_dual,
 )
 
-from .conftest import make_projected_cg_state, make_qp_subproblem, unbounded_box
+from .conftest import (
+    FailingProjector,
+    make_projected_cg_state,
+    make_qp_subproblem,
+    unbounded_box,
+)
 
 
 @pytest.mark.parametrize(
@@ -91,18 +94,6 @@ def test_active_lower_bound_fixes_component():
     assert jnp.allclose(dx.x[0], expected_fixed, atol=1e-6)
 
 
-class _FailingProjector(SVDProjector):
-    """SVD projector that reports its (fictitious) inner solve as failed."""
-
-    def build(self, subproblem, preconditioner=None):
-        ctx = super().build(subproblem, preconditioner)
-        return eqx.tree_at(
-            lambda c: (c.converged, c.n_iter),
-            ctx,
-            (jnp.asarray(False), jnp.asarray(3, jnp.int32)),
-        )
-
-
 @pytest.mark.parametrize(
     ("solver_kwargs", "x_shift", "reason", "status"),
     [
@@ -117,7 +108,7 @@ class _FailingProjector(SVDProjector):
             RESULTS.max_steps_reached,
         ),
         (
-            {"projector": _FailingProjector()},
+            {"projector": FailingProjector()},
             0.0,
             KKT_SOLVER_RESULTS.projector_failure,
             RESULTS.max_steps_reached,
@@ -157,7 +148,7 @@ def test_kkt_state_classifies_the_solve(solver_kwargs, x_shift, reason, status):
         else:
             assert float(state.projected_grad_norm) < 1e-4
     # Inner projector work is folded into the iteration count.
-    n_inner = 3 if isinstance(solver.projector, _FailingProjector) else 0
+    n_inner = 3 if isinstance(solver.projector, FailingProjector) else 0
     assert int(state.n_iter) >= n_inner
 
 

@@ -244,6 +244,30 @@ class ProjectionContext(Module):
         r = self.A_work @ d - self.effective_rhs(b)
         return d - self.A_work.T @ self.solve_normal(r)
 
+    def preconditioned_feasibility_correction(
+        self, d: Vector_n, b: Float[Array, " m"]
+    ) -> Vector_n:
+        """Pull ``d`` back onto ``A_work d = b_eff`` along the ``M``-metric range space.
+
+        The correction ``δd`` is the minimum-``M``-norm change satisfying
+        ``A_work (d − δd) = b_eff``. Equals :meth:`feasibility_correction`
+        when no preconditioner is attached.
+
+        Parameters
+        ----------
+        d
+            Candidate primal step (full length ``n``).
+        b
+            Full right-hand side ``b`` of ``A d = b``.
+
+        Returns
+        -------
+        Vector_n
+            ``d − M⁻¹ A_workᵀ (A_work M⁻¹ A_workᵀ)⁺ (A_work d − b_eff)``.
+        """
+        r = self.A_work @ d - self.effective_rhs(b)
+        return d - self.apply_Minv(self.A_work.T @ self.solve_preconditioned_normal(r))
+
 
 class SVDProjectionContext(ProjectionContext):
     """Direct :class:`ProjectionContext` from a thin SVD of ``A_work``.

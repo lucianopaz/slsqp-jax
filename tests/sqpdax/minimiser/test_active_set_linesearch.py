@@ -28,6 +28,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ClampSafeguard,
     CraigProjector,
     LeastSquaresMultiplierRecovery,
+    MinresQLPSubProblemSolver,
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
 )
@@ -243,13 +244,21 @@ def _execute_synthetic_step(
 
 
 @pytest.mark.parametrize(
-    ("kind", "expected"),
+    ("kind", "qp_status", "expected"),
     [
-        ("qp", ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure),
-        ("ls", ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure),
+        ("qp", RESULTS.singular, ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure),
+        # A feasibility floor above target (MINRES-QLP ``residual_floor``)
+        # surfaces as ``stagnation`` and is a real QP failure too.
+        (
+            "qp",
+            RESULTS.stagnation,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
+        ),
+        ("ls", RESULTS.successful, ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure),
     ],
+    ids=["qp-singular", "qp-stagnation", "line-search"],
 )
-def test_failure_counters_wait_for_fatal_threshold(kind, expected):
+def test_failure_counters_wait_for_fatal_threshold(kind, qp_status, expected):
     """QP and line-search failures become fatal only after their patience."""
     problem = make_unconstrained_quadratic()
     solver = ActiveSetLineSearchMinimiser(
@@ -264,7 +273,7 @@ def test_failure_counters_wait_for_fatal_threshold(kind, expected):
             problem,
             accepted=kind == "qp",
             qp_success=kind == "ls",
-            qp_status=RESULTS.successful if kind == "ls" else RESULTS.singular,
+            qp_status=qp_status,
             x=solver.iterate.x,
             merit=float(solver.best_merit),
         )
@@ -507,6 +516,38 @@ def test_projector_option_selects_the_craig_backend(minimiser_cls):
         sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
     )
     assert bool(sol.stats["kkt_reason"] == KKT_SOLVER_RESULTS.converged)
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+def test_minres_qlp_option_selects_the_saddle_point_solver(minimiser_cls):
+    """``options['subproblem']['subproblem_solver']`` accepts a MINRES-QLP solver."""
+    problem, x_star, dual_star = make_shifted_box_quadratic()
+    inner = MinresQLPSubProblemSolver(max_iter=50, proj_refine_max_iter=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sol = minimise(
+            problem,
+            minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=2),
+            jnp.array([0.5, 0.5, 0.5]),
+            max_steps=40,
+            throw=False,
+            options={"subproblem": {"subproblem_solver": inner}},
+        )
+    ctx = sol.state._init_subproblem(problem)
+    assert isinstance(ctx.solver.subproblem_solver, MinresQLPSubProblemSolver)
+    assert ctx.solver.subproblem_solver.max_iter == 50
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, x_star, atol=1e-4)
+    assert jnp.allclose(
+        sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
+    )
+    assert bool(sol.stats["kkt_reason"] == KKT_SOLVER_RESULTS.converged)
+    assert int(sol.stats["kkt_n_refinements"]) <= 2
+    assert float(sol.stats["kkt_feasibility_residual"]) < 1e-6
 
 
 @pytest.mark.parametrize(
