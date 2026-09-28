@@ -58,10 +58,16 @@ class ProximalActiveSetSubProblem(ActiveSetSubProblem):
     ``kkt_rhs()[1].eq = -c_eq``.
 
     The equality multipliers of :attr:`L_k` are zeroed together with the
-    equality rows. With exact curvature this drops the equality-constraint
-    curvature ``Σ λ_i ∇² c_i`` from the QP Hessian; the line-search
-    minimiser evaluates the QP Lagrangian at a zero dual anyway, so this
-    matches its existing behaviour.
+    equality rows so no ``A_eqᵀ λ`` term survives in the masked model. The
+    Hessian ``B`` is the unmasked Lagrangian Hessian ``∇²ₓₓL(x_k, λ_k)``
+    inherited from :class:`ActiveSetSubProblem`, so with exact curvature the
+    equality-constraint curvature ``Σ λ_i ∇² c_i`` is retained.
+
+    **Dual convention.** SQP view like the parent: ``g`` is the objective
+    gradient ``∇f_k`` and the inequality / bound multipliers solved by the
+    inner KKT solver are absolute. The equality block is not part of the
+    KKT system; :meth:`recover_eq_multipliers` produces it (absolute as
+    well) from the proximal centre.
     """
 
     mu: Scalar
@@ -138,12 +144,12 @@ class ProximalActiveSetSubProblem(ActiveSetSubProblem):
 
     def kkt_mvp_primal(self, step: tuple[Primal, Dual]) -> Primal:
         """Stabilised Hessian product ``B v + (1/μ) A_eqᵀ A_eq v``."""
-        base = self.L_k.kkt_mvp_primal(step)
+        base = super().kkt_mvp_primal(step)
         return cast(Primal, Primal(x=base.x + self.stabilisation_hvp(step[0].x)))
 
     def primal_grad(self) -> Primal:
-        """Stabilised gradient ``g + A_eqᵀ (λ_k + c_eq / μ)``."""
-        base = self.L_k.primal_grad
+        """Stabilised gradient ``∇f_k + A_eqᵀ (λ_k + c_eq / μ)``."""
+        base = super().primal_grad()
         shift = self.eq_jac.T @ (self.eq_center + self.eq_val / self.mu)
         return cast(Primal, Primal(x=base.x + shift))
 

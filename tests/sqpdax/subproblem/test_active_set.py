@@ -71,14 +71,17 @@ def test_masked_lagrangian_and_delegation():
     assert jnp.array_equal(sub.L_k.null_lb, expected_L_k.null_lb)
     assert jnp.array_equal(sub.L_k.null_ub, expected_L_k.null_ub)
 
-    assert jnp.allclose(sub.primal_grad().x, expected_L_k.primal_grad.x)
+    # SQP view: the RHS is the objective gradient, not ``∇_x L`` of ``L_k``.
+    assert not sub.is_kkt_dual_increment
+    assert jnp.allclose(sub.primal_grad().x, lag.grad_val)
     assert jnp.allclose(sub.dual_grad().flatten(), expected_L_k.dual_grad.flatten())
     assert jnp.allclose(
         sub.nonbound_constraint_jac(), expected_L_k.nonbound_constraint_jac
     )
 
     step = make_step(lag.n, lag.meq, lag.mineq)
-    assert jnp.allclose(sub.kkt_mvp_primal(step).x, expected_L_k.kkt_mvp_primal(step).x)
+    # The Hessian block uses the *unmasked* multipliers.
+    assert jnp.allclose(sub.kkt_mvp_primal(step).x, lag.kkt_mvp_primal(step).x)
     assert jnp.allclose(
         sub.kkt_mvp_upper_offdiag(step).x, expected_L_k.kkt_mvp_upper_offdiag(step).x
     )
@@ -90,8 +93,9 @@ def test_masked_lagrangian_and_delegation():
         sub.kkt_mvp_dual(step).flatten(), expected_L_k.kkt_mvp_dual(step).flatten()
     )
     mvp_p, mvp_d = sub.kkt_mvp(step)
-    exp_p, exp_d = expected_L_k.kkt_mvp(step)
-    assert jnp.allclose(mvp_p.x, exp_p.x)
+    exp_p = lag.kkt_mvp_primal(step).x + expected_L_k.kkt_mvp_upper_offdiag(step).x
+    _, exp_d = expected_L_k.kkt_mvp(step)
+    assert jnp.allclose(mvp_p.x, exp_p)
     assert jnp.allclose(mvp_d.flatten(), exp_d.flatten())
 
 

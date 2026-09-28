@@ -7,6 +7,8 @@ import pytest
 
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import Problem
+from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
+from slsqp_jax.sqpdax.subproblem.base import SubProblem
 from tests.sqpdax.lagrangian.conftest import make_problem
 
 from .conftest import (
@@ -82,6 +84,61 @@ def test_step_norm_and_to_native_identity():
     native = sub.to_native_step(step)
     assert jnp.allclose(native[0].x, step[0].x)
     assert jnp.allclose(native[1].flatten(), step[1].flatten())
+
+
+class NewtonViewSubProblem(ActiveSetSubProblem):
+    """Stub declaring the Newton view: the KKT dual block is ``Δλ``."""
+
+    @property
+    def is_kkt_dual_increment(self) -> bool:
+        return True
+
+
+def test_to_native_step_resolves_the_declared_dual_convention():
+    """SQP view returns the dual as is; Newton view shifts it by ``λ_k``."""
+    sqp = make_active_set_subproblem(active_inequalities=(True, False))
+    newton = NewtonViewSubProblem(sqp.lagrangian, sqp.active_set)
+    step = make_step(sqp.n, sqp.meq, sqp.mineq, dx=jnp.array([0.1, -0.2]))
+
+    assert not sqp.is_kkt_dual_increment
+    assert newton.is_kkt_dual_increment
+    _, sqp_dual = sqp.to_native_step(step)
+    _, newton_dual = newton.to_native_step(step)
+    assert jnp.allclose(sqp_dual.flatten(), step[1].flatten())
+    assert jnp.allclose(
+        newton_dual.flatten(), step[1].flatten() + sqp.lagrangian.dual.flatten()
+    )
+
+
+@pytest.mark.parametrize(
+    ("active_lb", "active_ub", "expected_free"),
+    [
+        ((False, False), (False, False), (True, True)),
+        ((True, False), (False, True), (False, False)),
+        ((True, False), (True, False), (False, True)),
+    ],
+    ids=["all-free", "lb-and-ub", "lower-wins-tie"],
+)
+def test_free_subspace_pins_active_bounds(active_lb, active_ub, expected_free):
+    """Fixed coordinates carry ``lb - x`` / ``ub - x``; lower wins ties."""
+    problem = make_problem(lb=jnp.array([0.0, -1.0]), ub=jnp.array([2.0, 3.0]))
+    sub = make_active_set_subproblem(
+        problem=problem, active_lb=active_lb, active_ub=active_ub
+    )
+    x = sub.lagrangian.ref.x
+    free, fixed = sub.free_subspace()
+    assert jnp.array_equal(free, jnp.array(expected_free))
+    lb_arr, ub_arr = jnp.array(active_lb), jnp.array(active_ub)
+    expected_fixed = jnp.where(
+        lb_arr, problem.lb - x, jnp.where(ub_arr, problem.ub - x, 0.0)
+    )
+    assert jnp.allclose(fixed, expected_fixed)
+    assert jnp.all(fixed[free] == 0.0)
+
+    # The base default declares every coordinate free.
+    base_free, base_fixed = SubProblem.free_subspace(sub)
+    assert jnp.all(base_free)
+    assert jnp.allclose(base_fixed, 0.0)
 
 
 @pytest.mark.parametrize(
