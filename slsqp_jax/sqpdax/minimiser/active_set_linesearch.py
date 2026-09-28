@@ -28,6 +28,7 @@ from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
+    KKT_SOLVER_RESULTS,
     RESULTS,
     ActiveSetQPSolver,
     ActiveSetQPSolverState,
@@ -360,6 +361,9 @@ class ActiveSetLineSearchMinimiser(
                 dual=self._init_dual(problem),
                 final_working_tol=jnp.asarray(self.effective_qp_tol, primal.x.dtype),
                 n_anti_cycling=jnp.asarray(0, jnp.int32),
+                last_kkt_feasibility_residual=jnp.asarray(0.0, primal.x.dtype),
+                last_kkt_n_refinements=jnp.asarray(0, jnp.int32),
+                last_kkt_reason=KKT_SOLVER_RESULTS.converged,
             ),
         )
 
@@ -521,19 +525,22 @@ class ActiveSetLineSearchMinimiser(
     ) -> SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType]:
         """Build an active-set QP context at the current iterate.
 
-        The Lagrangian is evaluated at a *zero* dual so the QP recovers the
-        full multiplier ``λ_{k+1}``. The subproblem's own working set is
-        empty; the QP solver builds its initial set from the current point
-        and from the carried state when ``qp_warm_start`` is set or the
-        LPEC-A predictor has seeded it (see :meth:`_seed_predicted_active_set`).
+        The Lagrangian is evaluated at the current ``(iterate, dual)`` so an
+        exact-curvature problem contributes ``∇²ₓₓL(x_k, λ_k)`` to the QP
+        Hessian; the QP still returns the full multiplier ``λ_{k+1}`` because
+        :class:`~slsqp_jax.sqpdax.subproblem.active_set.ActiveSetSubProblem`
+        uses the objective gradient as its right-hand side (SQP view). The
+        subproblem's own working set is empty; the QP solver builds its
+        initial set from the current point and from the carried state when
+        ``qp_warm_start`` is set or the LPEC-A predictor has seeded it (see
+        :meth:`_seed_predicted_active_set`).
         """
         iterate = cast(Primal, self.iterate)
         dual = cast(Dual, self.dual)
         n = problem.n
         dtype = iterate.x.dtype
         lag_module = self._lagrangian_module(problem)
-        # Zero-dual eval => QP returns the *full* multiplier lambda_{k+1}.
-        qp_lag = lag_module(iterate, self._init_dual(problem))
+        qp_lag = lag_module(iterate, dual)
 
         solver = self._configured_qp_solver(problem, dtype)
         if self.active_set_predictor.enabled:
@@ -930,6 +937,9 @@ class ActiveSetLineSearchMinimiser(
             "qp_result": solver_state.qp_result,
             "qp_final_working_tol": solver_state.final_working_tol,
             "n_qp_anti_cycling": solver_state.n_anti_cycling,
+            "kkt_feasibility_residual": solver_state.last_kkt_feasibility_residual,
+            "kkt_n_refinements": solver_state.last_kkt_n_refinements,
+            "kkt_reason": solver_state.last_kkt_reason,
             "n_lpeca_bypassed": self.n_lpeca_bypassed,
             "n_lpeca_capped": self.n_lpeca_capped,
             "n_lpeca_bounds_prefixed": self.n_lpeca_bounds_prefixed,

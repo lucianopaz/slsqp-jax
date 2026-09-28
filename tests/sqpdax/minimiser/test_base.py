@@ -17,6 +17,8 @@ from slsqp_jax.sqpdax.minimiser import (
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.registry import FrozenDict
 from slsqp_jax.sqpdax.step_controller import StepResult
+from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
+from slsqp_jax.sqpdax.subproblem.solver import ProjectedCGState, SubProblemSolver
 from tests.sqpdax.lagrangian.conftest import make_problem
 from tests.sqpdax.subproblem.solver.conftest import unbounded_box
 
@@ -207,6 +209,42 @@ def test_execute_step_commits_dual_iff_finite(minimiser_cls, accepted, fill):
         assert jnp.array_equal(got, want)
     assert all(jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(advanced.dual))
     assert int(advanced.step_count) == 1
+
+
+class _NewtonViewQP(ActiveSetSubProblem):
+    @property
+    def is_kkt_dual_increment(self) -> bool:
+        return True
+
+
+class _EchoSolver(SubProblemSolver):
+    """Returns the warm start untouched, whatever the subproblem."""
+
+    solver_state_class: type = ProjectedCGState
+
+    def solve(self, subproblem, x0, initial_state):
+        return x0, initial_state
+
+
+@pytest.mark.parametrize("newton_view", [False, True], ids=["sqp-view", "newton-view"])
+def test_solve_direction_resolves_the_dual_convention(newton_view):
+    """``_solve_direction`` routes the solver's answer through ``to_native_step``."""
+    problem = make_problem(n=2, meq=1, mineq=2, with_curvature=True)
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.asarray([0.5, 0.5]))
+    lam_k = jax.tree.map(lambda d: d + 0.3, solver.dual)
+    solver = eqx.tree_at(lambda m: m.dual, solver, lam_k)
+    ctx = solver._init_subproblem(problem)
+    sub = ctx.subproblem
+    if newton_view:
+        sub = _NewtonViewQP(sub.lagrangian, sub.active_set)
+    ctx = eqx.tree_at(lambda c: (c.subproblem, c.solver), ctx, (sub, _EchoSolver()))
+    warm_dual = jax.tree.map(lambda d: d + 1.0, lam_k)
+    ctx = eqx.tree_at(lambda c: c.warm, ctx, (ctx.warm[0], warm_dual))
+
+    _, step_dual, _ = solver._solve_direction(ctx)
+
+    shift = lam_k.flatten() if newton_view else 0.0
+    assert jnp.allclose(step_dual.flatten(), warm_dual.flatten() + shift)
 
 
 def test_step_updates_secant_on_inexact_problem():
