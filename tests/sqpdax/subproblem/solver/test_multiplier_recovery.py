@@ -243,8 +243,23 @@ def test_safeguards_reject_newton_view_subproblems(safeguard):
         )
 
 
-def test_least_squares_recovery_matches_trust_region_interior_point_multipliers():
-    """LS + barrier safeguard reproduces the trust-region solver's eq. 19.37/19.38 dual."""
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        None,
+        LeastSquaresMultiplierRecovery(
+            refinement_rounds=0, safeguard=BarrierSafeguard()
+        ),
+        LeastSquaresMultiplierRecovery(safeguard=ClampSafeguard()),
+    ],
+    ids=["default", "no-refinement", "clamp"],
+)
+def test_trust_region_interior_point_uses_the_multiplier_recovery_strategy(recovery):
+    """The trust-region solver's dual is exactly its ``multiplier_recovery`` output.
+
+    The default is least squares (eq. 19.37) with the barrier safeguard
+    (eq. 19.38); any other strategy is honoured verbatim.
+    """
     sub = make_scaled_barrier_subproblem()
     lag = sub.lagrangian
     warm = (
@@ -252,16 +267,30 @@ def test_least_squares_recovery_matches_trust_region_interior_point_multipliers(
         jax.tree.map(jnp.zeros_like, lag.dual),
     )
     tr = TrustRegionInteriorPointSolver()
+    if recovery is not None:
+        tr = tr.init(multiplier_recovery=recovery)
     (_, tr_dual), _ = tr.solve(sub, warm, make_trust_region_state(1.0))
-    recovery = LeastSquaresMultiplierRecovery(
-        refinement_rounds=0,
-        safeguard=BarrierSafeguard(),
-        rtol=tr.mult_rtol,
-        atol=tr.mult_atol,
-        max_steps=tr.mult_max_steps,
+    assert isinstance(tr.multiplier_recovery, LeastSquaresMultiplierRecovery)
+    if recovery is None:
+        assert isinstance(tr.multiplier_recovery.safeguard, BarrierSafeguard)
+    expected = tr.multiplier_recovery.recover(sub, None, warm[0])
+    assert jnp.allclose(tr_dual.flatten(), expected.flatten(), atol=1e-6)
+    # Every strategy here enforces dual feasibility on inequalities / bounds.
+    assert jnp.all(tr_dual.ineq_multipliers >= 0)
+    assert jnp.all(tr_dual.lb_multipliers >= 0)
+    assert jnp.all(tr_dual.ub_multipliers >= 0)
+    # Refinement changes the estimate only within LSMR's own tolerance.
+    unrefined = (
+        LeastSquaresMultiplierRecovery(
+            refinement_rounds=0, safeguard=BarrierSafeguard()
+        )
+        .recover(sub, None, warm[0])
+        .flatten()
     )
-    ls_dual = recovery.recover(sub, None, warm[0])
-    assert jnp.allclose(ls_dual.flatten(), tr_dual.flatten(), atol=1e-5)
-    # Refinement keeps the result within LSMR's own tolerance.
-    refined = recovery.init(refinement_rounds=1).recover(sub, None, warm[0])
-    assert jnp.allclose(refined.flatten(), tr_dual.flatten(), atol=1e-4)
+    assert jnp.allclose(
+        TrustRegionInteriorPointSolver()
+        .solve(sub, warm, make_trust_region_state(1.0))[0][1]
+        .flatten(),
+        unrefined,
+        atol=1e-4,
+    )

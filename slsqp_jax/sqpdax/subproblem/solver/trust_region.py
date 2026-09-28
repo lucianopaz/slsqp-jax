@@ -3,11 +3,9 @@
 from typing import Generic, cast
 
 import jax
-import lineax as lx
 from equinox import field, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
-from lineax import AbstractLinearOperator, AbstractLinearSolver
 from typing_extensions import TypeVar
 
 from ...dual import Dual
@@ -16,6 +14,11 @@ from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
 from .dogleg import DogLegSolver, DogLegSolverState
 from .gradient_projection import GradientProjection
+from .multiplier_recovery import (
+    BarrierSafeguard,
+    LeastSquaresMultiplierRecovery,
+    MultiplierRecovery,
+)
 from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
@@ -79,9 +82,10 @@ class TrustRegionInteriorPointSolver(
     Orchestrates a normal (feasibility) step and a tangential (optimality)
     step on a
     :class:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem`,
-    recovers least-squares multipliers (eq. 19.37) with the positivity
-    safeguard (eq. 19.38), and reports the predicted reduction (eq. 19.41) and
-    merit penalty ``ν`` (eq. 19.42). The radius update and the
+    recovers the multipliers through the pluggable :attr:`multiplier_recovery`
+    (by default least squares, eq. 19.37, with the positivity safeguard,
+    eq. 19.38), and reports the predicted reduction (eq. 19.41) and merit
+    penalty ``ν`` (eq. 19.42). The radius update and the
     actual / predicted step-acceptance test (eq. 19.39) belong to the outer
     loop.
 
@@ -103,9 +107,14 @@ class TrustRegionInteriorPointSolver(
         ``ρ`` in the merit-penalty update (eq. 19.42).
     penalty_margin
         Additive margin when raising ``ν``.
-    mult_rtol, mult_atol, mult_max_steps
-        Lineax LSMR tolerances for matrix-free multiplier recovery on
-        ``Âᵀ``.
+    multiplier_recovery
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
+        producing the dual block (default
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.LeastSquaresMultiplierRecovery`
+        with a
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.BarrierSafeguard`,
+        run matrix-free on ``Âᵀ`` since the primal carries slacks). Its
+        ``rtol`` / ``atol`` / ``max_steps`` are the LSMR tolerances.
     normal_solver
         Feasibility-step solver (default
         :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolver`).
@@ -122,10 +131,12 @@ class TrustRegionInteriorPointSolver(
     tau: float = 0.995  # fraction-to-boundary parameter (eq. 19.31e)
     penalty_rho: float = 0.3  # rho in eq. 19.42
     penalty_margin: float = 1e-4
-    # Matrix-free least-squares multiplier recovery (lineax LSMR on Ahat^T).
-    mult_rtol: float = 1e-8
-    mult_atol: float = 1e-8
-    mult_max_steps: int | None = None
+    # Multiplier recovery (eq. 19.37 + 19.38 by default); matrix-free on Ahat^T.
+    multiplier_recovery: MultiplierRecovery = field(
+        default_factory=lambda: LeastSquaresMultiplierRecovery(
+            safeguard=BarrierSafeguard()
+        )
+    )
     normal_solver: SubProblemSolver = field(default_factory=DogLegSolver)
     tangential_solver: SubProblemSolver = field(
         default_factory=SteihaugTointCGTangentialStepSolver
@@ -185,10 +196,7 @@ class TrustRegionInteriorPointSolver(
                 "full-space KKT solvers)."
             )
         lag = subproblem.lagrangian
-        n, meq, mineq = lag.n, lag.meq, lag.mineq
-        m_total = meq + mineq + 2 * n
-        mu = lag.barrier.weight
-        null_lb, null_ub = lag.null_lb, lag.null_ub
+        n, mineq = lag.n, lag.mineq
         radius = initial_state.radius
         dtype = x0[0].flatten().dtype
         zero_i = jnp.zeros((), jnp.int32)
@@ -197,17 +205,12 @@ class TrustRegionInteriorPointSolver(
         # --- scaled operators from the SubProblem interface (same construction as
         # the tangential solver): ghat / chat are the scaled objective gradient and
         # constraint residual, apply_H the scaled Hessian block, and A / At the
-        # scaled constraint Jacobian Ahat and its transpose.  Everything is applied
-        # matrix-free: the dense Ahat (O(n^2) for the barrier system) is never
-        # assembled -- neither for the multipliers nor the predicted reduction. ---
-        w_dim = 3 * n + mineq
+        # scaled constraint Jacobian Ahat.  Everything is applied matrix-free: the
+        # dense Ahat (O(n^2) for the barrier system) is never assembled -- neither
+        # for the multipliers nor the predicted reduction. ---
         zero_dual = cast(Dual, jax.tree.map(jnp.zeros_like, lag.dual))
-        zero_primal = InteriorPointPrimal.from_flat(
-            jnp.zeros((w_dim,), dtype), n, mineq
-        )
         ghat = subproblem.primal_grad().flatten()
         chat = subproblem.dual_grad().flatten()
-        s, s_lb, s_ub = lag.slack.s, lag.slack.s_lb, lag.slack.s_ub
 
         def apply_H(w: Float[Array, " w"]) -> Float[Array, " w"]:
             step = (InteriorPointPrimal.from_flat(w, n, mineq), zero_dual)
@@ -217,33 +220,6 @@ class TrustRegionInteriorPointSolver(
             return subproblem.kkt_mvp_lower_offdiag(
                 (InteriorPointPrimal.from_flat(v, n, mineq), zero_dual)
             ).flatten()
-
-        def At(lam: Float[Array, " m_total"]) -> Float[Array, " w"]:  # Ahat^T lam
-            return subproblem.kkt_mvp_upper_offdiag(
-                (zero_primal, Dual.from_flat(lam, n, mineq, meq))
-            ).flatten()
-
-        # --- least-squares multipliers via LSMR on the rectangular Ahat^T --------
-        # ``min_lam ||Ahat^T lam + ghat||`` <=> solve ``Ahat^T lam = -ghat`` in the
-        # least-squares sense.  lineax's LSMR works matrix-free on the ``At``
-        # operator and returns the pseudoinverse solution for rank-deficient Ahat
-        # (e.g. null-bound zero rows).
-        At_op = cast(
-            AbstractLinearOperator,
-            lx.FunctionLinearOperator(At, jax.ShapeDtypeStruct((m_total,), dtype)),
-        )
-        lsmr = cast(
-            AbstractLinearSolver,
-            lx.LSMR(
-                rtol=self.mult_rtol,
-                atol=self.mult_atol,
-                max_steps=self.mult_max_steps,
-            ),
-        )
-
-        def least_squares_multipliers() -> Float[Array, " m_total"]:
-            sol = lx.linear_solve(At_op, -ghat, lsmr, throw=False)
-            return sol.value
 
         # --- composite step: normal (feasibility) then tangential (optimality) ---
         # The normal solver runs at the reduced radius zeta * radius (eq. 19.34b).
@@ -307,41 +283,11 @@ class TrustRegionInteriorPointSolver(
             ),
         )
 
-        # --- least-squares multipliers (eq. 19.37). Positivity safeguard (eq. 19.38):
-        # z_i <- min(1e-3, mu / s_i) if z_i <= 0. Null bounds get z = 0.
-        lam = least_squares_multipliers()
-        y = lam[:meq]
-        z_ineq = lam[meq : meq + mineq]
-        z_lb = lam[meq + mineq : meq + mineq + n]
-        z_ub = lam[meq + mineq + n :]
-        z_ineq = jnp.where(z_ineq > 0, z_ineq, jnp.minimum(1e-3, mu / s))
-        z_lb = jnp.where(
-            null_lb,
-            0.0,
-            jnp.where(
-                z_lb > 0,
-                z_lb,
-                jnp.minimum(1e-3, mu / jnp.where(null_lb, 1.0, s_lb)),
-            ),
-        )
-        z_ub = jnp.where(
-            null_ub,
-            0.0,
-            jnp.where(
-                z_ub > 0,
-                z_ub,
-                jnp.minimum(1e-3, mu / jnp.where(null_ub, 1.0, s_ub)),
-            ),
-        )
-        step_dual = cast(
-            Dual,
-            Dual(
-                eq_multipliers=y,
-                ineq_multipliers=z_ineq,
-                lb_multipliers=z_lb,
-                ub_multipliers=z_ub,
-            ),
-        )
+        # --- multipliers (eq. 19.37 least squares + eq. 19.38 safeguard by
+        # default).  The scaled-barrier primal carries slacks, so the recovery runs
+        # its matrix-free LSMR path on ``Âᵀ`` (``projector=None``); the LS target
+        # ``-ĝ`` is step-independent, hence the primal step is only a placeholder.
+        step_dual = self.multiplier_recovery.recover(subproblem, None, step_primal)
 
         # --- predicted reduction (eq. 19.41) and penalty update (eq. 19.42) ---
         Hw = apply_H(w)

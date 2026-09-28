@@ -9,6 +9,11 @@ from slsqp_jax.sqpdax.barrier import AdaptiveBarrierUpdate, LogBarrier
 from slsqp_jax.sqpdax.minimiser import TrustRegionInteriorPointMinimiser, minimise
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal
 from slsqp_jax.sqpdax.registry import FrozenDict
+from slsqp_jax.sqpdax.subproblem.solver import (
+    BarrierSafeguard,
+    LeastSquaresMultiplierRecovery,
+    TrustRegionInteriorPointSolver,
+)
 
 from .conftest import make_equality_quadratic, make_unconstrained_quadratic
 
@@ -39,17 +44,39 @@ def test_parse_options_builds_barrier_update_from_kind_spec():
     assert isinstance(solver.barrier_update, AdaptiveBarrierUpdate)
 
 
-def test_step_applies_subproblem_options():
+@pytest.mark.parametrize(
+    ("subproblem_options", "check"),
+    [
+        ({"zeta": 0.5}, lambda tr: tr.zeta == 0.5),
+        (
+            {
+                "multiplier_recovery": LeastSquaresMultiplierRecovery(
+                    refinement_rounds=2, safeguard=BarrierSafeguard(cap=1e-2)
+                )
+            },
+            lambda tr: tr.multiplier_recovery.refinement_rounds == 2
+            and tr.multiplier_recovery.safeguard.cap == 1e-2,
+        ),
+    ],
+    ids=["zeta", "multiplier-recovery"],
+)
+def test_step_applies_subproblem_options(subproblem_options, check):
     """Non-empty ``subproblem`` options are forwarded into ``solver.init``."""
     problem = make_unconstrained_quadratic()
     solver = TrustRegionInteriorPointMinimiser(initial_mu=0.1).init(
         problem,
         jnp.ones(2),
-        options={"subproblem": {"zeta": 0.5}},
+        options={"subproblem": subproblem_options},
     )
+    tr = solver._init_subproblem(problem).solver
+    assert isinstance(tr, TrustRegionInteriorPointSolver)
+    assert check(tr)
     solver = solver.step(problem)
     assert int(solver.step_count) == 1
     assert jnp.all(jnp.isfinite(solver.iterate.flatten()))
+    assert jnp.all(solver.dual.ineq_multipliers >= 0)
+    assert jnp.all(solver.dual.lb_multipliers >= 0)
+    assert jnp.all(solver.dual.ub_multipliers >= 0)
 
 
 def test_step_reduces_merit_on_unconstrained():
