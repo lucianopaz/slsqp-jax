@@ -39,6 +39,10 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
     :meth:`~slsqp_jax.sqpdax.secant.lbfgs.LBFGS.should_skip`; no
     special-casing is needed in the outer loop.
 
+    The ratio ``ρ`` is written back to the returned state (``rho``) so the
+    outer loop can detect model failures (``ρ = -inf`` when the predicted
+    reduction is non-positive) without recomputing the merit.
+
     Attributes
     ----------
     merit
@@ -88,7 +92,7 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
         StepResult
             New (or retained) iterate, acceptance flag, merit at that
             iterate, and updated solver state (new ``radius`` /
-            ``success``).
+            ``success`` / ``rho``).
 
         Raises
         ------
@@ -127,6 +131,8 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
         >>> bool(result.accepted)
         True
         >>> float(result.solver_state.radius)
+        1.0
+        >>> float(result.solver_state.rho)
         1.0
         """
         if not isinstance(solver_state, TrustRegionSolverState):
@@ -168,9 +174,9 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
             ),
         )
         new_state = eqx.tree_at(
-            lambda s: (s.radius, s.success),
+            lambda s: (s.radius, s.success, s.rho),
             solver_state,
-            (new_radius, accepted),
+            (new_radius, accepted, jnp.asarray(rho, solver_state.rho.dtype)),
         )
         proposed_step_norm = jnp.linalg.norm(x_new.x - x0.x)
         return cast(
