@@ -11,6 +11,7 @@ from jax import Array
 from lineax._operator import IdentityLinearOperator, MatrixLinearOperator
 
 from slsqp_jax.sqpdax.preconditioner import (
+    DiagonalPreconditioner,
     GenericPreconditioner,
     IdentityPreconditioner,
     MatrixPreconditioner,
@@ -35,6 +36,7 @@ from .conftest import (
     [
         ("identity", IdentityPreconditioner),
         ("matrix", MatrixPreconditioner),
+        ("diagonal", DiagonalPreconditioner),
         ("generic", GenericPreconditioner),
     ],
 )
@@ -141,6 +143,27 @@ def test_matrix_preconditioner_square_roundtrip():
 
 
 @pytest.mark.parametrize(
+    "values",
+    [(2.0,), (0.5, 3.0, 10.0), (1.0, 1.5, 2.0, 3.0, 4.0, 5.0)],
+    ids=["n1", "n3", "n6"],
+)
+def test_diagonal_preconditioner_matches_dense_diagonal(values):
+    """``diag(d)`` maps, its inverse and its lineax operators match the dense form."""
+    diagonal = jnp.asarray(values)
+    prec = DiagonalPreconditioner(diagonal)
+    dense = MatrixPreconditioner(jnp.diag(diagonal))
+    x = jnp.linspace(-1.0, 1.0, diagonal.shape[0])
+
+    assert prec.input_structure == prec.output_structure
+    for name in ("pushforward", "pullback", "invert", "invert_transpose"):
+        assert jnp.allclose(getattr(prec, name)(x), getattr(dense, name)(x), atol=1e-6)
+    assert isinstance(prec.as_linear_operator(), lx.DiagonalLinearOperator)
+    assert jnp.allclose(prec.as_linear_operator().as_matrix(), jnp.diag(diagonal))
+    assert jnp.allclose(prec.as_inverse_linear_operator().mv(x), x / diagonal)
+    assert jnp.allclose(prec.invert(prec.pushforward(x)), x, atol=1e-6)
+
+
+@pytest.mark.parametrize(
     "with_invert", [False, True], ids=["lineax-invert", "direct-invert"]
 )
 def test_generic_preconditioner_matches_matrix(with_invert: bool):
@@ -192,9 +215,10 @@ def test_as_inverse_linear_operator_applies_inverse():
     [
         lambda: IdentityPreconditioner(jnp.zeros(3)),
         lambda: make_matrix_preconditioner(3),
+        lambda: DiagonalPreconditioner(jnp.array([1.0, 2.0, 4.0])),
         lambda: make_generic_from_matrix(make_spd_matrix(3), with_invert=True),
     ],
-    ids=["identity", "matrix", "generic"],
+    ids=["identity", "matrix", "diagonal", "generic"],
 )
 def test_preconditioner_jittable(prec_factory):
     """Pushforward / invert remain usable under :func:`equinox.filter_jit`."""

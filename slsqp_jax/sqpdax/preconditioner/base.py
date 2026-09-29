@@ -23,6 +23,7 @@ from jaxtyping import Array, Float
 from lineax import AbstractLinearSolver, AutoLinearSolver, linear_solve
 from lineax._operator import (
     AbstractLinearOperator,
+    DiagonalLinearOperator,
     IdentityLinearOperator,
     MatrixLinearOperator,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "Preconditioner",
     "IdentityPreconditioner",
     "MatrixPreconditioner",
+    "DiagonalPreconditioner",
     "GenericPreconditioner",
 ]
 
@@ -331,6 +333,65 @@ class MatrixPreconditioner(Preconditioner):
     def as_linear_operator(self) -> AbstractLinearOperator:
         """Dense matrix operator wrapping :attr:`matrix`."""
         return cast(AbstractLinearOperator, MatrixLinearOperator(self.matrix))
+
+
+class DiagonalPreconditioner(Preconditioner):
+    """Diagonal preconditioner ``M = diag(d)`` with an exact ``O(n)`` inverse.
+
+    All four maps are elementwise: ``M x = d ⊙ x`` and ``M⁻¹ x = x / d``;
+    both are self-adjoint. The forward lineax operator is a
+    :class:`~lineax.DiagonalLinearOperator`. ``d`` must be strictly positive
+    for ``M`` to be SPD; that is the caller's responsibility.
+
+    Parameters
+    ----------
+    diagonal
+        Diagonal entries ``d`` of ``M``.
+
+    Attributes
+    ----------
+    diagonal
+        The stored diagonal ``d``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.preconditioner import DiagonalPreconditioner
+    >>> pre = DiagonalPreconditioner(jnp.array([2.0, 4.0]))
+    >>> pre.invert(jnp.array([1.0, 1.0])).tolist()
+    [0.5, 0.25]
+    """
+
+    kind: ClassVar[str] = "diagonal"
+
+    diagonal: Float[Array, " m"]
+
+    def __init__(self, diagonal: Float[Array, " m"]):
+        self.diagonal = diagonal
+        self.input_structure = jax.ShapeDtypeStruct(
+            shape=diagonal.shape, dtype=diagonal.dtype
+        )
+        self.output_structure = self.input_structure
+
+    def pushforward(self, x: Float[Array, " m"]) -> Float[Array, " m"]:
+        """Return ``d ⊙ x``."""
+        return self.diagonal * x
+
+    def pullback(self, x: Float[Array, " m"]) -> Float[Array, " m"]:
+        """Return ``d ⊙ x`` (``M`` is symmetric)."""
+        return self.diagonal * x
+
+    def invert(self, x: Float[Array, " m"]) -> Float[Array, " m"]:
+        """Return ``x / d``."""
+        return x / self.diagonal
+
+    def invert_transpose(self, x: Float[Array, " m"]) -> Float[Array, " m"]:
+        """Return ``x / d`` (``M⁻¹`` is symmetric)."""
+        return x / self.diagonal
+
+    def as_linear_operator(self) -> AbstractLinearOperator:
+        """Diagonal operator wrapping :attr:`diagonal`."""
+        return cast(AbstractLinearOperator, DiagonalLinearOperator(self.diagonal))
 
 
 class GenericPreconditioner(Preconditioner):
