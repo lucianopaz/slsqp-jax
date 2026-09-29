@@ -1,4 +1,4 @@
-from typing import Generic, cast
+from typing import Generic, Self, cast
 
 import equinox as eqx
 import jax
@@ -9,6 +9,7 @@ from typing_extensions import TypeVar
 
 from ...active_set import ActiveSet
 from ...dual import Dual
+from ...preconditioner import Preconditioner
 from ...primal import Primal
 from ...types import Scalar
 from ..active_set import ActiveSetSubProblem
@@ -196,6 +197,32 @@ class ActiveSetQPSolver(
     def max_iter(self) -> int:
         """Working-set iteration budget, read from :attr:`working_set_policy`."""
         return self.working_set_policy.max_iter
+
+    def accepts_preconditioner(self) -> bool:
+        """Whether the inner :attr:`subproblem_solver` accepts one."""
+        return self.subproblem_solver.accepts_preconditioner()
+
+    def with_default_preconditioner(
+        self, preconditioner: Preconditioner | None
+    ) -> Self:
+        """Forward ``preconditioner`` to the inner :attr:`subproblem_solver`.
+
+        Parameters
+        ----------
+        preconditioner
+            Candidate preconditioner, or ``None`` for no change.
+
+        Returns
+        -------
+        Self
+            Copy whose inner solver received the candidate (it keeps its own
+            preconditioner if one is already configured).
+        """
+        return eqx.tree_at(
+            lambda s: s.subproblem_solver,
+            self,
+            self.subproblem_solver.with_default_preconditioner(preconditioner),
+        )
 
     def _kkt_solver(
         self, subproblem: ActiveSetSubProblem

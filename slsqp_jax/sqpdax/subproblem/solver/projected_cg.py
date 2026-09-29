@@ -9,7 +9,13 @@ from ...preconditioner import Preconditioner
 from ...primal import Primal
 from ...types import Vector_n
 from ..active_set import ActiveSetSubProblem
-from .base import KKT_SOLVER_RESULTS, RESULTS, KKTSolverState, SubProblemSolver
+from .base import (
+    KKT_SOLVER_RESULTS,
+    RESULTS,
+    KKTSolverState,
+    SubProblemSolver,
+    install_default_preconditioner,
+)
 from .multiplier_recovery import KKTMultiplierRecovery, MultiplierRecovery
 from .projector import Projector, SVDProjector
 
@@ -108,6 +114,16 @@ class ProjectedCGSubProblemSolver(
     multiplier_recovery: MultiplierRecovery = field(
         default_factory=KKTMultiplierRecovery
     )
+
+    def accepts_preconditioner(self) -> bool:
+        """``True``: :attr:`preconditioner` drives the constraint preconditioner."""
+        return True
+
+    def with_default_preconditioner(
+        self, preconditioner: Preconditioner | None
+    ) -> "ProjectedCGSubProblemSolver":
+        """Install ``preconditioner`` when :attr:`preconditioner` is ``None``."""
+        return install_default_preconditioner(self, preconditioner)
 
     def solve(
         self,

@@ -1,9 +1,9 @@
 """Cached Lagrangian values, gradients, and KKT operators at a reference point."""
 
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, Self, TypeVar, cast
 
 import jax
-from equinox import Module
+from equinox import Module, tree_at
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float
 
@@ -56,6 +56,22 @@ class EvaluatedLagrangian(Module, Generic[PrimalType]):
     def has_exact_curvature(self) -> bool:
         """Whether exact QVPs are available and no secant is attached."""
         return self.evaluated.has_exact_curvature and self.secant is None
+
+    def without_secant(self) -> Self:
+        """Copy that uses the exact QVPs instead of the attached secant.
+
+        The cached :attr:`evaluated` is reused, so no problem function is
+        re-evaluated. Only meaningful when ``evaluated.has_exact_curvature``;
+        otherwise :meth:`hvp` on the copy raises.
+
+        Returns
+        -------
+        Self
+            Same evaluation with ``secant = None``.
+        """
+        if self.secant is None:
+            return self
+        return tree_at(lambda lag: lag.secant, self, None, is_leaf=lambda z: z is None)
 
     @property
     def is_kkt_dual_regularized(self) -> bool:
