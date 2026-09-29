@@ -310,7 +310,13 @@ class CommonMinimiser(
         Default ``"none"``.
     secant_reset
         :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetPolicy` applied
-        after every step; configure with a mapping of its fields.
+        after every step; configure with a mapping of its fields. Each
+        minimiser feeds the policy through
+        :meth:`_secant_reset_signals`, mapping its own counters onto the
+        ``subproblem`` / ``step`` / ``model`` channels of
+        :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` (the
+        active-set loops use the first two, the trust-region interior-point
+        loop the last).
     secant_stats
         :class:`~slsqp_jax.sqpdax.secant.statistics.SecantStatistics` of the
         maintained secant, or ``None`` when no secant is kept.
@@ -1040,7 +1046,8 @@ class CommonMinimiser(
 
         Called on the minimiser *after* :meth:`_advance_dynamics`, so
         overrides read the counters of the step just taken. The default
-        reports no failures, leaving only the conditioning trigger.
+        reports no failures on any channel, leaving only the conditioning
+        trigger; it is only consulted when a secant is maintained.
 
         Returns
         -------

@@ -9,7 +9,7 @@ import equinox as eqx
 import jax
 import optimistix as optx
 from jax import numpy as jnp
-from jaxtyping import Array, Bool
+from jaxtyping import Array, Bool, Int
 
 from ..barrier import Barrier, BarrierUpdate, LogBarrier, MonotoneBarrierUpdate
 from ..dual import Dual
@@ -26,6 +26,7 @@ from ..results import (
     MINIMISER_RESULTS,
     ResultAdapter,
 )
+from ..secant import SecantResetSignals
 from ..step_controller import StepController, StepResult, TrustRegionManager
 from ..subproblem import ScaledBarrierSubProblem
 from ..subproblem.solver import (
@@ -185,6 +186,23 @@ class TrustRegionInteriorPointMinimiser(
     ``E(x, s, y, z; 0)`` against ``atol``. There is no relative tolerance, so
     passing ``rtol`` raises.
 
+    When the subproblem model uses a secant, the minimiser feeds the
+    ``model`` channel of :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals`
+    from two model-quality stalls detected after every step:
+
+    * **radius collapse** — the trust-region radius has fallen below
+      ``radius_floor * max(1, ||x||)`` while the unperturbed KKT error is
+      still above ``atol``;
+    * **model failure** — the step was rejected with an actual / predicted
+      reduction ratio below ``model_failure_rho`` (including ``-inf`` when
+      the model predicted no decrease).
+
+    Consecutive stalls build ``consecutive_model_failures``; a healthy
+    rejection or an accepted step with a sound radius resets it, so ordinary
+    shrink-and-retry never triggers a reset. Subproblem failures and plain
+    rejections are *not* reported to the reset policy: the former terminate
+    immediately and the latter only shrink the radius.
+
     Attributes
     ----------
     initial_mu
@@ -207,6 +225,16 @@ class TrustRegionInteriorPointMinimiser(
         absolute KKT-error test does not implement.
     eta, shrink_threshold, grow_threshold, shrink_factor, grow_factor, max_radius
         Forwarded to :class:`TrustRegionManager`.
+    radius_floor
+        Relative radius floor for the radius-collapse stall
+        (``radius < radius_floor * max(1, ||x||)``).
+    model_failure_rho
+        A rejected step with ``rho`` below this value counts as a model
+        failure stall.
+    model_stall_patience
+        Stall streak at which the patience-level (identity) secant reset
+        fires; the soft reset fires on the first stall. Forwarded as
+        ``model_patience`` of :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals`.
     barrier
         Dynamic barrier whose ``weight`` *is* ``μ`` (seeded in
         :meth:`_init_dynamics`).
@@ -214,6 +242,9 @@ class TrustRegionInteriorPointMinimiser(
         Dynamic flag recording whether the last :attr:`barrier_update` call
         judged the barrier subproblem solved; read by
         :meth:`termination_metrics` as the inner stopping test.
+    consecutive_model_failures
+        Dynamic count of consecutive model-quality stalls, reported to the
+        secant reset policy as ``model_streak``.
     """
 
     initial_mu: float = eqx.field(static=True, default=1.0)
@@ -233,8 +264,15 @@ class TrustRegionInteriorPointMinimiser(
     shrink_factor: float = eqx.field(static=True, default=0.25)
     grow_factor: float = eqx.field(static=True, default=2.0)
     max_radius: float = eqx.field(static=True, default=1e10)
+    # secant model-stall detection (feeds the ``model`` reset channel)
+    radius_floor: float = eqx.field(static=True, default=1e-8)
+    model_failure_rho: float = eqx.field(static=True, default=-1.0)
+    model_stall_patience: int = eqx.field(static=True, default=3)
     # The barrier is dynamic state: its ``weight`` *is* mu, updated each step.
     barrier: Barrier | None = None
+    consecutive_model_failures: Int[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
 
     @property
     def result_adapter(self) -> TrustRegionInteriorPointResultAdapter:
@@ -249,6 +287,11 @@ class TrustRegionInteriorPointMinimiser(
             raise ValueError(
                 "TrustRegionInteriorPointMinimiser does not provide a relative "
                 "tolerance for convergence. Use the absolute tolerance instead."
+            )
+        if self.model_stall_patience < 1:
+            raise ValueError(
+                "model_stall_patience must be at least 1; got "
+                f"{self.model_stall_patience}"
             )
 
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
@@ -280,12 +323,12 @@ class TrustRegionInteriorPointMinimiser(
     def _init_dynamics(
         self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
     ) -> Self:
-        """Seed the secant (via super) then the barrier so Lagrangian / merit see ``μ``."""
+        """Seed the secant (via super), the barrier, and a zero model-stall streak."""
         base = super()._init_dynamics(problem, x0)
         return eqx.tree_at(
-            lambda m: m.barrier,
+            lambda m: (m.barrier, m.consecutive_model_failures),
             base,
-            self._make_barrier(problem),
+            (self._make_barrier(problem), jnp.asarray(0, jnp.int32)),
             is_leaf=lambda z: z is None,
         )
 
@@ -343,6 +386,8 @@ class TrustRegionInteriorPointMinimiser(
                 on_boundary=jnp.asarray(False),
                 success=jnp.asarray(False),
                 status=SUBPROBLEM_RESULTS.successful,
+                # Overwritten by ``TrustRegionManager.step`` before it is read.
+                rho=jnp.asarray(1.0),
             ),
         )
 
@@ -454,13 +499,20 @@ class TrustRegionInteriorPointMinimiser(
         result: StepResult[InteriorPointPrimal, TrustRegionStateType],
         step_dual: Dual,
     ) -> Self:
-        """Reduce ``μ`` from the KKT / complementarity state at the new iterate.
+        """Reduce ``μ`` and refresh the model-stall streak at the new iterate.
 
         Also records whether the policy judged the barrier subproblem solved,
         which :meth:`termination_metrics` reads back as the inner
         ``E(·; μ) ≤ ε_μ`` test of N&W Algorithm 19.4. That test is evaluated
         at the iterate, so it runs on rejected steps too — ``result.x`` is
         then the retained iterate.
+
+        The model-stall streak counts consecutive steps at which either the
+        radius collapsed while the unperturbed KKT error ``E(·; 0)`` was still
+        above ``atol``, or the step was rejected with ``rho`` below
+        :attr:`model_failure_rho`. The unperturbed residual is used (rather
+        than the barrier policy's ``updated`` flag) because adaptive
+        schedules report ``updated`` unconditionally.
 
         Parameters
         ----------
@@ -474,7 +526,8 @@ class TrustRegionInteriorPointMinimiser(
         Returns
         -------
         Self
-            Minimiser with ``barrier`` and ``barrier_updated`` refreshed.
+            Minimiser with ``barrier``, ``barrier_updated`` and
+            ``consecutive_model_failures`` refreshed.
         """
         # ``ctx.lagrangian`` is the module; re-evaluate at (x_new, step_dual)
         # exactly as ``_update_secant`` does. Complementarity is secant-independent,
@@ -485,10 +538,47 @@ class TrustRegionInteriorPointMinimiser(
         new_barrier, updated = self.barrier_update.update(
             cast(Barrier, self.barrier), lagrangian
         )
+
+        # The trust-region controller always writes the solver state back.
+        state = cast(TrustRegionSolverState, result.solver_state)
+        unconverged = (
+            self.barrier_update.optimality_residual(lagrangian, jnp.asarray(0.0))
+            > self.atol
+        )
+        x_scale = jnp.maximum(1.0, jnp.linalg.norm(x_new.x))
+        radius_collapse = (state.radius < self.radius_floor * x_scale) & unconverged
+        model_failure = ~result.accepted & (state.rho < self.model_failure_rho)
+        stall = radius_collapse | model_failure
+        streak = jnp.where(stall, self.consecutive_model_failures + 1, 0).astype(
+            jnp.int32
+        )
         return eqx.tree_at(
-            lambda m: (m.barrier, m.barrier_updated),
+            lambda m: (m.barrier, m.barrier_updated, m.consecutive_model_failures),
             self,
-            (new_barrier, updated),
+            (new_barrier, updated, streak),
+        )
+
+    def _secant_reset_signals(self) -> SecantResetSignals:
+        """Report model-quality stalls on the ``model`` channel only.
+
+        Subproblem failures terminate the run and plain rejections only
+        shrink the radius, so both of those channels stay at zero.
+
+        Returns
+        -------
+        SecantResetSignals
+            ``model_streak`` from :attr:`consecutive_model_failures` with
+            ``model_patience`` from :attr:`model_stall_patience`.
+        """
+        zero = jnp.asarray(0, jnp.int32)
+        return cast(
+            SecantResetSignals,
+            SecantResetSignals(
+                subproblem_streak=zero,
+                step_streak=zero,
+                model_streak=self.consecutive_model_failures,
+                model_patience=self.model_stall_patience,
+            ),
         )
 
     def termination_metrics(
