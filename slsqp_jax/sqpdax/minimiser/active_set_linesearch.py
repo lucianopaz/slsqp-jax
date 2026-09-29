@@ -24,6 +24,7 @@ from ..results import (
     MINIMISER_RESULTS,
     ResultAdapter,
 )
+from ..secant import SecantResetSignals
 from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
@@ -370,10 +371,10 @@ class ActiveSetLineSearchMinimiser(
     def _lagrangian_module(
         self, problem: ProblemProtocol[Primal]
     ) -> Lagrangian[Primal, EvaluatedLagrangian[Primal]]:
-        """Unevaluated Lagrangian wrapping the current secant (if any)."""
+        """Unevaluated Lagrangian wrapping the model secant (if the model uses one)."""
         return cast(
             Lagrangian[Primal, EvaluatedLagrangian[Primal]],
-            Lagrangian(problem, self.secant),
+            Lagrangian(problem, self._model_secant(problem)),
         )
 
     def _make_qp_solver(
@@ -533,7 +534,11 @@ class ActiveSetLineSearchMinimiser(
         subproblem's own working set is empty; the QP solver builds its
         initial set from the current point and from the carried state when
         ``qp_warm_start`` is set or the LPEC-A predictor has seeded it (see
-        :meth:`_seed_predicted_active_set`).
+        :meth:`_seed_predicted_active_set`). The configured solver then
+        receives this step's
+        :attr:`~slsqp_jax.sqpdax.minimiser.base.CommonMinimiser.preconditioner`
+        (options are applied first, so a user-supplied inner solver is
+        preconditioned too unless it carries its own preconditioner).
         """
         iterate = cast(Primal, self.iterate)
         dual = cast(Dual, self.dual)
@@ -542,7 +547,12 @@ class ActiveSetLineSearchMinimiser(
         lag_module = self._lagrangian_module(problem)
         qp_lag = lag_module(iterate, dual)
 
-        solver = self._configured_qp_solver(problem, dtype)
+        solver = cast(
+            ActiveSetQPSolver[Any, ActiveSetStateType],
+            self._precondition(
+                self._configured_qp_solver(problem, dtype), problem, qp_lag
+            ),
+        )
         if self.active_set_predictor.enabled:
             solver = solver.init(warm_start=True)
         return cast(
@@ -760,6 +770,18 @@ class ActiveSetLineSearchMinimiser(
             ),
         )
 
+    def _secant_reset_signals(self) -> SecantResetSignals:
+        """Report QP failures as subproblem and line-search failures as step streaks."""
+        return cast(
+            SecantResetSignals,
+            SecantResetSignals(
+                subproblem_streak=self.consecutive_qp_failures,
+                step_streak=self.consecutive_ls_failures,
+                subproblem_patience=self.qp_failure_patience,
+                step_patience=self.ls_failure_patience,
+            ),
+        )
+
     def termination_metrics(
         self, ctx: OptimisationContext[Primal, ActiveSetStateType]
     ) -> ActiveSetLineSearchTerminationMetrics:
@@ -921,8 +943,7 @@ class ActiveSetLineSearchMinimiser(
         lagrangian = ctx.lagrangian
         dual = cast(Dual, self.dual)
         solver_state = cast(ActiveSetStateType, self.solver_state)
-        return {
-            "num_steps": self.step_count,
+        return super()._postprocess_stats(problem, result) | {
             "final_objective": lagrangian.fn_val,
             "final_grad_norm": jnp.linalg.norm(lagrangian.grad_val),
             "final_lagrangian_grad_norm": jnp.linalg.norm(lagrangian.x_grad),

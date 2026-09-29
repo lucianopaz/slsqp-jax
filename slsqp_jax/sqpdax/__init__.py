@@ -58,10 +58,16 @@ from .minimiser import (
     solver_option_keys,
 )
 from .preconditioner import (
+    DiagonalPreconditioner,
     GenericPreconditioner,
     IdentityPreconditioner,
     MatrixPreconditioner,
+    NoPreconditioner,
     Preconditioner,
+    PreconditionerContext,
+    PreconditionerStrategy,
+    SecantPreconditioner,
+    StochasticDiagonalPreconditioner,
 )
 from .primal import InteriorPointPrimal, Primal, Slack
 from .problem import EvaluatedProblem, Problem, ProblemProtocol, build_problem
@@ -70,7 +76,14 @@ from .results import (
     ResultAdapter,
     is_successful,
 )
-from .secant import LBFGS, CurvatureDiagnostics, Secant
+from .secant import (
+    LBFGS,
+    CurvatureDiagnostics,
+    Secant,
+    SecantResetPolicy,
+    SecantResetSignals,
+    SecantStatistics,
+)
 from .step_controller import (
     ArmijoLineSearch,
     LineSearch,
@@ -176,6 +189,9 @@ __all__ = [
     "CurvatureDiagnostics",
     "Secant",
     "LBFGS",
+    "SecantResetPolicy",
+    "SecantResetSignals",
+    "SecantStatistics",
     "Lagrangian",
     "InteriorPointLagrangian",
     "EvaluatedLagrangian",
@@ -184,6 +200,12 @@ __all__ = [
     "IdentityPreconditioner",
     "MatrixPreconditioner",
     "GenericPreconditioner",
+    "DiagonalPreconditioner",
+    "PreconditionerContext",
+    "PreconditionerStrategy",
+    "NoPreconditioner",
+    "SecantPreconditioner",
+    "StochasticDiagonalPreconditioner",
     "ActiveSet",
     "LPECAPrediction",
     "LPECAPredictor",

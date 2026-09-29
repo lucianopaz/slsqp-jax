@@ -354,7 +354,7 @@ class TrustRegionInteriorPointMinimiser(
             Lagrangian[InteriorPointPrimal, EvaluatedLagrangian[InteriorPointPrimal]],
             InteriorPointLagrangian(
                 problem,
-                self.secant,
+                self._model_secant(problem),
                 cast(Barrier, self.barrier),
                 primal_dual=self.primal_dual,
             ),
@@ -396,6 +396,10 @@ class TrustRegionInteriorPointMinimiser(
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
+        solver = cast(
+            TrustRegionInteriorPointSolver[TrustRegionStateType],
+            self._precondition(solver, problem, lag),
+        )
         zero_warm = cast(InteriorPointPrimal, jax.tree.map(jnp.zeros_like, iterate))
         return cast(
             SubproblemContext[
