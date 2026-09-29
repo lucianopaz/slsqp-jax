@@ -13,9 +13,40 @@ from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner
 from slsqp_jax.sqpdax.preconditioner.utils import (
     linear_adjoint,
     preconditioner_from_secant,
+    stochastic_diagonal,
     woodbury_preconditioner,
 )
 from slsqp_jax.sqpdax.secant import LBFGS
+
+from .conftest import make_spd_matrix
+
+
+@pytest.mark.parametrize("n_probes", [1, 4, 16])
+@pytest.mark.parametrize(
+    "values",
+    [(1.0, 2.0, 3.0), (-4.0, 0.0, 0.5, 7.0)],
+    ids=["positive", "indefinite"],
+)
+def test_stochastic_diagonal_is_exact_for_diagonal_matrices(values, n_probes):
+    """Rademacher probes square to one, so a diagonal ``H`` is recovered exactly."""
+    diagonal = jnp.asarray(values)
+    est = stochastic_diagonal(
+        lambda v: diagonal * v,
+        diagonal.shape[0],
+        jax.random.key(1),
+        n_probes,
+        diagonal.dtype,
+    )
+    assert est.dtype == diagonal.dtype
+    assert jnp.allclose(est, diagonal)
+
+
+def test_stochastic_diagonal_is_unbiased_on_dense_matrix():
+    """For a dense SPD ``H`` many probes converge to ``diag(H)``."""
+    matrix = make_spd_matrix(3)
+    est = stochastic_diagonal(lambda v: matrix @ v, 3, jax.random.key(0), 4000)
+    rel_err = jnp.abs(est - jnp.diag(matrix)) / jnp.diag(matrix)
+    assert float(jnp.max(rel_err)) < 0.1
 
 
 def _lbfgs_with_pairs(n: int, pairs: list[tuple], *, memory: int = 4) -> LBFGS:

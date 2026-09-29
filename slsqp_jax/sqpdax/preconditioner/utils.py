@@ -19,6 +19,7 @@ from .base import GenericPreconditioner, Preconditioner
 __all__ = [
     "linear_adjoint",
     "preconditioner_from_secant",
+    "stochastic_diagonal",
     "woodbury_preconditioner",
 ]
 
@@ -158,6 +159,57 @@ def preconditioner_from_secant(
             invert_transpose=invert_transpose,
         ),
     )
+
+
+def stochastic_diagonal(
+    hvp: Callable[[Float[Array, " n"]], Float[Array, " n"]],
+    n: int,
+    key: Array,
+    n_probes: int,
+    dtype: jnp.dtype | None = None,
+) -> Float[Array, " n"]:
+    """Estimate ``diag(H)`` from Hessian-vector products alone.
+
+    Bekas, Kokiopoulou & Saad (2007): for Rademacher probes ``z`` (entries
+    i.i.d. ``±1``), ``E[z ⊙ (H z)] = diag(H)``. Averaging ``n_probes``
+    samples gives an unbiased estimate with variance
+    ``O(‖offdiag(H)‖² / n_probes)``, so it is accurate for diagonally
+    dominant ``H`` and exact for a diagonal one. The probes are evaluated
+    with a single :func:`jax.vmap` over ``hvp``.
+
+    Parameters
+    ----------
+    hvp
+        Linear map ``v ↦ H v``.
+    n
+        Dimension of ``H``.
+    key
+        PRNG key for the probes.
+    n_probes
+        Number of Rademacher probes (each costs one ``hvp``).
+    dtype
+        Floating dtype of the probes. Defaults to JAX's default float dtype.
+
+    Returns
+    -------
+    jax.Array
+        Estimated diagonal of ``H``, shape ``(n,)``.
+
+    Examples
+    --------
+    >>> import jax
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.preconditioner.utils import stochastic_diagonal
+    >>> d = jnp.array([1.0, 2.0, 3.0])
+    >>> est = stochastic_diagonal(lambda v: d * v, 3, jax.random.key(0), n_probes=4)
+    >>> est.tolist()
+    [1.0, 2.0, 3.0]
+    """
+    if dtype is None:
+        dtype = jnp.result_type(float)
+    Z = 2.0 * jax.random.bernoulli(key, shape=(n_probes, n)).astype(dtype) - 1.0
+    W = jax.vmap(hvp)(Z)
+    return jnp.mean(Z * W, axis=0)
 
 
 def woodbury_preconditioner(
