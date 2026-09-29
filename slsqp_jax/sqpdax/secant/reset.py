@@ -20,9 +20,10 @@ class SecantResetSignals(Module):
     """Failure streaks a minimiser reports to :class:`SecantResetPolicy`.
 
     The policy is algorithm-agnostic: each minimiser maps its own failure
-    counters onto the two channels below (e.g. the active-set line search
+    counters onto the three channels below (e.g. the active-set line search
     reports QP failures as ``subproblem`` and line-search failures as
-    ``step``).
+    ``step``; the trust-region interior-point loop reports model-quality
+    stalls as ``model``).
 
     Attributes
     ----------
@@ -30,21 +31,35 @@ class SecantResetSignals(Module):
         Consecutive subproblem (QP / KKT) failures, including this step.
     step_streak
         Consecutive globalisation (line-search / step-acceptance) failures.
-    subproblem_patience, step_patience
+    model_streak
+        Consecutive model-quality stalls reported by trust-region
+        minimisers: a collapsed radius while the KKT error is still above
+        tolerance, or a rejected step whose actual / predicted reduction
+        ratio is far below zero (the model predicted no decrease).
+    subproblem_patience, step_patience, model_patience
         Streak length at which the patience-level reset fires (``≥ 1``).
     """
 
     subproblem_streak: Int[Array, ""]
     step_streak: Int[Array, ""]
+    model_streak: Int[Array, ""] = field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
     subproblem_patience: int = field(static=True, default=1)
     step_patience: int = field(static=True, default=1)
+    model_patience: int = field(static=True, default=3)
 
     def __check_init__(self) -> None:
-        if self.subproblem_patience < 1 or self.step_patience < 1:
+        if (
+            self.subproblem_patience < 1
+            or self.step_patience < 1
+            or self.model_patience < 1
+        ):
             raise ValueError(
                 "reset patience must be at least 1; got "
                 f"subproblem_patience={self.subproblem_patience}, "
-                f"step_patience={self.step_patience}"
+                f"step_patience={self.step_patience}, "
+                f"model_patience={self.model_patience}"
             )
 
     @classmethod
@@ -57,7 +72,7 @@ class SecantResetSignals(Module):
             Zero streaks.
         """
         zero = jnp.asarray(0, jnp.int32)
-        return cls(subproblem_streak=zero, step_streak=zero)
+        return cls(subproblem_streak=zero, step_streak=zero, model_streak=zero)
 
 
 class SecantResetPolicy(InitializableModule):
@@ -74,7 +89,10 @@ class SecantResetPolicy(InitializableModule):
       :attr:`first_failure_severity`;
     * a streak reaching its patience fires :attr:`patience_severity`.
 
-    When several triggers fire the strongest severity wins. Severities follow
+    The streak triggers apply identically to each of the three
+    :class:`SecantResetSignals` channels (``subproblem``, ``step``,
+    ``model``). When several triggers fire the strongest severity wins.
+    Severities follow
     :meth:`~slsqp_jax.sqpdax.secant.base.Secant.reset` (for
     :class:`~slsqp_jax.sqpdax.secant.lbfgs.LBFGS`: ``0`` soft, ``1`` diagonal,
     ``2`` identity).
@@ -101,6 +119,12 @@ class SecantResetPolicy(InitializableModule):
     ... )
     >>> int(policy.severity(LBFGS(n=2, memory=2), signals))
     2
+    >>> stalled = SecantResetSignals(
+    ...     subproblem_streak=jnp.asarray(0), step_streak=jnp.asarray(0),
+    ...     model_streak=jnp.asarray(1), model_patience=3,
+    ... )
+    >>> int(policy.severity(LBFGS(n=2, memory=2), stalled))
+    0
     """
 
     enabled: bool = field(static=True, default=True)
@@ -137,6 +161,7 @@ class SecantResetPolicy(InitializableModule):
         for streak, patience in (
             (signals.subproblem_streak, signals.subproblem_patience),
             (signals.step_streak, signals.step_patience),
+            (signals.model_streak, signals.model_patience),
         ):
             triggers.append((streak == 1, self.first_failure_severity))
             triggers.append((streak >= patience, self.patience_severity))

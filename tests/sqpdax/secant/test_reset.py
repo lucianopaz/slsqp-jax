@@ -26,30 +26,39 @@ def _secant(*, n_pairs: int, ill_conditioned: bool) -> LBFGS:
     return secant
 
 
-def _signals(sub: int, step: int, patience: int = 3) -> SecantResetSignals:
+def _signals(
+    sub: int, step: int, model: int = 0, patience: int = 3
+) -> SecantResetSignals:
     return SecantResetSignals(
         subproblem_streak=jnp.asarray(sub),
         step_streak=jnp.asarray(step),
+        model_streak=jnp.asarray(model),
         subproblem_patience=patience,
         step_patience=patience,
+        model_patience=patience,
     )
 
 
 @pytest.mark.parametrize(
-    ("n_pairs", "ill", "sub", "step", "policy_kwargs", "expected"),
+    ("n_pairs", "ill", "sub", "step", "model", "policy_kwargs", "expected"),
     [
-        (2, False, 0, 0, {}, -1),
-        (2, True, 0, 0, {}, 0),
-        (1, True, 0, 0, {}, -1),
-        (2, False, 1, 0, {}, 0),
-        (2, False, 0, 1, {}, 0),
-        (2, False, 2, 0, {}, -1),
-        (2, False, 3, 0, {}, 2),
-        (2, False, 0, 4, {}, 2),
-        (2, True, 3, 1, {}, 2),
-        (2, True, 0, 0, {"condition_severity": 1}, 1),
-        (2, False, 1, 0, {"first_failure_severity": 1}, 1),
-        (2, True, 3, 3, {"enabled": False}, -1),
+        (2, False, 0, 0, 0, {}, -1),
+        (2, True, 0, 0, 0, {}, 0),
+        (1, True, 0, 0, 0, {}, -1),
+        (2, False, 1, 0, 0, {}, 0),
+        (2, False, 0, 1, 0, {}, 0),
+        (2, False, 0, 0, 1, {}, 0),
+        (2, False, 2, 0, 0, {}, -1),
+        (2, False, 0, 0, 2, {}, -1),
+        (2, False, 3, 0, 0, {}, 2),
+        (2, False, 0, 4, 0, {}, 2),
+        (2, False, 0, 0, 3, {}, 2),
+        (2, True, 3, 1, 0, {}, 2),
+        (2, False, 0, 1, 3, {}, 2),
+        (2, True, 0, 0, 0, {"condition_severity": 1}, 1),
+        (2, False, 1, 0, 0, {"first_failure_severity": 1}, 1),
+        (2, False, 0, 0, 1, {"first_failure_severity": 1}, 1),
+        (2, True, 3, 3, 3, {"enabled": False}, -1),
     ],
     ids=[
         "quiet",
@@ -57,20 +66,25 @@ def _signals(sub: int, step: int, patience: int = 3) -> SecantResetSignals:
         "ill-but-one-pair",
         "first-qp-failure",
         "first-ls-failure",
+        "first-model-stall",
         "mid-streak",
+        "model-mid-streak",
         "qp-patience",
         "ls-beyond-patience",
+        "model-patience",
         "strongest-wins",
+        "model-strongest-wins",
         "custom-condition-severity",
         "custom-first-failure-severity",
+        "custom-first-model-severity",
         "disabled",
     ],
 )
-def test_severity_truth_table(n_pairs, ill, sub, step, policy_kwargs, expected):
+def test_severity_truth_table(n_pairs, ill, sub, step, model, policy_kwargs, expected):
     """Each trigger maps to its configured severity; the strongest one wins."""
     policy = SecantResetPolicy().init(**policy_kwargs)
     secant = _secant(n_pairs=n_pairs, ill_conditioned=ill)
-    assert int(policy.severity(secant, _signals(sub, step))) == expected
+    assert int(policy.severity(secant, _signals(sub, step, model))) == expected
 
 
 def test_patience_equal_one_escalates_first_failure_to_patience_level():
@@ -101,15 +115,22 @@ def test_none_signals_report_no_failures():
     """``SecantResetSignals.none()`` only leaves the conditioning trigger."""
     policy = SecantResetPolicy()
     quiet = SecantResetSignals.none()
+    assert int(quiet.subproblem_streak) == 0
+    assert int(quiet.step_streak) == 0
+    assert int(quiet.model_streak) == 0
     assert int(policy.severity(_secant(n_pairs=2, ill_conditioned=False), quiet)) == -1
     assert int(policy.severity(_secant(n_pairs=2, ill_conditioned=True), quiet)) == 0
 
 
-def test_signals_reject_nonpositive_patience():
+@pytest.mark.parametrize(
+    "patience_kwarg",
+    ["subproblem_patience", "step_patience", "model_patience"],
+)
+def test_signals_reject_nonpositive_patience(patience_kwarg: str):
     """A patience below one would fire on a zero streak, so it is rejected."""
     with pytest.raises(ValueError, match="patience must be at least 1"):
         SecantResetSignals(
             subproblem_streak=jnp.asarray(0),
             step_streak=jnp.asarray(0),
-            subproblem_patience=0,
+            **{patience_kwarg: 0},
         )
