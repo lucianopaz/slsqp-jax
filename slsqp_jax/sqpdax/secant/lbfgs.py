@@ -147,18 +147,67 @@ class LBFGS(Secant):
         Returns
         -------
         CurvatureDiagnostics
-            Raw inner product, normalised curvature, and skip flag from
-            :meth:`should_skip`.
+            Raw inner product, normalised curvature, skip flag from
+            :meth:`should_skip`, and the VARCHEN damping weight
+            :meth:`append` would apply (``1`` for a skipped pair).
         """
         s_norm = jnp.linalg.norm(s)
         y_norm = jnp.linalg.norm(y)
         sty = jnp.dot(s, y)
         relative_curvature = jnp.abs(sty) / jnp.maximum(s_norm * y_norm, 1e-30)
         skipped = self.should_skip(s, y)
+        theta = jnp.where(skipped, 1.0, self._damping_theta(s, y))
         return cast(
             CurvatureDiagnostics,
-            CurvatureDiagnostics(sty, relative_curvature, skipped),
+            CurvatureDiagnostics(sty, relative_curvature, skipped, theta),
         )
+
+    @property
+    def num_pairs(self) -> Int[Array, ""]:
+        """Number of valid ``(s, y)`` pairs in the circular buffer."""
+        return self.count
+
+    def curvature_bounds(self) -> tuple[Scalar, Scalar]:
+        """Eigenvalue bounds of ``B₀ = diag(diagonal)``: ``(min d, max d)``.
+
+        The ratio is ``κ(B₀)``, not the condition number of the full
+        compact-form ``B``.
+
+        Returns
+        -------
+        tuple[Scalar, Scalar]
+            ``(min(diagonal), max(diagonal))``.
+        """
+        return jnp.min(self.diagonal), jnp.max(self.diagonal)
+
+    def _damping_theta(self, s: Vector_n, y: Vector_n) -> Scalar:
+        """VARCHEN damping weight ``θ`` toward ``B₀`` (Lotfi et al., 2020).
+
+        Parameters
+        ----------
+        s
+            Step vector.
+        y
+            Gradient difference.
+
+        Returns
+        -------
+        Scalar
+            ``θ ∈ [0, 1]`` such that ``sᵀ y_damped ≥ damping_threshold · sᵀ B₀ s``
+            for ``y_damped = θ y + (1 - θ) B₀ s``.
+        """
+        B0s = self.diagonal * s
+        sTB0s_safe = jnp.maximum(jnp.dot(s, B0s), 1e-12)
+        sTy = jnp.dot(s, y)
+        use_damping = sTy < self.damping_threshold * sTB0s_safe
+        theta = jax.lax.cond(
+            use_damping,
+            lambda: (1.0 - self.damping_threshold)
+            * sTB0s_safe
+            / (sTB0s_safe - sTy + 1e-12),
+            lambda: jnp.array(1.0),
+        )
+        return jnp.clip(theta, 0.0, 1.0)
 
     def should_skip(self, s: Vector_n, y: Vector_n) -> Bool[Array, ""]:
         """Return whether ``append`` would reject the pair ``(s, y)``.
@@ -451,19 +500,7 @@ class LBFGS(Secant):
             # VARCHEN-style damping toward B0 = diag(diagonal).
             # O(n) and always well-conditioned, unlike the full lbfgs_hvp.
             B0s = self.diagonal * s
-            sTB0s = jnp.dot(s, B0s)
-            sTy = jnp.dot(s, y)
-            sTB0s_safe = jnp.maximum(sTB0s, 1e-12)
-
-            use_damping = sTy < self.damping_threshold * sTB0s_safe
-            theta = jax.lax.cond(
-                use_damping,
-                lambda: (1.0 - self.damping_threshold)
-                * sTB0s_safe
-                / (sTB0s_safe - sTy + 1e-12),
-                lambda: jnp.array(1.0),
-            )
-            theta = jnp.clip(theta, 0.0, 1.0)
+            theta = self._damping_theta(s, y)
             y_damped = theta * y + (1.0 - theta) * B0s
 
             yTy = jnp.dot(y_damped, y_damped)
