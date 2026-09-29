@@ -4,7 +4,7 @@ from abc import abstractmethod
 from typing import ClassVar, Self
 
 from equinox import Module
-from jaxtyping import Array, Bool
+from jaxtyping import Array, Bool, Int
 
 from ..registry import KindRegistryMixin
 from ..types import InitializableModule, Scalar, Vector_n
@@ -30,11 +30,15 @@ class CurvatureDiagnostics(Module):
         between ``s`` and ``y``).
     skipped
         Whether the pair would be rejected by the secant's skip logic.
+    damping_theta
+        Interpolation weight ``θ ∈ [0, 1]`` the secant would apply to ``y``
+        (``y_damped = θ y + (1 - θ) B₀ s``); ``1`` means undamped.
     """
 
     raw_curvature: Scalar  # s dot product y
     relative_curvature: Scalar  # |s.y| / (||s|| * ||y||)
     skipped: Bool[Array, ""]  # |s.y| < skip_threshold
+    damping_theta: Scalar
 
 
 class Secant(KindRegistryMixin, InitializableModule):
@@ -119,7 +123,35 @@ class Secant(KindRegistryMixin, InitializableModule):
         Returns
         -------
         CurvatureDiagnostics
-            Raw / relative curvature and skip flag.
+            Raw / relative curvature, skip flag, and damping weight.
+        """
+        ...  # pragma: no cover
+
+    @property
+    @abstractmethod
+    def num_pairs(self) -> Int[Array, ""]:
+        """Number of curvature pairs currently stored.
+
+        Returns
+        -------
+        Int[Array, ""]
+            Stored-pair count (``0`` for a fresh or fully reset secant).
+        """
+        ...  # pragma: no cover
+
+    @abstractmethod
+    def curvature_bounds(self) -> tuple[Scalar, Scalar]:
+        """Cheap eigenvalue bounds of the approximation's scaling matrix.
+
+        These are *not* bounds on the spectrum of the full approximation
+        ``B`` (which would cost a dense eigensolve); they describe the
+        initial / scaling matrix the approximation is built on, and their
+        ratio is the condition estimate used by reset triggers.
+
+        Returns
+        -------
+        tuple[Scalar, Scalar]
+            ``(lower, upper)`` with ``0 < lower ≤ upper``.
         """
         ...  # pragma: no cover
 
