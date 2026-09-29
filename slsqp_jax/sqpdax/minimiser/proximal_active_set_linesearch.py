@@ -10,7 +10,7 @@ from jaxtyping import Array, Bool
 
 from ..barrier.update import _inf_norm
 from ..dual import Dual
-from ..preconditioner import preconditioner_from_secant
+from ..preconditioner import PreconditionerStrategy, SecantPreconditioner
 from ..primal import Primal
 from ..problem import ProblemProtocol
 from ..step_controller import StepResult
@@ -57,11 +57,16 @@ class ProximalActiveSetLineSearchMinimiser(
     solver state, is warm-started from the previous solve, and is re-synced to
     the committed dual after a best-iterate rollback.
 
-    When a secant is active, the projected CG is preconditioned with ``M = B``
-    (``M⁻¹ = H`` from the secant); the proximal solver wraps it in the
-    Woodbury update ``B + (1/μ) A_eqᵀ A_eq`` so the constraint preconditioner
-    matches the stabilised Hessian. With exact curvature and no user-supplied
-    preconditioner the CG runs unpreconditioned.
+    The default :attr:`preconditioner` is
+    :class:`~slsqp_jax.sqpdax.preconditioner.strategy.SecantPreconditioner`
+    with ``require_secant=False``: when the model uses a secant, the inner
+    KKT solver is preconditioned with ``M = B`` (``M⁻¹ = H`` from the
+    secant), and the proximal solver wraps it in the Woodbury update
+    ``B + (1/μ) A_eqᵀ A_eq`` so the constraint preconditioner matches the
+    stabilised Hessian. With exact curvature and no user-supplied
+    preconditioner the solve runs unpreconditioned; pass
+    ``{"minimiser": {"preconditioner": {"kind": "lbfgs"}}}`` to keep a secant
+    for preconditioning anyway.
 
     Schedule parameters are set through ``options['subproblem']``:
     ``{"subproblem": {"tau": 0.5, "mu_min": 1e-6, "mu_max": 0.1}}``.
@@ -85,6 +90,11 @@ class ProximalActiveSetLineSearchMinimiser(
     ``x`` stays put).
     """
 
+    preconditioner: PreconditionerStrategy = eqx.field(
+        static=True,
+        default_factory=lambda: SecantPreconditioner(require_secant=False),
+    )
+
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
         """Root solver class for ``options['subproblem']`` validation."""
         return ProximalActiveSetQPSolver
@@ -100,18 +110,15 @@ class ProximalActiveSetLineSearchMinimiser(
     def _make_qp_solver(
         self, problem: ProblemProtocol[Primal], dtype: jnp.dtype
     ) -> ProximalActiveSetQPSolver:
-        """Proximal active-set loop around a (secant-preconditioned) projected CG."""
-        preconditioner = None
-        if self.secant is not None:
-            preconditioner = preconditioner_from_secant(
-                self.secant, problem.n, dtype, inverse_as_forward=False
-            )
+        """Proximal active-set loop around a projected CG.
+
+        The inner solver is left unpreconditioned here; the per-step
+        :attr:`preconditioner` strategy fills it in after options are applied.
+        """
         return cast(
             ProximalActiveSetQPSolver,
             ProximalActiveSetQPSolver(
-                subproblem_solver=ProjectedCGSubProblemSolver(
-                    preconditioner=preconditioner
-                ),
+                subproblem_solver=ProjectedCGSubProblemSolver(),
                 working_set_policy=self._make_working_set_policy(),
                 warm_start=self.qp_warm_start,
             ),

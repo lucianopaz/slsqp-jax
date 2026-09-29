@@ -15,8 +15,9 @@ def minimiser_option_keys(cls: type) -> set[str]:
     """Recognised ``options['minimiser']`` keys for ``cls``.
 
     Includes static tunable Equinox fields plus any ``kind``-family fields
-    (``secant`` / ``barrier_update``). ``options`` itself is a static field
-    but is the bag being validated, so it is never returned as a key.
+    (``secant`` / ``preconditioner`` / ``barrier_update``). ``options``
+    itself is a static field but is the bag being validated, so it is never
+    returned as a key.
 
     Parameters
     ----------
@@ -33,8 +34,11 @@ def minimiser_option_keys(cls: type) -> set[str]:
     --------
     >>> from slsqp_jax.sqpdax.minimiser.base import CommonMinimiser
     >>> from slsqp_jax.sqpdax.minimiser.utils import minimiser_option_keys
-    >>> sorted(minimiser_option_keys(CommonMinimiser))
-    ['atol', 'min_steps', 'rtol', 'secant', 'secant_memory']
+    >>> keys = sorted(minimiser_option_keys(CommonMinimiser))
+    >>> keys[:4]
+    ['atol', 'curvature', 'min_steps', 'preconditioner']
+    >>> keys[4:]
+    ['rtol', 'secant', 'secant_memory', 'secant_reset']
     """
     return (static_field_names(cls) | kind_family_field_names(cls)) - {"options"}
 

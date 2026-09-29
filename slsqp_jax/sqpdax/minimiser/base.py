@@ -6,7 +6,7 @@ import warnings
 from abc import abstractmethod
 from collections.abc import Mapping
 from dataclasses import fields, replace
-from typing import Any, Generic, Self, cast, get_origin, get_type_hints
+from typing import Any, Generic, Literal, Self, cast, get_origin, get_type_hints
 
 import equinox as eqx
 import jax
@@ -17,11 +17,22 @@ from jaxtyping import Array, Bool, Int
 
 from ..dual import Dual
 from ..lagrangian import EvaluatedLagrangian, Lagrangian
+from ..preconditioner import (
+    NoPreconditioner,
+    PreconditionerContext,
+    PreconditionerStrategy,
+)
 from ..primal import Primal, PrimalType
 from ..problem import ProblemProtocol
 from ..registry import FrozenDict, static_field_names
 from ..results import ResultAdapter, ResultType
-from ..secant import LBFGS, Secant
+from ..secant import (
+    LBFGS,
+    Secant,
+    SecantResetPolicy,
+    SecantResetSignals,
+    SecantStatistics,
+)
 from ..step_controller import StepController, StepResult
 from ..subproblem.base import SubProblemType
 from ..subproblem.solver import SubProblemSolver, SubProblemSolverStateType
@@ -110,8 +121,8 @@ class AbstractConstrainedMinimiser(
     dual
         Current multipliers, or ``None`` before :meth:`init`.
     secant
-        Optional curvature approximation, or ``None`` when the problem
-        supplies exact HVPs.
+        Maintained curvature approximation, or ``None`` when neither the
+        subproblem model nor the preconditioner needs one.
     solver_state
         Subproblem-solver carry threaded across outer steps.
     step_count
@@ -265,7 +276,17 @@ class CommonMinimiser(
     3. ``_assess_direction`` — run the
        :class:`~slsqp_jax.sqpdax.step_controller.base.StepController`;
     4. ``_execute_step`` — commit iterate / dual / solver state, refresh the
-       secant, and apply post-iterate updates via ``_advance_dynamics``.
+       secant, apply post-iterate updates via ``_advance_dynamics``, and
+       finally let :attr:`secant_reset` react to the updated failure
+       counters (``_reset_secant``).
+
+    Curvature is configured by three independent components:
+    :attr:`curvature` chooses what the subproblem model uses,
+    :attr:`preconditioner` builds a per-step preconditioner for iterative
+    subproblem solvers, and :attr:`secant_reset` decides when the maintained
+    secant is reset. A secant is maintained whenever the model uses it *or*
+    the preconditioner requires one, so exact HVPs can drive the QP while
+    L-BFGS only preconditions it.
 
     Attributes
     ----------
@@ -277,14 +298,46 @@ class CommonMinimiser(
         Minimum outer steps before convergence may fire.
     secant_memory
         Default L-BFGS memory when no ``minimiser.secant`` kind-spec is given.
+    curvature
+        Hessian used by the subproblem model: ``"exact"`` Lagrangian HVPs
+        (the problem must supply them), the ``"secant"`` approximation, or
+        ``"auto"`` (default) for exact when available and secant otherwise.
+    preconditioner
+        :class:`~slsqp_jax.sqpdax.preconditioner.strategy.PreconditionerStrategy`
+        rebuilt every step; set through
+        ``options['minimiser']['preconditioner']`` as a ``{"kind": ...}``
+        spec, a mapping of the current strategy's fields, or an instance.
+        Default ``"none"``.
+    secant_reset
+        :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetPolicy` applied
+        after every step; configure with a mapping of its fields.
+    secant_stats
+        :class:`~slsqp_jax.sqpdax.secant.statistics.SecantStatistics` of the
+        maintained secant, or ``None`` when no secant is kept.
     """
 
     solver_state: SubProblemSolverStateType | None = None
+    secant_stats: SecantStatistics | None = None
     # --- convergence / secant configuration ---
     rtol: float = eqx.field(static=True, default=1e-6)
     atol: float = eqx.field(static=True, default=1e-6)
     min_steps: int = eqx.field(static=True, default=1)
     secant_memory: int = eqx.field(static=True, default=10)
+    curvature: Literal["auto", "exact", "secant"] = eqx.field(
+        static=True, default="auto"
+    )
+    preconditioner: PreconditionerStrategy = eqx.field(
+        static=True, default_factory=NoPreconditioner
+    )
+    secant_reset: SecantResetPolicy = eqx.field(
+        static=True, default_factory=SecantResetPolicy
+    )
+
+    def __check_init__(self) -> None:
+        if self.curvature not in ("auto", "exact", "secant"):
+            raise ValueError(
+                f"curvature must be 'auto', 'exact' or 'secant'; got {self.curvature!r}"
+            )
 
     # ================================ init =================================
 
@@ -389,11 +442,57 @@ class CommonMinimiser(
         frozen = FrozenDict({} if options is None else options)
         base = replace(self, options=frozen)
         mopts = frozen.get("minimiser", {})
-        static_names = static_field_names(type(self))
+        static_names = static_field_names(type(self)) - {
+            "preconditioner",
+            "secant_reset",
+        }
         updates = {k: mopts[k] for k in mopts if k in static_names}
+        if "preconditioner" in mopts:
+            updates["preconditioner"] = self._parse_preconditioner(
+                mopts["preconditioner"]
+            )
+        if "secant_reset" in mopts:
+            spec = mopts["secant_reset"]
+            updates["secant_reset"] = (
+                self.secant_reset.init(**spec) if isinstance(spec, Mapping) else spec
+            )
         if updates:
             base = replace(base, **updates)
         return base
+
+    def _parse_preconditioner(self, spec: Any) -> PreconditionerStrategy:
+        """Resolve ``options['minimiser']['preconditioner']`` into a strategy.
+
+        Parameters
+        ----------
+        spec
+            A :class:`~slsqp_jax.sqpdax.preconditioner.strategy.PreconditionerStrategy`
+            (used as is), a ``{"kind": ..., **params}`` mapping (built from
+            the registry), or a mapping without ``kind`` (applied to the
+            current strategy's fields).
+
+        Returns
+        -------
+        PreconditionerStrategy
+            Configured strategy.
+
+        Raises
+        ------
+        TypeError
+            If ``spec`` is neither a strategy nor a mapping.
+        """
+        if isinstance(spec, PreconditionerStrategy):
+            return spec
+        if isinstance(spec, Mapping):
+            if "kind" in spec:
+                return cast(
+                    PreconditionerStrategy, PreconditionerStrategy.from_spec(spec)
+                )
+            return self.preconditioner.init(**spec)
+        raise TypeError(
+            "options['minimiser']['preconditioner'] must be a PreconditionerStrategy "
+            f"or a mapping; got {type(spec).__name__}"
+        )
 
     def _init_primal(
         self, problem: ProblemProtocol[PrimalType], x0: Vector_n
@@ -488,9 +587,10 @@ class CommonMinimiser(
         """Seed dynamic state that ``step`` needs before the iterate is built.
 
         Owns the secant: a curvature approximation is created via
-        :meth:`_make_secant` unless the problem supplies exact curvature.
-        Overrides should call ``super()._init_dynamics(...)`` first, then
-        seed any extra state (e.g. barrier weight ``μ``).
+        :meth:`_make_secant` when :meth:`_maintains_secant` holds, together
+        with its :attr:`secant_stats`. Overrides should call
+        ``super()._init_dynamics(...)`` first, then seed any extra state
+        (e.g. barrier weight ``μ``).
 
         Parameters
         ----------
@@ -502,12 +602,154 @@ class CommonMinimiser(
         Returns
         -------
         Self
-            Copy with ``secant`` (and any subclass extras) seeded.
+            Copy with ``secant`` / ``secant_stats`` (and any subclass extras)
+            seeded.
+
+        Raises
+        ------
+        ValueError
+            If the configuration needs exact HVPs the problem lacks.
         """
-        secant = None if problem.has_exact_curvature else self._make_secant(problem)
-        return eqx.tree_at(
-            lambda m: m.secant, self, secant, is_leaf=lambda z: z is None
+        self._validate_curvature(problem)
+        secant = self._make_secant(problem) if self._maintains_secant(problem) else None
+        stats = (
+            None
+            if secant is None
+            else SecantStatistics.initial(secant, jnp.result_type(x0.dtype, float))
         )
+        return eqx.tree_at(
+            lambda m: (m.secant, m.secant_stats),
+            self,
+            (secant, stats),
+            is_leaf=lambda z: z is None,
+        )
+
+    def _validate_curvature(self, problem: ProblemProtocol[PrimalType]) -> None:
+        """Reject configurations that need exact HVPs the problem lacks.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Raises
+        ------
+        ValueError
+            If ``curvature="exact"`` or the preconditioner strategy requires
+            exact HVPs while ``problem.has_exact_curvature`` is false.
+        """
+        if problem.has_exact_curvature:
+            return
+        if self.curvature == "exact":
+            raise ValueError(
+                f"{type(self).__name__}: curvature='exact' requires a problem "
+                "with exact Hessian-vector products"
+            )
+        if self.preconditioner.requires_exact_hvp:
+            raise ValueError(
+                f"{type(self).__name__}: preconditioner "
+                f"'{self.preconditioner.kind}' requires a problem with exact "
+                "Hessian-vector products"
+            )
+
+    def _uses_secant_model(self, problem: ProblemProtocol[PrimalType]) -> bool:
+        """Whether the subproblem model uses the secant instead of exact HVPs.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        bool
+            Resolution of :attr:`curvature` for ``problem``.
+        """
+        if self.curvature == "auto":
+            return not problem.has_exact_curvature
+        return self.curvature == "secant"
+
+    def _maintains_secant(self, problem: ProblemProtocol[PrimalType]) -> bool:
+        """Whether a secant is kept (for the model or for preconditioning).
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        bool
+            ``True`` when the model uses the secant or the preconditioner
+            strategy requires one.
+        """
+        return self._uses_secant_model(problem) or self.preconditioner.requires_secant
+
+    def _model_secant(self, problem: ProblemProtocol[PrimalType]) -> Secant | None:
+        """Secant handed to the subproblem Lagrangian, or ``None`` for exact HVPs.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+
+        Returns
+        -------
+        Secant or None
+            :attr:`secant` when the model uses it, otherwise ``None`` (even
+            if a secant is maintained for preconditioning).
+        """
+        return self.secant if self._uses_secant_model(problem) else None
+
+    def _precondition(
+        self,
+        solver: SubProblemSolver,
+        problem: ProblemProtocol[PrimalType],
+        lagrangian: EvaluatedLagrangian[PrimalType],
+    ) -> SubProblemSolver:
+        """Install this step's :attr:`preconditioner` into ``solver``.
+
+        Parameters
+        ----------
+        solver
+            Fully configured subproblem solver (options already applied).
+        problem
+            NLP being minimised.
+        lagrangian
+            Lagrangian evaluated at the current iterate (with or without the
+            model secant; the exact view is derived from it).
+
+        Returns
+        -------
+        SubProblemSolver
+            ``solver`` with the freshly built preconditioner installed where
+            it accepts one (a user-configured preconditioner is kept), or
+            ``solver`` unchanged when the strategy is inactive or the solver
+            accepts no preconditioner (which warns, since the configured
+            strategy would be ignored).
+        """
+        strategy = self.preconditioner
+        if not strategy.is_active:
+            return solver
+        if not solver.accepts_preconditioner():
+            warnings.warn(
+                f"{type(self).__name__}: preconditioner '{strategy.kind}' is "
+                f"ignored because {type(solver).__name__} accepts no "
+                "preconditioner"
+            )
+            return solver
+        ctx = cast(
+            PreconditionerContext,
+            PreconditionerContext(
+                x_ref=lagrangian.x_ref,
+                secant=self.secant,
+                lagrangian=(
+                    lagrangian.without_secant() if problem.has_exact_curvature else None
+                ),
+                step_count=self.step_count,
+            ),
+        )
+        return solver.with_default_preconditioner(strategy.build(ctx))
 
     def init(
         self,
@@ -764,30 +1006,72 @@ class CommonMinimiser(
                 cast(Dual, self.dual),
             ),
         )
-        new_secant = self._update_secant(ctx.lagrangian, x_new, committed_dual)
+        new_secant, new_stats = self._update_secant(
+            ctx.lagrangian, x_new, committed_dual
+        )
         advanced = cast(
             Self,
             eqx.tree_at(
-                lambda m: (m.iterate, m.dual, m.secant, m.solver_state, m.step_count),
+                lambda m: (
+                    m.iterate,
+                    m.dual,
+                    m.secant,
+                    m.secant_stats,
+                    m.solver_state,
+                    m.step_count,
+                ),
                 self,
                 (
                     x_new,
                     committed_dual,
                     new_secant,
+                    new_stats,
                     result.solver_state,
                     self.step_count + 1,
                 ),
                 is_leaf=lambda z: z is None,
             ),
         )
-        return advanced._advance_dynamics(ctx, result, committed_dual)
+        advanced = advanced._advance_dynamics(ctx, result, committed_dual)
+        return advanced._reset_secant()
+
+    def _secant_reset_signals(self) -> SecantResetSignals:
+        """Failure streaks reported to :attr:`secant_reset` after a step.
+
+        Called on the minimiser *after* :meth:`_advance_dynamics`, so
+        overrides read the counters of the step just taken. The default
+        reports no failures, leaving only the conditioning trigger.
+
+        Returns
+        -------
+        SecantResetSignals
+            Current failure streaks and their patiences.
+        """
+        return SecantResetSignals.none()
+
+    def _reset_secant(self) -> Self:
+        """Apply :attr:`secant_reset` to the maintained secant and record it.
+
+        Returns
+        -------
+        Self
+            Minimiser with a possibly reset ``secant`` and updated
+            ``secant_stats``; unchanged when no secant is kept.
+        """
+        if self.secant is None:
+            return self
+        secant, severity = self.secant_reset.apply(
+            self.secant, self._secant_reset_signals()
+        )
+        stats = cast(SecantStatistics, self.secant_stats).record_reset(severity, secant)
+        return eqx.tree_at(lambda m: (m.secant, m.secant_stats), self, (secant, stats))
 
     def _update_secant(
         self,
         lagrangian: Lagrangian[PrimalType, EvaluatedLagrangian[PrimalType]],
         x_new: PrimalType,
         step_dual: Dual,
-    ) -> Secant | None:
+    ) -> tuple[Secant | None, SecantStatistics | None]:
         """Append a curvature pair at shared multipliers, or keep ``None``.
 
         Parameters
@@ -802,11 +1086,14 @@ class CommonMinimiser(
 
         Returns
         -------
-        Secant or None
+        secant
             Updated approximation, or ``None`` when no secant is active.
+        stats
+            :attr:`secant_stats` with the attempted append recorded, or
+            ``None`` when no secant is active.
         """
         if self.secant is None:
-            return None
+            return None, None
         iterate = cast(PrimalType, self.iterate)
         # Share a single multiplier vector (the freshly solved ``step_dual``) at
         # both endpoints so the secant pair satisfies the Lagrangian secant
@@ -814,7 +1101,12 @@ class CommonMinimiser(
         prev = lagrangian(iterate, step_dual)
         s = x_new.x - iterate.x
         y = lagrangian.curvature_estimate(x_new, prev)
-        return self.secant.append(s, y)
+        diagnostics = self.secant.diagnostics(s, y)
+        secant = self.secant.append(s, y)
+        stats = cast(SecantStatistics, self.secant_stats).record_append(
+            diagnostics, secant
+        )
+        return secant, stats
 
     @abstractmethod
     def _advance_dynamics(
@@ -983,8 +1275,15 @@ class CommonMinimiser(
     def _postprocess_stats(
         self, problem: ProblemProtocol[PrimalType], result: ResultType
     ) -> dict[str, Any]:
-        """Build algorithm-specific solution statistics."""
-        return {"num_steps": self.step_count}
+        """Build algorithm-specific solution statistics.
+
+        Always reports ``num_steps``; adds the ``secant_*`` fields of
+        :attr:`secant_stats` when a secant is maintained.
+        """
+        stats: dict[str, Any] = {"num_steps": self.step_count}
+        if self.secant_stats is not None:
+            stats.update(self.secant_stats.as_stats())
+        return stats
 
     def postprocess(
         self, problem: ProblemProtocol[PrimalType], result: ResultType
