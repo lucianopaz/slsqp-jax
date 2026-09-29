@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.barrier import AdaptiveBarrierUpdate, LogBarrier
-from slsqp_jax.sqpdax.minimiser import TrustRegionInteriorPointMinimiser, minimise
+from slsqp_jax.sqpdax.minimiser import (
+    ActiveSetLineSearchMinimiser,
+    TrustRegionInteriorPointMinimiser,
+    minimise,
+)
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal
 from slsqp_jax.sqpdax.registry import FrozenDict
+from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem.solver import (
     BarrierSafeguard,
     LeastSquaresMultiplierRecovery,
     TrustRegionInteriorPointSolver,
 )
 
-from .conftest import make_equality_quadratic, make_unconstrained_quadratic
+from .conftest import (
+    make_equality_quadratic,
+    make_scaled_quartic,
+    make_unconstrained_quadratic,
+)
 
 
 def test_init_builds_interior_point_primal_and_barrier():
@@ -142,3 +152,131 @@ def test_minimiser_raises_on_rtol():
         match="TrustRegionInteriorPointMinimiser does not provide a relative",
     ):
         TrustRegionInteriorPointMinimiser(rtol=1e-3)
+
+
+def test_minimiser_raises_on_nonpositive_model_stall_patience():
+    with pytest.raises(ValueError, match="model_stall_patience must be at least 1"):
+        TrustRegionInteriorPointMinimiser(model_stall_patience=0)
+
+
+# --- secant model-stall detection -------------------------------------------
+
+
+def _secant_model_solver(**kwargs) -> TrustRegionInteriorPointMinimiser:
+    """TR-IP on a problem without exact HVPs, so an L-BFGS secant is kept."""
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = TrustRegionInteriorPointMinimiser(**kwargs).init(
+        problem, jnp.array([0.5, 0.3, 0.2])
+    )
+    assert solver.secant is not None
+    return solver
+
+
+def _with_pairs(solver):
+    """Seed three curvature pairs so resets are observable via ``num_pairs``."""
+    secant = solver.secant
+    for k in range(3):
+        s = jnp.zeros(3).at[k].set(1.0) + 0.1
+        secant = secant.append(s, (k + 2.0) * s)
+    return eqx.tree_at(lambda m: m.secant, solver, secant)
+
+
+@pytest.mark.parametrize(
+    ("radius", "rho", "accepted", "atol", "expected_streak"),
+    [
+        (1e-12, 1.0, True, 1e-6, 3),
+        (1e-12, 1.0, True, 1e6, 0),
+        (1.0, -jnp.inf, False, 1e-6, 3),
+        (1.0, -5.0, False, 1e-6, 3),
+        (1.0, -0.5, False, 1e-6, 0),
+        (1.0, 1.0, True, 1e-6, 0),
+        (1.0, -jnp.inf, True, 1e-6, 0),
+    ],
+    ids=[
+        "radius-collapse-unconverged",
+        "radius-collapse-converged",
+        "rejected-nonpositive-pred",
+        "rejected-very-negative-rho",
+        "healthy-rejection",
+        "accepted-sound-radius",
+        "accepted-ignores-rho",
+    ],
+)
+def test_advance_dynamics_tracks_model_stall_streak(
+    radius, rho, accepted, atol, expected_streak
+):
+    """Only radius collapse (while unconverged) or a model failure extend the streak.
+
+    The counter is seeded at ``2`` so an increment (``3``) is distinguishable
+    from a reset to zero. ``atol=1e6`` makes the current iterate count as
+    converged, which must silence the radius-collapse branch.
+    """
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = _secant_model_solver(atol=atol)
+    solver = eqx.tree_at(
+        lambda m: m.consecutive_model_failures, solver, jnp.asarray(2, jnp.int32)
+    )
+    ctx = solver._init_subproblem(problem)
+    state = eqx.tree_at(
+        lambda s: (s.radius, s.rho),
+        solver.solver_state,
+        (jnp.asarray(radius), jnp.asarray(rho)),
+    )
+    result = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(0.0),
+        solver_state=state,
+        step_size=jnp.asarray(1.0 if accepted else 0.0),
+        proposed_step_norm=jnp.asarray(1.0),
+    )
+
+    advanced = solver._advance_dynamics(ctx, result, solver.dual)
+
+    assert int(advanced.consecutive_model_failures) == expected_streak
+    signals = advanced._secant_reset_signals()
+    assert int(signals.model_streak) == expected_streak
+    assert signals.model_patience == solver.model_stall_patience
+    assert int(signals.subproblem_streak) == 0
+    assert int(signals.step_streak) == 0
+
+
+@pytest.mark.parametrize(
+    ("streak", "expected_pairs", "expected_severity"),
+    [(0, 3, -1), (1, 1, 0), (2, 3, -1), (3, 0, 2), (4, 0, 2)],
+    ids=["none", "soft", "wait", "identity", "beyond-patience"],
+)
+def test_reset_secant_escalates_on_model_streak(
+    streak, expected_pairs, expected_severity
+):
+    """Stall 1 soft-resets, stall 2 waits, stall ``patience`` identity-resets."""
+    solver = _with_pairs(_secant_model_solver(model_stall_patience=3))
+    solver = eqx.tree_at(
+        lambda m: m.consecutive_model_failures, solver, jnp.asarray(streak, jnp.int32)
+    )
+    after = solver._reset_secant()
+
+    assert int(after.secant.num_pairs) == expected_pairs
+    expected_resets = jnp.zeros(3, jnp.int32)
+    if expected_severity >= 0:
+        expected_resets = expected_resets.at[expected_severity].set(1)
+    assert jnp.array_equal(after.secant_stats.n_resets, expected_resets)
+
+
+def test_init_zeroes_model_stall_streak():
+    """Re-initialising a used minimiser starts from an empty stall streak."""
+    problem = make_scaled_quartic(with_curvature=False)
+    used = eqx.tree_at(
+        lambda m: m.consecutive_model_failures,
+        _secant_model_solver(),
+        jnp.asarray(4, jnp.int32),
+    )
+    fresh = used.init(problem, jnp.array([0.5, 0.3, 0.2]))
+    assert int(fresh.consecutive_model_failures) == 0
+
+
+def test_active_set_reports_no_model_stalls():
+    """The line-search minimiser never feeds the ``model`` channel."""
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.array([0.5, 0.3, 0.2]))
+    assert int(solver._secant_reset_signals().model_streak) == 0
