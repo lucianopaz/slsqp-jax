@@ -52,4 +52,5 @@ def make_tr_state(
         merit_penalty=state.merit_penalty,
         n_cg_iter=state.n_cg_iter,
         on_boundary=jnp.asarray(on_boundary),
+        rho=jnp.asarray(1.0),
     )

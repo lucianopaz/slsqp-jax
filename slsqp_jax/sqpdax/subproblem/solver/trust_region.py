@@ -52,6 +52,12 @@ class TrustRegionSolverState(SubProblemSolverState):
         Cumulative tangential projected-CG iterations.
     on_boundary
         ``True`` when the tangential step saturates the trust-region radius.
+    rho
+        Actual / predicted reduction ratio of the last controlled step, as
+        written back by
+        :class:`~slsqp_jax.sqpdax.step_controller.trust_region_radius.TrustRegionManager`;
+        ``-inf`` when the model predicted no decrease. Seeded at ``1`` before
+        the first step and untouched by the subproblem solver itself.
     """
 
     radius: Scalar
@@ -59,6 +65,7 @@ class TrustRegionSolverState(SubProblemSolverState):
     merit_penalty: Scalar
     n_cg_iter: int
     on_boundary: Bool[Array, ""]
+    rho: Scalar = field(default_factory=lambda: jnp.asarray(1.0))
 
 
 # Solver carry; defaulted so bare ``TrustRegionInteriorPointSolver`` keeps

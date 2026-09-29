@@ -72,6 +72,13 @@ def test_trust_region_accept_and_radius(
         result.step_size, result.accepted.astype(result.step_size.dtype)
     )
 
+    # ``rho`` is written back to the state: actual / predicted reduction, or
+    # ``-inf`` when the model predicted no decrease.
+    x_trial = Primal(x0.x + direction)
+    actual = mgr.merit(x0) - mgr.merit(x_trial)
+    expected_rho = actual / predicted_reduction if predicted_reduction > 0 else -jnp.inf
+    assert jnp.allclose(result.solver_state.rho, expected_rho)
+
     new_radius = float(result.solver_state.radius)
     if radius_mode == "keep":
         assert jnp.isclose(new_radius, radius0)
