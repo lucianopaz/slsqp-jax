@@ -17,7 +17,13 @@ from ...preconditioner import Preconditioner
 from ...primal import PrimalType
 from ...types import Scalar
 from ..base import SubProblem
-from .base import KKT_SOLVER_RESULTS, RESULTS, KKTSolverState, SubProblemSolver
+from .base import (
+    KKT_SOLVER_RESULTS,
+    RESULTS,
+    KKTSolverState,
+    SubProblemSolver,
+    install_default_preconditioner,
+)
 from .multiplier_recovery import KKTMultiplierRecovery, MultiplierRecovery
 from .projector import ProjectionContext, Projector, SVDProjector
 
@@ -489,6 +495,16 @@ class MinresQLPSubProblemSolver(
     multiplier_recovery: MultiplierRecovery = field(
         default_factory=KKTMultiplierRecovery
     )
+
+    def accepts_preconditioner(self) -> bool:
+        """``True``: :attr:`preconditioner` fills the block-diagonal preconditioner."""
+        return True
+
+    def with_default_preconditioner(
+        self, preconditioner: Preconditioner | None
+    ) -> "MinresQLPSubProblemSolver":
+        """Install ``preconditioner`` when :attr:`preconditioner` is ``None``."""
+        return install_default_preconditioner(self, preconditioner)
 
     def solve(
         self,

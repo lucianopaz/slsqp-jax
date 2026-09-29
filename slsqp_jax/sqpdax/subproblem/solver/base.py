@@ -3,7 +3,7 @@
 from abc import abstractmethod
 from typing import Generic, Self, TypeVar
 
-from equinox import Enumeration, Module, field
+from equinox import Enumeration, Module, field, tree_at
 from jax import numpy as jnp
 from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Int
@@ -12,6 +12,7 @@ from lineax._solution import RESULTS
 from ...dual import Dual
 from ...lagrangian.basic import Lagrangian
 from ...lagrangian.evaluated import EvaluatedLagrangian
+from ...preconditioner import Preconditioner
 from ...primal import PrimalType
 from ...problem import ProblemProtocol
 from ...types import InitializableModule, Scalar
@@ -25,6 +26,7 @@ __all__ = [
     "SubProblemSolverStateType",
     "SubProblemSolver",
     "SubproblemContext",
+    "install_default_preconditioner",
 ]
 
 
@@ -205,6 +207,73 @@ class SubProblemSolver(
             exact / problem-supplied HVPs alone.
         """
         return False
+
+    def accepts_preconditioner(self) -> bool:
+        """Whether :meth:`with_default_preconditioner` can install anything.
+
+        Returns
+        -------
+        bool
+            ``False`` by default. Solvers with a ``preconditioner`` field (or
+            wrapping such a solver) override this.
+        """
+        return False
+
+    def with_default_preconditioner(
+        self, preconditioner: Preconditioner | None
+    ) -> Self:
+        """Install ``preconditioner`` unless one is already configured.
+
+        Minimisers call this every outer step with a preconditioner rebuilt
+        from the current curvature information. A preconditioner the user
+        configured explicitly always wins.
+
+        Parameters
+        ----------
+        preconditioner
+            Candidate preconditioner, or ``None`` for no change.
+
+        Returns
+        -------
+        Self
+            ``self`` unchanged by default.
+        """
+        return self
+
+
+SolverT = TypeVar("SolverT", bound=SubProblemSolver)
+
+
+def install_default_preconditioner(
+    solver: SolverT, preconditioner: Preconditioner | None
+) -> SolverT:
+    """Set ``solver.preconditioner`` when it is unset and a candidate exists.
+
+    Shared implementation of
+    :meth:`SubProblemSolver.with_default_preconditioner` for solvers that
+    declare a ``preconditioner: Preconditioner | None`` field.
+
+    Parameters
+    ----------
+    solver
+        Solver with a ``preconditioner`` field.
+    preconditioner
+        Candidate preconditioner, or ``None`` for no change.
+
+    Returns
+    -------
+    SolverT
+        ``solver`` with the candidate installed, or unchanged when it
+        already has a preconditioner or the candidate is ``None``.
+    """
+    if preconditioner is None or getattr(solver, "preconditioner") is not None:
+        return solver
+    return tree_at(
+        lambda s: s.preconditioner,
+        solver,
+        preconditioner,
+        is_leaf=lambda z: z is None,
+    )
 
 
 class SubproblemContext(
