@@ -171,6 +171,47 @@ def test_append_damps_negative_curvature_pairs():
     assert not jnp.allclose(stored_y, y)
 
 
+@pytest.mark.parametrize(
+    ("y", "expect_damped"),
+    [
+        (jnp.array([2.0, 1.0, 0.0]), False),
+        (jnp.array([-1.0, 0.5, 0.0]), True),
+        (jnp.array([0.05, 0.0, 0.0]), True),
+    ],
+    ids=["positive-curvature", "negative-curvature", "weak-curvature"],
+)
+def test_diagnostics_damping_theta_matches_append(y: jnp.ndarray, expect_damped: bool):
+    """``diagnostics(...).damping_theta`` is the θ ``append`` interpolates with."""
+    hist = LBFGS(n=3, memory=4, damping_threshold=0.2)
+    s = jnp.array([1.0, 0.0, 0.0])
+    diag = hist.diagnostics(s, y)
+    theta = float(diag.damping_theta)
+    assert (theta < 1.0) is expect_damped
+    assert 0.0 <= theta <= 1.0
+
+    out = hist.append(s, y)
+    expected = theta * y + (1.0 - theta) * hist.diagonal * s
+    np.testing.assert_allclose(out.y_history[0], expected, rtol=1e-10)
+
+
+@pytest.mark.parametrize("n_pairs", [0, 2, 5], ids=["empty", "two", "full"])
+def test_num_pairs_and_curvature_bounds(n_pairs: int):
+    """``num_pairs`` counts stored pairs; bounds are the ``B₀`` diagonal extrema."""
+    key = jax.random.PRNGKey(3)
+    pairs = []
+    for _ in range(n_pairs):
+        k1, k2, key = jax.random.split(key, 3)
+        s = jax.random.normal(k1, (4,))
+        pairs.append((s, 2.0 * s + 0.1 * jax.random.normal(k2, (4,))))
+    hist = build_lbfgs_with_pairs(4, pairs, memory=5)
+    assert int(hist.num_pairs) == int(hist.count) == n_pairs
+    lower, upper = hist.curvature_bounds()
+    np.testing.assert_allclose(lower, jnp.min(hist.diagonal))
+    np.testing.assert_allclose(upper, jnp.max(hist.diagonal))
+    inv_lo, inv_hi = hist.estimate_condition()
+    np.testing.assert_allclose(upper / lower, inv_hi / inv_lo, rtol=1e-12)
+
+
 def test_circular_buffer_overwrites_oldest_pairs():
     """Once full, further appends keep ``count == memory`` and wrap ``next_idx``."""
     memory = 3
