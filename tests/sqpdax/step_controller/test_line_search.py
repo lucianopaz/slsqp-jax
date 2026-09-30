@@ -70,6 +70,7 @@ def test_armijo_step_acceptance(
     result = ls.step(x0, direction)
 
     assert bool(result.accepted) is expect_accepted
+    assert not bool(result.accepted_by_fallback)
     assert jnp.isfinite(result.merit_val)
     if expect_x is not None:
         assert jnp.allclose(result.x.x, expect_x, atol=1e-6)
@@ -116,6 +117,7 @@ def test_armijo_rejection_retains_x0(x0, direction, max_steps):
     result = ls.step(x0, direction, carry)
 
     assert not bool(result.accepted)
+    assert not bool(result.accepted_by_fallback)
     assert jnp.allclose(result.x.x, x0.x)
     # Merit is unchanged by a rejected step, and matches the returned iterate.
     assert float(result.merit_val) == pytest.approx(float(ls.merit(x0)))
@@ -192,6 +194,7 @@ def test_armijo_small_alpha_decrease_fallback():
     result = ls.step(x0, direction)
 
     assert bool(result.accepted)
+    assert bool(result.accepted_by_fallback)
     # Fallback only fires once α has contracted below 0.1.
     alpha = float(jnp.linalg.norm(result.x.x - x0.x) / jnp.linalg.norm(direction.x))
     assert alpha < 0.1
@@ -209,3 +212,4 @@ def test_armijo_small_alpha_decrease_fallback():
         alpha=jnp.asarray(0.05),
     )
     assert bool(ls.stop_search(state))
+    assert bool(ls.accepted_by_fallback(state))
