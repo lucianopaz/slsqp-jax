@@ -258,3 +258,71 @@ def test_step_updates_secant_on_inexact_problem():
     assert solver.secant is not None
     # Either a new buffer object or same instance after a skipped pair.
     assert solver.secant is not before or int(solver.step_count) == 1
+
+
+@pytest.mark.parametrize(
+    ("accepted", "x_new", "nonfinite_curvature"),
+    [
+        (False, jnp.array([0.5, 0.5]), False),
+        (True, jnp.ones(2), False),
+        (True, jnp.array([0.5, 0.5]), True),
+    ],
+    ids=["rejected", "zero-displacement", "nonfinite-curvature"],
+)
+def test_unusable_steps_do_not_touch_secant_or_append_statistics(
+    accepted, x_new, nonfinite_curvature
+):
+    """Only accepted finite nonzero curvature pairs count as append attempts."""
+    lb, ub = unbounded_box(2)
+    problem = make_problem(n=2, meq=0, mineq=0, lb=lb, ub=ub, with_curvature=False)
+    solver = ActiveSetLineSearchStub().init(problem, jnp.ones(2))
+    lagrangian = solver._init_subproblem(problem).lagrangian
+
+    if nonfinite_curvature:
+
+        class NonfiniteCurvature:
+            def __call__(self, x, dual):
+                return None
+
+            def curvature_estimate(self, x, prev):
+                return jnp.full_like(x.x, jnp.nan)
+
+        lagrangian = NonfiniteCurvature()
+
+    result = StepResult(
+        x=Primal(x_new),
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(0.0),
+        solver_state=solver.solver_state,
+    )
+    secant, stats = solver._update_secant(lagrangian, result, solver.dual)
+
+    assert eqx.tree_equal(secant, solver.secant)
+    assert eqx.tree_equal(stats, solver.secant_stats)
+
+
+def test_rejected_step_skips_append_but_still_runs_failure_reset():
+    """Curvature gating does not suppress the independent recovery cascade."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(curvature="secant").init(problem, jnp.ones(2))
+    secant = solver.secant
+    for scale in (2.0, 3.0, 4.0):
+        s = jnp.asarray([1.0, 0.1 * scale])
+        secant = secant.append(s, scale * s)
+    solver = eqx.tree_at(lambda m: m.secant, solver, secant)
+    ctx = solver._init_subproblem(problem)
+    state = eqx.tree_at(lambda s: s.success, solver.solver_state, jnp.asarray(True))
+    result = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(False),
+        merit_val=solver.best_merit,
+        solver_state=state,
+        step_size=jnp.asarray(0.0),
+        proposed_step_norm=jnp.asarray(1.0),
+    )
+
+    advanced = solver._execute_step(ctx, solver.dual, result)
+
+    assert int(advanced.secant_stats.n_skips) == 0
+    assert int(advanced.secant_stats.n_resets[0]) == 1
+    assert int(advanced.secant.num_pairs) < int(secant.num_pairs)

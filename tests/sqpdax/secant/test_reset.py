@@ -8,7 +8,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax.sqpdax.secant import LBFGS, SecantResetPolicy, SecantResetSignals
+from slsqp_jax.sqpdax.secant import (
+    LBFGS,
+    FailureRecoverySchedule,
+    SecantRecoveryState,
+    SecantResetPolicy,
+    SecantResetSignals,
+)
 from tests.sqpdax.secant.conftest import build_lbfgs_with_pairs
 
 jax.config.update("jax_enable_x64", True)
@@ -26,111 +32,147 @@ def _secant(*, n_pairs: int, ill_conditioned: bool) -> LBFGS:
     return secant
 
 
-def _signals(
-    sub: int, step: int, model: int = 0, patience: int = 3
-) -> SecantResetSignals:
+def _signals(sub: int, step: int, model: int = 0) -> SecantResetSignals:
     return SecantResetSignals(
         subproblem_streak=jnp.asarray(sub),
         step_streak=jnp.asarray(step),
         model_streak=jnp.asarray(model),
-        subproblem_patience=patience,
-        step_patience=patience,
-        model_patience=patience,
     )
 
 
-@pytest.mark.parametrize(
-    ("n_pairs", "ill", "sub", "step", "model", "policy_kwargs", "expected"),
-    [
-        (2, False, 0, 0, 0, {}, -1),
-        (2, True, 0, 0, 0, {}, 0),
-        (1, True, 0, 0, 0, {}, -1),
-        (2, False, 1, 0, 0, {}, 0),
-        (2, False, 0, 1, 0, {}, 0),
-        (2, False, 0, 0, 1, {}, 0),
-        (2, False, 2, 0, 0, {}, -1),
-        (2, False, 0, 0, 2, {}, -1),
-        (2, False, 3, 0, 0, {}, 2),
-        (2, False, 0, 4, 0, {}, 2),
-        (2, False, 0, 0, 3, {}, 2),
-        (2, True, 3, 1, 0, {}, 2),
-        (2, False, 0, 1, 3, {}, 2),
-        (2, True, 0, 0, 0, {"condition_severity": 1}, 1),
-        (2, False, 1, 0, 0, {"first_failure_severity": 1}, 1),
-        (2, False, 0, 0, 1, {"first_failure_severity": 1}, 1),
-        (2, True, 3, 3, 3, {"enabled": False}, -1),
-    ],
-    ids=[
-        "quiet",
-        "ill-conditioned",
-        "ill-but-one-pair",
-        "first-qp-failure",
-        "first-ls-failure",
-        "first-model-stall",
-        "mid-streak",
-        "model-mid-streak",
-        "qp-patience",
-        "ls-beyond-patience",
-        "model-patience",
-        "strongest-wins",
-        "model-strongest-wins",
-        "custom-condition-severity",
-        "custom-first-failure-severity",
-        "custom-first-model-severity",
-        "disabled",
-    ],
-)
-def test_severity_truth_table(n_pairs, ill, sub, step, model, policy_kwargs, expected):
-    """Each trigger maps to its configured severity; the strongest one wins."""
-    policy = SecantResetPolicy().init(**policy_kwargs)
-    secant = _secant(n_pairs=n_pairs, ill_conditioned=ill)
-    assert int(policy.severity(secant, _signals(sub, step, model))) == expected
-
-
-def test_patience_equal_one_escalates_first_failure_to_patience_level():
-    """With ``patience=1`` the first failure already is the patience failure."""
+def test_default_schedule_is_soft_diagonal_identity_then_fatal_under_jit():
+    """One global episode advances through the default 1/2/3/4 stages."""
     policy = SecantResetPolicy()
     secant = _secant(n_pairs=2, ill_conditioned=False)
-    assert int(policy.severity(secant, _signals(1, 0, patience=1))) == 2
+    state = SecantRecoveryState()
+
+    expected = [
+        (0, 1, 0, False, 1),
+        (1, 2, 1, False, 0),
+        (2, 3, 2, False, 0),
+        (-1, 4, 2, True, 0),
+    ]
+    for severity_expected, streak, stage, fatal, pairs in expected:
+        secant, state, severity = jax.jit(policy.apply)(
+            secant, _signals(streak, 0), state
+        )
+        assert int(severity) == severity_expected
+        assert int(state.failure_streak) == streak
+        assert int(state.stage) == stage
+        assert bool(state.fatal) is fatal
+        assert int(secant.num_pairs) == pairs
 
 
-@pytest.mark.parametrize(
-    ("sub", "expected_count"),
-    [(0, 2), (1, 1), (3, 0)],
-    ids=["no-reset", "soft", "identity"],
-)
-def test_apply_resets_at_selected_severity_under_jit(sub: int, expected_count: int):
-    """``apply`` resets iff a trigger fired and reports the applied severity."""
+def test_mixed_channel_failures_count_once_and_never_downgrade():
+    """Changing failure source cannot restart or blur a recovery episode."""
     policy = SecantResetPolicy()
     secant = _secant(n_pairs=2, ill_conditioned=False)
-    out, severity = jax.jit(policy.apply)(secant, _signals(sub, 0))
-    assert int(out.num_pairs) == expected_count
-    expected = policy.severity(secant, _signals(sub, 0))
-    assert int(severity) == int(expected)
-    if int(severity) < 0:
-        np.testing.assert_allclose(out.s_history, secant.s_history)
+    state = SecantRecoveryState()
+    episodes = [
+        (_signals(1, 1, 1), 0, 1, 0),
+        (_signals(0, 2, 1), 1, 2, 1),
+        (_signals(1, 0, 3), 2, 3, 2),
+    ]
+    for signals, expected_severity, expected_streak, expected_stage in episodes:
+        secant, state, severity = policy.apply(secant, signals, state)
+        assert int(severity) == expected_severity
+        assert int(state.failure_streak) == expected_streak
+        assert int(state.stage) == expected_stage
+
+
+def test_healthy_iteration_clears_episode_and_next_failure_restarts_soft():
+    """A genuinely healthy iteration starts a fresh recovery epoch."""
+    policy = SecantResetPolicy()
+    secant = _secant(n_pairs=2, ill_conditioned=False)
+    secant, state, _ = policy.apply(secant, _signals(1, 0), SecantRecoveryState())
+    secant, state, severity = policy.apply(secant, _signals(0, 0), state)
+    assert int(severity) == -1
+    assert int(state.failure_streak) == 0
+    assert int(state.stage) == -1
+    assert not bool(state.fatal)
+
+    _, state, severity = policy.apply(secant, _signals(0, 1), state)
+    assert int(severity) == 0
+    assert int(state.failure_streak) == 1
+    assert int(state.stage) == 0
+
+
+def test_custom_global_schedule_has_one_shot_stage_transitions():
+    """Configured gaps retry the current stage without reapplying it."""
+    policy = SecantResetPolicy(
+        recovery_schedule=FailureRecoverySchedule(
+            soft=1, diagonal=3, identity=5, fatal=6
+        )
+    )
+    secant = _secant(n_pairs=2, ill_conditioned=False)
+    state = SecantRecoveryState()
+    expected = {1: 0, 3: 1, 5: 2}
+    for streak in range(1, 7):
+        secant, state, severity = policy.apply(secant, _signals(streak, 0), state)
+        assert int(severity) == expected.get(streak, -1)
+    assert bool(state.fatal)
+
+
+def test_conditioning_and_channel_failures_share_the_same_clock():
+    """Ill-conditioning starts recovery; a later channel failure advances it."""
+    policy = SecantResetPolicy()
+    secant = _secant(n_pairs=2, ill_conditioned=True)
+    secant, state, severity = policy.apply(
+        secant, _signals(0, 0), SecantRecoveryState()
+    )
+    assert int(severity) == 0
+    assert int(state.failure_streak) == 1
+
+    _, state, severity = policy.apply(secant, _signals(0, 1), state)
+    assert int(severity) == 1
+    assert int(state.failure_streak) == 2
+
+
+def test_disabled_policy_clears_recovery_without_changing_secant():
+    """Disabling recovery suppresses resets and fatal state."""
+    policy = SecantResetPolicy(enabled=False)
+    secant = _secant(n_pairs=2, ill_conditioned=True)
+    state = SecantRecoveryState(
+        failure_streak=jnp.asarray(4),
+        stage=jnp.asarray(2),
+        fatal=jnp.asarray(True),
+    )
+    out, state, severity = policy.apply(secant, _signals(4, 4, 4), state)
+    assert int(severity) == -1
+    assert int(state.failure_streak) == 0
+    assert int(state.stage) == -1
+    assert not bool(state.fatal)
+    np.testing.assert_allclose(out.s_history, secant.s_history)
 
 
 def test_none_signals_report_no_failures():
-    """``SecantResetSignals.none()`` only leaves the conditioning trigger."""
+    """``none`` reports no channels while preserving conditioning recovery."""
     policy = SecantResetPolicy()
     quiet = SecantResetSignals.none()
     assert int(quiet.subproblem_streak) == 0
     assert int(quiet.step_streak) == 0
     assert int(quiet.model_streak) == 0
-    assert int(policy.severity(_secant(n_pairs=2, ill_conditioned=False), quiet)) == -1
-    assert int(policy.severity(_secant(n_pairs=2, ill_conditioned=True), quiet)) == 0
+    state = SecantRecoveryState()
+    assert (
+        int(policy.severity(_secant(n_pairs=2, ill_conditioned=False), quiet, state))
+        == -1
+    )
+    assert (
+        int(policy.severity(_secant(n_pairs=2, ill_conditioned=True), quiet, state))
+        == 0
+    )
 
 
 @pytest.mark.parametrize(
-    "patience_kwarg",
-    ["subproblem_patience", "step_patience", "model_patience"],
+    "values",
+    [(0, 3, 6, 9), (1, 1, 6, 9), (1, 3, 3, 9), (1, 3, 6, 6)],
 )
-def test_signals_reject_nonpositive_patience(patience_kwarg: str):
-    """A patience below one would fire on a zero streak, so it is rejected."""
-    with pytest.raises(ValueError, match="patience must be at least 1"):
-        SecantResetSignals(
-            subproblem_streak=jnp.asarray(0),
-            step_streak=jnp.asarray(0),
-            **{patience_kwarg: 0},
+def test_schedule_rejects_nonpositive_or_unordered_thresholds(values):
+    """Every reset stage and the fatal threshold must be strictly ordered."""
+    with pytest.raises(ValueError, match="0 < soft < diagonal < identity < fatal"):
+        FailureRecoverySchedule(
+            soft=values[0],
+            diagonal=values[1],
+            identity=values[2],
+            fatal=values[3],
         )

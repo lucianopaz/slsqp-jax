@@ -13,6 +13,7 @@ from ..dual import Dual
 from ..preconditioner import PreconditionerStrategy, SecantPreconditioner
 from ..primal import Primal
 from ..problem import ProblemProtocol
+from ..secant import SecantResetSignals
 from ..step_controller import StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
@@ -194,6 +195,26 @@ class ProximalActiveSetLineSearchMinimiser(
             jnp.asarray(dual.eq_multipliers, state.eq_center.dtype),
         )
         return cast(Self, eqx.tree_at(lambda m: m.solver_state, advanced, state))
+
+    def _secant_reset_signals(self) -> SecantResetSignals:
+        """Report structural QP failures, but not productive proximal retries.
+
+        A rejected proximal primal step still commits a multiplier-center
+        update and reduces the residual-driven proximal parameter. It is
+        therefore not evidence that the shared Hessian model needs recovery,
+        unlike a structural QP failure.
+
+        Returns
+        -------
+        SecantResetSignals
+            The base raw QP streak with the step channel suppressed.
+        """
+        signals = super()._secant_reset_signals()
+        return eqx.tree_at(
+            lambda s: s.step_streak,
+            signals,
+            jnp.asarray(0, jnp.int32),
+        )
 
     def _infeasible_stationary(
         self,

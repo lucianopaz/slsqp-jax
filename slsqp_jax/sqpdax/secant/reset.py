@@ -1,19 +1,70 @@
 """Failure- and conditioning-driven escalation of secant resets."""
 
-from typing import Self
+from typing import Self, cast
 
 import jax
 from equinox import Module, field
 from jax import numpy as jnp
-from jaxtyping import Array, Int
+from jaxtyping import Array, Bool, Int
 
 from ..types import InitializableModule
 from .base import Secant
 
 __all__ = [
+    "FailureRecoverySchedule",
+    "SecantRecoveryState",
     "SecantResetSignals",
     "SecantResetPolicy",
 ]
+
+
+class FailureRecoverySchedule(InitializableModule):
+    """Ordered global failure thresholds for staged recovery.
+
+    Attributes
+    ----------
+    soft, diagonal, identity
+        Exact streak values at which the corresponding secant reset fires.
+    fatal
+        Global failure count at which recovery terminates, after an identity
+        reset has already been attempted.
+    """
+
+    soft: int = field(static=True, default=1)
+    diagonal: int = field(static=True, default=2)
+    identity: int = field(static=True, default=3)
+    fatal: int = field(static=True, default=4)
+
+    def __check_init__(self) -> None:
+        if not (0 < self.soft < self.diagonal < self.identity < self.fatal):
+            raise ValueError(
+                "failure recovery thresholds must satisfy "
+                "0 < soft < diagonal < identity < fatal; got "
+                f"({self.soft}, {self.diagonal}, {self.identity}, {self.fatal})"
+            )
+
+
+class SecantRecoveryState(Module):
+    """Dynamic state of one monotone secant-recovery episode.
+
+    Attributes
+    ----------
+    failure_streak
+        Number of consecutive outer iterations on which at least one recovery
+        channel fired. Multiple channels on one iteration count once.
+    stage
+        Strongest reset already applied in the current episode (``-1`` for
+        none, ``0`` soft, ``1`` diagonal, ``2`` identity).
+    fatal
+        Whether the configured failure threshold was reached after identity
+        recovery.
+    """
+
+    failure_streak: Int[Array, ""] = field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    stage: Int[Array, ""] = field(default_factory=lambda: jnp.asarray(-1, jnp.int32))
+    fatal: Bool[Array, ""] = field(default_factory=lambda: jnp.asarray(False))
 
 
 class SecantResetSignals(Module):
@@ -36,8 +87,9 @@ class SecantResetSignals(Module):
         minimisers: a collapsed radius while the KKT error is still above
         tolerance, or a rejected step whose actual / predicted reduction
         ratio is far below zero (the model predicted no decrease).
-    subproblem_patience, step_patience, model_patience
-        Streak length at which the patience-level reset fires (``≥ 1``).
+    The individual streaks identify the failure source for diagnostics only.
+    :class:`SecantResetPolicy` collapses all nonzero channels into one global
+    recovery event per outer iteration.
     """
 
     subproblem_streak: Int[Array, ""]
@@ -45,22 +97,6 @@ class SecantResetSignals(Module):
     model_streak: Int[Array, ""] = field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
-    subproblem_patience: int = field(static=True, default=1)
-    step_patience: int = field(static=True, default=1)
-    model_patience: int = field(static=True, default=3)
-
-    def __check_init__(self) -> None:
-        if (
-            self.subproblem_patience < 1
-            or self.step_patience < 1
-            or self.model_patience < 1
-        ):
-            raise ValueError(
-                "reset patience must be at least 1; got "
-                f"subproblem_patience={self.subproblem_patience}, "
-                f"step_patience={self.step_patience}, "
-                f"model_patience={self.model_patience}"
-            )
 
     @classmethod
     def none(cls) -> Self:
@@ -76,26 +112,17 @@ class SecantResetSignals(Module):
 
 
 class SecantResetPolicy(InitializableModule):
-    """Choose when and how hard to reset a secant approximation.
+    """Advance one global, monotone secant-recovery lifecycle.
 
-    Mirrors the recovery cascade of the legacy solver:
+    A recovery event occurs when any failure channel is nonzero or the
+    approximation is ill-conditioned. Events from several channels on the
+    same outer iteration increment the global streak only once. The default
+    schedule applies soft, diagonal, and identity resets on failures 1, 2,
+    and 3, then marks failure 4 fatal. A healthy iteration clears the episode.
 
-    * the approximation is ill-conditioned — at least
-      :attr:`condition_min_pairs` stored pairs and
-      ``upper / lower > condition_threshold`` from
-      :meth:`~slsqp_jax.sqpdax.secant.base.Secant.curvature_bounds` — fires
-      :attr:`condition_severity`;
-    * the first failure of a streak (``streak == 1``) fires
-      :attr:`first_failure_severity`;
-    * a streak reaching its patience fires :attr:`patience_severity`.
-
-    The streak triggers apply identically to each of the three
-    :class:`SecantResetSignals` channels (``subproblem``, ``step``,
-    ``model``). When several triggers fire the strongest severity wins.
-    Severities follow
-    :meth:`~slsqp_jax.sqpdax.secant.base.Secant.reset` (for
-    :class:`~slsqp_jax.sqpdax.secant.lbfgs.LBFGS`: ``0`` soft, ``1`` diagonal,
-    ``2`` identity).
+    A stage is applied only if it is stronger than the stage already attempted
+    in the current episode, so a failure in another channel cannot downgrade
+    or repeat recovery.
 
     Attributes
     ----------
@@ -105,8 +132,8 @@ class SecantResetPolicy(InitializableModule):
         Condition-estimate threshold for the ill-conditioning trigger.
     condition_min_pairs
         Minimum stored pairs before the conditioning trigger may fire.
-    condition_severity, first_failure_severity, patience_severity
-        Severity applied by each trigger.
+    recovery_schedule
+        Global soft / diagonal / identity / fatal thresholds.
 
     Examples
     --------
@@ -114,28 +141,71 @@ class SecantResetPolicy(InitializableModule):
     >>> from slsqp_jax.sqpdax.secant import LBFGS, SecantResetPolicy, SecantResetSignals
     >>> policy = SecantResetPolicy()
     >>> signals = SecantResetSignals(
-    ...     subproblem_streak=jnp.asarray(3), step_streak=jnp.asarray(0),
-    ...     subproblem_patience=3, step_patience=3,
+    ...     subproblem_streak=jnp.asarray(1), step_streak=jnp.asarray(0),
     ... )
-    >>> int(policy.severity(LBFGS(n=2, memory=2), signals))
-    2
-    >>> stalled = SecantResetSignals(
-    ...     subproblem_streak=jnp.asarray(0), step_streak=jnp.asarray(0),
-    ...     model_streak=jnp.asarray(1), model_patience=3,
+    >>> state = SecantRecoveryState()
+    >>> _, state, severity = policy.apply(LBFGS(n=2, memory=2), signals, state)
+    >>> int(severity), int(state.failure_streak)
+    (0, 1)
+    >>> mixed = SecantResetSignals(
+    ...     subproblem_streak=jnp.asarray(2), step_streak=jnp.asarray(1),
     ... )
-    >>> int(policy.severity(LBFGS(n=2, memory=2), stalled))
-    0
+    >>> _, state, severity = policy.apply(LBFGS(n=2, memory=2), mixed, state)
+    >>> int(severity), int(state.failure_streak)
+    (1, 2)
+    >>> _, state, severity = policy.apply(
+    ...     LBFGS(n=2, memory=2), SecantResetSignals.none(), state
+    ... )
+    >>> int(severity), int(state.failure_streak)
+    (-1, 0)
     """
 
     enabled: bool = field(static=True, default=True)
     condition_threshold: float = field(static=True, default=1e6)
     condition_min_pairs: int = field(static=True, default=2)
-    condition_severity: int = field(static=True, default=0)
-    first_failure_severity: int = field(static=True, default=0)
-    patience_severity: int = field(static=True, default=2)
+    recovery_schedule: FailureRecoverySchedule = field(
+        static=True, default_factory=FailureRecoverySchedule
+    )
 
-    def severity(self, secant: Secant, signals: SecantResetSignals) -> Int[Array, ""]:
-        """Strongest triggered severity, or ``-1`` when nothing fires.
+    def recovery_event(
+        self, secant: Secant, signals: SecantResetSignals
+    ) -> Bool[Array, ""]:
+        """Whether this outer iteration advances global recovery.
+
+        Parameters
+        ----------
+        secant
+            Current approximation.
+        signals
+            Raw failure channels from the owning minimiser.
+
+        Returns
+        -------
+        Bool[Array, ""]
+            ``True`` for one global recovery event, regardless of how many
+            channels fired.
+        """
+        if not self.enabled:
+            return jnp.asarray(False)
+        lower, upper = secant.curvature_bounds()
+        condition = upper / jnp.maximum(lower, 1e-30)
+        ill_conditioned = (secant.num_pairs >= self.condition_min_pairs) & (
+            condition > self.condition_threshold
+        )
+        channel_failure = (
+            (signals.subproblem_streak > 0)
+            | (signals.step_streak > 0)
+            | (signals.model_streak > 0)
+        )
+        return ill_conditioned | channel_failure
+
+    def severity(
+        self,
+        secant: Secant,
+        signals: SecantResetSignals,
+        state: SecantRecoveryState,
+    ) -> Int[Array, ""]:
+        """Next stronger reset severity, or ``-1`` when none fires.
 
         Parameters
         ----------
@@ -143,6 +213,8 @@ class SecantResetPolicy(InitializableModule):
             Current approximation.
         signals
             Failure streaks reported by the minimiser.
+        state
+            Current global recovery state.
 
         Returns
         -------
@@ -152,28 +224,22 @@ class SecantResetPolicy(InitializableModule):
         none = jnp.asarray(-1, jnp.int32)
         if not self.enabled:
             return none
-        lower, upper = secant.curvature_bounds()
-        condition = upper / jnp.maximum(lower, 1e-30)
-        ill_conditioned = (secant.num_pairs >= self.condition_min_pairs) & (
-            condition > self.condition_threshold
-        )
-        triggers = [(ill_conditioned, self.condition_severity)]
-        for streak, patience in (
-            (signals.subproblem_streak, signals.subproblem_patience),
-            (signals.step_streak, signals.step_patience),
-            (signals.model_streak, signals.model_patience),
-        ):
-            triggers.append((streak == 1, self.first_failure_severity))
-            triggers.append((streak >= patience, self.patience_severity))
-        severity = none
-        for fired, level in triggers:
-            severity = jnp.where(fired, jnp.maximum(severity, level), severity)
-        return severity
+        event = self.recovery_event(secant, signals)
+        streak = state.failure_streak + 1
+        schedule = self.recovery_schedule
+        requested = none
+        requested = jnp.where(streak == schedule.soft, 0, requested)
+        requested = jnp.where(streak == schedule.diagonal, 1, requested)
+        requested = jnp.where(streak == schedule.identity, 2, requested)
+        return jnp.where(event & (requested > state.stage), requested, none)
 
     def apply(
-        self, secant: Secant, signals: SecantResetSignals
-    ) -> tuple[Secant, Int[Array, ""]]:
-        """Reset ``secant`` at the selected severity, if any.
+        self,
+        secant: Secant,
+        signals: SecantResetSignals,
+        state: SecantRecoveryState,
+    ) -> tuple[Secant, SecantRecoveryState, Int[Array, ""]]:
+        """Advance recovery and reset ``secant`` at a new stage, if any.
 
         Parameters
         ----------
@@ -181,21 +247,43 @@ class SecantResetPolicy(InitializableModule):
             Current approximation.
         signals
             Failure streaks reported by the minimiser.
+        state
+            Current global recovery state.
 
         Returns
         -------
         secant
             Reset approximation, or ``secant`` unchanged.
+        state
+            Advanced global recovery state.
         severity
             Applied severity (negative when no reset fired).
         """
-        severity = self.severity(secant, signals)
+        severity = self.severity(secant, signals, state)
         if not self.enabled:
-            return secant, severity
+            return secant, cast(SecantRecoveryState, SecantRecoveryState()), severity
+        event = self.recovery_event(secant, signals)
+        failure_streak = jnp.where(event, state.failure_streak + 1, 0).astype(jnp.int32)
+        stage = jnp.where(event, jnp.maximum(state.stage, severity), -1).astype(
+            jnp.int32
+        )
+        fatal = (
+            event
+            & (state.stage >= 2)
+            & (failure_streak >= self.recovery_schedule.fatal)
+        )
+        next_state = cast(
+            SecantRecoveryState,
+            SecantRecoveryState(
+                failure_streak=failure_streak,
+                stage=stage,
+                fatal=fatal,
+            ),
+        )
         new = jax.lax.cond(
             severity >= 0,
             lambda sev: secant.reset(sev),
             lambda _: secant,
             severity,
         )
-        return new, severity
+        return new, next_state, severity

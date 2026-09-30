@@ -182,10 +182,11 @@ class ActiveSetLineSearchMinimiser(
         Cumulative predictor diagnostics: steps whose prediction was
         discarded (trust gate or warm-up), steps where the rank cap
         truncated it, and bounds seeded into the working set.
-    penalty_floor
-        Lower bound on the L1 merit penalty ``ρ``.
-    penalty_factor
-        Multiplier on ``‖λ‖_∞`` used to form ``ρ``.
+    initial_penalty
+        Initial (and therefore minimum) L1 merit penalty ``ρ``.
+    penalty_multiplier_margin
+        Han--Powell multiplier margin used in the monotone update
+        ``ρ_next = max(ρ, margin * ‖λ_QP‖_∞)``.
     armijo_c1
         Armijo sufficient-decrease constant.
     armijo_backtrack
@@ -200,8 +201,9 @@ class ActiveSetLineSearchMinimiser(
         Relative merit-improvement threshold and no-improvement window.
     divergence_factor, divergence_patience
         Excess-merit threshold and consecutive count before best-point rollback.
-    qp_failure_patience, ls_failure_patience
-        Failure streak scales; fatal termination occurs at twice each value.
+    secant_reset
+        Shared soft / diagonal / identity / fatal recovery policy. QP and
+        line-search failures advance one global recovery episode.
     """
 
     # QP inner solve
@@ -213,9 +215,10 @@ class ActiveSetLineSearchMinimiser(
     active_set_predictor: LPECAPredictor = eqx.field(
         static=True, default_factory=LPECAPredictor
     )
-    # L1-merit penalty schedule: rho = max(penalty_floor, penalty_factor * ||lambda||_inf)
-    penalty_floor: float = eqx.field(static=True, default=1.0)
-    penalty_factor: float = eqx.field(static=True, default=2.0)
+    # Monotone Han--Powell L1-merit penalty schedule.
+    initial_penalty: float = eqx.field(static=True, default=1.0)
+    penalty_multiplier_margin: float = eqx.field(static=True, default=1.1)
+    merit_penalty: Scalar = eqx.field(default_factory=lambda: jnp.asarray(1.0))
     # backtracking line search
     armijo_c1: float = eqx.field(static=True, default=1e-4)
     armijo_backtrack: float = eqx.field(static=True, default=0.5)
@@ -227,8 +230,6 @@ class ActiveSetLineSearchMinimiser(
     stagnation_patience: int = eqx.field(static=True, default=10)
     divergence_factor: float = eqx.field(static=True, default=10.0)
     divergence_patience: int = eqx.field(static=True, default=3)
-    qp_failure_patience: int = eqx.field(static=True, default=3)
-    ls_failure_patience: int = eqx.field(static=True, default=3)
     # termination state
     best_merit: Scalar = eqx.field(default_factory=lambda: jnp.asarray(jnp.inf))
     best_iterate: Primal | None = None
@@ -253,11 +254,18 @@ class ActiveSetLineSearchMinimiser(
     iterate_blowup: Bool[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(False)
     )
-    qp_fatal: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
-    ls_fatal: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
     last_step_size: Scalar = eqx.field(default_factory=lambda: jnp.asarray(0.0))
     last_ls_success: Bool[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(False)
+    )
+    last_ls_fallback: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    n_armijo_accepts: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    n_fallback_accepts: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
     # LPEC-A diagnostics
     n_lpeca_bypassed: Array = eqx.field(
@@ -267,6 +275,19 @@ class ActiveSetLineSearchMinimiser(
     n_lpeca_bounds_prefixed: Array = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
+
+    def __check_init__(self) -> None:
+        """Validate the common minimiser and Han--Powell configuration."""
+        super().__check_init__()
+        if self.initial_penalty <= 0:
+            raise ValueError(
+                f"initial_penalty must be positive; got {self.initial_penalty}"
+            )
+        if self.penalty_multiplier_margin <= 1:
+            raise ValueError(
+                "penalty_multiplier_margin must be greater than 1; got "
+                f"{self.penalty_multiplier_margin}"
+            )
 
     def _parse_options(self, options: dict | None) -> Self:
         """Freeze options and configure ``active_set_predictor`` from a nested mapping.
@@ -278,7 +299,8 @@ class ActiveSetLineSearchMinimiser(
         :meth:`~slsqp_jax.sqpdax.types.InitializableModule.init`.
         """
         base = super()._parse_options(options)
-        spec = base.options.get("minimiser", {}).get("active_set_predictor")
+        mopts = base.options.get("minimiser", {})
+        spec = mopts.get("active_set_predictor")
         if isinstance(spec, Mapping):
             base = replace(
                 base, active_set_predictor=self.active_set_predictor.init(**spec)
@@ -301,21 +323,22 @@ class ActiveSetLineSearchMinimiser(
     ) -> Self:
         """Seed secant and best-iterate termination state."""
         base = super()._close_init(primal, dual, solver_state, problem)
+        merit_penalty = jnp.asarray(base.initial_penalty, primal.x.dtype)
         merit = cast(
             NormMerit,
             NormMerit(
                 problem,
                 barrier=None,
                 problem_weight=jnp.asarray(1.0),
-                feasibility_weight=jnp.asarray(base.penalty_floor),
+                feasibility_weight=merit_penalty,
                 norm=1,
             ),
         )
         initial_merit = merit(primal)
         return eqx.tree_at(
-            lambda m: (m.best_merit, m.best_iterate, m.best_dual),
+            lambda m: (m.merit_penalty, m.best_merit, m.best_iterate, m.best_dual),
             base,
-            (initial_merit, primal, dual),
+            (merit_penalty, initial_merit, primal, dual),
             is_leaf=lambda z: z is None,
         )
 
@@ -573,10 +596,8 @@ class ActiveSetLineSearchMinimiser(
         step_dual: Dual,
         solver_state: ActiveSetStateType,
     ) -> StepController[Primal, ActiveSetStateType]:
-        """Armijo line search on an L1 merit with multiplier-based penalty."""
-        rho = jnp.maximum(
-            self.penalty_floor, self.penalty_factor * _inf_norm(step_dual.flatten())
-        )
+        """Armijo line search on the monotonically updated L1 merit."""
+        rho = self._next_merit_penalty(step_dual, solver_state)
         merit = NormMerit(
             ctx.problem,
             barrier=None,
@@ -593,6 +614,32 @@ class ActiveSetLineSearchMinimiser(
                 backtrack=self.armijo_backtrack,
             ),
         )
+
+    def _next_merit_penalty(
+        self,
+        step_dual: Dual,
+        solver_state: ActiveSetStateType,
+    ) -> Scalar:
+        """Return the trusted monotone Han--Powell penalty for this QP.
+
+        Equality multipliers enter by magnitude. Inequality and bound
+        multipliers are clamped to their dual-feasible non-negative sign for
+        this calculation only; the raw QP multipliers remain untouched.
+        Failed QPs and non-finite multiplier estimates cannot ratchet the
+        carried penalty.
+        """
+        penalty_multipliers = jnp.concatenate(
+            [
+                step_dual.eq_multipliers,
+                jnp.maximum(step_dual.ineq_multipliers, 0.0),
+                jnp.maximum(step_dual.lb_multipliers, 0.0),
+                jnp.maximum(step_dual.ub_multipliers, 0.0),
+            ]
+        )
+        finite = jnp.all(jnp.isfinite(penalty_multipliers))
+        candidate = self.penalty_multiplier_margin * _inf_norm(penalty_multipliers)
+        updated = jnp.maximum(self.merit_penalty, candidate)
+        return jnp.where(solver_state.success & finite, updated, self.merit_penalty)
 
     def _feasibility_error(
         self, ctx: OptimisationContext[Primal, ActiveSetStateType]
@@ -626,8 +673,22 @@ class ActiveSetLineSearchMinimiser(
         lagrangian = ctx.lagrangian(result.x, step_dual)
         feasible = self._feasibility_from_lagrangian(lagrangian) <= self.atol
         solver_state = cast(ActiveSetStateType, result.solver_state)
+        merit_penalty = self._next_merit_penalty(step_dual, solver_state)
 
-        best_merit = self.best_merit
+        # The penalty may have increased since the stored best point was
+        # selected. Re-evaluate that point in the current merit units before
+        # comparing it with this step or using it for divergence rollback.
+        merit = cast(
+            NormMerit,
+            NormMerit(
+                ctx.problem,
+                barrier=None,
+                problem_weight=jnp.asarray(1.0),
+                feasibility_weight=merit_penalty,
+                norm=1,
+            ),
+        )
+        best_merit = merit(cast(Primal, self.best_iterate))
         merit_scale = jnp.maximum(jnp.abs(best_merit), 1.0)
         improved = (~jnp.isfinite(best_merit)) | (
             result.merit_val < best_merit - self.stagnation_tol * merit_scale
@@ -685,11 +746,12 @@ class ActiveSetLineSearchMinimiser(
             0,
             jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
         )
-        qp_fatal = qp_failures >= 2 * self.qp_failure_patience
-        ls_fatal = ls_failures >= 2 * self.ls_failure_patience
+        fallback_accept = result.accepted & result.accepted_by_fallback
+        armijo_accept = result.accepted & ~result.accepted_by_fallback
 
         updated = eqx.tree_at(
             lambda m: (
+                m.merit_penalty,
                 m.best_merit,
                 m.best_iterate,
                 m.best_dual,
@@ -701,13 +763,15 @@ class ActiveSetLineSearchMinimiser(
                 m.qp_optimal,
                 m.consecutive_qp_failures,
                 m.consecutive_ls_failures,
-                m.qp_fatal,
-                m.ls_fatal,
                 m.last_step_size,
                 m.last_ls_success,
+                m.last_ls_fallback,
+                m.n_armijo_accepts,
+                m.n_fallback_accepts,
             ),
             self,
             (
+                merit_penalty,
                 new_best_merit,
                 new_best_iterate,
                 new_best_dual,
@@ -719,10 +783,11 @@ class ActiveSetLineSearchMinimiser(
                 qp_optimal,
                 qp_failures,
                 ls_failures,
-                qp_fatal,
-                ls_fatal,
                 result.step_size,
                 result.accepted,
+                fallback_accept,
+                self.n_armijo_accepts + armijo_accept.astype(jnp.int32),
+                self.n_fallback_accepts + fallback_accept.astype(jnp.int32),
             ),
             is_leaf=lambda z: z is None,
         )
@@ -777,8 +842,6 @@ class ActiveSetLineSearchMinimiser(
             SecantResetSignals(
                 subproblem_streak=self.consecutive_qp_failures,
                 step_streak=self.consecutive_ls_failures,
-                subproblem_patience=self.qp_failure_patience,
-                step_patience=self.ls_failure_patience,
             ),
         )
 
@@ -883,29 +946,19 @@ class ActiveSetLineSearchMinimiser(
             & (self.last_step_size >= 1.0 - 1e-6)
             & metrics.has_min_steps
         )
-        converged = classical | qp_kkt
+        recovery_fatal = self.secant_recovery_state.fatal
+        converged = (classical | qp_kkt) & ~recovery_fatal
 
         infeasible_stationary = self._infeasible_stationary(
             metrics, stationary, feasible
         )
         fatal = (
             self.merit_stagnation
-            | self.ls_fatal
-            | self.qp_fatal
             | self.iterate_blowup
             | infeasible_stationary
+            | recovery_fatal
         )
         fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.merit_stagnation
-        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
-            self.qp_fatal,
-            ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
-            fatal_result,
-        )
-        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
-            self.ls_fatal,
-            ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure,
-            fatal_result,
-        )
         fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
             self.iterate_blowup,
             ACTIVE_SET_LINE_SEARCH_RESULTS.iterate_blowup,
@@ -919,6 +972,11 @@ class ActiveSetLineSearchMinimiser(
         fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
             infeasible_stationary,
             ACTIVE_SET_LINE_SEARCH_RESULTS.infeasible_stationary,
+            fatal_result,
+        )
+        fatal_result = ACTIVE_SET_LINE_SEARCH_RESULTS.where(
+            recovery_fatal,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
             fatal_result,
         )
 
@@ -967,14 +1025,17 @@ class ActiveSetLineSearchMinimiser(
             "n_lpeca_bypassed": self.n_lpeca_bypassed,
             "n_lpeca_capped": self.n_lpeca_capped,
             "n_lpeca_bounds_prefixed": self.n_lpeca_bounds_prefixed,
+            "merit_penalty": self.merit_penalty,
             "last_step_size": self.last_step_size,
+            "last_ls_success": self.last_ls_success,
+            "last_ls_fallback": self.last_ls_fallback,
+            "n_armijo_accepts": self.n_armijo_accepts,
+            "n_fallback_accepts": self.n_fallback_accepts,
             "steps_without_improvement": self.steps_without_improvement,
             "blowup_count": self.blowup_count,
             "consecutive_qp_failures": self.consecutive_qp_failures,
             "consecutive_ls_failures": self.consecutive_ls_failures,
             "merit_stagnation": self.merit_stagnation,
-            "qp_fatal": self.qp_fatal,
-            "ls_fatal": self.ls_fatal,
             "diverging": self.iterate_blowup,
             "sqpdax_result": result,
         }

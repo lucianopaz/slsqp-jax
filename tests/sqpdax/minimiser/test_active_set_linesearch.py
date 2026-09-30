@@ -20,6 +20,7 @@ from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
     ACTIVE_SET_LINE_SEARCH_RESULTS,
 )
 from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.secant import FailureRecoverySchedule
 from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
@@ -45,6 +46,109 @@ def test_init_builds_primal_dual_and_qp_state():
     assert solver.dual is not None
     assert solver.solver_state is not None
     assert int(solver.solver_state.n_iter) == 0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"initial_penalty": 0.0}, "initial_penalty must be positive"),
+        (
+            {"penalty_multiplier_margin": 1.0},
+            "penalty_multiplier_margin must be greater than 1",
+        ),
+    ],
+)
+def test_penalty_configuration_is_validated(kwargs, match):
+    """Han--Powell options must define a positive strict multiplier margin."""
+    with pytest.raises(ValueError, match=match):
+        ActiveSetLineSearchMinimiser(**kwargs)
+
+
+def test_penalty_options_replace_the_stateless_names():
+    """The explicit stateful names are accepted and old names are rejected."""
+    problem = make_unconstrained_quadratic()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = ActiveSetLineSearchMinimiser().init(
+            problem,
+            jnp.ones(2),
+            options={
+                "minimiser": {
+                    "initial_penalty": 2.0,
+                    "penalty_multiplier_margin": 1.25,
+                    "penalty_floor": 3.0,
+                    "penalty_factor": 4.0,
+                }
+            },
+        )
+    messages = " ".join(str(item.message) for item in caught)
+    assert "unknown minimiser option 'penalty_floor'" in messages
+    assert "unknown minimiser option 'penalty_factor'" in messages
+    assert solver.initial_penalty == 2.0
+    assert solver.penalty_multiplier_margin == 1.25
+    assert float(solver.merit_penalty) == pytest.approx(2.0)
+
+
+def test_penalty_update_is_monotone_sign_clamped_and_trust_gated():
+    """Only finite, successful, dual-feasible multiplier magnitudes ratchet rho."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        initial_penalty=2.0, penalty_multiplier_margin=1.1
+    ).init(problem, jnp.ones(2))
+    state = eqx.tree_at(lambda s: s.success, solver.solver_state, jnp.asarray(True))
+    dual = eqx.tree_at(
+        lambda d: (d.lb_multipliers, d.ub_multipliers),
+        solver.dual,
+        (jnp.asarray([-100.0, 4.0]), jnp.asarray([5.0, -200.0])),
+    )
+    rho = solver._next_merit_penalty(dual, state)
+    assert float(rho) == pytest.approx(5.5)
+
+    raised = eqx.tree_at(lambda m: m.merit_penalty, solver, rho)
+    smaller = jax.tree.map(lambda leaf: 0.1 * leaf, dual)
+    assert float(raised._next_merit_penalty(smaller, state)) == pytest.approx(5.5)
+
+    failed = eqx.tree_at(lambda s: s.success, state, jnp.asarray(False))
+    assert float(solver._next_merit_penalty(dual, failed)) == pytest.approx(2.0)
+    nonfinite = eqx.tree_at(
+        lambda d: d.lb_multipliers,
+        dual,
+        jnp.asarray([jnp.nan, 4.0]),
+    )
+    assert float(solver._next_merit_penalty(nonfinite, state)) == pytest.approx(2.0)
+
+
+def test_penalty_increase_revalues_best_iterate_before_progress_comparison():
+    """Best-point comparisons use one rho after a multiplier-driven ratchet."""
+    problem = make_equality_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        initial_penalty=1.0,
+        penalty_multiplier_margin=1.1,
+        stagnation_patience=100,
+    ).init(problem, jnp.zeros(2))
+    ctx = solver._init_subproblem(problem)
+    state = eqx.tree_at(lambda s: s.success, solver.solver_state, jnp.asarray(True))
+    step_dual = eqx.tree_at(
+        lambda d: d.eq_multipliers, solver.dual, jnp.asarray([10.0])
+    )
+    x_new = Primal(jnp.asarray([0.25, 0.25]))
+    controller = solver._step_controller(ctx, step_dual, state)
+    merit_new = controller.merit(x_new)
+    # With rho=1 the old best merit is 1, while with rho=11 it is 11.
+    # The new point is an improvement only after comparing in the new units.
+    assert 1.0 < float(merit_new) < 11.0
+    result = StepResult(
+        x=x_new,
+        accepted=jnp.asarray(True),
+        merit_val=merit_new,
+        solver_state=state,
+        step_size=jnp.asarray(1.0),
+        proposed_step_norm=jnp.asarray(jnp.sqrt(0.125)),
+    )
+    advanced = solver._advance_dynamics(ctx, result, step_dual)
+    assert float(advanced.merit_penalty) == pytest.approx(11.0)
+    assert jnp.array_equal(advanced.best_iterate.x, x_new.x)
+    assert float(advanced.best_merit) == pytest.approx(float(merit_new))
 
 
 def test_step_and_minimise_unconstrained():
@@ -109,6 +213,30 @@ def test_init_accepts_option_bag(options):
         # Exercise the ``subproblem`` option path inside ``_init_subproblem``.
         solver = solver.step(problem)
         assert int(solver.step_count) == 1
+
+
+def test_global_failure_recovery_schedule_accepts_nested_options():
+    """One nested schedule configures recovery across all failure channels."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser().init(
+        problem,
+        jnp.ones(2),
+        options={
+            "minimiser": {
+                "secant_reset": {
+                    "recovery_schedule": {
+                        "soft": 2,
+                        "diagonal": 4,
+                        "identity": 6,
+                        "fatal": 8,
+                    }
+                },
+            }
+        },
+    )
+    assert solver.secant_reset.recovery_schedule == FailureRecoverySchedule(
+        soft=2, diagonal=4, identity=6, fatal=8
+    )
 
 
 @pytest.mark.parametrize(
@@ -213,6 +341,7 @@ def _execute_synthetic_step(
     merit: float,
     step_size: float | None = None,
     proposed_step_norm: float = 1.0,
+    accepted_by_fallback: bool = False,
 ):
     """Exercise phase four with a controlled line-search/QP outcome."""
     ctx = solver._init_subproblem(problem)
@@ -239,6 +368,7 @@ def _execute_synthetic_step(
             (1.0 if accepted else 0.0) if step_size is None else step_size
         ),
         proposed_step_norm=jnp.asarray(proposed_step_norm),
+        accepted_by_fallback=jnp.asarray(accepted_by_fallback),
     )
     return solver._execute_step(ctx, solver.dual, result)
 
@@ -246,28 +376,37 @@ def _execute_synthetic_step(
 @pytest.mark.parametrize(
     ("kind", "qp_status", "expected"),
     [
-        ("qp", RESULTS.singular, ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure),
+        (
+            "qp",
+            RESULTS.singular,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
+        ),
         # A feasibility floor above target (MINRES-QLP ``residual_floor``)
         # surfaces as ``stagnation`` and is a real QP failure too.
         (
             "qp",
             RESULTS.stagnation,
-            ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
         ),
-        ("ls", RESULTS.successful, ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure),
+        (
+            "ls",
+            RESULTS.successful,
+            ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
+        ),
     ],
     ids=["qp-singular", "qp-stagnation", "line-search"],
 )
-def test_failure_counters_wait_for_fatal_threshold(kind, qp_status, expected):
-    """QP and line-search failures become fatal only after their patience."""
+def test_failure_channels_share_global_recovery_fatal_threshold(
+    kind, qp_status, expected
+):
+    """Each channel advances the same reset lifecycle and fatal threshold."""
     problem = make_unconstrained_quadratic()
     solver = ActiveSetLineSearchMinimiser(
         rtol=-1.0,
-        qp_failure_patience=1,
-        ls_failure_patience=1,
+        curvature="secant",
         stagnation_patience=100,
     ).init(problem, jnp.ones(2))
-    for index in range(2):
+    for index in range(4):
         solver = _execute_synthetic_step(
             solver,
             problem,
@@ -278,9 +417,12 @@ def test_failure_counters_wait_for_fatal_threshold(kind, qp_status, expected):
             merit=float(solver.best_merit),
         )
         done, _ = solver.terminate(problem)
-        assert bool(done) is (index == 1)
+        assert bool(done) is (index == 3)
     _, result = solver.terminate(problem)
     assert bool(result == expected)
+    assert int(solver.secant_recovery_state.failure_streak) == 4
+    assert int(solver.secant_recovery_state.stage) == 2
+    assert bool(solver.secant_recovery_state.fatal)
 
 
 @pytest.mark.parametrize(
@@ -299,15 +441,14 @@ def test_nonfinite_qp_direction_counts_as_qp_failure(proposed_step_norm, expect_
     problem = make_unconstrained_quadratic()
     solver = ActiveSetLineSearchMinimiser(
         rtol=-1.0,
-        qp_failure_patience=1,
-        ls_failure_patience=100,
+        curvature="secant",
         stagnation_patience=100,
     ).init(problem, jnp.ones(2))
-    for _ in range(2):
+    for _ in range(4):
         solver = _execute_synthetic_step(
             solver,
             problem,
-            accepted=False,
+            accepted=not expect_fatal,
             qp_success=False,
             qp_status=RESULTS.max_steps_reached,
             x=solver.iterate.x,
@@ -316,47 +457,37 @@ def test_nonfinite_qp_direction_counts_as_qp_failure(proposed_step_norm, expect_
         )
     done, result = solver.terminate(problem)
     assert bool(done) is expect_fatal
-    assert bool(solver.qp_fatal) is expect_fatal
+    assert bool(solver.secant_recovery_state.fatal) is expect_fatal
     if expect_fatal:
-        assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure)
+        assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure)
     else:
         assert int(solver.consecutive_qp_failures) == 0
 
 
-def test_nan_curvature_terminates_with_qp_failure_without_moving():
-    """End-to-end: a NaN QP direction never moves ``(x, λ)`` and exits cleanly.
+def test_mixed_failure_channels_do_not_restart_global_recovery():
+    """Alternating QP and line-search failures reach identity, then fatal."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        rtol=-1.0,
+        curvature="secant",
+        stagnation_patience=100,
+    ).init(problem, jnp.ones(2))
 
-    A NaN Hessian-vector product poisons the CG direction only; the objective,
-    gradient and constraints stay finite so the termination check does not
-    see it directly. The line search must reject without trials, the dual
-    must stay at its previous (finite) value, and the run must end with
-    ``qp_subproblem_failure`` rather than ``nonfinite``.
-    """
-    problem = replace(
-        make_unconstrained_quadratic(),
-        hvp=lambda x, v: jnp.full_like(v, jnp.nan),
-    )
-    x0 = jnp.ones(2)
-    sol = minimise(
-        problem,
-        ActiveSetLineSearchMinimiser(qp_failure_patience=1, min_steps=1),
-        x0,
-        max_steps=20,
-        throw=False,
-    )
-    assert bool(
-        sol.stats["sqpdax_result"]
-        == ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure
-    )
-    assert jnp.array_equal(sol.value, x0)
-    for key in (
-        "multipliers_eq",
-        "multipliers_ineq",
-        "multipliers_lb",
-        "multipliers_ub",
-    ):
-        assert jnp.all(jnp.isfinite(sol.stats[key]))
-    assert int(sol.stats["consecutive_qp_failures"]) == 2
+    for kind in ("qp", "ls", "qp", "ls"):
+        solver = _execute_synthetic_step(
+            solver,
+            problem,
+            accepted=kind == "qp",
+            qp_success=kind == "ls",
+            qp_status=RESULTS.singular if kind == "qp" else RESULTS.successful,
+            x=solver.iterate.x,
+            merit=float(solver.best_merit),
+        )
+
+    done, result = solver.terminate(problem)
+    assert bool(done)
+    assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure)
+    assert jnp.array_equal(solver.secant_stats.n_resets, jnp.ones(3, jnp.int32))
 
 
 @pytest.mark.parametrize("bad_merit", [100.0, jnp.inf], ids=["growth", "nonfinite"])
@@ -429,6 +560,29 @@ def test_tiny_line_search_step_cannot_trigger_qp_kkt_success():
     assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.running)
 
 
+def test_acceptance_kind_is_counted_and_exposed():
+    """Strict Armijo and fallback-only accepted steps remain distinguishable."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(rtol=-1.0, stagnation_patience=100).init(
+        problem, jnp.ones(2)
+    )
+    for fallback in (False, True):
+        solver = _execute_synthetic_step(
+            solver,
+            problem,
+            accepted=True,
+            accepted_by_fallback=fallback,
+            qp_success=True,
+            qp_status=RESULTS.successful,
+            x=solver.iterate.x,
+            merit=float(solver.best_merit),
+        )
+    assert bool(solver.last_ls_success)
+    assert bool(solver.last_ls_fallback)
+    assert int(solver.n_armijo_accepts) == 1
+    assert int(solver.n_fallback_accepts) == 1
+
+
 def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
     """Active-set solutions expose the detailed diagnostics promised by the API."""
     problem = make_unconstrained_quadratic()
@@ -461,9 +615,17 @@ def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
         "n_lpeca_bypassed",
         "n_lpeca_capped",
         "n_lpeca_bounds_prefixed",
+        "merit_penalty",
         "last_step_size",
+        "last_ls_success",
+        "last_ls_fallback",
+        "n_armijo_accepts",
+        "n_fallback_accepts",
         "consecutive_qp_failures",
         "consecutive_ls_failures",
+        "secant_recovery_streak",
+        "secant_recovery_stage",
+        "secant_recovery_fatal",
         "sqpdax_result",
     }
     assert expected <= set(sol.stats)

@@ -29,6 +29,7 @@ from ..results import ResultAdapter, ResultType
 from ..secant import (
     LBFGS,
     Secant,
+    SecantRecoveryState,
     SecantResetPolicy,
     SecantResetSignals,
     SecantStatistics,
@@ -320,10 +321,15 @@ class CommonMinimiser(
     secant_stats
         :class:`~slsqp_jax.sqpdax.secant.statistics.SecantStatistics` of the
         maintained secant, or ``None`` when no secant is kept.
+    secant_recovery_state
+        Dynamic global recovery episode shared by all failure channels.
     """
 
     solver_state: SubProblemSolverStateType | None = None
     secant_stats: SecantStatistics | None = None
+    secant_recovery_state: SecantRecoveryState = eqx.field(
+        default_factory=SecantRecoveryState
+    )
     # --- convergence / secant configuration ---
     rtol: float = eqx.field(static=True, default=1e-6)
     atol: float = eqx.field(static=True, default=1e-6)
@@ -624,9 +630,9 @@ class CommonMinimiser(
             else SecantStatistics.initial(secant, jnp.result_type(x0.dtype, float))
         )
         return eqx.tree_at(
-            lambda m: (m.secant, m.secant_stats),
+            lambda m: (m.secant, m.secant_stats, m.secant_recovery_state),
             self,
-            (secant, stats),
+            (secant, stats, SecantRecoveryState()),
             is_leaf=lambda z: z is None,
         )
 
@@ -1013,7 +1019,7 @@ class CommonMinimiser(
             ),
         )
         new_secant, new_stats = self._update_secant(
-            ctx.lagrangian, x_new, committed_dual
+            ctx.lagrangian, result, committed_dual
         )
         advanced = cast(
             Self,
@@ -1052,9 +1058,9 @@ class CommonMinimiser(
         Returns
         -------
         SecantResetSignals
-            Current failure streaks and their patiences.
+            Current raw failure streaks.
         """
-        return SecantResetSignals.none()
+        return SecantResetSignals.none()  # pragma: no cover
 
     def _reset_secant(self) -> Self:
         """Apply :attr:`secant_reset` to the maintained secant and record it.
@@ -1067,26 +1073,34 @@ class CommonMinimiser(
         """
         if self.secant is None:
             return self
-        secant, severity = self.secant_reset.apply(
-            self.secant, self._secant_reset_signals()
+        secant, recovery, severity = self.secant_reset.apply(
+            self.secant,
+            self._secant_reset_signals(),
+            self.secant_recovery_state,
         )
         stats = cast(SecantStatistics, self.secant_stats).record_reset(severity, secant)
-        return eqx.tree_at(lambda m: (m.secant, m.secant_stats), self, (secant, stats))
+        return eqx.tree_at(
+            lambda m: (m.secant, m.secant_stats, m.secant_recovery_state),
+            self,
+            (secant, stats, recovery),
+        )
 
     def _update_secant(
         self,
         lagrangian: Lagrangian[PrimalType, EvaluatedLagrangian[PrimalType]],
-        x_new: PrimalType,
+        result: StepResult[PrimalType, SubProblemSolverStateType],
         step_dual: Dual,
     ) -> tuple[Secant | None, SecantStatistics | None]:
-        """Append a curvature pair at shared multipliers, or keep ``None``.
+        """Append a usable accepted curvature pair, or preserve the secant.
 
         Parameters
         ----------
         lagrangian
             Unevaluated Lagrangian module (uses current ``secant``).
-        x_new
-            Accepted (or retained) primal after the controlled step.
+        result
+            Controlled-step result. Rejected, zero-displacement, and
+            non-finite-curvature steps leave both secant and append
+            statistics unchanged.
         step_dual
             Multipliers shared at both secant endpoints (N&W §18.3); the
             committed dual (the previous one if the proposal was non-finite).
@@ -1102,18 +1116,40 @@ class CommonMinimiser(
         if self.secant is None:
             return None, None
         iterate = cast(PrimalType, self.iterate)
-        # Share a single multiplier vector (the freshly solved ``step_dual``) at
-        # both endpoints so the secant pair satisfies the Lagrangian secant
-        # condition (N&W 18.3); the constant +-1 bound Jacobian then cancels.
-        prev = lagrangian(iterate, step_dual)
+        x_new = result.x
         s = x_new.x - iterate.x
-        y = lagrangian.curvature_estimate(x_new, prev)
-        diagnostics = self.secant.diagnostics(s, y)
-        secant = self.secant.append(s, y)
-        stats = cast(SecantStatistics, self.secant_stats).record_append(
-            diagnostics, secant
+        displacement_usable = (
+            result.accepted & jnp.all(jnp.isfinite(s)) & jnp.any(s != 0)
         )
-        return secant, stats
+        secant0 = self.secant
+        stats0 = cast(SecantStatistics, self.secant_stats)
+
+        def maybe_append(_: None) -> tuple[Secant, SecantStatistics]:
+            # Share one freshly solved multiplier vector at both endpoints
+            # (N&W 18.3); constant bound Jacobians then cancel from y.
+            prev = lagrangian(iterate, step_dual)
+            y = lagrangian.curvature_estimate(x_new, prev)
+            finite_curvature = jnp.all(jnp.isfinite(y))
+
+            def append(_: None) -> tuple[Secant, SecantStatistics]:
+                diagnostics = secant0.diagnostics(s, y)
+                secant = secant0.append(s, y)
+                stats = stats0.record_append(diagnostics, secant)
+                return secant, stats
+
+            return jax.lax.cond(
+                finite_curvature,
+                append,
+                lambda _: (secant0, stats0),
+                operand=None,
+            )
+
+        return jax.lax.cond(
+            displacement_usable,
+            maybe_append,
+            lambda _: (secant0, stats0),
+            operand=None,
+        )
 
     @abstractmethod
     def _advance_dynamics(
@@ -1284,10 +1320,15 @@ class CommonMinimiser(
     ) -> dict[str, Any]:
         """Build algorithm-specific solution statistics.
 
-        Always reports ``num_steps``; adds the ``secant_*`` fields of
-        :attr:`secant_stats` when a secant is maintained.
+        Always reports ``num_steps`` and the global recovery state; adds the
+        remaining ``secant_*`` statistics when a secant is maintained.
         """
-        stats: dict[str, Any] = {"num_steps": self.step_count}
+        stats: dict[str, Any] = {
+            "num_steps": self.step_count,
+            "secant_recovery_streak": self.secant_recovery_state.failure_streak,
+            "secant_recovery_stage": self.secant_recovery_state.stage,
+            "secant_recovery_fatal": self.secant_recovery_state.fatal,
+        }
         if self.secant_stats is not None:
             stats.update(self.secant_stats.as_stats())
         return stats

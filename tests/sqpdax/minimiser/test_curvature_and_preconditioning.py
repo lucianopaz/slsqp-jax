@@ -228,50 +228,33 @@ def _with_pairs(solver):
     return eqx.tree_at(lambda m: m.secant, solver, secant)
 
 
-@pytest.mark.parametrize(
-    ("qp_streak", "ls_streak", "severity"),
-    [
-        (0, 0, -1),
-        (1, 0, 0),
-        (0, 1, 0),
-        (2, 0, -1),
-        (3, 0, 2),
-        (0, 3, 2),
-        (3, 1, 2),
-    ],
-    ids=["none", "qp-first", "ls-first", "qp-mid", "qp-patience", "ls-patience", "mix"],
-)
-def test_reset_secant_follows_failure_streaks(qp_streak, ls_streak, severity):
-    """QP / line-search streaks escalate the reset; counts land in the stats."""
+def test_reset_secant_carries_one_recovery_state_across_failure_channels():
+    """QP and line-search events advance one soft/diagonal/identity episode."""
     problem = make_scaled_quartic(with_curvature=False)
-    solver = ActiveSetLineSearchMinimiser(
-        qp_failure_patience=3, ls_failure_patience=3
-    ).init(problem, _x0())
-    solver = _with_pairs(solver)
-    solver = eqx.tree_at(
-        lambda m: (m.consecutive_qp_failures, m.consecutive_ls_failures),
-        solver,
-        (jnp.asarray(qp_streak), jnp.asarray(ls_streak)),
-    )
-    before = solver.secant
-    after = solver._reset_secant()
+    solver = _with_pairs(ActiveSetLineSearchMinimiser().init(problem, _x0()))
+    channels = [(1, 0), (0, 1), (1, 1), (2, 1)]
+    for index, (qp_streak, ls_streak) in enumerate(channels, start=1):
+        solver = eqx.tree_at(
+            lambda m: (m.consecutive_qp_failures, m.consecutive_ls_failures),
+            solver,
+            (jnp.asarray(qp_streak), jnp.asarray(ls_streak)),
+        )
+        solver = solver._reset_secant()
+        assert int(solver.secant_recovery_state.failure_streak) == index
+        assert int(solver.secant_recovery_state.stage) == min(index - 1, 2)
 
-    expected_secant = before if severity < 0 else before.reset(jnp.asarray(severity))
-    assert eqx.tree_equal(after.secant, expected_secant)
-    expected_resets = jnp.zeros(3, jnp.int32)
-    if severity >= 0:
-        expected_resets = expected_resets.at[severity].set(1)
-    assert jnp.array_equal(after.secant_stats.n_resets, expected_resets)
+    assert jnp.array_equal(solver.secant_stats.n_resets, jnp.ones(3, jnp.int32))
+    assert bool(solver.secant_recovery_state.fatal)
 
 
 def test_reset_secant_respects_disabled_policy():
-    """A disabled policy leaves the secant untouched even at full patience."""
+    """A disabled policy leaves the secant untouched under repeated failure."""
     problem = make_scaled_quartic(with_curvature=False)
     solver = ActiveSetLineSearchMinimiser(
-        qp_failure_patience=1, secant_reset=SecantResetPolicy(enabled=False)
+        secant_reset=SecantResetPolicy(enabled=False)
     ).init(problem, _x0())
     solver = eqx.tree_at(
-        lambda m: m.consecutive_qp_failures, _with_pairs(solver), jnp.asarray(5)
+        lambda m: m.consecutive_qp_failures, _with_pairs(solver), jnp.asarray(6)
     )
     after = solver._reset_secant()
     assert eqx.tree_equal(after.secant, solver.secant)

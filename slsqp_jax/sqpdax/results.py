@@ -31,6 +31,7 @@ class MINIMISER_RESULTS(Enumeration):
     successful = "The minimiser converged successfully."
     nonfinite = "A non-finite iterate or optimality quantity was encountered."
     max_steps_reached = "The maximum number of outer iterations was reached."
+    secant_recovery_failure = "The problem failed again after identity secant recovery."
 
 
 ResultType = TypeVar("ResultType", bound=MINIMISER_RESULTS)
