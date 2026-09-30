@@ -135,6 +135,15 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         """
         ...
 
+    def accepted_by_fallback(self, state: LineSearchState) -> Bool[Array, ""]:
+        """Whether ``state`` passed a fallback but not the primary test.
+
+        Concrete searches without a fallback inherit ``False``. This keeps
+        the commit decision in :meth:`stop_search` while exposing weaker
+        acceptance separately in :class:`StepResult`.
+        """
+        return jnp.asarray(False)
+
     def step(
         self,
         x0: Primal,
@@ -235,6 +244,7 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         # not the last trial, so the outer loop never moves to a point the
         # search refused.
         accepted = self.stop_search(state)
+        accepted_by_fallback = accepted & self.accepted_by_fallback(state)
         proposed_step_norm = jnp.linalg.norm(state.step.x)
 
         result = jax.lax.cond(
@@ -246,6 +256,7 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
                 solver_state=solver_state,
                 step_size=state.alpha,
                 proposed_step_norm=proposed_step_norm,
+                accepted_by_fallback=accepted_by_fallback,
             ),
             lambda: StepResult(
                 x=x0,
@@ -254,6 +265,7 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
                 solver_state=solver_state,
                 step_size=jnp.asarray(0.0),
                 proposed_step_norm=proposed_step_norm,
+                accepted_by_fallback=jnp.asarray(False),
             ),
         )
         return cast(StepResult[Primal, SubProblemSolverState], result)
@@ -284,6 +296,18 @@ class ArmijoLineSearch(LineSearch):
     c1: Scalar = eqx.field(default=1e-4)
     backtrack: Scalar = eqx.field(default=0.5)
 
+    def _acceptance_flags(
+        self, state: LineSearchState
+    ) -> tuple[Bool[Array, ""], Bool[Array, ""]]:
+        """Return strict-Armijo and fallback-only acceptance flags."""
+        sufficient_decrease = state.merit0_val + (
+            self.c1 * state.alpha * state.merit0_grad_dot_step
+        )
+        armijo_satisfied = state.merit_val <= sufficient_decrease
+        merit_decreased = state.merit_val < state.merit0_val
+        fallback_only = ~armijo_satisfied & merit_decreased & (state.alpha < 0.1)
+        return armijo_satisfied, fallback_only
+
     def stop_search(self, state: LineSearchState) -> Bool[Array, ""]:
         """Armijo test (with small-``α`` decrease fallback).
 
@@ -297,19 +321,13 @@ class ArmijoLineSearch(LineSearch):
         Bool[Array, ""]
             ``True`` when the trial satisfies Armijo or the fallback.
         """
-        sufficient_decrease = state.merit0_val + (
-            self.c1 * state.alpha * state.merit0_grad_dot_step
-        )
+        armijo_satisfied, fallback_only = self._acceptance_flags(state)
+        return armijo_satisfied | fallback_only
 
-        # Check if current alpha satisfies the condition
-        armijo_satisfied = state.merit_val <= sufficient_decrease
-
-        # Also accept if merit decreased at all (fallback)
-        merit_decreased = state.merit_val < state.merit0_val
-
-        # Accept if Armijo is satisfied, or if we've improved and alpha is small
-        accept = armijo_satisfied | (merit_decreased & (state.alpha < 0.1))
-        return accept
+    def accepted_by_fallback(self, state: LineSearchState) -> Bool[Array, ""]:
+        """Whether only the small-step merit-decrease fallback accepted."""
+        _, fallback_only = self._acceptance_flags(state)
+        return fallback_only
 
     def trial(self, state: LineSearchState) -> LineSearchState:
         """Evaluate the next geometrically contracted trial step.

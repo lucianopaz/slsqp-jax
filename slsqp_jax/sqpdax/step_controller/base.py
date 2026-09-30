@@ -37,6 +37,10 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
         Merit value at ``x``.
     solver_state
         Refreshed (or threaded) subproblem-solver carry, or ``None``.
+    accepted_by_fallback
+        ``True`` only when a line search accepted through its weaker
+        fallback after the primary sufficient-decrease condition failed.
+        Non-line-search controllers leave this ``False``.
     """
 
     x: PrimalType
@@ -45,6 +49,9 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
     solver_state: SubProblemSolverStateType | None = None
     step_size: Scalar = field(default_factory=lambda: jnp.asarray(1.0))
     proposed_step_norm: Scalar = field(default_factory=lambda: jnp.asarray(0.0))
+    accepted_by_fallback: Bool[Array, ""] = field(
+        default_factory=lambda: jnp.asarray(False)
+    )
 
 
 class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
