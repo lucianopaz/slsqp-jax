@@ -8,6 +8,7 @@ import pytest
 
 from slsqp_jax.sqpdax.barrier import AdaptiveBarrierUpdate, LogBarrier
 from slsqp_jax.sqpdax.minimiser import (
+    TRUST_REGION_INTERIOR_POINT_RESULTS,
     ActiveSetLineSearchMinimiser,
     TrustRegionInteriorPointMinimiser,
     minimise,
@@ -154,11 +155,6 @@ def test_minimiser_raises_on_rtol():
         TrustRegionInteriorPointMinimiser(rtol=1e-3)
 
 
-def test_minimiser_raises_on_nonpositive_model_stall_patience():
-    with pytest.raises(ValueError, match="model_stall_patience must be at least 1"):
-        TrustRegionInteriorPointMinimiser(model_stall_patience=0)
-
-
 # --- secant model-stall detection -------------------------------------------
 
 
@@ -236,35 +232,32 @@ def test_advance_dynamics_tracks_model_stall_streak(
     assert int(advanced.consecutive_model_failures) == expected_streak
     signals = advanced._secant_reset_signals()
     assert int(signals.model_streak) == expected_streak
-    assert signals.model_patience == solver.model_stall_patience
     assert int(signals.subproblem_streak) == 0
     assert int(signals.step_streak) == 0
 
 
-@pytest.mark.parametrize(
-    ("streak", "expected_pairs", "expected_severity"),
-    [(0, 3, -1), (1, 1, 0), (2, 3, -1), (3, 0, 2), (4, 0, 2)],
-    ids=["none", "soft", "wait", "identity", "beyond-patience"],
-)
-def test_reset_secant_escalates_on_model_streak(
-    streak, expected_pairs, expected_severity
-):
-    """Stall 1 soft-resets, stall 2 waits, stall ``patience`` identity-resets."""
-    solver = _with_pairs(_secant_model_solver(model_stall_patience=3))
-    solver = eqx.tree_at(
-        lambda m: m.consecutive_model_failures, solver, jnp.asarray(streak, jnp.int32)
-    )
-    after = solver._reset_secant()
+def test_model_stalls_use_global_recovery_and_report_post_identity_failure():
+    """Four model stalls apply all reset stages and terminate specifically."""
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = _with_pairs(_secant_model_solver())
+    for streak in range(1, 5):
+        solver = eqx.tree_at(
+            lambda m: m.consecutive_model_failures,
+            solver,
+            jnp.asarray(streak, jnp.int32),
+        )
+        solver = solver._reset_secant()
+        assert int(solver.secant_recovery_state.failure_streak) == streak
 
-    assert int(after.secant.num_pairs) == expected_pairs
-    expected_resets = jnp.zeros(3, jnp.int32)
-    if expected_severity >= 0:
-        expected_resets = expected_resets.at[expected_severity].set(1)
-    assert jnp.array_equal(after.secant_stats.n_resets, expected_resets)
+    assert jnp.array_equal(solver.secant_stats.n_resets, jnp.ones(3, jnp.int32))
+    assert bool(solver.secant_recovery_state.fatal)
+    done, result = solver.terminate(problem)
+    assert bool(done)
+    assert bool(result == TRUST_REGION_INTERIOR_POINT_RESULTS.secant_recovery_failure)
 
 
 def test_init_zeroes_model_stall_streak():
-    """Re-initialising a used minimiser starts from an empty stall streak."""
+    """Re-initialising starts from empty raw and global recovery streaks."""
     problem = make_scaled_quartic(with_curvature=False)
     used = eqx.tree_at(
         lambda m: m.consecutive_model_failures,
@@ -273,6 +266,7 @@ def test_init_zeroes_model_stall_streak():
     )
     fresh = used.init(problem, jnp.array([0.5, 0.3, 0.2]))
     assert int(fresh.consecutive_model_failures) == 0
+    assert int(fresh.secant_recovery_state.failure_streak) == 0
 
 
 def test_active_set_reports_no_model_stalls():

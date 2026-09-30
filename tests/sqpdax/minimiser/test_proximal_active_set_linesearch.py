@@ -117,6 +117,20 @@ def test_first_proximal_step_is_stationary_but_not_fatal():
     assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.running)
 
 
+def test_proximal_retries_do_not_signal_secant_recovery():
+    """Rejected primal retries are productive multiplier-centre updates."""
+    problem = make_problem(with_curvature=False)
+    solver = ProximalActiveSetLineSearchMinimiser().init(problem, jnp.array([0.5, 0.5]))
+    solver = eqx.tree_at(
+        lambda m: (m.consecutive_qp_failures, m.consecutive_ls_failures),
+        solver,
+        (jnp.asarray(2, jnp.int32), jnp.asarray(4, jnp.int32)),
+    )
+    signals = solver._secant_reset_signals()
+    assert int(signals.subproblem_streak) == 2
+    assert int(signals.step_streak) == 0
+
+
 def test_mu_floor_survives_tight_atol_and_options_are_accepted():
     """``atol=1e-14`` cannot push ``μ`` below ``mu_min``; option bag is recognised."""
     problem = make_equality_quadratic()

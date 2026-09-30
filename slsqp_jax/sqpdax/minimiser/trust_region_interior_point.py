@@ -231,10 +231,9 @@ class TrustRegionInteriorPointMinimiser(
     model_failure_rho
         A rejected step with ``rho`` below this value counts as a model
         failure stall.
-    model_stall_patience
-        Stall streak at which the patience-level (identity) secant reset
-        fires; the soft reset fires on the first stall. Forwarded as
-        ``model_patience`` of :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals`.
+    secant_reset
+        Shared soft / diagonal / identity / fatal recovery policy. Model
+        stalls advance its one global recovery episode.
     barrier
         Dynamic barrier whose ``weight`` *is* ``μ`` (seeded in
         :meth:`_init_dynamics`).
@@ -267,7 +266,6 @@ class TrustRegionInteriorPointMinimiser(
     # secant model-stall detection (feeds the ``model`` reset channel)
     radius_floor: float = eqx.field(static=True, default=1e-8)
     model_failure_rho: float = eqx.field(static=True, default=-1.0)
-    model_stall_patience: int = eqx.field(static=True, default=3)
     # The barrier is dynamic state: its ``weight`` *is* mu, updated each step.
     barrier: Barrier | None = None
     consecutive_model_failures: Int[Array, ""] = eqx.field(
@@ -287,11 +285,6 @@ class TrustRegionInteriorPointMinimiser(
             raise ValueError(
                 "TrustRegionInteriorPointMinimiser does not provide a relative "
                 "tolerance for convergence. Use the absolute tolerance instead."
-            )
-        if self.model_stall_patience < 1:
-            raise ValueError(
-                "model_stall_patience must be at least 1; got "
-                f"{self.model_stall_patience}"
             )
 
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
@@ -567,8 +560,7 @@ class TrustRegionInteriorPointMinimiser(
         Returns
         -------
         SecantResetSignals
-            ``model_streak`` from :attr:`consecutive_model_failures` with
-            ``model_patience`` from :attr:`model_stall_patience`.
+            Raw ``model_streak`` from :attr:`consecutive_model_failures`.
         """
         zero = jnp.asarray(0, jnp.int32)
         return cast(
@@ -577,7 +569,6 @@ class TrustRegionInteriorPointMinimiser(
                 subproblem_streak=zero,
                 step_streak=zero,
                 model_streak=self.consecutive_model_failures,
-                model_patience=self.model_stall_patience,
             ),
         )
 
@@ -680,7 +671,8 @@ class TrustRegionInteriorPointMinimiser(
         barrier_updated = metrics.barrier_updated
         acceptable_residual = metrics.optimality_residual <= self.atol
         nonfinite = metrics.nonfinite
-        fatal = (
+        recovery_fatal = self.secant_recovery_state.fatal
+        subproblem_fatal = (
             cast(TrustRegionStateType, ctx.solver_state).status
             != SUBPROBLEM_RESULTS.successful
         )
@@ -689,14 +681,20 @@ class TrustRegionInteriorPointMinimiser(
             & acceptable_residual
             & metrics.has_min_steps
             & ~nonfinite
-            & ~fatal
+            & ~subproblem_fatal
+            & ~recovery_fatal
+        )
+        fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.where(
+            recovery_fatal,
+            TRUST_REGION_INTERIOR_POINT_RESULTS.secant_recovery_failure,
+            metrics.fatal_result,
         )
         return cast(
             TerminationFlags,
             TerminationFlags(
                 converged=converged,
                 nonfinite=nonfinite,
-                fatal=fatal,
-                fatal_result=metrics.fatal_result,
+                fatal=subproblem_fatal | recovery_fatal,
+                fatal_result=fatal_result,
             ),
         )
