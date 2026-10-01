@@ -12,6 +12,7 @@ from lineax._solution import RESULTS
 from ...dual import Dual
 from ...lagrangian.basic import Lagrangian
 from ...lagrangian.evaluated import EvaluatedLagrangian
+from ...logging import Logger
 from ...preconditioner import Preconditioner
 from ...primal import PrimalType
 from ...problem import ProblemProtocol
@@ -153,9 +154,15 @@ class SubProblemSolver(
     solver_state_class
         Concrete :class:`SubProblemSolverState` subclass used to seed and
         refresh carry. Marked static so Equinox treats it as configuration.
+    logger
+        :class:`~slsqp_jax.sqpdax.logging.logger.Logger` for the solver's
+        own records. Minimisers inject their ``minimiser.subproblem`` child
+        through :meth:`~slsqp_jax.sqpdax.types.InitializableModule.init`;
+        the default never emits.
     """
 
     solver_state_class: type[SubProblemSolverStateType] = field(static=True)
+    logger: Logger = field(static=True, default_factory=Logger.disabled)
 
     @abstractmethod
     def solve(

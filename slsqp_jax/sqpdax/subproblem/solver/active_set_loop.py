@@ -1,4 +1,4 @@
-from typing import Generic, Self, cast
+from typing import Any, Generic, Self, cast
 
 import equinox as eqx
 import jax
@@ -37,6 +37,15 @@ __all__ = [
 KKTSolverStateType = TypeVar(
     "KKTSolverStateType", bound=KKTSolverState, default=ProjectedCGState
 )
+
+
+def _count_active(active_set: ActiveSet) -> Int[Array, ""]:
+    """Number of inequalities and bounds in the working set (for logging)."""
+    return (
+        jnp.sum(active_set.active_inequalities)
+        + jnp.sum(active_set.active_lb)
+        + jnp.sum(active_set.active_ub)
+    ).astype(jnp.int32)
 
 
 class ACTIVE_SET_QP_RESULTS(Enumeration):
@@ -292,6 +301,66 @@ class ActiveSetQPSolver(
             undefined on a ``Δλ`` block, so the active-set loop requires a
             SQP-view subproblem (Nocedal & Wright eq. 18.11).
         """
+        step, state = self._solve_working_set(subproblem, x0, initial_state)
+        self._emit_qp_diagnostic(step, state)
+        return step, state
+
+    def _emit_qp_diagnostic(
+        self, step: tuple[Primal, Dual], state: ActiveSetStateType
+    ) -> None:
+        """Emit the per-solve ``"qp"`` diagnostic record (if enabled)."""
+        self.logger.diagnostic("qp", lambda: self._qp_diagnostic_fields(step, state))
+
+    def _qp_diagnostic_fields(
+        self, step: tuple[Primal, Dual], state: ActiveSetStateType
+    ) -> dict[str, Any]:
+        """Payload of the per-solve ``"qp"`` diagnostic record.
+
+        Only evaluated when the logger's diagnostics channel is enabled.
+        Subclasses extend the payload by calling ``super()``.
+
+        Parameters
+        ----------
+        step
+            Primal-dual QP solution returned by :meth:`solve`.
+        state
+            Refreshed carry returned by :meth:`solve`.
+
+        Returns
+        -------
+        dict
+            Outcome codes, iteration counts, the step, the final working set
+            and multipliers, and the inner KKT solver's last residuals.
+        """
+        return {
+            "qp_result": state.qp_result,
+            "status": state.status,
+            "success": state.success,
+            "iters": state.last_n_iter,
+            "cg_iters": state.last_n_cg_iter,
+            "step": step[0],
+            "dual": step[1],
+            "active_set": state.active_set,
+            "qp_dual": state.dual,
+            "final_working_tol": state.final_working_tol,
+            "n_anti_cycling": state.n_anti_cycling,
+            "kkt_feasibility_residual": state.last_kkt_feasibility_residual,
+            "kkt_n_refinements": state.last_kkt_n_refinements,
+            "kkt_reason": state.last_kkt_reason,
+        }
+
+    def _solve_working_set(
+        self,
+        subproblem: ActiveSetSubProblem,
+        x0: tuple[Primal, Dual],
+        initial_state: ActiveSetStateType,
+    ) -> tuple[tuple[Primal, Dual], ActiveSetStateType]:
+        """Body of :meth:`solve` without the per-solve diagnostic record.
+
+        Subclasses that post-process the loop's output (e.g. the proximal
+        solver) call this instead of :meth:`solve` so the ``"qp"`` record
+        describes the final step and carry.
+        """
         if subproblem.is_kkt_dual_increment:
             raise TypeError(
                 "ActiveSetQPSolver requires SQP-view multipliers (the dual block "
@@ -356,6 +425,34 @@ class ActiveSetQPSolver(
                 lag, step_new, active_set, policy_state
             )
             changed = jnp.logical_not(eqx.tree_equal(next_set, active_set))
+            self.logger.debug(
+                "working-set iter={iter}: active={n_active} kkt_iters={kkt_iters} "
+                "kkt_ok={kkt_ok} kkt_reason={kkt_reason} changed={changed} "
+                "cycled={cycled}",
+                iter=n_iter,
+                n_active=_count_active(active_set),
+                kkt_iters=kkt_state_new.n_iter,
+                kkt_ok=kkt_state_new.success,
+                kkt_reason=kkt_state_new.reason,
+                changed=changed,
+                cycled=cycled,
+            )
+            # Capture the working-set iteration where a failure is first
+            # detected, before later iterations can degrade the iterate.
+            self.logger.diagnostic(
+                "qp_iter_failure",
+                lambda: {
+                    "iter": n_iter,
+                    "active_set": active_set,
+                    "next_set": next_set,
+                    "step": step_new[0],
+                    "dual": step_new[1],
+                    "kkt_state": kkt_state_new,
+                    "changed": changed,
+                    "cycled": cycled,
+                },
+                when=~kkt_state_new.success | kkt_state_new.nonfinite | cycled,
+            )
             return (
                 next_set,
                 active_set,
@@ -425,6 +522,25 @@ class ActiveSetQPSolver(
                 ),
             ),
             ACTIVE_SET_QP_RESULTS.kkt_solver_failure,
+        )
+        self.logger.info(
+            "qp solved: result={qp_result} iters={iters} cg_iters={cg_iters} "
+            "active={n_active}",
+            when=success,
+            qp_result=qp_result,
+            iters=n_iter_f,
+            cg_iters=n_cg_f,
+            n_active=_count_active(cast(ActiveSet, solved_f)),
+        )
+        self.logger.warning(
+            "qp failed: result={qp_result} status={status} iters={iters} "
+            "cg_iters={cg_iters} kkt_reason={kkt_reason}",
+            when=~success,
+            qp_result=qp_result,
+            status=status,
+            iters=n_iter_f,
+            cg_iters=n_cg_f,
+            kkt_reason=kkt_state_f.reason,
         )
         # Carry the proposed set (it already holds the newly violated rows,
         # which is what a warm start wants) except when the guard fired: the

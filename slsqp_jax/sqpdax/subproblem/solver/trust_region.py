@@ -31,6 +31,13 @@ __all__ = [
 ]
 
 
+def _all_finite(tree: object) -> Bool[Array, ""]:
+    """``True`` when every leaf of ``tree`` is finite."""
+    return jnp.all(
+        jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(tree)])
+    )
+
+
 class TrustRegionSolverState(SubProblemSolverState):
     """Carry threaded across trust-region composite-step solves.
 
@@ -250,7 +257,22 @@ class TrustRegionInteriorPointSolver(
                 active_bounds=active_bounds,
             ),
         )
-        (normal_primal, _), _ = self.normal_solver.solve(subproblem, x0, normal_state)
+        (normal_primal, _), normal_new_state = self.normal_solver.solve(
+            subproblem, x0, normal_state
+        )
+        normal_finite = _all_finite(normal_primal)
+        self.logger.diagnostic(
+            "normal_step_failure",
+            lambda: {
+                "radius": radius,
+                "normal_radius": self.zeta * radius,
+                "normal_step": normal_primal,
+                "normal_state": normal_new_state,
+                "finite": normal_finite,
+                "active_bounds": active_bounds,
+            },
+            when=~normal_new_state.success | ~normal_finite,
+        )
         w_normal_primal = cast(
             InteriorPointPrimal,
             InteriorPointPrimal(
@@ -280,6 +302,19 @@ class TrustRegionInteriorPointSolver(
         w = tang_primal.flatten()  # full scaled step
         n_cg = tang_new_state.n_cg_iter
         on_bnd = tang_new_state.on_boundary
+        tang_finite = jnp.all(jnp.isfinite(w))
+        self.logger.diagnostic(
+            "tangential_step_failure",
+            lambda: {
+                "radius": radius,
+                "normal_step": w_normal_primal,
+                "tangential_step": tang_primal,
+                "tangential_state": tang_new_state,
+                "finite": tang_finite,
+                "active_bounds": active_bounds,
+            },
+            when=~tang_new_state.success | ~tang_finite,
+        )
 
         # --- recover the native primal step p = (p_x, p_s = S p_s_tilde) ---
         step_primal = cast(
@@ -317,10 +352,53 @@ class TrustRegionInteriorPointSolver(
         pred = -obj_model + nu_new * v_pred
 
         step = (step_primal, step_dual)
-        finite = jnp.all(
-            jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(step)])
-        )
+        finite = _all_finite(step)
         status = RESULTS.where(finite, RESULTS.successful, RESULTS.singular)
+        self.logger.diagnostic(
+            "recovery_failure",
+            lambda: {
+                "radius": radius,
+                "step_primal": step_primal,
+                "step_dual": step_dual,
+                "primal_finite": _all_finite(step_primal),
+                "dual_finite": _all_finite(step_dual),
+            },
+            when=~finite,
+        )
+        self.logger.diagnostic(
+            "tr_step",
+            lambda: {
+                "radius": radius,
+                "cg_iters": n_cg,
+                "on_boundary": on_bnd,
+                "obj_model": obj_model,
+                "v_pred": v_pred,
+                "pred": pred,
+                "nu": nu_new,
+                "step_primal": step_primal,
+                "step_dual": step_dual,
+                "normal_step": normal_primal,
+                "status": status,
+                "success": finite,
+                "active_bounds": active_bounds,
+            },
+        )
+        self.logger.debug(
+            "trust-region step: radius={radius:.3e} cg_iters={cg_iters} "
+            "on_boundary={on_boundary} pred={pred:.3e} nu={nu:.3e} "
+            "status={status}",
+            radius=radius,
+            cg_iters=n_cg,
+            on_boundary=on_bnd,
+            pred=pred,
+            nu=nu_new,
+            status=status,
+        )
+        self.logger.warning(
+            "trust-region step is non-finite (status={status})",
+            when=~finite,
+            status=status,
+        )
         new_state = cast(
             TrustRegionStateType,
             tree_at(
