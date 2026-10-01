@@ -7,6 +7,7 @@ from equinox import Module, field
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Scalar
 
+from ..logging import Logger
 from ..merit import Merit
 from ..primal import PrimalType
 from ..subproblem.solver import SubProblemSolverStateType
@@ -77,9 +78,15 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
     ----------
     merit
         Merit used to score candidate iterates.
+    logger
+        :class:`~slsqp_jax.sqpdax.logging.logger.Logger` for the
+        controller's own records (trial steps, acceptance / rejection).
+        Minimisers pass their ``minimiser.step_controller`` child; the
+        default never emits.
     """
 
     merit: Merit
+    logger: Logger = field(static=True, default_factory=Logger.disabled)
 
     @abstractmethod
     def step(

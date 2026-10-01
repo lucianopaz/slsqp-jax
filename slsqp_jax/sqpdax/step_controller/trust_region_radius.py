@@ -173,6 +173,22 @@ class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
                 radius,
             ),
         )
+        self.logger.info(
+            "rho={rho:.3e} accepted={accepted} radius {radius:.3e} -> "
+            "{new_radius:.3e} actual={actual:.3e} predicted={pred:.3e}",
+            rho=rho,
+            accepted=accepted,
+            radius=radius,
+            new_radius=new_radius,
+            actual=actual_reduction,
+            pred=pred,
+        )
+        self.logger.warning(
+            "rejected step: rho={rho:.3e} radius shrunk to {new_radius:.3e}",
+            when=~accepted,
+            rho=rho,
+            new_radius=new_radius,
+        )
         new_state = eqx.tree_at(
             lambda s: (s.radius, s.success, s.rho),
             solver_state,

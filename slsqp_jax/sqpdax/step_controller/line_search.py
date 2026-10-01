@@ -219,6 +219,15 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
 
         def body_fun(state):
             new_state = self.trial(state)
+            self.logger.debug(
+                "trial {trial}: alpha={alpha:.3e} merit={merit:.6e} "
+                "merit0={merit0:.6e} slope={slope:.3e}",
+                trial=state.iteration,
+                alpha=new_state.alpha,
+                merit=new_state.merit_val,
+                merit0=new_state.merit0_val,
+                slope=new_state.merit0_grad_dot_step,
+            )
             new_state = eqx.tree_at(
                 lambda s: s.iteration, new_state, state.iteration + 1
             )
@@ -246,6 +255,26 @@ class LineSearch(StepController[Primal, SubProblemSolverState]):
         accepted = self.stop_search(state)
         accepted_by_fallback = accepted & self.accepted_by_fallback(state)
         proposed_step_norm = jnp.linalg.norm(state.step.x)
+        self.logger.info(
+            "accepted alpha={alpha:.3e} after {trials} trial(s): "
+            "merit {merit0:.6e} -> {merit:.6e} fallback={fallback}",
+            when=accepted,
+            alpha=state.alpha,
+            trials=state.iteration,
+            merit0=merit0_val,
+            merit=state.merit_val,
+            fallback=accepted_by_fallback,
+        )
+        self.logger.warning(
+            "rejected direction after {trials} trial(s): merit0={merit0:.6e} "
+            "last_merit={merit:.6e} slope={slope:.3e} direction_finite={finite}",
+            when=~accepted,
+            trials=state.iteration,
+            merit0=merit0_val,
+            merit=state.merit_val,
+            slope=merit0_grad_dot_step,
+            finite=direction_finite,
+        )
 
         result = jax.lax.cond(
             accepted,
