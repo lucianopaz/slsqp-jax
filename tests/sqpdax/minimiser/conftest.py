@@ -21,10 +21,16 @@ def make_unconstrained_quadratic(*, n: int = 2) -> Problem:
     return make_problem(n=n, meq=0, mineq=0, lb=lb, ub=ub, with_curvature=True)
 
 
-def make_equality_quadratic(*, n: int = 2) -> Problem:
-    """``f(x) = ‖x‖²`` subject to ``x₀ + x₁ = 1`` (unbounded)."""
+def make_equality_quadratic(*, n: int = 2, with_curvature: bool = True) -> Problem:
+    """``f(x) = ‖x‖²`` subject to ``x₀ + x₁ = 1`` (unbounded).
+
+    With ``with_curvature=False`` the problem exposes no HVPs, so minimisers
+    built on it carry an L-BFGS secant.
+    """
     lb, ub = unbounded_box(n)
-    return make_problem(n=n, meq=1, mineq=0, lb=lb, ub=ub, with_curvature=True)
+    return make_problem(
+        n=n, meq=1, mineq=0, lb=lb, ub=ub, with_curvature=with_curvature
+    )
 
 
 def make_scaled_quartic(*, with_curvature: bool = True) -> Problem:

@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 
 from slsqp_jax.sqpdax.logging import (
-    DEBUG,
     INFO,
     WARNING,
     Logger,
@@ -44,8 +43,10 @@ _SOLVE_KIND = {
 }
 
 
-def _run(make_solver, logging_spec, *, max_steps: int = 40, **extra_options):
-    problem = make_equality_quadratic()
+def _run(
+    make_solver, logging_spec, *, max_steps: int = 40, problem=None, **extra_options
+):
+    problem = make_equality_quadratic() if problem is None else problem
     options = dict(extra_options)
     if logging_spec is not None:
         options["logging"] = logging_spec
@@ -120,7 +121,10 @@ def test_child_levels_are_honoured_independently(make_solver, child, sibling):
     _run(make_solver, {"level": "WARNING", "handler": handler, child: "DEBUG"})
     child_records = _by_name(handler, f"minimiser.{child}")
     sibling_records = _by_name(handler, f"minimiser.{sibling}")
-    assert any(r.levelno == DEBUG for r in child_records)
+    # The child runs at DEBUG while the root and sibling stay at WARNING. Not
+    # every component emits DEBUG records (the trust-region manager only logs
+    # at INFO and above), so the check is "below the root level".
+    assert any(r.levelno < WARNING for r in child_records)
     assert all(r.levelno >= WARNING for r in sibling_records)
     assert all(r.levelno >= WARNING for r in _by_name(handler, "minimiser"))
     assert all(r.depth == 1 for r in child_records)
@@ -230,6 +234,35 @@ def test_algorithm_specific_step_fields(make_solver):
         TrustRegionInteriorPointMinimiser: {"barrier_weight", "radius", "rho", "slack"},
     }[type(sol.state)]
     assert expected <= set(payload)
+
+
+@pytest.mark.parametrize("make_solver", _MINIMISERS)
+def test_secant_fields_are_reported_when_curvature_is_inexact(make_solver):
+    """Without an exact HVP the minimiser carries an L-BFGS secant, and both
+    the INFO summary and the diagnostics payload report its state."""
+    text = MemoryHandler()
+    diag = MemoryDiagnosticsHandler()
+    sol, _ = _run(
+        make_solver,
+        {"level": "INFO", "handler": text, "diagnostics": diag},
+        problem=make_equality_quadratic(with_curvature=False),
+    )
+    diag.close()
+    assert sol.state.secant is not None
+    n_steps = int(sol.stats["num_steps"])
+    summaries = [
+        r for r in _by_name(text, "minimiser") if r.message.startswith("step=")
+    ]
+    assert len(summaries) == n_steps
+    assert all(isinstance(r.values["pairs"], int) for r in summaries)
+    steps = diag.select(name="minimiser", kind="step")
+    assert len(steps) == n_steps
+    payload = steps[-1].values
+    assert payload["pairs"] == summaries[-1].values["pairs"]
+    assert (
+        type(payload["secant_stats"]).__name__ == type(sol.state.secant_stats).__name__
+    )
+    assert type(payload["secant_recovery"]) is type(sol.state.secant_recovery_state)
 
 
 @pytest.mark.parametrize(

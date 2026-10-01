@@ -49,10 +49,9 @@ def _enum_name(item: EnumerationItem) -> str:
 
 def _leaf_to_host(value: Any) -> Any:
     """Convert one callback leaf into a Python scalar, numpy array or name."""
+    # ``None`` never reaches here: it is an empty pytree node for ``jax.tree.map``.
     if isinstance(value, EnumerationItem):
         return _enum_name(value)
-    if value is None:
-        return None
     arr = np.asarray(value)
     if arr.ndim == 0:
         return arr.item()

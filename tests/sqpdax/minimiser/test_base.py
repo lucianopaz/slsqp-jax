@@ -154,6 +154,14 @@ def test_abstract_validate_options_is_noop():
     assert AbstractConstrainedMinimiser.validate_options(solver) is None
 
 
+def test_default_step_log_fields_are_empty():
+    """The base ``_step_log_fields`` hook contributes nothing to the summary."""
+    from slsqp_jax.sqpdax.minimiser.base import CommonMinimiser
+
+    solver = ActiveSetLineSearchStub()
+    assert CommonMinimiser._step_log_fields(solver, None, None, None, None, None) == {}
+
+
 def test_nested_subproblem_option_validation_warns():
     """Unknown keys inside a nested ``SubProblemSolver`` section warn."""
     problem = make_unconstrained_quadratic()
