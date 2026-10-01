@@ -10,7 +10,11 @@ import pytest
 
 from slsqp_jax.sqpdax.merit import NormMerit
 from slsqp_jax.sqpdax.primal import Primal
-from slsqp_jax.sqpdax.step_controller import ArmijoLineSearch, LineSearchState
+from slsqp_jax.sqpdax.step_controller import (
+    ArmijoLineSearch,
+    LineSearch,
+    LineSearchState,
+)
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS, SubProblemSolverState
 from tests.sqpdax.lagrangian.conftest import obj
 
@@ -213,3 +217,5 @@ def test_armijo_small_alpha_decrease_fallback():
     )
     assert bool(ls.stop_search(state))
     assert bool(ls.accepted_by_fallback(state))
+    # Searches without a fallback inherit the base behaviour: never by fallback.
+    assert not bool(LineSearch.accepted_by_fallback(ls, state))

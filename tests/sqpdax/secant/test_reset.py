@@ -137,6 +137,8 @@ def test_disabled_policy_clears_recovery_without_changing_secant():
         stage=jnp.asarray(2),
         fatal=jnp.asarray(True),
     )
+    # No channel can fire while disabled, however bad the inputs look.
+    assert not bool(policy.recovery_event(secant, _signals(4, 4, 4)))
     out, state, severity = policy.apply(secant, _signals(4, 4, 4), state)
     assert int(severity) == -1
     assert int(state.failure_streak) == 0
