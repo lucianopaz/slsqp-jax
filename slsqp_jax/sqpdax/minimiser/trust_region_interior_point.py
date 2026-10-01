@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Generic, Self, cast
+from typing import Any, Generic, Self, cast
 
 import equinox as eqx
 import jax
@@ -434,6 +434,7 @@ class TrustRegionInteriorPointMinimiser(
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
+        solver = solver.init(logger=self.logger.child("subproblem"))
         solver = cast(
             TrustRegionInteriorPointSolver[TrustRegionStateType],
             self._precondition(solver, problem, lag),
@@ -475,6 +476,7 @@ class TrustRegionInteriorPointMinimiser(
             StepController[InteriorPointPrimal, TrustRegionStateType],
             TrustRegionManager(
                 merit=merit,
+                logger=self.logger.child("step_controller"),
                 eta=self.eta,
                 shrink_threshold=self.shrink_threshold,
                 grow_threshold=self.grow_threshold,
@@ -545,11 +547,77 @@ class TrustRegionInteriorPointMinimiser(
         streak = jnp.where(stall, self.consecutive_model_failures + 1, 0).astype(
             jnp.int32
         )
+        self.logger.warning(
+            "model stall: radius_collapse={collapse} model_failure={failure} "
+            "rho={rho:.3e} radius={radius:.3e} consecutive={streak}",
+            when=stall,
+            collapse=radius_collapse,
+            failure=model_failure,
+            rho=state.rho,
+            radius=state.radius,
+            streak=streak,
+        )
+        self.logger.info(
+            "barrier reduced: mu={mu:.3e}",
+            when=updated,
+            mu=new_barrier.weight,
+        )
         return eqx.tree_at(
             lambda m: (m.barrier, m.barrier_updated, m.consecutive_model_failures),
             self,
             (new_barrier, updated, streak),
         )
+
+    def _step_log_fields(
+        self,
+        ctx: SubproblemContext[
+            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
+        ],
+        result: StepResult[InteriorPointPrimal, TrustRegionStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[InteriorPointPrimal, TrustRegionStateType],
+        metrics: TrustRegionInteriorPointTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Barrier weight, KKT error, trust-region radius / ratio and penalty."""
+        state = cast(TrustRegionSolverState, result.solver_state)
+        return {
+            "kkt": (metrics.optimality_residual, ".2e"),
+            "mu": (cast(Barrier, self.barrier).weight, ".2e"),
+            "mu_updated": metrics.barrier_updated,
+            "radius": (state.radius, ".2e"),
+            "rho": (state.rho, ".2e"),
+            "nu": (state.merit_penalty, ".2e"),
+            "cg_total": state.n_cg_iter,
+            "model_fail": self.consecutive_model_failures,
+        }
+
+    def _diagnostic_fields(
+        self,
+        ctx: SubproblemContext[
+            InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
+        ],
+        result: StepResult[InteriorPointPrimal, TrustRegionStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[InteriorPointPrimal, TrustRegionStateType],
+        metrics: TrustRegionInteriorPointTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Base payload plus barrier weight, trust-region state and slacks."""
+        fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
+        state = cast(TrustRegionSolverState, result.solver_state)
+        fields.update(
+            {
+                "barrier_weight": cast(Barrier, self.barrier).weight,
+                "barrier_updated": metrics.barrier_updated,
+                "radius": state.radius,
+                "rho": state.rho,
+                "nu": state.merit_penalty,
+                "predicted_reduction": state.predicted_reduction,
+                "cg_total": state.n_cg_iter,
+                "consecutive_model_failures": self.consecutive_model_failures,
+                "slack": cast(InteriorPointPrimal, self.iterate).slack,
+            }
+        )
+        return fields
 
     def _secant_reset_signals(self) -> SecantResetSignals:
         """Report model-quality stalls on the ``model`` channel only.

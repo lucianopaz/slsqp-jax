@@ -461,6 +461,7 @@ class ActiveSetLineSearchMinimiser(
         sub_opts = dict(self.options.get("subproblem", {}))
         if sub_opts:
             solver = solver.init(**sub_opts)
+        solver = solver.init(logger=self.logger.child("subproblem"))
         policy = solver.working_set_policy
         if self.active_set_predictor.disables_expand and isinstance(
             policy, ThresholdWorkingSetPolicy
@@ -609,6 +610,7 @@ class ActiveSetLineSearchMinimiser(
             StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
                 merit=merit,
+                logger=self.logger.child("step_controller"),
                 max_steps=self.line_search_max_steps,
                 c1=self.armijo_c1,
                 backtrack=self.armijo_backtrack,
@@ -749,6 +751,31 @@ class ActiveSetLineSearchMinimiser(
         fallback_accept = result.accepted & result.accepted_by_fallback
         armijo_accept = result.accepted & ~result.accepted_by_fallback
 
+        self.logger.warning(
+            "qp failure: result={qp_result} status={status} nonfinite={nonfinite} "
+            "consecutive={streak}",
+            when=qp_real_failure,
+            qp_result=solver_state.qp_result,
+            status=solver_state.status,
+            nonfinite=qp_nonfinite,
+            streak=qp_failures,
+        )
+        self.logger.warning(
+            "line search rejected the step: feasible={feasible} "
+            "consecutive_failures={streak}",
+            when=~result.accepted,
+            feasible=feasible,
+            streak=ls_failures,
+        )
+        self.logger.warning(
+            "merit blow-up ({count} consecutive): rolling back to the best "
+            "iterate (merit={best:.6e}, current={current:.6e})",
+            when=iterate_blowup,
+            count=blowup_count,
+            best=new_best_merit,
+            current=result.merit_val,
+        )
+
         updated = eqx.tree_at(
             lambda m: (
                 m.merit_penalty,
@@ -834,6 +861,57 @@ class ActiveSetLineSearchMinimiser(
                 ),
             ),
         )
+
+    def _step_log_fields(
+        self,
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        result: StepResult[Primal, ActiveSetStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[Primal, ActiveSetStateType],
+        metrics: ActiveSetLineSearchTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Stationarity / feasibility, penalty, QP outcome and failure streaks."""
+        solver_state = cast(ActiveSetStateType, result.solver_state)
+        return {
+            "kkt": (metrics.stationarity, ".2e"),
+            "kkt_ratio": (metrics.kkt_ratio, ".2e"),
+            "feas": (metrics.feasibility, ".2e"),
+            "penalty": (self.merit_penalty, ".2e"),
+            "qp_result": solver_state.qp_result,
+            "qp_iters": solver_state.last_n_iter,
+            "cg_iters": solver_state.last_n_cg_iter,
+            "ls_fallback": self.last_ls_fallback,
+            "qp_fail": self.consecutive_qp_failures,
+            "ls_fail": self.consecutive_ls_failures,
+            "stall": self.steps_without_improvement,
+        }
+
+    def _diagnostic_fields(
+        self,
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        result: StepResult[Primal, ActiveSetStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[Primal, ActiveSetStateType],
+        metrics: ActiveSetLineSearchTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Base payload plus penalty, failure streaks and the QP working set."""
+        fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
+        solver_state = cast(ActiveSetStateType, result.solver_state)
+        fields.update(
+            {
+                "merit_penalty": self.merit_penalty,
+                "consecutive_qp_failures": self.consecutive_qp_failures,
+                "consecutive_ls_failures": self.consecutive_ls_failures,
+                "consecutive_zero_steps": self.consecutive_zero_steps,
+                "steps_without_improvement": self.steps_without_improvement,
+                "blowup_count": self.blowup_count,
+                "last_ls_fallback": self.last_ls_fallback,
+                "qp_result": solver_state.qp_result,
+                "qp_active_set": solver_state.active_set,
+                "qp_dual": solver_state.dual,
+            }
+        )
+        return fields
 
     def _secant_reset_signals(self) -> SecantResetSignals:
         """Report QP failures as subproblem and line-search failures as step streaks."""

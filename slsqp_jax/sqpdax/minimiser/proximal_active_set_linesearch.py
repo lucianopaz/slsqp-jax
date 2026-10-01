@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Self, cast
+from typing import Any, Self, cast
 
 import equinox as eqx
 from jax import numpy as jnp
@@ -31,6 +31,7 @@ from .active_set_linesearch import (
     ActiveSetLineSearchMinimiser,
     ActiveSetLineSearchTerminationMetrics,
 )
+from .base import OptimisationContext
 
 __all__ = [
     "ProximalActiveSetLineSearchMinimiser",
@@ -195,6 +196,41 @@ class ProximalActiveSetLineSearchMinimiser(
             jnp.asarray(dual.eq_multipliers, state.eq_center.dtype),
         )
         return cast(Self, eqx.tree_at(lambda m: m.solver_state, advanced, state))
+
+    def _step_log_fields(
+        self,
+        ctx: SubproblemContext[
+            Primal, ActiveSetSubProblem, ProximalActiveSetQPSolverState
+        ],
+        result: StepResult[Primal, ProximalActiveSetQPSolverState],
+        step_dual: Dual,
+        octx: OptimisationContext[Primal, ProximalActiveSetQPSolverState],
+        metrics: ActiveSetLineSearchTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Base columns plus the proximal parameter and residual."""
+        fields = super()._step_log_fields(ctx, result, step_dual, octx, metrics)
+        state = cast(ProximalActiveSetQPSolverState, result.solver_state)
+        fields["prox_mu"] = (state.mu, ".2e")
+        fields["prox_res"] = (state.kkt_residual, ".2e")
+        return fields
+
+    def _diagnostic_fields(
+        self,
+        ctx: SubproblemContext[
+            Primal, ActiveSetSubProblem, ProximalActiveSetQPSolverState
+        ],
+        result: StepResult[Primal, ProximalActiveSetQPSolverState],
+        step_dual: Dual,
+        octx: OptimisationContext[Primal, ProximalActiveSetQPSolverState],
+        metrics: ActiveSetLineSearchTerminationMetrics,
+    ) -> dict[str, Any]:
+        """Base payload plus the proximal parameter, residual and centre."""
+        fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
+        state = cast(ProximalActiveSetQPSolverState, result.solver_state)
+        fields["prox_mu"] = state.mu
+        fields["prox_kkt_residual"] = state.kkt_residual
+        fields["eq_center"] = state.eq_center
+        return fields
 
     def _secant_reset_signals(self) -> SecantResetSignals:
         """Report structural QP failures, but not productive proximal retries.

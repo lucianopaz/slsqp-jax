@@ -9,6 +9,7 @@ import jax
 import optimistix as optx
 from jax import numpy as jnp
 
+from ..logging import Logger
 from ..problem import ProblemProtocol, bind_problem_args
 from ..types import Vector_n
 from .base import AbstractConstrainedMinimiser
@@ -55,8 +56,13 @@ def minimise(
         If ``True``, wrap the solution in :func:`equinox.error_if` when
         the status is not ``successful``.
     options
-        Optional ``{"minimiser": {...}, "subproblem": {...}}`` bag
-        forwarded to :meth:`init`.
+        Optional ``{"minimiser": {...}, "subproblem": {...}, "logging": ...}``
+        bag forwarded to :meth:`init`; the ``logging`` entry configures the
+        solver's :class:`~slsqp_jax.sqpdax.logging.logger.Logger` (see
+        :meth:`~slsqp_jax.sqpdax.logging.logger.Logger.from_options`); a
+        :class:`~slsqp_jax.sqpdax.logging.handlers.DiagnosticsHandler`
+        under its ``diagnostics`` key additionally collects structured
+        per-step / per-solve records and a final ``"run"`` record.
     problem_args
         Additional positional arguments forwarded to the problem.
     problem_kwargs
@@ -76,6 +82,11 @@ def minimise(
     """
     problem = bind_problem_args(problem, problem_args, problem_kwargs)
     solver = solver.init(problem, x0, options)
+    logger = getattr(solver, "logger", Logger.disabled())
+    logger.info(
+        f"{type(solver).__name__}: n={problem.n} meq={problem.meq} "
+        f"mineq={problem.mineq} max_steps={max_steps}"
+    )
 
     def cond(carry):
         solver, n = carry
@@ -93,6 +104,29 @@ def minimise(
     done, result = solver.terminate(problem)
     result = solver.result_adapter.result_type.where(
         done, result, solver.result_adapter.max_steps_reached
+    )
+    successful = solver.result_adapter.is_successful(result)
+    logger.info(
+        "finished: result={result} steps={steps}",
+        when=successful,
+        result=result,
+        steps=solver.step_count,
+    )
+    logger.warning(
+        "finished without success: result={result} steps={steps}",
+        when=~successful,
+        result=result,
+        steps=solver.step_count,
+    )
+    logger.diagnostic(
+        "run",
+        {
+            "result": result,
+            "successful": successful,
+            "steps": solver.step_count,
+            "x": solver.iterate,
+            "dual": solver.dual,
+        },
     )
     solution = solver.postprocess(problem, result)
     if throw:
