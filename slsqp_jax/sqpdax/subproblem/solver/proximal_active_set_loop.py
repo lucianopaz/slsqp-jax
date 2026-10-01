@@ -1,6 +1,6 @@
 """Proximal (stabilised-SQP) wrapper around the active-set QP loop."""
 
-from typing import Generic, cast
+from typing import Any, Generic, cast
 
 from equinox import tree_at
 from jax import numpy as jnp
@@ -191,10 +191,21 @@ class ProximalActiveSetQPSolver(
             ProximalActiveSetSubProblem(lag, subproblem.active_set, mu, eq_center),
         )
 
-        step, state = super().solve(prox, x0, initial_state)
+        step, state = self._solve_working_set(prox, x0, initial_state)
         lam_eq = prox.recover_eq_multipliers(step[0].x)
         step = (step[0], tree_at(lambda d: d.eq_multipliers, step[1], lam_eq))
         new_state = tree_at(
             lambda s: (s.mu, s.eq_center, s.dual), state, (mu, lam_eq, step[1])
         )
+        self._emit_qp_diagnostic(step, new_state)
         return step, new_state
+
+    def _qp_diagnostic_fields(
+        self, step: tuple[Primal, Dual], state: ProximalActiveSetQPSolverState
+    ) -> dict[str, Any]:
+        """Base payload plus the proximal parameter, residual and centre."""
+        fields = super()._qp_diagnostic_fields(step, state)
+        fields["prox_mu"] = state.mu
+        fields["prox_kkt_residual"] = state.kkt_residual
+        fields["eq_center"] = state.eq_center
+        return fields
