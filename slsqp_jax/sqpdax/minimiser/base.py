@@ -17,6 +17,7 @@ from jaxtyping import Array, Bool, Int
 
 from ..dual import Dual
 from ..lagrangian import EvaluatedLagrangian, Lagrangian
+from ..logging import INFO, Logger, format_fields
 from ..preconditioner import (
     NoPreconditioner,
     PreconditionerContext,
@@ -323,6 +324,18 @@ class CommonMinimiser(
         maintained secant, or ``None`` when no secant is kept.
     secant_recovery_state
         Dynamic global recovery episode shared by all failure channels.
+    logger
+        Root :class:`~slsqp_jax.sqpdax.logging.logger.Logger` (name
+        ``"minimiser"``); configure through ``options['logging']`` (see
+        :meth:`~slsqp_jax.sqpdax.logging.logger.Logger.from_options`).
+        Child loggers ``minimiser.subproblem`` and
+        ``minimiser.step_controller`` are handed to the subproblem solver
+        and the step controller built each step. Disabled by default.
+        Passing a
+        :class:`~slsqp_jax.sqpdax.logging.handlers.DiagnosticsHandler` under
+        ``options['logging']['diagnostics']`` additionally records a
+        structured ``"step"`` payload per iteration (see
+        :meth:`_diagnostic_fields`) plus the solver records.
     """
 
     solver_state: SubProblemSolverStateType | None = None
@@ -344,6 +357,7 @@ class CommonMinimiser(
     secant_reset: SecantResetPolicy = eqx.field(
         static=True, default_factory=SecantResetPolicy
     )
+    logger: Logger = eqx.field(static=True, default_factory=Logger.disabled)
 
     def __check_init__(self) -> None:
         if self.curvature not in ("auto", "exact", "secant"):
@@ -376,7 +390,7 @@ class CommonMinimiser(
         recursing into nested ``SubProblemSolver`` fields.
         """
         opts = self.options
-        for k in sorted(set(opts) - {"minimiser", "subproblem"}):
+        for k in sorted(set(opts) - {"minimiser", "subproblem", "logging"}):
             warnings.warn(
                 f"{type(self).__name__}: ignoring unknown option section '{k}'"
             )
@@ -438,7 +452,8 @@ class CommonMinimiser(
         The option bag is stored as a hashable :class:`~slsqp_jax.sqpdax.registry.FrozenDict`
         so the module stays a valid static-aux ``while_loop`` carry. Recognised
         ``minimiser`` static-field keys are applied via
-        :func:`dataclasses.replace`. Concrete solvers may override to also
+        :func:`dataclasses.replace`, and an optional ``logging`` section
+        builds :attr:`logger`. Concrete solvers may override to also
         build ``kind``-family fields (e.g. ``barrier_update``).
 
         Parameters
@@ -457,8 +472,11 @@ class CommonMinimiser(
         static_names = static_field_names(type(self)) - {
             "preconditioner",
             "secant_reset",
+            "logger",
         }
         updates = {k: mopts[k] for k in mopts if k in static_names}
+        if "logging" in frozen:
+            updates["logger"] = Logger.from_options(frozen["logging"])
         if "preconditioner" in mopts:
             updates["preconditioner"] = self._parse_preconditioner(
                 mopts["preconditioner"]
@@ -1045,7 +1063,163 @@ class CommonMinimiser(
             ),
         )
         advanced = advanced._advance_dynamics(ctx, result, committed_dual)
-        return advanced._reset_secant()
+        advanced = advanced._reset_secant()
+        advanced._log_step(ctx, result, committed_dual)
+        return advanced
+
+    def _log_step(
+        self,
+        ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
+        result: StepResult[PrimalType, SubProblemSolverStateType],
+        step_dual: Dual,
+    ) -> None:
+        """Emit the per-step ``INFO`` summary and ``"step"`` diagnostic record.
+
+        Called on the *updated* minimiser at the very end of
+        :meth:`_execute_step`, so every field describes the committed
+        state. Nothing is traced when the logger is below ``INFO`` and its
+        diagnostics channel is off: the termination metrics used by both
+        outputs are only computed inside the enabled branch.
+
+        The shared text columns are the step counter, objective, merit, step
+        length, proposed step norm, acceptance flag, subproblem success /
+        status and (when a secant is kept) the number of stored pairs;
+        :meth:`_step_log_fields` appends the algorithm-specific ones. The
+        diagnostic payload is assembled by :meth:`_diagnostic_fields`.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        result
+            Outcome of :meth:`_assess_direction`.
+        step_dual
+            Committed multipliers.
+        """
+        text = self.logger.is_enabled_for(INFO)
+        diagnostics = self.logger.diagnostics_enabled
+        if not (text or diagnostics):
+            return
+        octx = self._optimisation_context(ctx.problem)
+        metrics = self.termination_metrics(octx)
+        solver_state = cast(SubProblemSolverStateType, result.solver_state)
+        if text:
+            fields: dict[str, Any] = {
+                "step": self.step_count,
+                "f": (octx.lagrangian.fn_val, ".6e"),
+                "merit": (result.merit_val, ".6e"),
+                "alpha": (result.step_size, ".2e"),
+                "dnorm": (result.proposed_step_norm, ".2e"),
+                "accepted": result.accepted,
+                "sub_ok": solver_state.success,
+                "sub_status": solver_state.status,
+            }
+            if self.secant is not None:
+                fields["pairs"] = self.secant.num_pairs
+            fields.update(self._step_log_fields(ctx, result, step_dual, octx, metrics))
+            msg, values = format_fields(fields)
+            self.logger.info(msg, **values)
+        if diagnostics:
+            self.logger.diagnostic(
+                "step", self._diagnostic_fields(ctx, result, step_dual, octx, metrics)
+            )
+
+    def _diagnostic_fields(
+        self,
+        ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
+        result: StepResult[PrimalType, SubProblemSolverStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[PrimalType, SubProblemSolverStateType],
+        metrics: TerminationMetricsType,
+    ) -> dict[str, Any]:
+        """Payload of the per-step ``"step"`` diagnostic record.
+
+        Only evaluated when the logger's diagnostics channel is enabled.
+        Values may be any pytree of arrays (modules, tuples, enumeration
+        items) but must not contain non-array leaves such as the curvature
+        closures on the evaluated problem. Subclasses extend the base payload
+        by calling ``super()`` and adding algorithm-specific entries.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        result
+            Outcome of :meth:`_assess_direction`.
+        step_dual
+            Committed multipliers.
+        octx
+            Termination context at the committed iterate.
+        metrics
+            :meth:`termination_metrics` evaluated on ``octx``.
+
+        Returns
+        -------
+        dict
+            Step counter, iterate, multipliers, objective / constraint values
+            and Jacobians, Lagrangian gradient, merit and step-control
+            outcome, the subproblem solver carry, the termination metrics and
+            (when a secant is kept) its statistics and recovery state.
+        """
+        lag = octx.lagrangian
+        fields: dict[str, Any] = {
+            "step": self.step_count,
+            "x": self.iterate,
+            "dual": self.dual,
+            "f": lag.fn_val,
+            "grad": lag.grad_val,
+            "grad_lagrangian": lag.x_grad,
+            "eq_val": lag.eq_fn_val,
+            "eq_jac": lag.eq_fn_jac_val,
+            "ineq_val": lag.ineq_fn_val,
+            "ineq_jac": lag.ineq_fn_jac_val,
+            "merit": result.merit_val,
+            "alpha": result.step_size,
+            "dnorm": result.proposed_step_norm,
+            "accepted": result.accepted,
+            "accepted_by_fallback": result.accepted_by_fallback,
+            "solver_state": result.solver_state,
+            "metrics": metrics,
+        }
+        if self.secant is not None:
+            fields["pairs"] = self.secant.num_pairs
+            fields["secant_stats"] = self.secant_stats
+            fields["secant_recovery"] = self.secant_recovery_state
+        return fields
+
+    def _step_log_fields(
+        self,
+        ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
+        result: StepResult[PrimalType, SubProblemSolverStateType],
+        step_dual: Dual,
+        octx: OptimisationContext[PrimalType, SubProblemSolverStateType],
+        metrics: TerminationMetricsType,
+    ) -> dict[str, Any]:
+        """Algorithm-specific columns appended to the per-step summary.
+
+        Only evaluated when the logger is enabled for ``INFO``. Keys must be
+        valid identifiers; values are bare arrays or ``(array, fmt)`` pairs
+        as accepted by :func:`~slsqp_jax.sqpdax.logging.logger.format_fields`.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        result
+            Outcome of :meth:`_assess_direction`.
+        step_dual
+            Committed multipliers.
+        octx
+            Termination context at the committed iterate.
+        metrics
+            :meth:`termination_metrics` evaluated on ``octx``.
+
+        Returns
+        -------
+        dict
+            Extra fields; empty by default.
+        """
+        return {}
 
     def _secant_reset_signals(self) -> SecantResetSignals:
         """Failure streaks reported to :attr:`secant_reset` after a step.
@@ -1079,6 +1253,27 @@ class CommonMinimiser(
             self.secant_recovery_state,
         )
         stats = cast(SecantStatistics, self.secant_stats).record_reset(severity, secant)
+        self.logger.warning(
+            "secant reset: severity={severity} recovery_streak={streak} "
+            "recovery_stage={stage} fatal={fatal}",
+            when=severity > 0,
+            severity=severity,
+            streak=recovery.failure_streak,
+            stage=recovery.stage,
+            fatal=recovery.fatal,
+        )
+        self.logger.diagnostic(
+            "secant_reset",
+            lambda: {
+                "step": self.step_count,
+                "severity": severity,
+                "recovery": recovery,
+                "stats_before": self.secant_stats,
+                "stats_after": stats,
+                "pairs_after": secant.num_pairs,
+            },
+            when=severity > 0,
+        )
         return eqx.tree_at(
             lambda m: (m.secant, m.secant_stats, m.secant_recovery_state),
             self,

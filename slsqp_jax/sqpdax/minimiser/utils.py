@@ -16,8 +16,9 @@ def minimiser_option_keys(cls: type) -> set[str]:
 
     Includes static tunable Equinox fields plus any ``kind``-family fields
     (``secant`` / ``preconditioner`` / ``barrier_update``). ``options``
-    itself is a static field but is the bag being validated, so it is never
-    returned as a key.
+    itself is a static field but is the bag being validated, and ``logger``
+    is configured through the separate ``options['logging']`` section, so
+    neither is returned as a key.
 
     Parameters
     ----------
@@ -40,14 +41,17 @@ def minimiser_option_keys(cls: type) -> set[str]:
     >>> keys[4:]
     ['rtol', 'secant', 'secant_memory', 'secant_reset']
     """
-    return (static_field_names(cls) | kind_family_field_names(cls)) - {"options"}
+    return (static_field_names(cls) | kind_family_field_names(cls)) - {
+        "options",
+        "logger",
+    }
 
 
 def solver_option_keys(cls: type) -> set[str]:
     """Recognised ``options['subproblem']`` keys for a subproblem-solver type.
 
-    All dataclass fields of ``cls`` except ``lagrangian`` (injected per
-    step, not user-set). Nested ``SubProblemSolver`` fields are validated
+    All dataclass fields of ``cls`` except ``lagrangian`` and ``logger``
+    (both injected per step, not user-set). Nested ``SubProblemSolver`` fields are validated
     recursively by
     :meth:`~slsqp_jax.sqpdax.minimiser.base.CommonMinimiser._validate_solver_options`.
 
@@ -71,4 +75,4 @@ def solver_option_keys(cls: type) -> set[str]:
     >>> "lagrangian" in solver_option_keys(ProjectedCGSubProblemSolver)
     False
     """
-    return {f.name for f in fields(cast(Any, cls))} - {"lagrangian"}
+    return {f.name for f in fields(cast(Any, cls))} - {"lagrangian", "logger"}
