@@ -9,6 +9,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Scalar
 
 from ...dual import Dual
+from ...linalg import steihaug_step
 from ...primal import InteriorPointPrimal
 from ..funnel_barrier import FunnelBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -217,7 +218,6 @@ class ScaledNormalStepSolver(
 
         # --- CGLS with Steihaug–Toint termination, started at w = 0 --------------
         rel_tol_sq = (jnp.asarray(self.tol, dtype) * pi_v) ** 2
-        r2 = radius**2
 
         def body(_i, carry):
             w, r, s, p, gamma, done, ncg, on_bnd = carry
@@ -227,17 +227,7 @@ class ScaledNormalStepSolver(
                 q = A(p)
                 qq = jnp.dot(q, q)
                 alpha = jnp.where(qq > tiny, gamma / jnp.maximum(qq, tiny), 0.0)
-                w_full = w + alpha * p
-                # Positive root of ‖w + β p‖² = δ² (step to the boundary).
-                pp = jnp.dot(p, p)
-                ww = jnp.dot(w, w)
-                wp = jnp.dot(w, p)
-                disc = jnp.sqrt(jnp.maximum(wp * wp + pp * (r2 - ww), 0.0))
-                beta_bnd = jnp.where(
-                    pp > tiny, (-wp + disc) / jnp.maximum(pp, tiny), 0.0
-                )
-                cross = jnp.dot(w_full, w_full) >= r2
-                w_new = jnp.where(cross, w + beta_bnd * p, w_full)
+                w_new, cross = steihaug_step(w, p, alpha, radius)
                 r_new = r - alpha * q
                 s_new = At(r_new)
                 gamma_new = jnp.dot(s_new, s_new)
