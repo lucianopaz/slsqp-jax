@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
+import jax
 import jax.numpy as jnp
 import pytest
 from jax import Array
@@ -17,12 +20,22 @@ from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.funnel_barrier import FunnelBarrierSubProblem
 from slsqp_jax.sqpdax.subproblem.scaled_barrier import ScaledBarrierSubProblem
+from tests.sqpdax.conftest import make_shifted_box_quadratic
 from tests.sqpdax.lagrangian.conftest import (
     make_dual,
     make_ip_primal,
     make_primal,
     make_problem,
 )
+
+# Problems the trust-funnel component tests are parametrised over.
+FUNNEL_PROBLEMS: dict[str, Callable[[], Problem]] = {
+    "eq-ineq-finite": lambda: make_problem(),
+    "eq-ineq-mixed-null": lambda: make_problem(
+        lb=jnp.array([0.0, -jnp.inf]), ub=jnp.array([jnp.inf, 3.0])
+    ),
+    "shifted-box": lambda: make_shifted_box_quadratic(n=3)[0],
+}
 
 
 def make_active_set(
@@ -158,6 +171,86 @@ def make_funnel_barrier_subproblem(
         dual=dual,
     )
     return FunnelBarrierSubProblem(evaluated, kappa_fbn=kappa_fbn, kappa_fbt=kappa_fbt)
+
+
+def dense_funnel_reference(
+    sub: FunnelBarrierSubProblem,
+) -> tuple[Array, Array, Array, Array]:
+    """Assemble ``(ĝ, Ĥ, Â, ĉ)`` densely from ``P``, ``J(x, s)`` and ``G``.
+
+    Null bound slacks are dead coordinates: ``P`` carries a zero there so
+    every scaled object vanishes on them, matching the operator masks.
+    """
+    lag = sub.lagrangian
+    n, meq, mineq = lag.n, lag.meq, lag.mineq
+    S = lag.slack
+    live_lb = ~lag.null_lb
+    live_ub = ~lag.null_ub
+    p = jnp.concatenate(
+        [
+            jnp.ones((n,)),
+            S.s,
+            jnp.where(live_lb, S.s_lb, 0.0),
+            jnp.where(live_ub, S.s_ub, 0.0),
+        ]
+    )
+    P = jnp.diag(p)
+
+    m = meq + mineq + 2 * n
+    N = n + mineq + 2 * n
+    J = jnp.zeros((m, N))
+    J = J.at[:meq, :n].set(lag.eq_fn_jac_val)
+    J = J.at[meq : meq + mineq, :n].set(lag.ineq_fn_jac_val)
+    J = J.at[meq : meq + mineq, n : n + mineq].set(jnp.eye(mineq))
+    r0 = meq + mineq
+    J = J.at[r0 : r0 + n, :n].set(-jnp.diag(live_lb.astype(J.dtype)))
+    J = J.at[r0 : r0 + n, n + mineq : n + mineq + n].set(
+        jnp.diag(live_lb.astype(J.dtype))
+    )
+    J = J.at[r0 + n :, :n].set(jnp.diag(live_ub.astype(J.dtype)))
+    J = J.at[r0 + n :, n + mineq + n :].set(jnp.diag(live_ub.astype(J.dtype)))
+
+    eye_n = jnp.eye(n)
+    H_xx = jnp.stack([lag.hvp(eye_n[i]) for i in range(n)], axis=1)
+    if lag.primal_dual:
+        y = lag.dual
+        D = jnp.concatenate(
+            [
+                y.ineq_multipliers / S.s,
+                y.lb_multipliers / S.s_lb,
+                y.ub_multipliers / S.s_ub,
+            ]
+        )
+    else:
+        eye_s = jnp.eye(mineq + 2 * n)
+        D = jnp.stack(
+            [
+                lag.barrier.hvp(Slack.from_flat(eye_s[i], n, mineq)).flatten()[i]
+                for i in range(mineq + 2 * n)
+            ]
+        )
+    live_s = jnp.concatenate([jnp.ones((mineq,), bool), live_lb, live_ub])
+    D = jnp.where(live_s, D, 0.0)
+    G = jax.scipy.linalg.block_diag(H_xx, jnp.diag(D))
+
+    g = jnp.concatenate([lag.grad_val, lag.barrier.grad_val.flatten()])
+    g = jnp.where(p > 0.0, g, 0.0)
+    c = lag.dual_grad.flatten()
+    return P @ g, P @ G @ P, J @ P, c
+
+
+def random_funnel_step(sub: FunnelBarrierSubProblem, seed: int) -> InteriorPointPrimal:
+    """Random scaled primal step for ``sub`` (deterministic in ``seed``)."""
+    lag = sub.lagrangian
+    flat = jax.random.normal(jax.random.key(seed), (lag.n + lag.mineq + 2 * lag.n,))
+    return InteriorPointPrimal.from_flat(0.3 * flat, lag.n, lag.mineq)
+
+
+def random_funnel_dual(sub: FunnelBarrierSubProblem, seed: int) -> Dual:
+    """Random dual vector for ``sub`` (deterministic in ``seed``)."""
+    lag = sub.lagrangian
+    flat = jax.random.normal(jax.random.key(seed), (lag.meq + lag.mineq + 2 * lag.n,))
+    return Dual.from_flat(flat, lag.n, lag.mineq, lag.meq)
 
 
 def make_scaled_barrier_subproblem(

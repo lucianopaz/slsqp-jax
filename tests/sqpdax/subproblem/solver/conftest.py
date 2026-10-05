@@ -19,6 +19,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     MinresQLPState,
     ProjectedCGState,
     ProximalActiveSetQPSolverState,
+    ScaledNormalStepState,
     SteihaugTointCGTangentialStepSolverState,
     SVDProjector,
     TrustRegionSolverState,
@@ -114,6 +115,11 @@ def make_steihaug_state(
         radius=jnp.asarray(radius),
         active_bounds=active_bounds,
     )
+
+
+def make_scaled_normal_state(radius: float | Array = 1.0) -> ScaledNormalStepState:
+    """Cold :class:`ScaledNormalStepState` with the given normal radius."""
+    return ScaledNormalStepState.cold(radius)
 
 
 def make_empty_active_set(n: int = 2, meq: int = 0, mineq: int = 0) -> ActiveSet:
