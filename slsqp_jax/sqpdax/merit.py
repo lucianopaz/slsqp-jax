@@ -23,6 +23,7 @@ __all__ = [
     "safe_norm",
     "Merit",
     "NormMerit",
+    "ConstraintViolation",
 ]
 
 
@@ -226,3 +227,57 @@ class NormMerit(Merit):
             safe_norm(eq_fn_val, ord=self.norm) + safe_norm(ineq, ord=self.norm)
         )
         return output
+
+
+class ConstraintViolation(Module):
+    """Joint-norm constraint violation matching the dual residual layout.
+
+    Evaluates ``‖[g(x); h(x)+s; ℓ-x+s_ℓ; x-u+s_u]‖`` (null-bound rows
+    zeroed) when ``x`` is an
+    :class:`~slsqp_jax.sqpdax.primal.InteriorPointPrimal`, and the same
+    concatenation without slacks when ``x`` is a plain
+    :class:`~slsqp_jax.sqpdax.primal.Primal`. The joint 2-norm of these
+    rows is the paper's ``v(x, s)`` and equals
+    :meth:`~slsqp_jax.sqpdax.dual.Dual.flatten` of the Lagrangian dual
+    residual, so the ratio ``ρᵛ`` uses the same norm as the linearised
+    model ``mᵛ``.
+
+    Attributes
+    ----------
+    problem
+        NLP whose constraint / bound residuals are scored.
+    norm
+        Order of the joint residual norm (``2`` for the trust-funnel
+        violation).
+    """
+
+    problem: ProblemProtocol
+    norm: int = field(default=2)
+
+    def __call__(self, x: Primal, *args, **kwargs) -> Scalar:
+        """Evaluate the joint residual norm at primal ``x``.
+
+        Parameters
+        ----------
+        x
+            Primal iterate (plain or interior-point).
+        *args, **kwargs
+            Extra arguments forwarded to ``problem(x, ...)``.
+
+        Returns
+        -------
+        Scalar
+            ``‖c(x[, s])‖`` in :attr:`norm`.
+        """
+        evaled = self.problem(x, *args, **kwargs)
+        eq = evaled.eq_fn_val
+        ineq = evaled.ineq_fn_val
+        lb = jnp.where(evaled.null_lb, 0.0, evaled.lb - x.x)
+        ub = jnp.where(evaled.null_ub, 0.0, x.x - evaled.ub)
+        if isinstance(x, InteriorPointPrimal):
+            slack = x.slack
+            ineq = ineq + slack.s
+            lb = lb + jnp.where(evaled.null_lb, 0.0, slack.s_lb)
+            ub = ub + jnp.where(evaled.null_ub, 0.0, slack.s_ub)
+        residual = jnp.concatenate([eq, ineq, lb, ub])
+        return safe_norm(residual, ord=self.norm)

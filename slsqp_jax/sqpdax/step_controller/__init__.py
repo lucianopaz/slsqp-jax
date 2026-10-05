@@ -8,7 +8,7 @@ take it and returns a :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`
 """
 
 from . import base, line_search, trust_region_radius
-from .base import StepController, StepResult
+from .base import MeritStepController, StepController, StepResult
 from .line_search import ArmijoLineSearch, LineSearch, LineSearchState
 from .trust_region_radius import TrustRegionManager
 
@@ -18,6 +18,7 @@ __all__ = [
     "trust_region_radius",
     "StepResult",
     "StepController",
+    "MeritStepController",
     "LineSearchState",
     "LineSearch",
     "ArmijoLineSearch",

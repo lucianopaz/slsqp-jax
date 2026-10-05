@@ -11,7 +11,7 @@ from jaxtyping import Array, Bool, Int, Scalar
 
 from ..primal import Primal
 from ..subproblem.solver import SubProblemSolverState
-from .base import StepController, StepResult
+from .base import MeritStepController, StepResult
 
 
 class LineSearchState(Module):
@@ -80,7 +80,7 @@ class LineSearchState(Module):
         return jax.tree.map(jnp.add, self.x0, scaled)
 
 
-class LineSearch(StepController[Primal, SubProblemSolverState]):
+class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
     """Abstract backtracking line search along a fixed direction.
 
     Template method: :meth:`step` evaluates the merit and its gradient at
