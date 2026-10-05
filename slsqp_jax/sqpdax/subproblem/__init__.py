@@ -29,8 +29,12 @@ from .solver import (
     ActiveSetQPSolverState,
     DogLegSolver,
     DogLegSolverState,
+    ForcingFunction,
     GradientProjection,
     GradientProjectionState,
+    LinearForcing,
+    MultiplierCase,
+    MultiplierClassification,
     ProjectedCGState,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
@@ -49,6 +53,7 @@ from .solver import (
     TrustRegionSolverState,
     WorkingSetPolicy,
     WorkingSetPolicyState,
+    classify_multiplier_case,
 )
 
 __all__ = [
@@ -73,6 +78,11 @@ __all__ = [
     "ActiveSetQPSolver",
     "DogLegSolverState",
     "DogLegSolver",
+    "ForcingFunction",
+    "LinearForcing",
+    "MultiplierCase",
+    "MultiplierClassification",
+    "classify_multiplier_case",
     "GradientProjectionState",
     "GradientProjection",
     "ProjectedCGState",

@@ -24,8 +24,12 @@ from slsqp_jax.sqpdax.subproblem.solver import (
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.subproblem.conftest import (
+    FUNNEL_PROBLEMS,
+    dense_funnel_reference,
+    make_funnel_barrier_subproblem,
     make_scaled_barrier_subproblem,
     make_zero_dual,
+    random_funnel_step,
 )
 
 from .conftest import make_qp_subproblem, make_trust_region_state, unbounded_box
@@ -226,6 +230,72 @@ def test_barrier_safeguard_matches_the_trust_region_rule():
     assert mineq == 2
     with pytest.raises(TypeError, match="interior-point"):
         BarrierSafeguard().apply(_as_free(), make_zero_dual(2, 1, 2))
+
+
+@pytest.mark.parametrize("max_norm", [0.5, 1e3], ids=["active", "inactive"])
+def test_barrier_safeguard_max_norm_caps_the_dual_without_breaking_positivity(
+    max_norm,
+):
+    """κ_y of (3.10): rescale onto the 2-norm ball only when it is exceeded."""
+    sub = make_scaled_barrier_subproblem()
+    n = sub.lagrangian.n
+    dual = Dual(
+        eq_multipliers=jnp.array([-2.0]),
+        ineq_multipliers=jnp.array([-1.0, 0.5]),
+        lb_multipliers=-jnp.ones(n),
+        ub_multipliers=jnp.full(n, 2.0),
+    )
+    uncapped = BarrierSafeguard().apply(sub, dual)
+    capped = BarrierSafeguard(max_norm=max_norm).apply(sub, dual)
+    norm = float(jnp.linalg.norm(uncapped.flatten()))
+    assert float(jnp.linalg.norm(capped.flatten())) <= max_norm * (1 + 1e-6)
+    if norm <= max_norm:
+        assert jnp.array_equal(capped.flatten(), uncapped.flatten())
+    else:
+        # Uniform shrink: same direction, norm exactly on the ball.
+        assert jnp.allclose(
+            capped.flatten(), uncapped.flatten() * (max_norm / norm), rtol=1e-6
+        )
+        assert jnp.isclose(jnp.linalg.norm(capped.flatten()), max_norm, rtol=1e-6)
+    # Positivity from the N&W repair survives the rescaling; nulls stay zero.
+    lag = sub.lagrangian
+    assert jnp.all(capped.ineq_multipliers > 0)
+    assert jnp.all(capped.lb_multipliers[~lag.null_lb] > 0)
+    assert jnp.all(capped.lb_multipliers[lag.null_lb] == 0)
+    assert jnp.all(capped.ub_multipliers[~lag.null_ub] > 0)
+    assert jnp.all(capped.ub_multipliers[lag.null_ub] == 0)
+
+
+def test_barrier_safeguard_rejects_non_positive_max_norm():
+    with pytest.raises(ValueError, match="max_norm"):
+        BarrierSafeguard(max_norm=0.0)
+
+
+@pytest.mark.parametrize(
+    "make_problem_", FUNNEL_PROBLEMS.values(), ids=FUNNEL_PROBLEMS.keys()
+)
+def test_kkt_recovery_on_funnel_subproblem_solves_the_scaled_least_squares(
+    make_problem_,
+):
+    """(2.7) of CGRT 2017: ``y = argmin ‖ĝ + Ĥ wₙ + Âᵀ y‖₂`` with ``wₙ`` the normal step.
+
+    Both the dense ``lstsq`` and the matrix-free LSMR path return the
+    minimum-norm solution, so they agree even when null bounds leave zero
+    rows in ``Â``.
+    """
+    sub = make_funnel_barrier_subproblem(problem=make_problem_())
+    g_hat, h_hat, a_hat, _ = dense_funnel_reference(sub)
+    w_n = random_funnel_step(sub, seed=3)
+    w_flat, _ = ravel_pytree(w_n)
+    rhs = -(g_hat + h_hat @ w_flat)
+    expected, *_ = jnp.linalg.lstsq(a_hat.T, rhs)
+
+    y = KKTMultiplierRecovery(rtol=1e-8, atol=1e-8).recover(sub, None, w_n)
+    assert jnp.allclose(y.flatten(), expected, atol=1e-4)
+    # The subproblem's residual (3.13) at this dual is the least-squares residual.
+    assert jnp.allclose(
+        ravel_pytree(sub.r(w_n, y))[0], a_hat.T @ expected - rhs, atol=1e-4
+    )
 
 
 @pytest.mark.parametrize(

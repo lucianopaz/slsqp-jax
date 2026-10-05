@@ -114,9 +114,13 @@ from .subproblem import (
     ActiveSetSubProblem,
     DogLegSolver,
     DogLegSolverState,
+    ForcingFunction,
     FunnelBarrierSubProblem,
     GradientProjection,
     GradientProjectionState,
+    LinearForcing,
+    MultiplierCase,
+    MultiplierClassification,
     ProjectedCGState,
     ProjectedCGSubProblemSolver,
     ProximalActiveSetQPSolver,
@@ -138,6 +142,7 @@ from .subproblem import (
     TrustRegionSolverState,
     WorkingSetPolicy,
     WorkingSetPolicyState,
+    classify_multiplier_case,
 )
 from .types import InitializableModule
 
@@ -255,6 +260,11 @@ __all__ = [
     "ActiveSetQPSolver",
     "DogLegSolverState",
     "DogLegSolver",
+    "ForcingFunction",
+    "LinearForcing",
+    "MultiplierCase",
+    "MultiplierClassification",
+    "classify_multiplier_case",
     "GradientProjectionState",
     "GradientProjection",
     "ProjectedCGState",

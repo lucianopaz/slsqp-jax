@@ -35,12 +35,15 @@ Shared infrastructure:
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
   — strategies returning a subproblem's dual for a primal step
   (KKT-consistent or Hessian-free least squares, optional safeguards).
+* :mod:`~slsqp_jax.sqpdax.subproblem.solver.funnel_multipliers`
+  — trust-funnel multiplier acceptance tests (3.15) and forcing functions.
 """
 
 from . import (
     active_set_loop,
     base,
     dogleg,
+    funnel_multipliers,
     gradient_projection,
     minres_qlp,
     multiplier_recovery,
@@ -69,6 +72,16 @@ from .base import (
     SubProblemSolverStateType,
 )
 from .dogleg import DogLegSolver, DogLegSolverState
+from .funnel_multipliers import (
+    ForcingFunction,
+    LinearForcing,
+    MultiplierCase,
+    MultiplierClassification,
+    classify_multiplier_case,
+    default_omega_n,
+    default_omega_t,
+    satisfies_forcing_condition,
+)
 from .gradient_projection import GradientProjection, GradientProjectionState
 from .minres_qlp import MinresQLPState, MinresQLPSubProblemSolver
 from .multiplier_recovery import (
@@ -113,6 +126,7 @@ __all__ = [
     "active_set_loop",
     "base",
     "dogleg",
+    "funnel_multipliers",
     "gradient_projection",
     "minres_qlp",
     "multiplier_recovery",
@@ -137,6 +151,14 @@ __all__ = [
     "ActiveSetQPSolver",
     "DogLegSolverState",
     "DogLegSolver",
+    "ForcingFunction",
+    "LinearForcing",
+    "MultiplierCase",
+    "MultiplierClassification",
+    "classify_multiplier_case",
+    "default_omega_n",
+    "default_omega_t",
+    "satisfies_forcing_condition",
     "GradientProjectionState",
     "GradientProjection",
     "ProjectedCGState",
