@@ -44,6 +44,7 @@ from . import (
     base,
     dogleg,
     funnel_multipliers,
+    funnel_tangential_step,
     gradient_projection,
     minres_qlp,
     multiplier_recovery,
@@ -81,6 +82,10 @@ from .funnel_multipliers import (
     default_omega_n,
     default_omega_t,
     satisfies_forcing_condition,
+)
+from .funnel_tangential_step import (
+    FunnelTangentialStepSolver,
+    FunnelTangentialStepState,
 )
 from .gradient_projection import GradientProjection, GradientProjectionState
 from .minres_qlp import MinresQLPState, MinresQLPSubProblemSolver
@@ -127,6 +132,7 @@ __all__ = [
     "base",
     "dogleg",
     "funnel_multipliers",
+    "funnel_tangential_step",
     "gradient_projection",
     "minres_qlp",
     "multiplier_recovery",
@@ -159,6 +165,8 @@ __all__ = [
     "default_omega_n",
     "default_omega_t",
     "satisfies_forcing_condition",
+    "FunnelTangentialStepSolver",
+    "FunnelTangentialStepState",
     "GradientProjectionState",
     "GradientProjection",
     "ProjectedCGState",
