@@ -6,6 +6,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 
 from ...dual import Dual
+from ...linalg import steihaug_step
 from ...primal import InteriorPointPrimal
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -246,7 +247,6 @@ class SteihaugTointCGTangentialStepSolver(
             return v - free_w * At(solve_normal(A(v)))
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2
-        r2 = radius**2
 
         # --- Steihaug projected CG, warm-started from the normal step x0 ---
         # Projected steepest-descent residual g = -P(H w + ghat) (N&W eq. 16.28c-d),
@@ -264,20 +264,14 @@ class SteihaugTointCGTangentialStepSolver(
                 Hp = H(p)
                 pHp = jnp.dot(p, Hp)
                 pp = jnp.dot(p, p)
-                ww = jnp.dot(w, w)
-                wp = jnp.dot(w, p)
-                # Positive root of ||w + b p||^2 = radius^2 (step to the boundary).
-                disc = jnp.sqrt(jnp.maximum(wp * wp + pp * (r2 - ww), 0.0))
-                bnd = jnp.where(pp > 1e-30, (-wp + disc) / jnp.maximum(pp, 1e-30), 0.0)
                 # Scale-invariant negative-curvature guard.
                 neg_curv = pHp <= self.cg_regularization * pp
                 alpha = jnp.where(neg_curv, 0.0, rz / jnp.maximum(pHp, 1e-30))
-                w_full = w + alpha * p
-                cross = jnp.dot(w_full, w_full) >= r2
                 # Steihaug: on negative curvature or a trust-region crossing, take the
                 # step to the boundary and stop.
-                to_boundary = neg_curv | cross
-                w_cand = jnp.where(to_boundary, w + bnd * p, w_full)
+                w_cand, to_boundary = steihaug_step(
+                    w, p, alpha, radius, force_boundary=neg_curv
+                )
                 r_cand = proj(-(H(w_cand) + ghat))
                 rz_cand = jnp.dot(r_cand, r_cand)
                 # Textbook Steihaug-Toint termination: accept the CG step and stop
