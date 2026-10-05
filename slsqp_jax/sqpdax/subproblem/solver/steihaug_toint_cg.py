@@ -6,7 +6,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 
 from ...dual import Dual
-from ...linalg import steihaug_step
+from ...linalg import box_fraction, null_space_projector, steihaug_cg
 from ...primal import InteriorPointPrimal
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -209,42 +209,16 @@ class SteihaugTointCGTangentialStepSolver(
 
         # --- matrix-free projector P = I - A_freeᵀ (A_free A_freeᵀ)⁺ A_free ------
         # ``A_free(p) = A(free_w ⊙ p)``.  The (Tikhonov-regularised) free-restricted
-        # normal equations ``(A_free A_freeᵀ + reg I) y = rhs`` are solved by an
-        # inner matrix-free CG; no dense Ahat / SVD is ever formed.
-        reg = jnp.asarray(self.proj_reg, dtype)
-        proj_tol_sq = jnp.asarray(self.proj_cg_tol, dtype) ** 2
-
-        def normal_op(y: Float[Array, " m_total"]) -> Float[Array, " m_total"]:
-            return A(free_w * At(y)) + reg * y
-
-        def solve_normal(rhs: Float[Array, " m_total"]) -> Float[Array, " m_total"]:
-            tol_r = proj_tol_sq * jnp.maximum(jnp.dot(rhs, rhs), 1.0)
-
-            def cg_body(_j, c):
-                y, r, p, rz, done = c
-
-                def do(cc):
-                    y, r, p, rz, _d = cc
-                    Ap = normal_op(p)
-                    pAp = jnp.dot(p, Ap)
-                    alpha = jnp.where(pAp > 1e-30, rz / jnp.maximum(pAp, 1e-30), 0.0)
-                    y_new = y + alpha * p
-                    r_new = r - alpha * Ap
-                    rz_new = jnp.dot(r_new, r_new)
-                    beta = jnp.where(rz > 1e-30, rz_new / jnp.maximum(rz, 1e-30), 0.0)
-                    p_new = r_new + beta * p
-                    return (y_new, r_new, p_new, rz_new, rz_new < tol_r)
-
-                return jax.lax.cond(done, lambda cc: cc, do, c)
-
-            rz0_ = jnp.dot(rhs, rhs)
-            init = (jnp.zeros_like(rhs), rhs, rhs, rz0_, rz0_ < tol_r)
-            y, *_ = jax.lax.fori_loop(0, self.proj_cg_max_iter, cg_body, init)
-            return y
-
-        def proj(v: Float[Array, " w"]) -> Float[Array, " w"]:
-            v = free_w * v
-            return v - free_w * At(solve_normal(A(v)))
+        # normal equations are solved by an inner matrix-free CG; no dense Ahat /
+        # SVD is ever formed.
+        proj = null_space_projector(
+            A,
+            At,
+            free_mask=free_w,
+            reg=self.proj_reg,
+            tol=self.proj_cg_tol,
+            max_iter=self.proj_cg_max_iter,
+        )
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2
 
@@ -252,62 +226,24 @@ class SteihaugTointCGTangentialStepSolver(
         # Projected steepest-descent residual g = -P(H w + ghat) (N&W eq. 16.28c-d),
         # recomputed from scratch each step for numerical robustness.  ``w0`` is
         # free-masked so the frozen (active-bound) coordinates stay at zero step.
+        # Textbook Steihaug-Toint termination: stop only on a trust-region
+        # boundary crossing / negative curvature or on convergence.  The
+        # projected-residual 2-norm is naturally non-monotonic on ill-conditioned
+        # reduced systems, so it must NOT be used as a no-progress guard --
+        # doing so aborts CG on the first descent step and reverts the interior
+        # Newton step to zero.  ``max_iter`` bounds the loop.
         w0 = free_w * x0[0].flatten()
-        r0 = proj(-(H(w0) + ghat))
-        rz0 = jnp.dot(r0, r0)
-
-        def body(_i, carry):
-            w, r, p, rz, done, ncg, on_bnd = carry
-
-            def do(c):
-                w, r, p, rz, _done, ncg, on_bnd = c
-                Hp = H(p)
-                pHp = jnp.dot(p, Hp)
-                pp = jnp.dot(p, p)
-                # Scale-invariant negative-curvature guard.
-                neg_curv = pHp <= self.cg_regularization * pp
-                alpha = jnp.where(neg_curv, 0.0, rz / jnp.maximum(pHp, 1e-30))
-                # Steihaug: on negative curvature or a trust-region crossing, take the
-                # step to the boundary and stop.
-                w_cand, to_boundary = steihaug_step(
-                    w, p, alpha, radius, force_boundary=neg_curv
-                )
-                r_cand = proj(-(H(w_cand) + ghat))
-                rz_cand = jnp.dot(r_cand, r_cand)
-                # Textbook Steihaug-Toint termination: accept the CG step and stop
-                # only on a trust-region boundary crossing / negative curvature
-                # (``to_boundary``) or on convergence (``rz_cand < tol_sq``).  The
-                # projected-residual 2-norm is naturally non-monotonic on
-                # ill-conditioned reduced systems, so it must NOT be used as a
-                # no-progress guard -- doing so aborts CG on the first descent step
-                # and reverts the interior Newton step to zero.  ``max_iter`` bounds
-                # the loop and ``conv`` catches the noise floor.
-                beta = jnp.where(rz > 1e-30, rz_cand / jnp.maximum(rz, 1e-30), 0.0)
-                p_new = r_cand + beta * p
-                conv = rz_cand < tol_sq
-                done_new = to_boundary | conv
-                return (
-                    w_cand,
-                    r_cand,
-                    p_new,
-                    rz_cand,
-                    done_new,
-                    ncg + 1,
-                    on_bnd | to_boundary,
-                )
-
-            return jax.lax.cond(jnp.reshape(done, ()), lambda c: c, do, carry)
-
-        init = (
+        cg = steihaug_cg(
+            H,
+            proj(-(H(w0) + ghat)),
             w0,
-            r0,
-            r0,
-            rz0,
-            jnp.reshape(rz0 < tol_sq, ()),
-            jnp.zeros((), jnp.int32),
-            jnp.asarray(False),
+            radius,
+            tol_sq=tol_sq,
+            max_iter=self.max_iter,
+            residual=lambda w: proj(-(H(w) + ghat)),
+            curvature_floor=self.cg_regularization,
         )
-        w, _, _, _, _, n_cg, on_bnd = jax.lax.fori_loop(0, self.max_iter, body, init)
+        w, n_cg, on_bnd = cg.w, cg.n_iter, cg.on_boundary
 
         # Backtrack the whole (normal + tangential) step for the fraction-to-
         # boundary rule (eq. 19.33e), then repackage as a ``(Primal, Dual)`` step.
@@ -374,10 +310,8 @@ class SteihaugTointCGTangentialStepSolver(
         Scalar
             Backtracking factor ``β``.
         """
-        slack = w[n:]
-        mask = slack_mask[n:]
-        if slack.shape[0] == 0:
-            return jnp.asarray(1.0, w.dtype)
-        neg = jnp.where((mask > 0) & (slack < 0), -slack, 0.0)
-        ratios = jnp.where(neg > 0, tau / neg, jnp.inf)
-        return jnp.minimum(jnp.asarray(1.0, w.dtype), jnp.min(ratios))
+        inf = jnp.asarray(jnp.inf, w.dtype)
+        lo = (
+            jnp.where(slack_mask > 0, -jnp.asarray(tau, w.dtype), -inf).at[:n].set(-inf)
+        )
+        return box_fraction(w, lo)

@@ -16,6 +16,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     ActiveSetQPSolverState,
     DogLegSolverState,
+    FunnelTangentialStepState,
     MinresQLPState,
     ProjectedCGState,
     ProximalActiveSetQPSolverState,
@@ -120,6 +121,13 @@ def make_steihaug_state(
 def make_scaled_normal_state(radius: float | Array = 1.0) -> ScaledNormalStepState:
     """Cold :class:`ScaledNormalStepState` with the given normal radius."""
     return ScaledNormalStepState.cold(radius)
+
+
+def make_funnel_tangential_state(
+    radius: float | Array = 1.0,
+) -> FunnelTangentialStepState:
+    """Cold :class:`FunnelTangentialStepState` with the given composite radius."""
+    return FunnelTangentialStepState.cold(radius)
 
 
 def make_empty_active_set(n: int = 2, meq: int = 0, mineq: int = 0) -> ActiveSet:
