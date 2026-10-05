@@ -53,7 +53,7 @@ from .logging import (
     MemoryHandler,
     StreamHandler,
 )
-from .merit import Merit, NormMerit
+from .merit import ConstraintViolation, Merit, NormMerit
 from .minimiser import (
     ACTIVE_SET_LINE_SEARCH_RESULTS,
     TRUST_REGION_INTERIOR_POINT_RESULTS,
@@ -100,6 +100,7 @@ from .step_controller import (
     ArmijoLineSearch,
     LineSearch,
     LineSearchState,
+    MeritStepController,
     StepController,
     StepResult,
     TrustRegionManager,
@@ -192,6 +193,7 @@ __all__ = [
     "InitializableModule",
     "StepResult",
     "StepController",
+    "MeritStepController",
     "LineSearchState",
     "LineSearch",
     "ArmijoLineSearch",
@@ -208,6 +210,7 @@ __all__ = [
     "InteriorPointPrimal",
     "Merit",
     "NormMerit",
+    "ConstraintViolation",
     "CurvatureDiagnostics",
     "Secant",
     "LBFGS",

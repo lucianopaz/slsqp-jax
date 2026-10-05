@@ -15,6 +15,7 @@ from ..subproblem.solver import SubProblemSolverStateType
 __all__ = [
     "StepResult",
     "StepController",
+    "MeritStepController",
 ]
 
 
@@ -22,11 +23,12 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
     """Outcome of a single controlled step.
 
     ``x`` is the iterate to move to (equal to the incoming ``x0`` when the step
-    was rejected).  ``accepted`` records whether the controller took the step.
-    ``merit_val`` is the merit at ``x`` (for the outer loop's best-merit / progress
-    tracking).  ``solver_state`` is the (possibly updated) subproblem-solver state:
-    the trust-region controller writes the new radius here; the line search passes
-    it through unchanged.
+    was rejected). ``accepted`` records whether the controller took the step.
+    ``merit_val`` is the controller's primary acceptance score at ``x``
+    (the merit for :class:`MeritStepController` subclasses; the barrier
+    value for a funnel controller). ``solver_state`` is the (possibly
+    updated) subproblem-solver state: the trust-region controller writes
+    the new radius here; the line search passes it through unchanged.
 
     Attributes
     ----------
@@ -35,7 +37,7 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
     accepted
         ``True`` when the controller took the proposed step.
     merit_val
-        Merit value at ``x``.
+        Primary acceptance score at ``x``.
     solver_state
         Refreshed (or threaded) subproblem-solver carry, or ``None``.
     accepted_by_fallback
@@ -60,12 +62,9 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
 
     The analogue of optimistix's per-iteration ``step``: given the current iterate
     ``x0`` and a ``direction`` produced by a ``SubProblemSolver``, decide the actual
-    move.  :class:`~slsqp_jax.sqpdax.step_controller.line_search.LineSearch`
-    selects the longest step length along ``direction`` that achieves the desired
-    merit reduction;
-    :class:`~slsqp_jax.sqpdax.step_controller.trust_region_radius.TrustRegionManager`
-    accepts or rejects the step from the actual/predicted-reduction ratio and
-    updates the radius.
+    move.  Merit-driven controllers inherit
+    :class:`MeritStepController`; funnel-style controllers score the
+    barrier and constraint violation independently.
 
     This is not a "globalization" abstraction -- these classes *execute* the step.
     Swapping a ``StepController`` is not free: each concrete controller is matched
@@ -76,8 +75,6 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
 
     Attributes
     ----------
-    merit
-        Merit used to score candidate iterates.
     logger
         :class:`~slsqp_jax.sqpdax.logging.logger.Logger` for the
         controller's own records (trial steps, acceptance / rejection).
@@ -85,8 +82,7 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
         default never emits.
     """
 
-    merit: Merit
-    logger: Logger = field(static=True, default_factory=Logger.disabled)
+    logger: Logger = field(static=True, default_factory=Logger.disabled, kw_only=True)
 
     @abstractmethod
     def step(
@@ -116,3 +112,23 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
             the (possibly updated) solver carry.
         """
         ...
+
+
+class MeritStepController(
+    StepController[PrimalType, SubProblemSolverStateType],
+    Generic[PrimalType, SubProblemSolverStateType],
+):
+    """Step controller that scores candidates with a single :class:`Merit`.
+
+    :class:`~slsqp_jax.sqpdax.step_controller.line_search.LineSearch` and
+    :class:`~slsqp_jax.sqpdax.step_controller.trust_region_radius.TrustRegionManager`
+    inherit this so the merit field stays required for those algorithms
+    without forcing every controller to be merit-driven.
+
+    Attributes
+    ----------
+    merit
+        Merit used to score candidate iterates.
+    """
+
+    merit: Merit

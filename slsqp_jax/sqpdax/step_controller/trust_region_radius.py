@@ -8,10 +8,10 @@ from jax import numpy as jnp
 
 from ..primal import Primal
 from ..subproblem.solver.trust_region import TrustRegionSolverState
-from .base import StepController, StepResult
+from .base import MeritStepController, StepResult
 
 
-class TrustRegionManager(StepController[Primal, TrustRegionSolverState]):
+class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
     """Trust-region step controller (N&W eqs. 19.39–19.40).
 
     Consumes the proposed step and the incoming

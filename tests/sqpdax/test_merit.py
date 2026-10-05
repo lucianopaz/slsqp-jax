@@ -9,10 +9,16 @@ import pytest
 from jax import Array
 
 from slsqp_jax.sqpdax.barrier import LogBarrier
-from slsqp_jax.sqpdax.merit import Merit, NormMerit, safe_norm
+from slsqp_jax.sqpdax.lagrangian import InteriorPointLagrangian, Lagrangian
+from slsqp_jax.sqpdax.merit import ConstraintViolation, Merit, NormMerit, safe_norm
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal
 from slsqp_jax.sqpdax.problem.basic import Problem
-from tests.sqpdax.lagrangian.conftest import make_ip_primal, make_primal, make_problem
+from tests.sqpdax.lagrangian.conftest import (
+    make_dual,
+    make_ip_primal,
+    make_primal,
+    make_problem,
+)
 
 
 def _expected_exterior_merit(
@@ -270,3 +276,59 @@ def test_norm_merit_empty_constraints():
     )
     p = Primal(x=jnp.array([1.0, -2.0]))
     assert jnp.allclose(merit(p), 2.0 * problem.fn(p.x)[0])
+
+
+@pytest.mark.parametrize(
+    "lb_ub",
+    [
+        (jnp.array([0.0, -1.0]), jnp.array([2.0, 3.0])),
+        (jnp.array([-jnp.inf, 0.0]), jnp.array([jnp.inf, 1.0])),
+        (jnp.full(2, -jnp.inf), jnp.full(2, jnp.inf)),
+    ],
+    ids=["finite", "mixed-null", "unbounded"],
+)
+def test_constraint_violation_matches_dual_grad_plain(lb_ub):
+    """Plain-primal violation is the joint 2-norm of the dual residual."""
+    lb, ub = lb_ub
+    problem = make_problem(lb=lb, ub=ub)
+    primal = make_primal(n=problem.n)
+    dual = Lagrangian(problem)(primal, make_dual(problem.n, problem.meq, problem.mineq))
+    viol = ConstraintViolation(problem=problem, norm=2)
+    assert jnp.allclose(viol(primal), jnp.linalg.norm(dual.dual_grad.flatten()))
+
+
+@pytest.mark.parametrize(
+    "lb_ub",
+    [
+        (jnp.array([0.0, -1.0]), jnp.array([2.0, 3.0])),
+        (jnp.array([-jnp.inf, 0.0]), jnp.array([jnp.inf, 1.0])),
+    ],
+    ids=["finite", "mixed-null"],
+)
+def test_constraint_violation_matches_dual_grad_interior(lb_ub):
+    """Interior-point violation matches slack-augmented dual residual."""
+    lb, ub = lb_ub
+    problem = make_problem(lb=lb, ub=ub)
+    primal = make_ip_primal(n=problem.n, mineq=problem.mineq)
+    barrier = LogBarrier(
+        weight=jnp.asarray(0.5),
+        null_lb=problem.null_lb,
+        null_ub=problem.null_ub,
+    )
+    lag = InteriorPointLagrangian(problem, None, barrier, primal_dual=True)
+    dual = make_dual(problem.n, problem.meq, problem.mineq)
+    evaluated = lag(primal, dual)
+    viol = ConstraintViolation(problem=problem, norm=2)
+    assert jnp.allclose(viol(primal), jnp.linalg.norm(evaluated.dual_grad.flatten()))
+
+
+def test_constraint_violation_zero_at_feasible_unconstrained():
+    """Unconstrained problem has identically zero violation."""
+    problem = make_problem(
+        meq=0,
+        mineq=0,
+        lb=jnp.full(2, -jnp.inf),
+        ub=jnp.full(2, jnp.inf),
+    )
+    viol = ConstraintViolation(problem=problem)
+    assert jnp.allclose(viol(Primal(x=jnp.array([3.0, -4.0]))), 0.0)
