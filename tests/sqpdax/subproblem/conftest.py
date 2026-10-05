@@ -15,6 +15,7 @@ from slsqp_jax.sqpdax.lagrangian.interior_point import InteriorPointLagrangian
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal, Slack
 from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
+from slsqp_jax.sqpdax.subproblem.funnel_barrier import FunnelBarrierSubProblem
 from slsqp_jax.sqpdax.subproblem.scaled_barrier import ScaledBarrierSubProblem
 from tests.sqpdax.lagrangian.conftest import (
     make_dual,
@@ -113,6 +114,8 @@ def make_ip_evaluated(
     weight: float = 0.5,
     dual_kkt_regularization: float = 0.0,
     primal_dual: bool = True,
+    primal: InteriorPointPrimal | None = None,
+    dual: Dual | None = None,
 ):
     """Evaluate an interior-point Lagrangian (optionally primal-dual)."""
     if problem is None:
@@ -129,9 +132,32 @@ def make_ip_evaluated(
         dual_kkt_regularization=dual_kkt_regularization,
         primal_dual=primal_dual,
     )
-    primal = make_ip_primal(n=problem.n, mineq=problem.mineq)
-    dual = make_dual(problem.n, problem.meq, problem.mineq)
+    if primal is None:
+        primal = make_ip_primal(n=problem.n, mineq=problem.mineq)
+    if dual is None:
+        dual = make_dual(problem.n, problem.meq, problem.mineq)
     return lag(primal, dual)
+
+
+def make_funnel_barrier_subproblem(
+    *,
+    problem: Problem | None = None,
+    weight: float = 0.5,
+    primal_dual: bool = True,
+    kappa_fbn: float = 0.1,
+    kappa_fbt: float = 0.1,
+    primal: InteriorPointPrimal | None = None,
+    dual: Dual | None = None,
+) -> FunnelBarrierSubProblem:
+    """Build a :class:`FunnelBarrierSubProblem` on an IP Lagrangian."""
+    evaluated = make_ip_evaluated(
+        problem=problem,
+        weight=weight,
+        primal_dual=primal_dual,
+        primal=primal,
+        dual=dual,
+    )
+    return FunnelBarrierSubProblem(evaluated, kappa_fbn=kappa_fbn, kappa_fbt=kappa_fbt)
 
 
 def make_scaled_barrier_subproblem(

@@ -11,11 +11,15 @@ package can drive. Concrete subclasses attach method-specific geometry:
   (stabilised-SQP) term.
 * :class:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem`
   — primal-dual interior-point Newton system in scaled slack coordinates.
+* :class:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem`
+  — the scaled barrier system plus the trust-funnel models, criticality
+  measures and fraction-to-boundary boxes.
 """
 
-from . import active_set, base, proximal, scaled_barrier, solver
+from . import active_set, base, funnel_barrier, proximal, scaled_barrier, solver
 from .active_set import ActiveSetSubProblem
 from .base import SubProblem
+from .funnel_barrier import FunnelBarrierSubProblem
 from .proximal import ProximalActiveSetSubProblem
 from .scaled_barrier import ScaledBarrierSubProblem
 from .solver import (
@@ -48,10 +52,12 @@ from .solver import (
 __all__ = [
     "active_set",
     "base",
+    "funnel_barrier",
     "proximal",
     "scaled_barrier",
     "solver",
     "ActiveSetSubProblem",
+    "FunnelBarrierSubProblem",
     "ProximalActiveSetSubProblem",
     "SubProblem",
     "ScaledBarrierSubProblem",
