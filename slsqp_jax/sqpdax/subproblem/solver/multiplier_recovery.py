@@ -118,15 +118,27 @@ class BarrierSafeguard(Safeguard):
 
     Non-positive inequality / bound multipliers are replaced by
     ``min(cap, μ / s_i)`` with the matching slack ``s_i``; null bounds get an
-    exact zero.
+    exact zero. Optionally the repaired vector is then shrunk onto the
+    2-norm ball of radius ``max_norm`` (the ``κ_y`` bound (3.10) of Curtis,
+    Gould, Robinson & Toint 2017, which keeps the Lagrangian Hessian
+    ``G_k`` built from these multipliers uniformly bounded). Uniform
+    rescaling preserves the positivity just established.
 
     Attributes
     ----------
     cap
         Upper cap of the replacement value (``1e-3`` in N&W).
+    max_norm
+        Optional 2-norm bound ``κ_y`` applied after the positivity fix.
+        ``None`` (default) leaves the norm unconstrained.
     """
 
     cap: float = field(static=True, default=1e-3)
+    max_norm: float | None = field(static=True, default=None)
+
+    def __check_init__(self):
+        if self.max_norm is not None and not self.max_norm > 0.0:
+            raise ValueError(f"max_norm must be positive or None; got {self.max_norm}")
 
     def apply(self, subproblem: SubProblem, dual: Dual) -> Dual:
         _require_sqp_view(subproblem, "BarrierSafeguard")
@@ -153,7 +165,7 @@ class BarrierSafeguard(Safeguard):
             0.0,
             fix(dual.ub_multipliers, jnp.where(lag.null_ub, 1.0, s_ub)),
         )
-        return cast(
+        repaired = cast(
             Dual,
             Dual(
                 eq_multipliers=dual.eq_multipliers,
@@ -162,6 +174,12 @@ class BarrierSafeguard(Safeguard):
                 ub_multipliers=z_ub,
             ),
         )
+        if self.max_norm is None:
+            return repaired
+        norm = jnp.linalg.norm(repaired.flatten())
+        max_norm = jnp.asarray(self.max_norm, norm.dtype)
+        scale = jnp.where(norm > max_norm, max_norm / jnp.maximum(norm, max_norm), 1.0)
+        return cast(Dual, jax.tree.map(lambda z: scale * z, repaired))
 
 
 class MultiplierRecovery(InitializableModule):
