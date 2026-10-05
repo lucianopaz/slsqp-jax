@@ -19,6 +19,9 @@ Public leaf solvers:
   — Steihaug–Toint tangential step on a scaled barrier QP.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.trust_region.TrustRegionInteriorPointSolver`
   — composite-step trust-region interior-point orchestrator (N&W §19.5).
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.scaled_normal_step.ScaledNormalStepSolver`
+  — Steihaug–Toint CGLS normal step of the interior-point trust-funnel
+  method (Curtis et al. 2017, Sect. 3.1).
 
 Shared infrastructure:
 
@@ -44,6 +47,7 @@ from . import (
     projected_cg,
     projector,
     proximal_active_set_loop,
+    scaled_normal_step,
     steihaug_toint_cg,
     trust_region,
     working_set_policy,
@@ -88,6 +92,7 @@ from .proximal_active_set_loop import (
     ProximalActiveSetQPSolver,
     ProximalActiveSetQPSolverState,
 )
+from .scaled_normal_step import ScaledNormalStepSolver, ScaledNormalStepState
 from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
@@ -114,6 +119,7 @@ __all__ = [
     "projected_cg",
     "projector",
     "proximal_active_set_loop",
+    "scaled_normal_step",
     "steihaug_toint_cg",
     "trust_region",
     "working_set_policy",
@@ -151,6 +157,8 @@ __all__ = [
     "LeastSquaresMultiplierRecovery",
     "ProximalActiveSetQPSolverState",
     "ProximalActiveSetQPSolver",
+    "ScaledNormalStepState",
+    "ScaledNormalStepSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
     "TrustRegionSolverState",
