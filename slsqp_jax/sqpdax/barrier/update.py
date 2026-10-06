@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import equinox as eqx
 from equinox import Module
@@ -21,6 +21,7 @@ __all__ = [
     "BarrierUpdate",
     "MonotoneBarrierUpdate",
     "AdaptiveBarrierUpdate",
+    "FunnelBarrierUpdate",
 ]
 
 
@@ -268,3 +269,184 @@ class AdaptiveBarrierUpdate(BarrierUpdate):
         return eqx.tree_at(lambda b: b.weight, barrier, new_mu), jnp.ones(
             (), dtype=bool
         )
+
+
+class FunnelBarrierUpdate(BarrierUpdate):
+    """Trust-funnel outer loop (CGRT 2017, Algorithm 3 and Table 1).
+
+    The barrier subproblem ``BSP(μ)`` counts as solved when the scaled
+    stationarity and the constraint violation meet the ``μ``-dependent
+    tolerances of (3.15a),
+
+    ```
+    πᶠ ≤ ε_π(μ) = ζ₁ μ^α    and    v ≤ ε_v(μ) = ζ₂ μ^β,            (5.3)
+    ```
+
+    in which case ``μ ← max{γ_μ μ, μ_min}`` (Algorithm 3, Step 8). The other
+    ``μ``-dependent constants of Table 1 are exposed as schedules satisfying
+    the limits (5.1)–(5.2):
+
+    ```
+    κ_fbn(μ) = min{κ_fb_max, κ_fb_scale μ^{κ_fb_power}}  → 0
+    κ_fbt(μ) = κ_fbn(μ)
+    κ_y(μ)   = κ_y_scale / μ                            → ∞
+    κ_D(μ)   = κ_D_scale / μ                            → ∞
+    ```
+
+    The paper fixes only the limits (and the form (5.3)); the power-law
+    choices above are conventional. ``κ_fbn``/``κ_fbt`` are the
+    fraction-to-boundary constants of
+    :class:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem`,
+    ``κ_y`` the multiplier cap (3.10) of
+    :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.BarrierSafeguard`
+    and ``κ_D`` the cap on the primal slack curvature ``μ S⁻²`` in (5.4).
+
+    Attributes
+    ----------
+    gamma_mu
+        Reduction factor ``γ_μ ∈ (0, 1)`` applied when the subproblem is
+        solved.
+    mu_min
+        Lower floor on the barrier parameter.
+    zeta1, alpha
+        Stationarity tolerance ``ε_π(μ) = ζ₁ μ^α`` with ``ζ₁ ∈ (0, 1)``,
+        ``α ≥ 1``.
+    zeta2, beta
+        Violation tolerance ``ε_v(μ) = ζ₂ μ^β`` with ``ζ₂, β > 0``.
+    kappa_fb_max, kappa_fb_scale, kappa_fb_power
+        Fraction-to-boundary schedule ``κ_fb(μ) = min{max, scale μ^power}``
+        shared by ``κ_fbn`` and ``κ_fbt``; ``max ∈ (0, 1)``, ``scale > 0``,
+        ``power > 0``.
+    kappa_y_scale, kappa_D_scale
+        Scales of the diverging caps ``κ_y(μ)``, ``κ_D(μ)``; both ``> 0``.
+    """
+
+    kind: ClassVar[str] = "funnel"
+
+    gamma_mu: float = eqx.field(default=0.2)
+    mu_min: float = eqx.field(default=1e-11)
+    zeta1: float = eqx.field(default=0.5)
+    alpha: float = eqx.field(default=1.0)
+    zeta2: float = eqx.field(default=1.0)
+    beta: float = eqx.field(default=1.0)
+    kappa_fb_max: float = eqx.field(default=0.1)
+    kappa_fb_scale: float = eqx.field(default=1.0)
+    kappa_fb_power: float = eqx.field(default=1.0)
+    kappa_y_scale: float = eqx.field(default=1e2)
+    kappa_D_scale: float = eqx.field(default=1e2)
+
+    def __check_init__(self):
+        def require(ok: bool, msg: str):
+            if not ok:
+                raise ValueError(msg)
+
+        require(
+            0.0 < self.gamma_mu < 1.0,
+            f"gamma_mu must be in (0, 1); got {self.gamma_mu}",
+        )
+        require(self.mu_min > 0.0, f"mu_min must be > 0; got {self.mu_min}")
+        require(0.0 < self.zeta1 < 1.0, f"zeta1 must be in (0, 1); got {self.zeta1}")
+        require(self.alpha >= 1.0, f"alpha must be >= 1; got {self.alpha}")
+        require(self.zeta2 > 0.0, f"zeta2 must be > 0; got {self.zeta2}")
+        require(self.beta > 0.0, f"beta must be > 0; got {self.beta}")
+        require(
+            0.0 < self.kappa_fb_max < 1.0,
+            f"kappa_fb_max must be in (0, 1); got {self.kappa_fb_max}",
+        )
+        require(
+            self.kappa_fb_scale > 0.0,
+            f"kappa_fb_scale must be > 0; got {self.kappa_fb_scale}",
+        )
+        require(
+            self.kappa_fb_power > 0.0,
+            f"kappa_fb_power must be > 0; got {self.kappa_fb_power}",
+        )
+        require(
+            self.kappa_y_scale > 0.0,
+            f"kappa_y_scale must be > 0; got {self.kappa_y_scale}",
+        )
+        require(
+            self.kappa_D_scale > 0.0,
+            f"kappa_D_scale must be > 0; got {self.kappa_D_scale}",
+        )
+
+    # --- Table 1 schedules -----------------------------------------------------
+
+    def eps_pi(self, mu: Scalar) -> Scalar:
+        """Stationarity tolerance ``ε_π(μ) = ζ₁ μ^α`` of (3.15a)/(5.3)."""
+        return self.zeta1 * jnp.asarray(mu) ** self.alpha
+
+    def eps_v(self, mu: Scalar) -> Scalar:
+        """Violation tolerance ``ε_v(μ) = ζ₂ μ^β`` of (3.15a)/(5.3)."""
+        return self.zeta2 * jnp.asarray(mu) ** self.beta
+
+    def kappa_fbn(self, mu: Scalar) -> Scalar:
+        """Normal-step fraction-to-boundary constant ``κ_fbn(μ)`` of (2.2)/(3.5)."""
+        return jnp.minimum(
+            self.kappa_fb_max,
+            self.kappa_fb_scale * jnp.asarray(mu) ** self.kappa_fb_power,
+        )
+
+    def kappa_fbt(self, mu: Scalar) -> Scalar:
+        """Tangential-step fraction-to-boundary constant ``κ_fbt(μ)`` of (3.19b)/(3.23b)."""
+        return self.kappa_fbn(mu)
+
+    def kappa_y(self, mu: Scalar) -> Scalar:
+        """Multiplier norm cap ``κ_y(μ)`` of (3.10)."""
+        return self.kappa_y_scale / jnp.asarray(mu)
+
+    def kappa_D(self, mu: Scalar) -> Scalar:
+        """Cap ``κ_D(μ)`` on the primal slack curvature ``μ S⁻²`` of (3.11)/(5.4)."""
+        return self.kappa_D_scale / jnp.asarray(mu)
+
+    # --- outer-loop test ---------------------------------------------------------
+
+    def solved(self, mu: Scalar, pi_f: Scalar, v: Scalar) -> Bool[Array, ""]:
+        """Whether ``(πᶠ, v)`` meet the (3.15a) tolerances at barrier weight ``μ``."""
+        return (pi_f <= self.eps_pi(mu)) & (v <= self.eps_v(mu))
+
+    def update(
+        self,
+        barrier: Barrier,
+        lag: InteriorPointEvaluatedLagrangian,
+        *,
+        pi_f: Scalar | None = None,
+        v: Scalar | None = None,
+    ) -> tuple[Barrier, Bool[Array, ""]]:
+        """Reduce ``μ`` by ``γ_μ`` once the barrier subproblem meets (3.15a).
+
+        Parameters
+        ----------
+        barrier
+            Current barrier; ``weight`` is the current ``μ``.
+        lag
+            Interior-point Lagrangian evaluation at the committed iterate.
+        pi_f
+            Scaled stationarity ``πᶠ`` at the iterate (Definition 1.2,
+            ``n = 0``). When omitted it is computed from ``lag`` through a
+            :class:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem`
+            with ``lag.dual`` as the multiplier estimate.
+        v
+            Constraint violation ``‖c(x, s)‖₂``. Defaults to the norm of
+            ``lag.dual_grad``.
+
+        Returns
+        -------
+        barrier
+            Copy with ``weight = max(γ_μ μ, μ_min)`` when solved, else unchanged.
+        solved
+            Whether ``πᶠ ≤ ε_π(μ)`` and ``v ≤ ε_v(μ)`` held.
+        """
+        if pi_f is None or v is None:
+            # Local import: the subproblem package depends on this module.
+            from ..subproblem.funnel_barrier import FunnelBarrierSubProblem
+
+            sub = cast(FunnelBarrierSubProblem, FunnelBarrierSubProblem(lag))
+            if pi_f is None:
+                pi_f = sub.pi_f(sub._zero_primal(), lag.dual)
+            if v is None:
+                v = sub.violation()
+        mu = barrier.weight
+        is_solved = self.solved(mu, pi_f, v)
+        new_mu = jnp.where(is_solved, jnp.maximum(self.gamma_mu * mu, self.mu_min), mu)
+        return eqx.tree_at(lambda b: b.weight, barrier, new_mu), is_solved

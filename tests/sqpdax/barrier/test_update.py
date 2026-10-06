@@ -8,6 +8,7 @@ import pytest
 from slsqp_jax.sqpdax.barrier import (
     AdaptiveBarrierUpdate,
     BarrierUpdate,
+    FunnelBarrierUpdate,
     LogBarrier,
     MonotoneBarrierUpdate,
 )
@@ -34,16 +35,20 @@ def test_inf_norm(v, expected):
 
 
 @pytest.mark.parametrize(
-    "kind_cls",
-    [MonotoneBarrierUpdate, AdaptiveBarrierUpdate],
-    ids=["monotone", "adaptive"],
+    ("kind_cls", "field"),
+    [
+        (MonotoneBarrierUpdate, "sigma"),
+        (AdaptiveBarrierUpdate, "sigma"),
+        (FunnelBarrierUpdate, "gamma_mu"),
+    ],
+    ids=["monotone", "adaptive", "funnel"],
 )
-def test_barrier_update_registers_on_family(kind_cls):
+def test_barrier_update_registers_on_family(kind_cls, field):
     """Concrete policies are discoverable via :meth:`BarrierUpdate.from_spec`."""
     assert BarrierUpdate._registry[kind_cls.kind] is kind_cls
-    built = BarrierUpdate.from_spec({"kind": kind_cls.kind, "sigma": 0.3})
+    built = BarrierUpdate.from_spec({"kind": kind_cls.kind, field: 0.3})
     assert isinstance(built, kind_cls)
-    assert built.sigma == pytest.approx(0.3)
+    assert getattr(built, field) == pytest.approx(0.3)
 
 
 def test_complementarity_averages_active_pairs_only():
@@ -193,8 +198,147 @@ def test_update_preserves_barrier_masks():
     for policy in (
         MonotoneBarrierUpdate(kappa_eps=1e6),
         AdaptiveBarrierUpdate(),
+        FunnelBarrierUpdate(zeta1=0.99, zeta2=1e6, alpha=1.0, beta=1.0),
     ):
         updated, _ = policy.update(barrier, evaluated)
         assert isinstance(updated, LogBarrier)
         assert jnp.array_equal(updated.null_lb, barrier.null_lb)
         assert jnp.array_equal(updated.null_ub, barrier.null_ub)
+
+
+# --------------------------------------------------------------------------- #
+# FunnelBarrierUpdate
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"gamma_mu": 1.0},
+        {"gamma_mu": 0.0},
+        {"mu_min": 0.0},
+        {"zeta1": 1.0},
+        {"alpha": 0.5},
+        {"zeta2": 0.0},
+        {"beta": 0.0},
+        {"kappa_fb_max": 1.0},
+        {"kappa_fb_scale": 0.0},
+        {"kappa_fb_power": 0.0},
+        {"kappa_y_scale": 0.0},
+        {"kappa_D_scale": -1.0},
+    ],
+    ids=lambda kw: "-".join(kw),
+)
+def test_funnel_check_init_rejects_invalid_constants(kwargs):
+    with pytest.raises(ValueError):
+        FunnelBarrierUpdate(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("pi_f", "v", "expect_solved"),
+    [
+        (0.0, 0.0, True),
+        (0.049, 0.09, True),  # both just inside ε_π = 0.05, ε_v = 0.1
+        (0.051, 0.0, False),  # stationarity fails
+        (0.0, 0.11, False),  # violation fails
+        (1.0, 1.0, False),
+    ],
+    ids=["exact", "inside", "pi-fails", "v-fails", "both-fail"],
+)
+def test_funnel_update_reduces_mu_iff_both_tolerances_met(pi_f, v, expect_solved):
+    """``μ`` drops by ``γ_μ`` iff ``πᶠ ≤ ζ₁ μ^α`` and ``v ≤ ζ₂ μ^β`` (3.15a)/(5.3)."""
+    mu = 0.1
+    evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
+    policy = FunnelBarrierUpdate(
+        gamma_mu=0.2, zeta1=0.5, alpha=1.0, zeta2=1.0, beta=1.0
+    )
+    assert float(policy.eps_pi(mu)) == pytest.approx(0.05)
+    assert float(policy.eps_v(mu)) == pytest.approx(0.1)
+    updated, solved = policy.update(
+        barrier, evaluated, pi_f=jnp.asarray(pi_f), v=jnp.asarray(v)
+    )
+    assert bool(solved) == expect_solved
+    assert bool(policy.solved(mu, jnp.asarray(pi_f), jnp.asarray(v))) == expect_solved
+    expected = 0.2 * mu if expect_solved else mu
+    assert float(updated.weight) == pytest.approx(expected)
+    assert float(barrier.weight) == pytest.approx(mu)  # input untouched
+
+
+def test_funnel_update_respects_mu_min():
+    evaluated, barrier = make_evaluated_ip_lagrangian(weight=1e-10)
+    policy = FunnelBarrierUpdate(gamma_mu=0.1, mu_min=1e-9)
+    updated, solved = policy.update(
+        barrier, evaluated, pi_f=jnp.asarray(0.0), v=jnp.asarray(0.0)
+    )
+    assert bool(solved)
+    assert float(updated.weight) == pytest.approx(1e-9)
+
+
+def test_funnel_update_defaults_pi_f_and_v_from_lagrangian():
+    """Omitted ``πᶠ``/``v`` are recomputed from ``lag`` (Definition 1.2, ``n = 0``)."""
+    from slsqp_jax.sqpdax.subproblem.funnel_barrier import FunnelBarrierSubProblem
+
+    mu = 0.5
+    evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
+    sub = FunnelBarrierSubProblem(evaluated)
+    pi_f = float(sub.pi_f(sub._zero_primal(), evaluated.dual))
+    v = float(sub.violation())
+    assert pi_f > 0.0 and v > 0.0
+
+    # Violation tolerance just above / below the recomputed ``v`` (πᶠ supplied).
+    loose = FunnelBarrierUpdate(zeta1=0.99, alpha=1.0, zeta2=2.0 * v / mu, beta=1.0)
+    tight = FunnelBarrierUpdate(zeta1=0.99, alpha=1.0, zeta2=0.5 * v / mu, beta=1.0)
+    assert float(loose.eps_v(mu)) > v > float(tight.eps_v(mu))
+    _, solved_loose = loose.update(barrier, evaluated, pi_f=jnp.asarray(0.0))
+    _, solved_tight = tight.update(barrier, evaluated, pi_f=jnp.asarray(0.0))
+    assert bool(solved_loose) and not bool(solved_tight)
+    # Stationarity recomputed (``v`` supplied): solved iff πᶠ ≤ ζ₁ μ.
+    _, solved_pi = FunnelBarrierUpdate(zeta1=0.99, zeta2=1e6).update(
+        barrier, evaluated, v=jnp.asarray(0.0)
+    )
+    assert bool(solved_pi) == (pi_f <= 0.99 * mu)
+
+
+@pytest.mark.parametrize(
+    "schedule, limit",
+    [
+        ("eps_pi", 0.0),
+        ("eps_v", 0.0),
+        ("kappa_fbn", 0.0),
+        ("kappa_fbt", 0.0),
+        ("kappa_y", jnp.inf),
+        ("kappa_D", jnp.inf),
+    ],
+)
+def test_funnel_schedules_are_monotone_with_the_paper_limits(schedule, limit):
+    """Table 1 schedules satisfy (5.1)–(5.2): monotone in ``μ`` with the stated limits."""
+    policy = FunnelBarrierUpdate()
+    mus = jnp.logspace(0, -10, 11)
+    values = jnp.stack([getattr(policy, schedule)(mu) for mu in mus])
+    assert jnp.all(values > 0.0)
+    if limit == 0.0:
+        assert jnp.all(jnp.diff(values) <= 0.0)
+        assert float(values[-1]) < 1e-8
+    else:
+        assert jnp.all(jnp.diff(values) >= 0.0)
+        assert float(values[-1]) > 1e8
+
+
+def test_funnel_fraction_to_boundary_schedule_is_capped():
+    policy = FunnelBarrierUpdate(
+        kappa_fb_max=0.1, kappa_fb_scale=1.0, kappa_fb_power=1.0
+    )
+    assert float(policy.kappa_fbn(10.0)) == pytest.approx(0.1)
+    assert float(policy.kappa_fbn(0.01)) == pytest.approx(0.01)
+    assert float(policy.kappa_fbt(0.01)) == pytest.approx(float(policy.kappa_fbn(0.01)))
+
+
+def test_funnel_defaults_satisfy_53():
+    """Default tolerances have the (5.3) form with ``ζ₁ ∈ (0,1)``, ``α ≥ 1``, ``ζ₂, β > 0``."""
+    policy = FunnelBarrierUpdate()
+    assert 0.0 < policy.zeta1 < 1.0
+    assert policy.alpha >= 1.0
+    assert policy.zeta2 > 0.0 and policy.beta > 0.0
+    for mu in (1.0, 1e-2, 1e-6):
+        assert float(policy.eps_pi(mu)) <= policy.zeta1 * mu**policy.alpha + 1e-12
+        assert float(policy.eps_v(mu)) <= policy.zeta2 * mu**policy.beta + 1e-12

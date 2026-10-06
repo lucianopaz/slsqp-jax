@@ -2,7 +2,12 @@
 
 from . import base, update
 from .base import Barrier, EvaluatedBarrier, LogBarrier
-from .update import AdaptiveBarrierUpdate, BarrierUpdate, MonotoneBarrierUpdate
+from .update import (
+    AdaptiveBarrierUpdate,
+    BarrierUpdate,
+    FunnelBarrierUpdate,
+    MonotoneBarrierUpdate,
+)
 
 __all__ = [
     "base",
@@ -13,4 +18,5 @@ __all__ = [
     "BarrierUpdate",
     "MonotoneBarrierUpdate",
     "AdaptiveBarrierUpdate",
+    "FunnelBarrierUpdate",
 ]
