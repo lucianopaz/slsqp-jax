@@ -23,6 +23,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     ScaledNormalStepState,
     SteihaugTointCGTangentialStepSolverState,
     SVDProjector,
+    TrustFunnelSolverState,
     TrustRegionSolverState,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
@@ -128,6 +129,27 @@ def make_funnel_tangential_state(
 ) -> FunnelTangentialStepState:
     """Cold :class:`FunnelTangentialStepState` with the given composite radius."""
     return FunnelTangentialStepState.cold(radius)
+
+
+def make_trust_funnel_state(
+    radius_v: float | Array = 1.0,
+    radius_f: float | Array = 1.0,
+    v_max: float | Array = 10.0,
+    *,
+    eps_pi: float = 1e-6,
+    eps_v: float = 1e-6,
+    pi_f_prev: float | Array = 0.0,
+    sf_flag: bool = False,
+) -> TrustFunnelSolverState:
+    """Cold :class:`TrustFunnelSolverState` with optional carried fields set."""
+    state = TrustFunnelSolverState.cold(
+        radius_v, radius_f, v_max, eps_pi=eps_pi, eps_v=eps_v
+    )
+    return eqx.tree_at(
+        lambda s: (s.pi_f_prev, s.sf_flag),
+        state,
+        (jnp.asarray(pi_f_prev, state.radius_v.dtype), jnp.asarray(sf_flag)),
+    )
 
 
 def make_empty_active_set(n: int = 2, meq: int = 0, mineq: int = 0) -> ActiveSet:

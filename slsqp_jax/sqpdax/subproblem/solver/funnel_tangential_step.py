@@ -117,10 +117,12 @@ class FunnelTangentialStepSolver(
     matrix-free from a
     :class:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem`.
 
-    * **Cauchy point** (3.17)–(3.18) / (3.21)–(3.22): ``t_C = −α_C r̂`` with
-      ``r̂ = ĝ + Ĥ w_n + Âᵀ y`` the scaled residual (3.13) and ``α_C`` the
-      exact 1-D minimiser of ``m_f(w_n − α r̂)`` clipped by the ball on
-      ``‖w_n − α r̂‖`` and the tangential fraction-to-boundary box
+    * **Cauchy point** (3.17)–(3.18) / (3.21)–(3.22): ``t_C = −α_C proj(r̂)``
+      with ``r̂ = ĝ + Ĥ w_n + Âᵀ y`` the scaled residual (3.13), ``proj`` the
+      orthogonal projector onto ``null(Â)`` (so ``proj(r̂) = proj(ĝ + Ĥ w_n)``,
+      which coincides with ``r̂`` itself when ``y`` solves (2.7) exactly) and
+      ``α_C`` the exact 1-D minimiser of ``m_f`` along the ray clipped by the
+      ball and the tangential fraction-to-boundary box
       :meth:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem.tangential_box`.
     * **Projected CG** with Steihaug–Toint termination
       (:func:`~slsqp_jax.sqpdax.linalg.steihaug_cg`), warm-started at
@@ -176,8 +178,9 @@ class FunnelTangentialStepSolver(
         subproblem
             Funnel barrier subproblem at the current iterate.
         x0
-            ``(w_n, y)``: scaled normal step and multiplier estimate defining
-            the Cauchy direction ``−r̂(w_n, y)``.
+            ``(w_n, y)``: scaled normal step and multiplier estimate; ``y``
+            enters the reported ``πᶠ = ‖r̂(w_n, y)‖`` while the Cauchy
+            direction is the projected residual ``−proj(r̂)``.
         initial_state
             Carries the composite ``radius`` on ``‖w_n + t‖``.
 
@@ -233,22 +236,6 @@ class FunnelTangentialStepSolver(
         w_n_norm = jnp.linalg.norm(w_n)
         room = w_n_norm < radius
 
-        # --- Cauchy point along −r̂ (3.17)–(3.18) --------------------------------
-        r_hat = g_n + At(y.flatten())
-        pi_f = jnp.linalg.norm(r_hat)
-        slope = jnp.dot(g_n, r_hat)  # = χᶠ πᶠ; must be > 0 for descent along −r̂
-        curv = jnp.dot(r_hat, H(r_hat))
-        alpha_star = jnp.where(
-            curv > tiny, slope / jnp.maximum(curv, tiny), jnp.asarray(jnp.inf, dtype)
-        )
-        alpha_ball = boundary_step_length(w_n, -r_hat, radius)
-        alpha_box = box_ray_length(-r_hat, lo)
-        alpha_c = jnp.minimum(alpha_star, jnp.minimum(alpha_ball, alpha_box))
-        alpha_c = jnp.where((slope > 0.0) & (pi_f > tiny) & room, alpha_c, 0.0)
-        t_c = -alpha_c * r_hat
-        cauchy_decrease = m_f_n - model_f(w_n + t_c)
-
-        # --- projected CG with Steihaug–Toint termination from w_n --------------
         proj = null_space_projector(
             A,
             At,
@@ -258,6 +245,29 @@ class FunnelTangentialStepSolver(
         )
         r0 = proj(-g_n)
         rz0 = jnp.dot(r0, r0)
+
+        # --- Cauchy point along −proj(r̂) (3.17)–(3.18) --------------------------
+        # With ``y`` the exact least-squares multiplier (2.7) the residual
+        # ``r̂ = ĝ + Ĥ w_n + Âᵀ y`` already lies in ``null(Â)`` and equals
+        # ``proj(ĝ + Ĥ w_n) = −r0``; projecting makes the Cauchy point tangential
+        # (so ``m_v(w_n + t_C) = m_v(w_n)``) even when ``y`` is only solved to a
+        # Krylov tolerance. ``πᶠ = ‖r̂‖`` is still reported from the raw residual.
+        r_hat = g_n + At(y.flatten())
+        pi_f = jnp.linalg.norm(r_hat)
+        d_c = -r0
+        slope = jnp.dot(g_n, d_c)  # = ‖proj(ĝ + Ĥ w_n)‖² ≥ 0 (χᶠ πᶠ for exact y)
+        curv = jnp.dot(d_c, H(d_c))
+        alpha_star = jnp.where(
+            curv > tiny, slope / jnp.maximum(curv, tiny), jnp.asarray(jnp.inf, dtype)
+        )
+        alpha_ball = boundary_step_length(w_n, -d_c, radius)
+        alpha_box = box_ray_length(-d_c, lo)
+        alpha_c = jnp.minimum(alpha_star, jnp.minimum(alpha_ball, alpha_box))
+        alpha_c = jnp.where((slope > 0.0) & (pi_f > tiny) & room, alpha_c, 0.0)
+        t_c = -alpha_c * d_c
+        cauchy_decrease = m_f_n - model_f(w_n + t_c)
+
+        # --- projected CG with Steihaug–Toint termination from w_n --------------
         # Convergence threshold: relative to the initial projected residual, with
         # an absolute floor at the projection noise level ``√eps ‖ĝ + Ĥ w_n‖`` so
         # that CG stops once the residual is pure roundoff (a 1-D null space is
