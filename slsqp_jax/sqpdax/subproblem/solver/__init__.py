@@ -53,6 +53,7 @@ from . import (
     proximal_active_set_loop,
     scaled_normal_step,
     steihaug_toint_cg,
+    trust_funnel,
     trust_region,
     working_set_policy,
 )
@@ -115,6 +116,7 @@ from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
 )
+from .trust_funnel import IterationType, TrustFunnelSolver, TrustFunnelSolverState
 from .trust_region import (
     TrustRegionInteriorPointSolver,
     TrustRegionSolverState,
@@ -141,6 +143,7 @@ __all__ = [
     "proximal_active_set_loop",
     "scaled_normal_step",
     "steihaug_toint_cg",
+    "trust_funnel",
     "trust_region",
     "working_set_policy",
     "RESULTS",
@@ -191,6 +194,9 @@ __all__ = [
     "ScaledNormalStepSolver",
     "SteihaugTointCGTangentialStepSolverState",
     "SteihaugTointCGTangentialStepSolver",
+    "IterationType",
+    "TrustFunnelSolverState",
+    "TrustFunnelSolver",
     "TrustRegionSolverState",
     "TrustRegionStateType",
     "TrustRegionInteriorPointSolver",

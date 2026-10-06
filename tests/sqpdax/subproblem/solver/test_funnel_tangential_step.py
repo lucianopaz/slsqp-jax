@@ -142,6 +142,30 @@ def test_step_is_tangential_inside_the_ball_and_box(
 
 
 @problem_ids
+@pytest.mark.parametrize("noise", [1e-3, 1e-1], ids=["small-noise", "large-noise"])
+def test_step_stays_tangential_with_inexact_multipliers(problem_name: str, noise):
+    """The Cauchy direction is ``−proj(r̂)``: an inexact ``y`` (so that ``r̂`` has
+    a ``range(Âᵀ)`` component) must not leak violation into the step."""
+    sub = build(problem_name)
+    w_n, y = normal_step_and_multipliers(sub)
+    y_flat = y.flatten()
+    noisy = Dual.from_flat(
+        y_flat + noise * jax.random.normal(jax.random.key(0), y_flat.shape),
+        sub.lagrangian.n,
+        sub.lagrangian.mineq,
+        sub.lagrangian.meq,
+    )
+    # Force the Cauchy fallback by allowing no CG iterations.
+    (t, _), state = solve(sub, w_n, noisy, 5.0, max_iter=0)
+    _, _, A_hat, _ = dense_funnel_reference(sub)
+    flat_t = t.flatten()
+    assert state.cauchy_decrease > 0.0
+    assert state.dm_f_t == pytest.approx(float(state.cauchy_decrease), rel=1e-5)
+    assert jnp.linalg.norm(A_hat @ flat_t) <= 1e-4 * (1.0 + jnp.linalg.norm(flat_t))
+    assert jnp.allclose(state.model_v_after, sub.model_v(w_n), rtol=1e-4, atol=1e-5)
+
+
+@problem_ids
 @pd_ids
 @radius_ids
 def test_decrease_dominates_cauchy_point(
