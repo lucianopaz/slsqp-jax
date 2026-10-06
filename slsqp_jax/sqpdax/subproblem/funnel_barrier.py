@@ -64,14 +64,15 @@ class FunnelBarrierSubProblem(ScaledBarrierSubProblem):
     masks them to zero, so they contribute nothing to any measure.
     """
 
-    kappa_fbn: float = 0.1
-    kappa_fbt: float = 0.1
+    kappa_fbn: float | Scalar = 0.1
+    kappa_fbt: float | Scalar = 0.1
+    tau: float | Scalar = 0.9
 
     def __init__(
         self,
         lagrangian: InteriorPointEvaluatedLagrangian,
-        kappa_fbn: float = 0.1,
-        kappa_fbt: float = 0.1,
+        kappa_fbn: float | Scalar = 0.1,
+        kappa_fbt: float | Scalar = 0.1,
     ):
         """Attach an interior-point Lagrangian and the fraction-to-boundary constants.
 
@@ -87,12 +88,14 @@ class FunnelBarrierSubProblem(ScaledBarrierSubProblem):
         Raises
         ------
         ValueError
-            If either constant lies outside ``(0, 1)``.
+            If either constant is a Python number outside ``(0, 1)``. Array
+            values (e.g. the ``μ``-dependent schedules of
+            :class:`~slsqp_jax.sqpdax.barrier.update.FunnelBarrierUpdate`
+            traced inside the outer loop) are accepted unchecked.
         """
-        if not 0.0 < kappa_fbn < 1.0:
-            raise ValueError(f"kappa_fbn must lie in (0, 1); got {kappa_fbn}")
-        if not 0.0 < kappa_fbt < 1.0:
-            raise ValueError(f"kappa_fbt must lie in (0, 1); got {kappa_fbt}")
+        for name, value in (("kappa_fbn", kappa_fbn), ("kappa_fbt", kappa_fbt)):
+            if isinstance(value, (int, float)) and not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must lie in (0, 1); got {value}")
         self.lagrangian = lagrangian
         self.kappa_fbn = kappa_fbn
         self.kappa_fbt = kappa_fbt

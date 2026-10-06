@@ -2,25 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any, Generic, Self, cast
 
 import equinox as eqx
-import jax
 import optimistix as optx
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Int
 
-from ..barrier import Barrier, BarrierUpdate, LogBarrier, MonotoneBarrierUpdate
+from ..barrier import Barrier
 from ..dual import Dual
-from ..lagrangian import (
-    EvaluatedLagrangian,
-    InteriorPointEvaluatedLagrangian,
-    InteriorPointLagrangian,
-    Lagrangian,
-)
+from ..lagrangian import InteriorPointEvaluatedLagrangian, InteriorPointLagrangian
 from ..merit import NormMerit
-from ..primal import InteriorPointPrimal, Slack
+from ..primal import InteriorPointPrimal
 from ..problem import ProblemProtocol
 from ..results import (
     MINIMISER_RESULTS,
@@ -40,7 +33,8 @@ from ..subproblem.solver import (
     TrustRegionStateType,
 )
 from ..types import Scalar, Vector_n
-from .base import CommonMinimiser, OptimisationContext
+from .base import OptimisationContext
+from .interior_point import InteriorPointMinimiser
 from .termination import TerminationFlags, TerminationMetrics
 
 __all__ = [
@@ -155,8 +149,7 @@ class TrustRegionInteriorPointResultAdapter(
 
 
 class TrustRegionInteriorPointMinimiser(
-    CommonMinimiser[
-        InteriorPointPrimal,
+    InteriorPointMinimiser[
         ScaledBarrierSubProblem,
         TrustRegionStateType,
         TrustRegionInteriorPointTerminationMetrics,
@@ -173,11 +166,9 @@ class TrustRegionInteriorPointMinimiser(
     :class:`~slsqp_jax.sqpdax.step_controller.trust_region_radius.TrustRegionManager`
     from the actual/predicted reduction of the barrier merit and updates the
     radius, and (iv) reduces the barrier parameter ``μ`` via a pluggable
-    :class:`~slsqp_jax.sqpdax.barrier.update.BarrierUpdate`. Inequality / bound
-    slacks are virtual variables absent from the user's ``x0``, so ``init``
-    builds the
-    :class:`~slsqp_jax.sqpdax.primal.InteriorPointPrimal` and picks
-    strictly-interior default slack values.
+    :class:`~slsqp_jax.sqpdax.barrier.update.BarrierUpdate`. Slack seeding,
+    initial multipliers and the barrier Lagrangian are inherited from
+    :class:`~slsqp_jax.sqpdax.minimiser.interior_point.InteriorPointMinimiser`.
 
     Termination follows the two nested tests of N&W Algorithm 19.4. The inner
     one — solve the current barrier subproblem to ``E(x, s, y, z; μ) ≤ ε_μ``
@@ -205,24 +196,10 @@ class TrustRegionInteriorPointMinimiser(
 
     Attributes
     ----------
-    initial_mu
-        Initial barrier weight ``μ``.
-    initial_slack
-        Floor used when seeding inequality / bound slacks.
     initial_radius
         Initial trust-region radius.
     initial_penalty
         Initial merit penalty ``ν``.
-    primal_dual
-        If ``True``, use the primal-dual slack-slack KKT block.
-    barrier_update
-        Policy that reduces ``μ``. Consulted after every outer step, accepted
-        or not: the test it applies is a property of the iterate, not of the
-        step, and on a rejected step the iterate is unchanged.
-    rtol
-        Unused; must be left at its ``NaN`` default. Present only to reject
-        the inherited relative-tolerance knob, which this algorithm's
-        absolute KKT-error test does not implement.
     eta, shrink_threshold, grow_threshold, shrink_factor, grow_factor, max_radius
         Forwarded to :class:`TrustRegionManager`.
     radius_floor
@@ -234,28 +211,13 @@ class TrustRegionInteriorPointMinimiser(
     secant_reset
         Shared soft / diagonal / identity / fatal recovery policy. Model
         stalls advance its one global recovery episode.
-    barrier
-        Dynamic barrier whose ``weight`` *is* ``μ`` (seeded in
-        :meth:`_init_dynamics`).
-    barrier_updated
-        Dynamic flag recording whether the last :attr:`barrier_update` call
-        judged the barrier subproblem solved; read by
-        :meth:`termination_metrics` as the inner stopping test.
     consecutive_model_failures
         Dynamic count of consecutive model-quality stalls, reported to the
         secant reset policy as ``model_streak``.
     """
 
-    initial_mu: float = eqx.field(static=True, default=1.0)
-    initial_slack: float = eqx.field(static=True, default=1.0)
     initial_radius: float = eqx.field(static=True, default=1.0)
     initial_penalty: float = eqx.field(static=True, default=1.0)
-    primal_dual: bool = eqx.field(static=True, default=True)
-    barrier_update: BarrierUpdate = eqx.field(default_factory=MonotoneBarrierUpdate)
-    barrier_updated: Bool[Array, ""] = eqx.field(
-        default_factory=lambda: jnp.asarray(False)
-    )
-    rtol: float = eqx.field(static=True, default=jnp.nan)
     # trust-region acceptance / radius policy (forwarded to TrustRegionManager)
     eta: float = eqx.field(static=True, default=1e-4)
     shrink_threshold: float = eqx.field(static=True, default=0.25)
@@ -266,8 +228,6 @@ class TrustRegionInteriorPointMinimiser(
     # secant model-stall detection (feeds the ``model`` reset channel)
     radius_floor: float = eqx.field(static=True, default=1e-8)
     model_failure_rho: float = eqx.field(static=True, default=-1.0)
-    # The barrier is dynamic state: its ``weight`` *is* mu, updated each step.
-    barrier: Barrier | None = None
     consecutive_model_failures: Int[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
@@ -280,82 +240,19 @@ class TrustRegionInteriorPointMinimiser(
             TrustRegionInteriorPointResultAdapter(),
         )
 
-    def __post_init__(self) -> None:
-        if bool(~jnp.isnan(self.rtol)):
-            raise ValueError(
-                "TrustRegionInteriorPointMinimiser does not provide a relative "
-                "tolerance for convergence. Use the absolute tolerance instead."
-            )
-
     def _subproblem_solver_type(self) -> type[SubProblemSolver]:
         """Root solver class for ``options['subproblem']`` validation."""
         return TrustRegionInteriorPointSolver
 
-    def _parse_options(self, options: dict | None) -> Self:
-        """Freeze options and optionally rebuild ``barrier_update`` from a kind-spec."""
-        base = super()._parse_options(options)
-        spec = base.options.get("minimiser", {}).get("barrier_update")
-        if spec is not None:
-            base = replace(
-                base,
-                barrier_update=cast(BarrierUpdate, BarrierUpdate.from_spec(spec)),
-            )
-        return base
-
-    def _make_barrier(self, problem: ProblemProtocol[InteriorPointPrimal]) -> Barrier:
-        """Log barrier seeded at :attr:`initial_mu` with the problem's null masks."""
-        return cast(
-            Barrier,
-            LogBarrier(
-                weight=jnp.asarray(self.initial_mu),
-                null_lb=problem.null_lb,
-                null_ub=problem.null_ub,
-            ),
-        )
-
     def _init_dynamics(
         self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
     ) -> Self:
-        """Seed the secant (via super), the barrier, and a zero model-stall streak."""
+        """Seed the secant and barrier (via super) and a zero model-stall streak."""
         base = super()._init_dynamics(problem, x0)
         return eqx.tree_at(
-            lambda m: (m.barrier, m.consecutive_model_failures),
+            lambda m: m.consecutive_model_failures,
             base,
-            (self._make_barrier(problem), jnp.asarray(0, jnp.int32)),
-            is_leaf=lambda z: z is None,
-        )
-
-    def _init_primal(
-        self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
-    ) -> InteriorPointPrimal:
-        """Strictly-interior default slacks for inequalities and finite bounds."""
-        h0 = problem.ineq_fn(x0)
-        s = jnp.maximum(-h0, self.initial_slack)
-        s_lb = jnp.where(
-            problem.null_lb,
-            self.initial_slack,
-            jnp.maximum(x0 - problem.lb, self.initial_slack),
-        )
-        s_ub = jnp.where(
-            problem.null_ub,
-            self.initial_slack,
-            jnp.maximum(problem.ub - x0, self.initial_slack),
-        )
-        return cast(
-            InteriorPointPrimal,
-            InteriorPointPrimal(x=x0, slack=Slack(s=s, s_lb=s_lb, s_ub=s_ub)),
-        )
-
-    def _init_dual(self, problem: ProblemProtocol[InteriorPointPrimal]) -> Dual:
-        """Positive inequality / bound multipliers for the primal-dual path."""
-        return cast(
-            Dual,
-            Dual(
-                eq_multipliers=jnp.zeros((problem.meq,)),
-                ineq_multipliers=jnp.ones((problem.mineq,)),
-                lb_multipliers=jnp.where(problem.null_lb, 0.0, 1.0),
-                ub_multipliers=jnp.where(problem.null_ub, 0.0, 1.0),
-            ),
+            jnp.asarray(0, jnp.int32),
         )
 
     def _init_solver_state(
@@ -384,20 +281,6 @@ class TrustRegionInteriorPointMinimiser(
             ),
         )
 
-    def _lagrangian_module(
-        self, problem: ProblemProtocol[InteriorPointPrimal]
-    ) -> Lagrangian[InteriorPointPrimal, EvaluatedLagrangian[InteriorPointPrimal]]:
-        """Barrier-augmented Lagrangian at the current secant / barrier."""
-        return cast(
-            Lagrangian[InteriorPointPrimal, EvaluatedLagrangian[InteriorPointPrimal]],
-            InteriorPointLagrangian(
-                problem,
-                self._model_secant(problem),
-                cast(Barrier, self.barrier),
-                primal_dual=self.primal_dual,
-            ),
-        )
-
     def _make_subproblem_solver(
         self, problem: ProblemProtocol[InteriorPointPrimal]
     ) -> TrustRegionInteriorPointSolver[TrustRegionStateType]:
@@ -420,39 +303,11 @@ class TrustRegionInteriorPointMinimiser(
             TrustRegionInteriorPointSolver(),
         )
 
-    def _init_subproblem(
-        self, problem: ProblemProtocol[InteriorPointPrimal]
-    ) -> SubproblemContext[
-        InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
-    ]:
-        """Build a scaled-barrier trust-region context at the current ``(x, s)``."""
-        iterate = cast(InteriorPointPrimal, self.iterate)
-        dual = cast(Dual, self.dual)
-        lag_module = cast(InteriorPointLagrangian, self._lagrangian_module(problem))
-        lag = lag_module(iterate, dual)
-        solver = self._make_subproblem_solver(problem)
-        sub_opts = dict(self.options.get("subproblem", {}))
-        if sub_opts:
-            solver = solver.init(**sub_opts)
-        solver = solver.init(logger=self.logger.child("subproblem"))
-        solver = cast(
-            TrustRegionInteriorPointSolver[TrustRegionStateType],
-            self._precondition(solver, problem, lag),
-        )
-        zero_warm = cast(InteriorPointPrimal, jax.tree.map(jnp.zeros_like, iterate))
-        return cast(
-            SubproblemContext[
-                InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
-            ],
-            SubproblemContext(
-                problem=problem,
-                lagrangian=lag_module,
-                subproblem=ScaledBarrierSubProblem(lag),
-                solver=solver,
-                warm=(zero_warm, dual),
-                state=cast(TrustRegionStateType, self.solver_state),
-            ),
-        )
+    def _make_subproblem(
+        self, lagrangian: InteriorPointEvaluatedLagrangian
+    ) -> ScaledBarrierSubProblem:
+        """Scaled-barrier model at the current ``(x, s)``."""
+        return cast(ScaledBarrierSubProblem, ScaledBarrierSubProblem(lagrangian))
 
     def _step_controller(
         self,
@@ -664,19 +519,12 @@ class TrustRegionInteriorPointMinimiser(
         optimality_residual = self.barrier_update.optimality_residual(
             lag, jnp.asarray(0.0)
         )
-        tracked = (
+        nonfinite = self._any_nonfinite(
             ctx.lagrangian.value,
             ctx.lagrangian.x_grad,
             primal,
             self.dual,
             optimality_residual,
-        )
-        nonfinite = jnp.logical_not(
-            jnp.all(
-                jnp.stack(
-                    [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(tracked)]
-                )
-            )
         )
         status = cast(TrustRegionStateType, ctx.solver_state).status
         fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_max_steps
