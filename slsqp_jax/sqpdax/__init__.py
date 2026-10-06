@@ -104,6 +104,7 @@ from .step_controller import (
     MeritStepController,
     StepController,
     StepResult,
+    TrustFunnelManager,
     TrustRegionManager,
 )
 from .subproblem import (
@@ -212,6 +213,7 @@ __all__ = [
     "LineSearchState",
     "LineSearch",
     "ArmijoLineSearch",
+    "TrustFunnelManager",
     "TrustRegionManager",
     "LogBarrier",
     "Barrier",

@@ -7,14 +7,16 @@ solver proposes a direction, the controller decides how (or whether) to
 take it and returns a :class:`~slsqp_jax.sqpdax.step_controller.base.StepResult`.
 """
 
-from . import base, line_search, trust_region_radius
+from . import base, line_search, trust_funnel, trust_region_radius
 from .base import MeritStepController, StepController, StepResult
 from .line_search import ArmijoLineSearch, LineSearch, LineSearchState
+from .trust_funnel import TrustFunnelManager
 from .trust_region_radius import TrustRegionManager
 
 __all__ = [
     "base",
     "line_search",
+    "trust_funnel",
     "trust_region_radius",
     "StepResult",
     "StepController",
@@ -22,5 +24,6 @@ __all__ = [
     "LineSearchState",
     "LineSearch",
     "ArmijoLineSearch",
+    "TrustFunnelManager",
     "TrustRegionManager",
 ]
