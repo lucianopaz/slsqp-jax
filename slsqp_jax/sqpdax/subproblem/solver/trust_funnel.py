@@ -396,13 +396,18 @@ class TrustFunnelSolver(
             "zero_normal_tangential must be 'relaxed' or 'very_relaxed'; got "
             f"{self.zero_normal_tangential!r}",
         )
-        taus = jnp.array([1e-8, 1e-4, 1.0, 1e4])
-        require(
-            bool(
+        # The solver is rebuilt inside the minimiser's traced loop body; the
+        # forcing-function check only involves static constants, so evaluate
+        # it eagerly rather than letting omnistaging turn it into a tracer.
+        with jax.ensure_compile_time_eval():
+            taus = jnp.array([1e-8, 1e-4, 1.0, 1e4])
+            forcing_ok = bool(
                 satisfies_forcing_condition(
                     self.omega_n, self.omega_t, self.kappa_omega, taus
                 )
-            ),
+            )
+        require(
+            forcing_ok,
             "omega_n / omega_t violate (3.16): omega_t(omega_n(tau)) > kappa_omega tau",
         )
 
