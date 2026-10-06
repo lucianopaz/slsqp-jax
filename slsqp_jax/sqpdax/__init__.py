@@ -26,6 +26,7 @@ from .barrier import (
     Barrier,
     BarrierUpdate,
     EvaluatedBarrier,
+    FunnelBarrierUpdate,
     LogBarrier,
     MonotoneBarrierUpdate,
 )
@@ -221,6 +222,7 @@ __all__ = [
     "BarrierUpdate",
     "MonotoneBarrierUpdate",
     "AdaptiveBarrierUpdate",
+    "FunnelBarrierUpdate",
     "Dual",
     "Primal",
     "Slack",
