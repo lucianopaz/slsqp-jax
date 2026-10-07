@@ -26,8 +26,10 @@ from slsqp_jax.sqpdax.subproblem.solver import (
 )
 from tests.sqpdax.subproblem.conftest import (
     FUNNEL_PROBLEMS,
+    FunnelCase,
     dense_funnel_reference,
-    make_funnel_barrier_subproblem,
+    funnel_problem,
+    make_funnel_case,
     make_scaled_barrier_subproblem,
 )
 
@@ -53,10 +55,8 @@ def build(
     problem_name: str,
     primal_dual: bool = True,
     primal: InteriorPointPrimal | None = None,
-) -> FunnelBarrierSubProblem:
-    return make_funnel_barrier_subproblem(
-        problem=FUNNEL_PROBLEMS[problem_name](), primal_dual=primal_dual, primal=primal
-    )
+) -> FunnelCase:
+    return make_funnel_case(problem_name, primal_dual=primal_dual, primal=primal)
 
 
 def feasible_primal(problem: Problem, x: Array) -> InteriorPointPrimal:
@@ -78,10 +78,19 @@ def random_primal(problem: Problem, seed: int) -> InteriorPointPrimal:
     )
 
 
-def solve(sub, state, solver: TrustFunnelSolver | None = None):
+def _solve_from_zero(sub, solver, warm, state):
+    return solver.solve(sub, warm, state)
+
+
+def solve(case: FunnelCase, state, solver: TrustFunnelSolver | None = None):
+    """Jitted solve from a zero warm start (one compilation per solver config)."""
     solver = TrustFunnelSolver() if solver is None else solver
-    zero = jax.tree.map(jnp.zeros_like, (sub.lagrangian.ref, sub.lagrangian.dual))
-    return solver.solve(sub, zero, state)
+    return case.apply(_solve_from_zero, solver, case.zero_warm(), state)
+
+
+def solve_eager(case: FunnelCase, state, solver: TrustFunnelSolver):
+    """Eager solve for solvers carrying Python-side state (loggers)."""
+    return solver.solve(case.sub, case.zero_warm(), state)
 
 
 def to_scaled(sub: FunnelBarrierSubProblem, d: InteriorPointPrimal) -> Array:
@@ -155,11 +164,14 @@ def test_rejects_non_funnel_subproblem():
 
 @problem_ids
 def test_feasible_iterate_skips_normal_step(problem_name):
-    problem = FUNNEL_PROBLEMS[problem_name]()
-    sub = build(problem_name, primal=feasible_primal(problem, FEASIBLE_X[problem_name]))
+    problem = funnel_problem(problem_name)
+    case = build(
+        problem_name, primal=feasible_primal(problem, FEASIBLE_X[problem_name])
+    )
+    sub = case.sub
     assert float(sub.violation()) == pytest.approx(0.0, abs=1e-6)
 
-    (d, _), st = solve(sub, make_trust_funnel_state(1.0, 1.0, v_max=1.0))
+    (d, _), st = solve(case, make_trust_funnel_state(1.0, 1.0, v_max=1.0))
 
     assert not bool(st.normal_computed)
     assert float(st.normal_norm) == 0.0
@@ -177,8 +189,8 @@ def test_feasible_iterate_skips_normal_step(problem_name):
 @problem_ids
 @pd_ids
 def test_kkt_tolerances_met_returns_zero_step(problem_name, primal_dual):
-    sub = build(problem_name, primal_dual)
-    (d, y), st = solve(sub, make_trust_funnel_state(1.0, 1.0, eps_pi=1e3, eps_v=1e3))
+    case = build(problem_name, primal_dual)
+    (d, y), st = solve(case, make_trust_funnel_state(1.0, 1.0, eps_pi=1e3, eps_v=1e3))
 
     assert bool(st.kkt_satisfied)
     assert st.multiplier_case == MultiplierCase.terminate
@@ -199,11 +211,12 @@ def test_kkt_tolerances_met_returns_zero_step(problem_name, primal_dual):
 @pd_ids
 def test_gate_312_failure_keeps_previous_multipliers(problem_name, primal_dual):
     """``‖P⁻¹n‖ = δᵛ > κ_B min{κ_vf δᵛ, δᶠ}`` ⇒ ``y = y_{k-1}`` and ``t = 0``."""
-    sub = build(problem_name, primal_dual)
+    case = build(problem_name, primal_dual)
+    sub = case.sub
     solver = TrustFunnelSolver()
     radius_v = 1e-3
     radius_f = 0.5 * radius_v
-    (d, y), st = solve(sub, make_trust_funnel_state(radius_v, radius_f), solver)
+    (d, y), st = solve(case, make_trust_funnel_state(radius_v, radius_f), solver)
 
     assert bool(st.normal_computed)
     assert float(st.normal_norm) == pytest.approx(radius_v, rel=1e-4)
@@ -227,15 +240,15 @@ def test_gate_312_failure_keeps_previous_multipliers(problem_name, primal_dual):
 @problem_ids
 @pytest.mark.parametrize("sf_flag", [True, False], ids=["sf-set", "sf-clear"])
 def test_radius_reset_331_fires_only_with_sf_flag(problem_name, sf_flag):
-    sub = build(problem_name)
+    case = build(problem_name)
     solver = TrustFunnelSolver(kappa_n=3.0)
     radius_v = 1e-3
     (_, _), st = solve(
-        sub, make_trust_funnel_state(radius_v, 1.0, sf_flag=sf_flag), solver
+        case, make_trust_funnel_state(radius_v, 1.0, sf_flag=sf_flag), solver
     )
 
     assert bool(st.normal_computed)
-    expected = max(radius_v, solver.kappa_n * unconstrained_cauchy_norm(sub))
+    expected = max(radius_v, solver.kappa_n * unconstrained_cauchy_norm(case.sub))
     if sf_flag:
         assert float(st.radius_v) == pytest.approx(expected, rel=1e-4)
         assert float(st.radius_v) > radius_v
@@ -246,11 +259,11 @@ def test_radius_reset_331_fires_only_with_sf_flag(problem_name, sf_flag):
 
 
 def test_sf_flag_survives_when_no_normal_step_is_taken():
-    problem = FUNNEL_PROBLEMS["shifted-box"]()
-    sub = build(
+    problem = funnel_problem("shifted-box")
+    case = build(
         "shifted-box", primal=feasible_primal(problem, FEASIBLE_X["shifted-box"])
     )
-    (_, _), st = solve(sub, make_trust_funnel_state(1e-3, 1.0, sf_flag=True))
+    (_, _), st = solve(case, make_trust_funnel_state(1e-3, 1.0, sf_flag=True))
     assert not bool(st.normal_computed)
     assert bool(st.sf_flag)
     assert float(st.radius_v) == pytest.approx(1e-3, rel=1e-6)
@@ -261,7 +274,8 @@ def test_sf_flag_survives_when_no_normal_step_is_taken():
 def test_zero_normal_step_policy(problem_name, policy):
     """With ``n = 0`` at an infeasible iterate (3.2 fails) the tangential
     radius follows the configured policy (3.21) or (3.17)."""
-    sub = build(problem_name)
+    case = build(problem_name)
+    sub = case.sub
     solver = TrustFunnelSolver(
         zero_normal_tangential=policy, omega_t=NEGLIGIBLE_OMEGA_T
     )
@@ -269,7 +283,7 @@ def test_zero_normal_step_policy(problem_name, policy):
     radius_v, radius_f, v_max = 0.4, 1.0, 1e3
     # πᵛ ≤ ω_n(πᶠ_{k-1}) with a huge carried πᶠ and v < κ_vv v_max ⇒ no normal step.
     state = make_trust_funnel_state(radius_v, radius_f, v_max=v_max, pi_f_prev=1e6)
-    (d, _), st = solve(sub, state, solver)
+    (d, _), st = solve(case, state, solver)
 
     assert v > 0.0
     assert not bool(st.normal_computed)
@@ -292,17 +306,19 @@ def test_zero_normal_step_policy(problem_name, policy):
 
 def test_very_relaxed_radius_binds_on_kappa_v_vmax():
     """At a feasible iterate ``n = 0`` and (3.21) caps the radius by ``κ_v v_max``."""
-    problem = FUNNEL_PROBLEMS["shifted-box"]()
-    sub = build(
+    problem = funnel_problem("shifted-box")
+    case = build(
         "shifted-box", primal=feasible_primal(problem, FEASIBLE_X["shifted-box"])
     )
     solver = TrustFunnelSolver(kappa_v=2.0)
     v_max = 1e-2
-    (d, _), st = solve(sub, make_trust_funnel_state(10.0, 10.0, v_max=v_max), solver)
+    (d, _), st = solve(case, make_trust_funnel_state(10.0, 10.0, v_max=v_max), solver)
     assert not bool(st.normal_computed)
     assert bool(st.tangential_computed)
     assert float(st.radius_t) == pytest.approx(solver.kappa_v * v_max)
-    assert float(jnp.linalg.norm(to_scaled(sub, d))) <= float(st.radius_t) * (1 + 1e-4)
+    assert float(jnp.linalg.norm(to_scaled(case.sub, d))) <= float(st.radius_t) * (
+        1 + 1e-4
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -310,20 +326,32 @@ def test_very_relaxed_radius_binds_on_kappa_v_vmax():
 # --------------------------------------------------------------------------- #
 
 
+LEMMA_3_3_SEEDS = (0, 1, 2)
+LEMMA_3_3_RADII = {"tiny": (0.05, 0.1), "medium": (0.5, 1.0), "wide": (5.0, 5.0)}
+
+
 @problem_ids
 @pd_ids
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize(
-    "radii", [(0.05, 0.1), (0.5, 1.0), (5.0, 5.0)], ids=["tiny", "medium", "wide"]
-)
-def test_lemma_3_3_properties(problem_name, primal_dual, seed, radii):
-    problem = FUNNEL_PROBLEMS[problem_name]()
-    sub = build(problem_name, primal_dual, primal=random_primal(problem, seed))
+def test_lemma_3_3_properties(problem_name, primal_dual):
+    """Lemma 3.3 and the Δm bookkeeping over random iterates × radii.
+
+    Seeds and radii are looped inside the test so that all nine cases share
+    one compilation of the funnel solve per ``(problem, primal_dual)``.
+    """
+    problem = funnel_problem(problem_name)
     solver = TrustFunnelSolver()
+    for seed in LEMMA_3_3_SEEDS:
+        case = build(problem_name, primal_dual, primal=random_primal(problem, seed))
+        for radii in LEMMA_3_3_RADII.values():
+            check_lemma_3_3_properties(case, solver, radii)
+
+
+def check_lemma_3_3_properties(case: FunnelCase, solver: TrustFunnelSolver, radii):
+    sub = case.sub
     radius_v, radius_f = radii
     v = float(sub.violation())
     state = make_trust_funnel_state(radius_v, radius_f, v_max=max(1.0, 2.0 * v))
-    (d, y), st = solve(sub, state, solver)
+    (d, y), st = solve(case, state, solver)
 
     assert bool(st.success)
     assert st.status == RESULTS.successful
@@ -405,10 +433,10 @@ def test_lemma_3_3_properties(problem_name, primal_dual, seed, radii):
 
 @problem_ids
 def test_always_normal_forces_normal_step(problem_name):
-    sub = build(problem_name)
+    case = build(problem_name)
     state = make_trust_funnel_state(0.5, 1.0, v_max=1e3, pi_f_prev=1e6)
-    (_, st_default) = solve(sub, state)
-    (_, st_forced) = solve(sub, state, TrustFunnelSolver(always_normal=True))
+    (_, st_default) = solve(case, state)
+    (_, st_forced) = solve(case, state, TrustFunnelSolver(always_normal=True))
     assert not bool(st_default.normal_computed)
     assert bool(st_forced.normal_computed)
     assert float(st_forced.normal_norm) > 0.0
@@ -497,13 +525,14 @@ class _LargeNullSpaceTangentialSolver(FunnelTangentialStepSolver):
 
 @problem_ids
 def test_t0_reset_discards_large_tangential_step_without_decrease(problem_name):
-    sub = build(problem_name)
+    case = build(problem_name)
+    sub = case.sub
     solver = TrustFunnelSolver(
         normal_solver=_UphillNormalSolver(),
         tangential_solver=_LargeNullSpaceTangentialSolver(),
         omega_t=NEGLIGIBLE_OMEGA_T,
     )
-    (d, _), st = solve(sub, make_trust_funnel_state(1.0, 1.0, v_max=1e3), solver)
+    (d, _), st = solve(case, make_trust_funnel_state(1.0, 1.0, v_max=1e3), solver)
 
     # Preconditions of the scenario: both steps were computed, (3.20) holds
     # and (2.10) fails because the normal step increased the model.
@@ -525,13 +554,13 @@ def test_t0_reset_discards_large_tangential_step_without_decrease(problem_name):
 @problem_ids
 def test_small_tangential_step_is_kept_despite_no_decrease(problem_name):
     """(3.20) fails when ``‖t‖ ≤ κ_tn ‖n‖`` so the step is kept (k ∉ T₀)."""
-    sub = build(problem_name)
+    case = build(problem_name)
     solver = TrustFunnelSolver(
         normal_solver=_UphillNormalSolver(norm=0.5),
         tangential_solver=_LargeNullSpaceTangentialSolver(norm=0.1),
         omega_t=NEGLIGIBLE_OMEGA_T,
     )
-    (_, _), st = solve(sub, make_trust_funnel_state(1.0, 1.0, v_max=1e3), solver)
+    (_, _), st = solve(case, make_trust_funnel_state(1.0, 1.0, v_max=1e3), solver)
     assert bool(st.tangential_computed)
     assert not bool(st.objective_decrease_ok)
     assert not bool(st.tangential_reset)
@@ -550,14 +579,15 @@ class _FunnelBreakingTangentialSolver(_LargeNullSpaceTangentialSolver):
 
 
 def test_tangential_step_violating_319d_is_discarded():
-    sub = build("shifted-box")
+    case = build("shifted-box")
+    sub = case.sub
     handler = MemoryHandler()
     solver = TrustFunnelSolver(
         tangential_solver=_FunnelBreakingTangentialSolver(),
         omega_t=NEGLIGIBLE_OMEGA_T,
         logger=Logger.from_options({"level": "WARNING", "handler": handler}),
     )
-    (d, _), st = solve(sub, make_trust_funnel_state(0.5, 5.0, v_max=1e3), solver)
+    (d, _), st = solve_eager(case, make_trust_funnel_state(0.5, 5.0, v_max=1e3), solver)
     assert bool(st.tangential_computed)
     assert bool(st.tangential_rejected)
     assert float(st.tangential_norm) == 0.0
@@ -575,12 +605,12 @@ def test_tangential_step_violating_319d_is_discarded():
 
 
 def test_logging_emits_debug_and_no_warning_on_clean_step():
-    sub = build("shifted-box")
+    case = build("shifted-box")
     handler = MemoryHandler()
     solver = TrustFunnelSolver(
         logger=Logger.from_options({"level": "DEBUG", "handler": handler})
     )
-    _, st = solve(sub, make_trust_funnel_state(5.0, 5.0, v_max=10.0), solver)
+    _, st = solve_eager(case, make_trust_funnel_state(5.0, 5.0, v_max=10.0), solver)
     debug = [r for r in handler.records if r.levelno == DEBUG]
     warnings = [r for r in handler.records if r.levelno >= WARNING]
     assert len(debug) == 1
@@ -593,14 +623,13 @@ def test_logging_emits_debug_and_no_warning_on_clean_step():
     assert warnings == []
 
 
-@problem_ids
-def test_solve_is_jittable_and_matches_eager(problem_name):
-    sub = build(problem_name)
+def test_solve_is_jittable_and_matches_eager():
+    """The eager solve agrees with the jitted one used throughout this module."""
+    case = build("eq-ineq-mixed-null")
     solver = TrustFunnelSolver()
     state = make_trust_funnel_state(0.5, 1.0, v_max=10.0)
-    zero = jax.tree.map(jnp.zeros_like, (sub.lagrangian.ref, sub.lagrangian.dual))
-    (d_e, y_e), st_e = solver.solve(sub, zero, state)
-    (d_j, y_j), st_j = jax.jit(lambda s: solver.solve(sub, zero, s))(state)
+    (d_e, y_e), st_e = solve_eager(case, state, solver)
+    (d_j, y_j), st_j = solve(case, state, solver)
     assert jnp.allclose(d_e.flatten(), d_j.flatten(), atol=1e-5)
     assert jnp.allclose(y_e.flatten(), y_j.flatten(), atol=1e-4)
     assert st_e.iteration_type == st_j.iteration_type
@@ -611,7 +640,7 @@ def test_solve_is_jittable_and_matches_eager(problem_name):
 def test_normal_equations_strategies_yield_the_same_funnel_step(problem_name):
     """The bound-eliminated solves reproduce the generic step and multipliers,
     and the attached factor is reported through the resolved strategy."""
-    sub = build(problem_name)
+    case = build(problem_name)
     state = make_trust_funnel_state(0.5, 1.0, v_max=10.0)
     results = {}
     for strategy in ("generic", "schur", "matrix-free"):
@@ -619,13 +648,13 @@ def test_normal_equations_strategies_yield_the_same_funnel_step(problem_name):
             tangential_solver=FunnelTangentialStepSolver(normal_equations=strategy),
             multiplier_recovery=KKTMultiplierRecovery(normal_equations=strategy),
         )
-        attached, resolved, rank = solver._attach_normal_equations(sub)
+        attached, resolved, rank = solver._attach_normal_equations(case.sub)
         assert resolved == strategy
         assert (attached.schur_cache is not None) == (strategy == "schur")
         assert int(rank) == (
             int(attached.schur_cache.rank) if strategy == "schur" else -1
         )
-        results[strategy] = solve(sub, state, solver)
+        results[strategy] = solve(case, state, solver)
     (d_ref, y_ref), st_ref = results["generic"]
     for (d, y), st in results.values():
         assert jnp.allclose(d.flatten(), d_ref.flatten(), rtol=1e-4, atol=1e-5)
@@ -636,15 +665,19 @@ def test_normal_equations_strategies_yield_the_same_funnel_step(problem_name):
 
 def test_returned_multipliers_are_least_squares_estimate():
     """When (3.12) holds the dual is the (unsafeguarded) LS estimate (2.7)."""
-    sub = build("eq-ineq-finite")
+    case = build("eq-ineq-finite")
+    sub = case.sub
     solver = TrustFunnelSolver()
-    (_, y), st = solve(sub, make_trust_funnel_state(5.0, 5.0, v_max=10.0), solver)
+    (_, y), st = solve(case, make_trust_funnel_state(5.0, 5.0, v_max=10.0), solver)
     assert float(st.normal_norm) <= solver.kappa_B * float(st.radius_t)
     g, H, A, _ = dense_funnel_reference(sub)
     # w_n is not observable from the returned step; recompute it with the
     # same normal solver and radius the orchestrator used.
-    (w_n, _), _ = solver.normal_solver.solve(
-        sub, (sub._zero_primal(), sub._zero_dual()), make_scaled_normal_state(5.0)
+    (w_n, _), _ = case.apply(
+        _solve_from_zero,
+        solver.normal_solver,
+        case.zero_warm(),
+        make_scaled_normal_state(5.0),
     )
     y_ls, *_ = jnp.linalg.lstsq(A.T, -(g + H @ w_n.flatten()), rcond=None)
     assert jnp.allclose(y.flatten(), y_ls, atol=1e-3)

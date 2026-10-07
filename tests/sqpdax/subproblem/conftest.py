@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Callable
+import functools
+from dataclasses import dataclass
+from typing import Any, Callable
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
@@ -36,6 +39,18 @@ FUNNEL_PROBLEMS: dict[str, Callable[[], Problem]] = {
     ),
     "shifted-box": lambda: make_shifted_box_quadratic(n=3)[0],
 }
+
+
+@functools.cache
+def funnel_problem(name: str) -> Problem:
+    """One shared :class:`Problem` instance per :data:`FUNNEL_PROBLEMS` entry.
+
+    The problem callables are static leaves that hash by identity, so jitted
+    helpers only reuse their compilation when every test hands them the
+    *same* instance. Only for float32 modules: the bound arrays are created
+    at first use and keep that dtype.
+    """
+    return FUNNEL_PROBLEMS[name]()
 
 
 def make_active_set(
@@ -121,6 +136,28 @@ def make_step(
     return Primal(x=dx), make_dual(n, meq, mineq)
 
 
+def make_ip_lagrangian(
+    problem: Problem,
+    *,
+    weight: float = 0.5,
+    dual_kkt_regularization: float = 0.0,
+    primal_dual: bool = True,
+) -> InteriorPointLagrangian:
+    """Unevaluated interior-point Lagrangian with a log barrier of ``weight``."""
+    barrier = LogBarrier(
+        weight=jnp.asarray(weight),
+        null_lb=problem.null_lb,
+        null_ub=problem.null_ub,
+    )
+    return InteriorPointLagrangian(
+        problem,
+        secant=None,
+        barrier=barrier,
+        dual_kkt_regularization=dual_kkt_regularization,
+        primal_dual=primal_dual,
+    )
+
+
 def make_ip_evaluated(
     *,
     problem: Problem | None = None,
@@ -133,15 +170,9 @@ def make_ip_evaluated(
     """Evaluate an interior-point Lagrangian (optionally primal-dual)."""
     if problem is None:
         problem = make_problem()
-    barrier = LogBarrier(
-        weight=jnp.asarray(weight),
-        null_lb=problem.null_lb,
-        null_ub=problem.null_ub,
-    )
-    lag = InteriorPointLagrangian(
+    lag = make_ip_lagrangian(
         problem,
-        secant=None,
-        barrier=barrier,
+        weight=weight,
         dual_kkt_regularization=dual_kkt_regularization,
         primal_dual=primal_dual,
     )
@@ -171,6 +202,99 @@ def make_funnel_barrier_subproblem(
         dual=dual,
     )
     return FunnelBarrierSubProblem(evaluated, kappa_fbn=kappa_fbn, kappa_fbt=kappa_fbt)
+
+
+@eqx.filter_jit
+def _apply_on_funnel_subproblem(
+    fn: Callable[..., Any],
+    lagrangian: InteriorPointLagrangian,
+    primal: InteriorPointPrimal,
+    dual: Dual,
+    kappa_fbn: float,
+    kappa_fbt: float,
+    args: tuple,
+):
+    """Evaluate the Lagrangian, build the funnel subproblem and run ``fn`` under jit."""
+    sub = FunnelBarrierSubProblem(
+        lagrangian(primal, dual), kappa_fbn=kappa_fbn, kappa_fbt=kappa_fbt
+    )
+    return fn(sub, *args)
+
+
+@dataclass(frozen=True)
+class FunnelCase:
+    """A funnel subproblem together with the pieces needed to rebuild it under jit.
+
+    An evaluated Lagrangian carries per-point closures, so a subproblem can
+    never be a cache-friendly jit argument. :meth:`apply` instead re-evaluates
+    the (unevaluated) Lagrangian inside the trace; with the shared instances
+    of :func:`funnel_problem` every call with the same ``(problem,
+    primal_dual, fn, static args)`` reuses one compilation across tests.
+    """
+
+    lagrangian: InteriorPointLagrangian
+    primal: InteriorPointPrimal
+    dual: Dual
+    kappa_fbn: float
+    kappa_fbt: float
+
+    @functools.cached_property
+    def sub(self) -> FunnelBarrierSubProblem:
+        """Eagerly evaluated subproblem for reference computations."""
+        return FunnelBarrierSubProblem(
+            self.lagrangian(self.primal, self.dual),
+            kappa_fbn=self.kappa_fbn,
+            kappa_fbt=self.kappa_fbt,
+        )
+
+    @property
+    def problem(self) -> Problem:
+        return self.lagrangian.problem  # type: ignore[return-value]
+
+    def zero_warm(self) -> tuple[InteriorPointPrimal, Dual]:
+        """All-zero ``(primal, dual)`` warm start."""
+        return jax.tree.map(jnp.zeros_like, (self.primal, self.dual))
+
+    def apply(self, fn: Callable[..., Any], *args):
+        """Run ``fn(sub, *args)`` under a shared jit.
+
+        ``fn`` must be a module-level function (lambdas defined inside a
+        test are new objects on every call and defeat the cache).
+        """
+        return _apply_on_funnel_subproblem(
+            fn,
+            self.lagrangian,
+            self.primal,
+            self.dual,
+            self.kappa_fbn,
+            self.kappa_fbt,
+            args,
+        )
+
+
+def make_funnel_case(
+    problem_name: str,
+    *,
+    weight: float = 0.5,
+    primal_dual: bool = True,
+    kappa_fbn: float = 0.1,
+    kappa_fbt: float = 0.1,
+    primal: InteriorPointPrimal | None = None,
+    dual: Dual | None = None,
+) -> FunnelCase:
+    """:class:`FunnelCase` on the shared instance of ``FUNNEL_PROBLEMS[problem_name]``."""
+    problem = funnel_problem(problem_name)
+    if primal is None:
+        primal = make_ip_primal(n=problem.n, mineq=problem.mineq)
+    if dual is None:
+        dual = make_dual(problem.n, problem.meq, problem.mineq)
+    return FunnelCase(
+        lagrangian=make_ip_lagrangian(problem, weight=weight, primal_dual=primal_dual),
+        primal=primal,
+        dual=dual,
+        kappa_fbn=kappa_fbn,
+        kappa_fbt=kappa_fbt,
+    )
 
 
 def dense_funnel_reference(

@@ -11,7 +11,6 @@ import optimistix as optx
 import pytest
 
 from slsqp_jax.sqpdax.barrier import FunnelBarrierUpdate, LogBarrier
-from slsqp_jax.sqpdax.logging import MemoryHandler
 from slsqp_jax.sqpdax.minimiser import (
     TRUST_FUNNEL_INTERIOR_POINT_RESULTS,
     InteriorPointMinimiser,
@@ -22,98 +21,24 @@ from slsqp_jax.sqpdax.minimiser import (
     minimise,
 )
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Slack
-from slsqp_jax.sqpdax.problem.basic import Problem
 from slsqp_jax.sqpdax.subproblem import FunnelBarrierSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     IterationType,
     TrustFunnelSolver,
     TrustFunnelSolverState,
 )
-from tests.sqpdax.conftest import make_shifted_box_quadratic
-from tests.sqpdax.lagrangian.conftest import make_problem
 
 from .conftest import (
+    CONVERGENCE_CASES,
+    constraint_residual,
+    funnel_minimiser,
+    make_bound_only_quadratic,
+    make_box_quadratic,
     make_equality_quadratic,
+    make_infeasible_problem,
     make_scaled_quartic,
     make_unconstrained_quadratic,
 )
-
-QUARTIC_X_STAR = [0.8684468143545903, 0.11959380513219049, 0.01195938051321905]
-
-
-# --- problems ----------------------------------------------------------------
-
-
-def make_box_quadratic() -> Problem:
-    """``min ‖x − c‖²`` with one active inequality and one active bound."""
-    return make_shifted_box_quadratic(n=3)[0]
-
-
-def make_bound_only_quadratic() -> Problem:
-    """``min ‖x‖²`` on ``[0.5, 2] × [−1, 3]``; solution ``(0.5, 0)``."""
-    return make_problem(
-        n=2,
-        meq=0,
-        mineq=0,
-        lb=jnp.array([0.5, -1.0]),
-        ub=jnp.array([2.0, 3.0]),
-        with_curvature=True,
-    )
-
-
-def make_infeasible_problem() -> Problem:
-    """``min ‖x‖²`` with ``x₀ ≤ 0`` and ``x₀ ≥ 1``: no feasible point."""
-    n = 2
-
-    def zero_rows(m: int):
-        return lambda x, *a: jnp.zeros((m, n), x.dtype)
-
-    return Problem(
-        fn=lambda x: (jnp.sum(x**2), None),
-        grad=lambda x: 2.0 * x,
-        hvp=lambda x, v: 2.0 * v,
-        eq_fn=lambda x: jnp.zeros((0,), x.dtype),
-        eq_fn_jac=zero_rows(0),
-        eq_fn_hvp=zero_rows(0),
-        ineq_fn=lambda x: x[:1],
-        ineq_fn_jac=lambda x: jnp.array([[1.0, 0.0]], x.dtype),
-        ineq_fn_hvp=zero_rows(1),
-        lb=jnp.array([1.0, -jnp.inf]),
-        ub=jnp.array([jnp.inf, jnp.inf]),
-        null_lb=jnp.array([False, True]),
-        null_ub=jnp.array([True, True]),
-        n=n,
-        meq=0,
-        mineq=1,
-    )
-
-
-# ``x0`` / ``x_star`` are plain lists: parametrize arguments are built at
-# import time, before the x64 contexts below are entered.
-CONVERGENCE_CASES = {
-    "box": (make_box_quadratic, [0.5, 0.0, 0.5], [0.9, -1.0, 0.0]),
-    "quartic": (make_scaled_quartic, [0.5, 0.3, 0.2], QUARTIC_X_STAR),
-    "equality": (make_equality_quadratic, [0.25, 0.25], [0.5, 0.5]),
-    "bound": (make_bound_only_quadratic, [1.0, 1.0], [0.5, 0.0]),
-}
-
-
-def constraint_residual(problem: Problem, primal: InteriorPointPrimal) -> jax.Array:
-    """``c(x, s)`` stacked over inequalities and live bounds."""
-    x, slack = primal.x, primal.slack
-    return jnp.concatenate(
-        [
-            problem.ineq_fn(x) + slack.s,
-            jnp.where(problem.null_lb, 0.0, problem.lb - x + slack.s_lb),
-            jnp.where(problem.null_ub, 0.0, x - problem.ub + slack.s_ub),
-        ]
-    )
-
-
-def funnel_minimiser(**kwargs) -> TrustFunnelInteriorPointMinimiser:
-    kwargs.setdefault("atol", 1e-6)
-    kwargs.setdefault("initial_mu", 0.1)
-    return TrustFunnelInteriorPointMinimiser(**kwargs)
 
 
 def run(problem, x0, max_steps=120, options=None, **kwargs):
@@ -271,33 +196,30 @@ def test_subproblem_uses_mu_dependent_fraction_to_boundary_constants():
 # --- single steps --------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("make_problem_fn", "x0"),
-    [
-        (make_box_quadratic, [0.5, 0.0, 0.5]),
-        (make_box_quadratic, [3.0, -5.0, 0.0]),
-        (make_scaled_quartic, [0.5, 0.3, 0.2]),
-        (make_bound_only_quadratic, [1.0, 1.0]),
-    ],
-    ids=["box-interior", "box-far", "quartic", "bound"],
-)
-def test_steps_preserve_funnel_invariants(make_problem_fn, x0):
-    """Every committed iterate keeps ``s > 0``, ``c(x, s) ≥ 0`` and ``v ≤ v_max``."""
-    problem = make_problem_fn()
-    solver = funnel_minimiser().init(problem, jnp.asarray(x0))
-    for _ in range(4):
-        solver = solver.step(problem)
-        iterate = solver.iterate
-        residual = constraint_residual(problem, iterate)
-        assert jnp.all(jnp.isfinite(iterate.flatten()))
-        assert jnp.all(iterate.slack.flatten() > 0)
-        assert jnp.all(residual >= -1e-6)
-        assert float(jnp.linalg.norm(residual)) <= float(solver.solver_state.v_max) * (
-            1 + 1e-6
-        )
-        # ``y`` are equality multipliers of ``c(x, s) = 0`` (sign-free in the
-        # paper), so only finiteness is required of them.
-        assert jnp.all(jnp.isfinite(solver.dual.flatten()))
+def check_funnel_invariants(problem, iterate, dual, solver_state) -> None:
+    """``s > 0``, ``c(x, s) ≥ 0`` and ``v ≤ v_max`` at a committed iterate."""
+    residual = constraint_residual(problem, iterate)
+    assert jnp.all(jnp.isfinite(iterate.flatten()))
+    assert jnp.all(iterate.slack.flatten() > 0)
+    assert jnp.all(residual >= -1e-6)
+    assert float(jnp.linalg.norm(residual)) <= float(solver_state.v_max) * (1 + 1e-6)
+    # ``y`` are equality multipliers of ``c(x, s) = 0`` (sign-free in the
+    # paper), so only finiteness is required of them.
+    assert jnp.all(jnp.isfinite(dual.flatten()))
+
+
+@pytest.mark.parametrize("case", list(CONVERGENCE_CASES), ids=list(CONVERGENCE_CASES))
+def test_steps_preserve_funnel_invariants(funnel_run, case):
+    """Every committed iterate of a full run keeps the funnel invariants
+    (``box-far`` starts outside the box, so slacks are reset on the way)."""
+    run_ = funnel_run(case)
+    assert run_.n_steps > 0
+    with jax.enable_x64(True):
+        for record in run_.steps:
+            payload = record.values
+            check_funnel_invariants(
+                run_.problem, payload["x"], payload["dual"], payload["solver_state"]
+            )
 
 
 def test_slack_reset_only_raises_slacks_and_lowers_f_and_v():
@@ -457,96 +379,128 @@ def test_result_adapter_maps_native_codes():
 # --- convergence ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("primal_dual", [True, False], ids=["primal-dual", "primal"])
-@pytest.mark.parametrize("case", list(CONVERGENCE_CASES), ids=list(CONVERGENCE_CASES))
-def test_minimise_converges_to_known_kkt_points(case, primal_dual):
-    """The driver reaches the analytic minimiser with exact curvature."""
-    make_problem_fn, x0, x_star = CONVERGENCE_CASES[case]
-    # f ≈ 1 at the solutions, so the actual-over-predicted ratios need x64 to
-    # resolve reductions at the 1e-6 KKT level.
-    with jax.enable_x64(True):
-        sol = run(make_problem_fn(), x0, primal_dual=primal_dual)
-        assert bool(sol.state.result_adapter.is_successful(sol.result))
-        assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
-        metrics = sol.state.termination_metrics(
-            sol.state._optimisation_context(make_problem_fn())
-        )
+def check_converged(sol, x_star, metrics=None) -> None:
+    """Successful result at the analytic minimiser (and KKT residual, if given)."""
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
+    if metrics is not None:
         assert float(metrics.optimality_residual) <= 1e-6
 
 
+@pytest.mark.parametrize("case", list(CONVERGENCE_CASES), ids=list(CONVERGENCE_CASES))
+def test_minimise_converges_to_known_kkt_points(funnel_run, case):
+    """The driver reaches the analytic minimiser with exact curvature.
+
+    ``f ≈ 1`` at the solutions, so the actual-over-predicted ratios need x64
+    to resolve reductions at the 1e-6 KKT level: the shared runs are float64.
+    """
+    run_ = funnel_run(case)
+    with jax.enable_x64(True):
+        check_converged(run_.sol, run_.x_star, run_.metrics)
+    assert run_.sol.value.dtype == jnp.float64
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        case if case in ("box", "bound") else pytest.param(case, marks=pytest.mark.slow)
+        for case in CONVERGENCE_CASES
+    ],
+    ids=list(CONVERGENCE_CASES),
+)
+def test_primal_barrier_model_converges_to_known_kkt_points(case):
+    """The primal (non primal-dual) barrier Hessian reaches the same points.
+
+    The two models differ only in the barrier Hessian, which is exercised
+    by the bound-active problems; the remaining cases are slow duplicates.
+    """
+    make_problem_fn, x0, x_star = CONVERGENCE_CASES[case]
+    with jax.enable_x64(True):
+        problem = make_problem_fn()
+        sol = run(problem, x0, primal_dual=False)
+        metrics = sol.state.termination_metrics(
+            sol.state._optimisation_context(problem)
+        )
+        check_converged(sol, x_star, metrics)
+
+
 @pytest.mark.parametrize("case", ["box", "quartic"])
-def test_normal_equations_strategies_converge_alike(case):
+def test_normal_equations_strategies_converge_alike(funnel_run, case):
     """Forcing each ``(Â Âᵀ)⁺`` realisation through the options reaches the
     same KKT point in a comparable number of steps, and the configured
-    strategy reaches both the tangential solver and the multiplier recovery."""
+    strategy reaches both the tangential solver and the multiplier recovery.
+
+    The shared run uses the default ``"auto"`` strategy, which resolves to
+    ``"schur"`` on these small problems and is the reference step count.
+    """
     make_problem_fn, x0, x_star = CONVERGENCE_CASES[case]
-    steps = {}
+    reference = funnel_run(case)
+    steps = {"schur": reference.n_steps}
     with jax.enable_x64(True):
-        for strategy in ("generic", "schur", "matrix-free"):
+        sub_solver = reference.sol.state._init_subproblem(reference.problem).solver
+        assert sub_solver.tangential_solver.normal_equations == "auto"
+        for strategy in ("generic", "matrix-free"):
             options = {
                 "subproblem": {
                     "tangential_solver": {"normal_equations": strategy},
                     "multiplier_recovery": {"normal_equations": strategy},
                 }
             }
-            sol = run(make_problem_fn(), x0, options=options)
-            sub_solver = sol.state._init_subproblem(make_problem_fn()).solver
+            problem = make_problem_fn()
+            sol = run(problem, x0, options=options)
+            sub_solver = sol.state._init_subproblem(problem).solver
             assert sub_solver.tangential_solver.normal_equations == strategy
             assert sub_solver.multiplier_recovery.normal_equations == strategy
-            assert bool(sol.state.result_adapter.is_successful(sol.result))
-            assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
+            check_converged(sol, x_star)
             steps[strategy] = int(sol.stats["num_steps"])
-    reference = steps["generic"]
-    for strategy in ("schur", "matrix-free"):
-        assert abs(steps[strategy] - reference) <= max(3, reference // 4)
+    for strategy in ("generic", "matrix-free"):
+        assert abs(steps[strategy] - steps["schur"]) <= max(3, steps["schur"] // 4)
 
 
 @pytest.mark.parametrize(
     ("make_problem_fn", "case"),
     [
         (make_box_quadratic, "box"),
-        (make_scaled_quartic, "quartic"),
+        pytest.param(make_scaled_quartic, "quartic", marks=pytest.mark.slow),
         (lambda: make_scaled_quartic(with_curvature=False), "quartic"),
     ],
     ids=["box", "quartic-with-hvp", "quartic-no-hvp"],
 )
 def test_minimise_converges_with_secant_model(make_problem_fn, case):
-    """The L-BFGS model drives the funnel to the same KKT points."""
+    """The L-BFGS model drives the funnel to the same KKT points.
+
+    Whether the problem exposes an HVP or not only changes how the secant
+    is selected, so the ``with_curvature=True`` variant is a slow duplicate
+    of the automatic selection exercised by ``quartic-no-hvp``.
+    """
     _, x0, x_star = CONVERGENCE_CASES[case]
     with jax.enable_x64(True):
         sol = run(make_problem_fn(), x0, curvature="secant")
-        assert bool(sol.state.result_adapter.is_successful(sol.result))
-        assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
+        check_converged(sol, x_star)
         assert "secant_n_appends" in sol.stats
 
 
-@pytest.mark.parametrize(
-    ("make_problem_fn", "x0"),
-    [
-        (make_equality_quadratic, [0.25, 0.25]),
-        (make_unconstrained_quadratic, [1.0, 1.0]),
-    ],
-    ids=["equality", "unconstrained"],
-)
-def test_agrees_with_trust_region_interior_point(make_problem_fn, x0):
+@pytest.mark.slow
+@pytest.mark.parametrize("case", ["equality", "unconstrained"])
+def test_agrees_with_trust_region_interior_point(funnel_run, case):
     """Both interior-point loops land on the same point.
 
     Restricted to the problems the trust-region loop currently solves to
     ``atol = 1e-6``; the funnel's bound-active cases are checked against the
-    analytic minimisers above.
+    analytic minimisers above (which also cover these two problems, so the
+    cross-check is a slow test).
     """
+    funnel = funnel_run(case)
     with jax.enable_x64(True):
-        funnel = run(make_problem_fn(), x0)
         tr = minimise(
-            make_problem_fn(),
+            CONVERGENCE_CASES[case][0](),
             TrustRegionInteriorPointMinimiser(atol=1e-6, initial_mu=0.1),
-            jnp.asarray(x0),
+            jnp.asarray(funnel.x0),
             max_steps=200,
             throw=False,
         )
-        assert bool(funnel.state.result_adapter.is_successful(funnel.result))
         assert bool(tr.state.result_adapter.is_successful(tr.result))
-        assert jnp.allclose(funnel.value, tr.value, atol=1e-4)
+        assert jnp.allclose(funnel.sol.value, tr.value, atol=1e-4)
 
 
 def test_float32_converges_at_loose_tolerance():
@@ -562,49 +516,32 @@ def test_float32_converges_at_loose_tolerance():
         assert jnp.allclose(sol.value, jnp.asarray([0.9, -1.0, 0.0]), atol=1e-2)
 
 
-def test_unconstrained_and_equality_converge_in_float32():
-    for make_problem_fn, x0, x_star in (
-        CONVERGENCE_CASES["equality"],
-        (make_unconstrained_quadratic, [1.0, 1.0], [0.0, 0.0]),
-    ):
+@pytest.mark.slow
+@pytest.mark.parametrize("case", ["equality", "unconstrained"])
+def test_unconstrained_and_equality_converge_in_float32(case):
+    """Without active bounds float32 reaches the tight tolerance as well.
+
+    A slow duplicate of the float64 convergence tests; the float32 code
+    path itself is covered by ``test_float32_converges_at_loose_tolerance``.
+    """
+    make_problem_fn, x0, x_star = CONVERGENCE_CASES[case]
+    with jax.enable_x64(False):
         sol = run(make_problem_fn(), x0, max_steps=40)
-        assert bool(sol.state.result_adapter.is_successful(sol.result))
-        assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
+        check_converged(sol, x_star)
 
 
 # --- logging / integration -------------------------------------------------------
 
 
-def test_step_logging_reports_funnel_columns_and_stalls():
+def test_step_logging_reports_funnel_columns_and_stalls(infeasible_funnel_run):
     """INFO rows carry the funnel measures; a y-streak logs a WARNING.
 
-    In float32 the infeasible problem ends through the fixed-point detector
-    (the slacks cannot shrink far enough for ``χᵛ`` to vanish), which is the
-    route that emits the streak warning; float64 reaches Step 8 directly.
-    The generic LSMR multiplier recovery is forced because the exact
-    pseudo-inverse paths hand the large least-squares multipliers of the
-    incompatible system to the ``κ_y`` cap instead of producing a y-streak.
+    See :class:`InfeasibleFunnelRun` for why the shared run is float32 with
+    the generic multiplier recovery.
     """
-    problem = make_infeasible_problem()
-    handler = MemoryHandler()
-    with jax.enable_x64(False):
-        sol = run(
-            problem,
-            [0.5, 0.3],
-            max_steps=80,
-            options={
-                "logging": {"level": "INFO", "handler": handler},
-                "subproblem": {
-                    "tangential_solver": {"normal_equations": "generic"},
-                    "multiplier_recovery": {"normal_equations": "generic"},
-                },
-            },
-        )
-        metrics = sol.state.termination_metrics(
-            sol.state._optimisation_context(problem)
-        )
+    sol, handler = infeasible_funnel_run.sol, infeasible_funnel_run.handler
     assert sol.result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.infeasible_stationary_point
-    assert bool(metrics.stalled)
+    assert bool(infeasible_funnel_run.metrics.stalled)
     steps = [r.message for r in handler.records if r.message.startswith("step=")]
     assert len(steps) == int(sol.stats["num_steps"])
     for column in (

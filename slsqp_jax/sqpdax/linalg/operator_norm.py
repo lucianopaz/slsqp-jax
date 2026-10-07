@@ -45,7 +45,7 @@ def power_iteration_norm(
     >>> import jax.numpy as jnp
     >>> from slsqp_jax.sqpdax.linalg import power_iteration_norm
     >>> M = jnp.diag(jnp.array([1.0, -3.0, 2.0]))
-    >>> float(power_iteration_norm(lambda v: M @ v, jnp.ones(3), n_iter=30))
+    >>> float(power_iteration_norm(lambda v: M @ v, jnp.ones(3), n_iter=50))
     3.0
     """
     dtype = x0.dtype

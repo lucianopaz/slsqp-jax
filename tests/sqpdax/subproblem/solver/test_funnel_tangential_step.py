@@ -20,8 +20,9 @@ from slsqp_jax.sqpdax.subproblem.solver import (
 )
 from tests.sqpdax.subproblem.conftest import (
     FUNNEL_PROBLEMS,
+    FunnelCase,
     dense_funnel_reference,
-    make_funnel_barrier_subproblem,
+    make_funnel_case,
     make_scaled_barrier_subproblem,
 )
 
@@ -31,7 +32,8 @@ problem_ids = pytest.mark.parametrize("problem_name", list(FUNNEL_PROBLEMS))
 pd_ids = pytest.mark.parametrize(
     "primal_dual", [True, False], ids=["primal-dual", "primal"]
 )
-radius_ids = pytest.mark.parametrize("radius", [0.6, 5.0], ids=["tight", "wide"])
+# Looped inside the tests so each (problem, primal_dual) compiles once.
+RADII = {"tight": 0.6, "wide": 5.0}
 
 KAPPA_FBN = 0.1
 KAPPA_FBT = 0.1
@@ -39,19 +41,16 @@ NORMAL_RADIUS = 0.5
 KAPPA_B = 0.9
 
 
-def build(problem_name: str, primal_dual: bool = True) -> FunnelBarrierSubProblem:
-    return make_funnel_barrier_subproblem(
-        problem=FUNNEL_PROBLEMS[problem_name](),
+def build(problem_name: str, primal_dual: bool = True) -> FunnelCase:
+    return make_funnel_case(
+        problem_name,
         primal_dual=primal_dual,
         kappa_fbn=KAPPA_FBN,
         kappa_fbt=KAPPA_FBT,
     )
 
 
-def normal_step_and_multipliers(
-    sub: FunnelBarrierSubProblem, *, zero_normal: bool = False
-) -> tuple[InteriorPointPrimal, Dual]:
-    """``(w_n, y)`` with ``w_n`` from the normal solver and ``y`` from (2.7)."""
+def _normal_step_and_multipliers(sub, zero_normal: bool):
     zero = jax.tree.map(jnp.zeros_like, (sub.lagrangian.ref, sub.lagrangian.dual))
     if zero_normal:
         w_n = zero[0]
@@ -63,9 +62,22 @@ def normal_step_and_multipliers(
     return w_n, y
 
 
-def solve(sub, w_n, y, radius, **solver_kwargs):
+def normal_step_and_multipliers(
+    case: FunnelCase, *, zero_normal: bool = False
+) -> tuple[InteriorPointPrimal, Dual]:
+    """``(w_n, y)`` with ``w_n`` from the normal solver and ``y`` from (2.7)."""
+    return case.apply(_normal_step_and_multipliers, zero_normal)
+
+
+def _tangential_solve(sub, solver, warm, state):
+    return solver.solve(sub, warm, state)
+
+
+def solve(case: FunnelCase, w_n, y, radius, **solver_kwargs):
+    """Jitted tangential solve; ``radius`` is traced, solver options are static."""
     solver = FunnelTangentialStepSolver(**solver_kwargs)
-    return solver.solve(sub, (w_n, y), make_funnel_tangential_state(radius))
+    state = make_funnel_tangential_state(jnp.asarray(radius))
+    return case.apply(_tangential_solve, solver, (w_n, y), state)
 
 
 def live_mask(sub: FunnelBarrierSubProblem) -> Array:
@@ -101,14 +113,19 @@ def projected_newton_step(sub: FunnelBarrierSubProblem) -> Array:
 
 @problem_ids
 @pd_ids
-@radius_ids
 def test_step_is_tangential_inside_the_ball_and_box(
-    problem_name: str, primal_dual: bool, radius: float
+    problem_name: str, primal_dual: bool
 ):
     """``Â t ≈ 0``, ``‖w_n + t‖ ≤ radius``, box faces hold; state is consistent."""
-    sub = build(problem_name, primal_dual)
-    w_n, y = normal_step_and_multipliers(sub)
-    (t, dual), state = solve(sub, w_n, y, radius)
+    case = build(problem_name, primal_dual)
+    w_n, y = normal_step_and_multipliers(case)
+    for radius in RADII.values():
+        check_step_is_tangential_inside_the_ball_and_box(case, w_n, y, radius)
+
+
+def check_step_is_tangential_inside_the_ball_and_box(case, w_n, y, radius):
+    sub = case.sub
+    (t, dual), state = solve(case, w_n, y, radius)
     flat_t, flat_n = t.flatten(), w_n.flatten()
     _, _, A_hat, _ = dense_funnel_reference(sub)
     lo, _ = sub.tangential_box(w_n)
@@ -142,80 +159,80 @@ def test_step_is_tangential_inside_the_ball_and_box(
 
 
 @problem_ids
-@pytest.mark.parametrize("noise", [1e-3, 1e-1], ids=["small-noise", "large-noise"])
-def test_step_stays_tangential_with_inexact_multipliers(problem_name: str, noise):
+def test_step_stays_tangential_with_inexact_multipliers(problem_name: str):
     """The Cauchy direction is ``−proj(r̂)``: an inexact ``y`` (so that ``r̂`` has
     a ``range(Âᵀ)`` component) must not leak violation into the step."""
-    sub = build(problem_name)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name)
+    sub = case.sub
+    w_n, y = normal_step_and_multipliers(case)
     y_flat = y.flatten()
-    noisy = Dual.from_flat(
-        y_flat + noise * jax.random.normal(jax.random.key(0), y_flat.shape),
-        sub.lagrangian.n,
-        sub.lagrangian.mineq,
-        sub.lagrangian.meq,
-    )
-    # Force the Cauchy fallback by allowing no CG iterations.
-    (t, _), state = solve(sub, w_n, noisy, 5.0, max_iter=0)
     _, _, A_hat, _ = dense_funnel_reference(sub)
-    flat_t = t.flatten()
-    assert state.cauchy_decrease > 0.0
-    assert state.dm_f_t == pytest.approx(float(state.cauchy_decrease), rel=1e-5)
-    assert jnp.linalg.norm(A_hat @ flat_t) <= 1e-4 * (1.0 + jnp.linalg.norm(flat_t))
-    assert jnp.allclose(state.model_v_after, sub.model_v(w_n), rtol=1e-4, atol=1e-5)
+    for noise in (1e-3, 1e-1):
+        noisy = Dual.from_flat(
+            y_flat + noise * jax.random.normal(jax.random.key(0), y_flat.shape),
+            sub.lagrangian.n,
+            sub.lagrangian.mineq,
+            sub.lagrangian.meq,
+        )
+        # Force the Cauchy fallback by allowing no CG iterations.
+        (t, _), state = solve(case, w_n, noisy, 5.0, max_iter=0)
+        flat_t = t.flatten()
+        assert state.cauchy_decrease > 0.0
+        assert state.dm_f_t == pytest.approx(float(state.cauchy_decrease), rel=1e-5)
+        assert jnp.linalg.norm(A_hat @ flat_t) <= 1e-4 * (1.0 + jnp.linalg.norm(flat_t))
+        assert jnp.allclose(state.model_v_after, sub.model_v(w_n), rtol=1e-4, atol=1e-5)
 
 
 @problem_ids
 @pd_ids
-@radius_ids
-def test_decrease_dominates_cauchy_point(
-    problem_name: str, primal_dual: bool, radius: float
-):
+def test_decrease_dominates_cauchy_point(problem_name: str, primal_dual: bool):
     """(3.19a)/(3.23a): ``Δm_f,t ≥ m_f(w_n) − m_f(w_n + t_C) > 0`` when ``χᶠ ≥ κ_χ πᶠ > 0``."""
-    sub = build(problem_name, primal_dual)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name, primal_dual)
+    sub = case.sub
+    w_n, y = normal_step_and_multipliers(case)
     pi_f, chi_f = sub.pi_f(w_n, y), sub.chi_f(w_n, y)
     assert pi_f > 0.0 and chi_f >= 0.1 * pi_f
-    (t, _), state = solve(sub, w_n, y, radius)
-    assert state.cauchy_decrease > 0.0
-    assert state.dm_f_t >= state.cauchy_decrease * (1.0 - 1e-5)
-    recomputed = sub.model_f(w_n) - sub.model_f(
-        InteriorPointPrimal.from_flat(
-            w_n.flatten() + t.flatten(), sub.lagrangian.n, sub.lagrangian.mineq
+    for radius in RADII.values():
+        (t, _), state = solve(case, w_n, y, radius)
+        assert state.cauchy_decrease > 0.0
+        assert state.dm_f_t >= state.cauchy_decrease * (1.0 - 1e-5)
+        recomputed = sub.model_f(w_n) - sub.model_f(
+            InteriorPointPrimal.from_flat(
+                w_n.flatten() + t.flatten(), sub.lagrangian.n, sub.lagrangian.mineq
+            )
         )
-    )
-    assert jnp.allclose(state.dm_f_t, recomputed, rtol=1e-4, atol=1e-6)
+        assert jnp.allclose(state.dm_f_t, recomputed, rtol=1e-4, atol=1e-6)
 
 
 @problem_ids
 @pd_ids
-@pytest.mark.parametrize("factor", [1.0, 10.0], ids=["radius-at-gate", "radius-10x"])
-def test_cauchy_decrease_satisfies_lemma_3_9(
-    problem_name: str, primal_dual: bool, factor: float
-):
+def test_cauchy_decrease_satisfies_lemma_3_9(problem_name: str, primal_dual: bool):
     """Lemma 3.9: ``m_f(n) − m_f(n + t_C) ≥ κ_ct πᶠ min{πᶠ, (1−κ_B)δᵗ, (1−κ_fbt)κ_fbn}``.
 
     ``κ_ct = κ_χ² / (2(1 + ‖Ĥ‖₂))`` with any ``κ_χ ∈ (0, 1)`` satisfying
     ``χᶠ ≥ κ_χ πᶠ``; the radius is chosen so that the gate (3.12)
-    ``‖w_n‖ ≤ κ_B δᵗ`` holds.
+    ``‖w_n‖ ≤ κ_B δᵗ`` holds (at the gate and ten times wider).
     """
-    sub = build(problem_name, primal_dual)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name, primal_dual)
+    sub = case.sub
+    w_n, y = normal_step_and_multipliers(case)
     pi_f, chi_f = sub.pi_f(w_n, y), sub.chi_f(w_n, y)
     kappa_chi = jnp.minimum(0.99, chi_f / pi_f)
-    radius = jnp.linalg.norm(w_n.flatten()) / KAPPA_B * factor
-    _, state = solve(sub, w_n, y, radius)
     _, H_hat, _, _ = dense_funnel_reference(sub)
     kappa_ct = kappa_chi**2 / (2.0 * (1.0 + jnp.linalg.norm(H_hat, ord=2)))
-    bound = (
-        kappa_ct
-        * pi_f
-        * jnp.minimum(
-            pi_f, jnp.minimum((1.0 - KAPPA_B) * radius, (1.0 - KAPPA_FBT) * KAPPA_FBN)
+    for factor in (1.0, 10.0):
+        radius = jnp.linalg.norm(w_n.flatten()) / KAPPA_B * factor
+        _, state = solve(case, w_n, y, radius)
+        bound = (
+            kappa_ct
+            * pi_f
+            * jnp.minimum(
+                pi_f,
+                jnp.minimum((1.0 - KAPPA_B) * radius, (1.0 - KAPPA_FBT) * KAPPA_FBN),
+            )
         )
-    )
-    assert bound > 0.0
-    assert state.cauchy_decrease >= bound * (1.0 - 1e-4)
+        assert bound > 0.0
+        assert state.cauchy_decrease >= bound * (1.0 - 1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +250,13 @@ def test_zero_normal_step_and_large_radius_recover_projected_newton_step(
     When that step leaves the FTB box it is returned ray-backtracked onto it
     (``β t_N``), unless the Cauchy point does better.
     """
-    sub = build(problem_name, primal_dual)
-    w_n, y = normal_step_and_multipliers(sub, zero_normal=True)
+    case = build(problem_name, primal_dual)
+    sub = case.sub
+    w_n, y = normal_step_and_multipliers(case, zero_normal=True)
     t_newton = projected_newton_step(sub)
     lo, _ = sub.tangential_box(w_n)
     beta = box_fraction(t_newton, lo)
-    (t, _), state = solve(sub, w_n, y, 1e3, tol=1e-8)
+    (t, _), state = solve(case, w_n, y, 1e3, tol=1e-8)
     assert not state.on_boundary
     assert bool(state.ftb_truncated) == bool(beta < 1.0)
     if state.dm_f_t > state.cauchy_decrease:
@@ -251,12 +269,12 @@ def test_zero_normal_step_and_large_radius_recover_projected_newton_step(
 @problem_ids
 def test_small_radius_saturates_ball(problem_name: str):
     """A ball barely larger than ``‖w_n‖`` returns ``‖w_n + t‖ = radius``."""
-    sub = build(problem_name)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name)
+    w_n, y = normal_step_and_multipliers(case)
     radius = jnp.linalg.norm(w_n.flatten()) * (1.0 + 1e-3)
-    _, unconstrained = solve(sub, w_n, y, 1e3)
+    _, unconstrained = solve(case, w_n, y, 1e3)
     assert unconstrained.total_norm > radius  # the ball is genuinely active
-    _, state = solve(sub, w_n, y, radius)
+    _, state = solve(case, w_n, y, radius)
     assert state.on_boundary
     assert jnp.allclose(state.total_norm, radius, rtol=1e-4)
     assert state.dm_f_t > 0.0
@@ -265,26 +283,27 @@ def test_small_radius_saturates_ball(problem_name: str):
 @problem_ids
 def test_normal_step_outside_ball_yields_zero_step(problem_name: str):
     """No room inside the ball: zero step, zero decreases, success."""
-    sub = build(problem_name)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name)
+    w_n, y = normal_step_and_multipliers(case)
     radius = jnp.linalg.norm(w_n.flatten()) * 0.5
-    (t, _), state = solve(sub, w_n, y, radius)
+    (t, _), state = solve(case, w_n, y, radius)
     assert jnp.allclose(t.flatten(), 0.0)
     assert state.success
     assert state.n_cg_iter == 0
     assert jnp.allclose(state.dm_f_t, 0.0)
     assert jnp.allclose(state.cauchy_decrease, 0.0)
-    assert jnp.allclose(state.model_v_after, sub.model_v(w_n))
+    assert jnp.allclose(state.model_v_after, case.sub.model_v(w_n))
 
 
 @problem_ids
 def test_normal_equations_strategies_yield_the_same_step(problem_name: str):
     """``schur``, ``matrix-free`` and ``generic`` projectors agree; ``auto``
     resolves by the number of general rows and reuses a cached factor."""
-    sub = build(problem_name)
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build(problem_name)
+    sub = case.sub
+    w_n, y = normal_step_and_multipliers(case)
     results = {
-        strategy: solve(sub, w_n, y, 5.0, normal_equations=strategy)
+        strategy: solve(case, w_n, y, 5.0, normal_equations=strategy)
         for strategy in ("generic", "schur", "matrix-free")
     }
     (t_ref, _), state_ref = results["generic"]
@@ -298,8 +317,17 @@ def test_normal_equations_strategies_yield_the_same_step(problem_name: str):
         FunnelTangentialStepSolver(schur_max_rows=m).resolve_normal_equations(sub)
         == "matrix-free"
     )
-    (t_cached, _), _ = solve(sub.with_schur_normal_equations(), w_n, y, 5.0)
+    (t_cached, _), _ = case.apply(
+        _tangential_solve_with_cached_factor,
+        FunnelTangentialStepSolver(),
+        (w_n, y),
+        make_funnel_tangential_state(5.0),
+    )
     assert jnp.allclose(t_cached.flatten(), results["schur"][0][0].flatten())
+
+
+def _tangential_solve_with_cached_factor(sub, solver, warm, state):
+    return solver.solve(sub.with_schur_normal_equations(), warm, state)
 
 
 def test_rejects_non_funnel_subproblem():
@@ -314,10 +342,10 @@ def test_logging_emits_debug_summary_and_no_warning_when_finite():
     """One DEBUG summary per solve with the state's numbers; no WARNING when finite."""
     handler = MemoryHandler()
     logger = Logger.from_options({"level": "DEBUG", "handler": handler})
-    sub = build("shifted-box")
-    w_n, y = normal_step_and_multipliers(sub)
+    case = build("shifted-box")
+    w_n, y = normal_step_and_multipliers(case)
     solver = FunnelTangentialStepSolver(logger=logger)
-    _, state = solver.solve(sub, (w_n, y), make_funnel_tangential_state(5.0))
+    _, state = solver.solve(case.sub, (w_n, y), make_funnel_tangential_state(5.0))
 
     assert len(handler.records) == 1
     (rec,) = handler.records
@@ -333,18 +361,13 @@ def test_logging_emits_debug_summary_and_no_warning_when_finite():
 
 
 def test_solve_is_jittable():
-    """The solver traces under ``jax.jit`` with the state as a pytree carry."""
-    sub = build("shifted-box")
-    w_n, y = normal_step_and_multipliers(sub)
+    """The eager solve agrees with the jitted one used throughout this module."""
+    case = build("shifted-box")
+    w_n, y = normal_step_and_multipliers(case)
     solver = FunnelTangentialStepSolver()
-
-    @jax.jit
-    def run(state):
-        return solver.solve(sub, (w_n, y), state)
-
-    (t, _), state = run(make_funnel_tangential_state(5.0))
+    (t, _), state = solve(case, w_n, y, 5.0)
     (t_ref, _), state_ref = solver.solve(
-        sub, (w_n, y), make_funnel_tangential_state(5.0)
+        case.sub, (w_n, y), make_funnel_tangential_state(5.0)
     )
     assert jnp.allclose(t.flatten(), t_ref.flatten(), atol=1e-5)
     assert jnp.allclose(state.dm_f_t, state_ref.dm_f_t, atol=1e-5)

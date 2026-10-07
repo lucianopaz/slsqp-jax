@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import replace
 
+import equinox as eqx
 import jax.numpy as jnp
 import pytest
 from jax import Array
@@ -215,8 +216,15 @@ def test_agrees_with_projected_cg(make_sub, make_pre, projector_cls):
     warm = _warm(sub)
     minres = MinresQLPSubProblemSolver(preconditioner=pre, projector=projector_cls())
     pcg = ProjectedCGSubProblemSolver(preconditioner=pre, projector=projector_cls())
-    (dx_m, lam_m), st_m = minres.solve(sub, warm, make_minres_qlp_state())
-    (dx_p, lam_p), st_p = pcg.solve(sub, warm, make_projected_cg_state())
+
+    @eqx.filter_jit
+    def solve_both(sub, warm):
+        return (
+            minres.solve(sub, warm, make_minres_qlp_state()),
+            pcg.solve(sub, warm, make_projected_cg_state()),
+        )
+
+    ((dx_m, lam_m), st_m), ((dx_p, lam_p), st_p) = solve_both(sub, warm)
 
     assert bool(st_m.success)
     assert st_m.status == RESULTS.successful
