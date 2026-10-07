@@ -9,6 +9,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Scalar
 
 from ...dual import Dual
+from ...linalg import power_iteration_norm, spectral_norm_estimate
 from ...primal import InteriorPointPrimal
 from ..funnel_barrier import FunnelBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -114,8 +115,29 @@ class TrustFunnelSolverState(SubProblemSolverState):
     cauchy_ratio_v, cauchy_ratio_f
         ``Δm_v,n / (m_v(0) − m_v(n_C))`` and ``Δm_f,t / (m_f(n) − m_f(n + t_C))``
         (``1`` when the Cauchy decrease is zero); both must be ``≥ 1``.
+    cauchy_ok
+        Both Cauchy ratios are at least ``1 − cauchy_tol`` ((3.6) and
+        (3.19a)/(3.23a) hold for the returned sub-steps).
+    gate_normal, gate_multiplier
+        The normal gate (3.2) and the multiplier gate (3.12) held at this
+        iteration (``normal_computed`` additionally requires ``πᵛ > 0``).
+    very_relaxed
+        The tangential step used the very relaxed radius (3.22).
+    ftb_normal, ftb_tangential
+        The corresponding sub-step was cut by its fraction-to-boundary rule.
     n_cg_iter
         Cumulative inner iterations of the normal and tangential solvers.
+    v_trial
+        ``v(x⁺, s⁺)`` at the trial point, written by the controller.
+    model_error_f, model_error_v
+        ``|f(x⁺) − m_f(d)|`` and ``|v(x⁺) − m_v(d)|`` at the trial point,
+        written by the controller (zero on y-iterations).
+    funnel_violated
+        The controller accepted an iterate with ``v⁺ > v_max`` — impossible
+        for an exact implementation of (2.11)/(3.35).
+    demoted
+        A step with ``t ≠ 0`` and (2.10) was classified as a v-iteration
+        because (2.11) ``v⁺ ≤ v_max`` failed (written by the controller).
     """
 
     radius_v: Scalar
@@ -153,7 +175,18 @@ class TrustFunnelSolverState(SubProblemSolverState):
     tangential_norm: Scalar
     cauchy_ratio_v: Scalar
     cauchy_ratio_f: Scalar
+    cauchy_ok: Bool[Array, ""]
+    gate_normal: Bool[Array, ""]
+    gate_multiplier: Bool[Array, ""]
+    very_relaxed: Bool[Array, ""]
+    ftb_normal: Bool[Array, ""]
+    ftb_tangential: Bool[Array, ""]
     n_cg_iter: int
+    v_trial: Scalar
+    model_error_f: Scalar
+    model_error_v: Scalar
+    funnel_violated: Bool[Array, ""]
+    demoted: Bool[Array, ""]
 
     @classmethod
     def cold(
@@ -225,7 +258,18 @@ class TrustFunnelSolverState(SubProblemSolverState):
             tangential_norm=zero,
             cauchy_ratio_v=jnp.asarray(1.0, dtype),
             cauchy_ratio_f=jnp.asarray(1.0, dtype),
+            cauchy_ok=jnp.asarray(True),
+            gate_normal=false,
+            gate_multiplier=false,
+            very_relaxed=false,
+            ftb_normal=false,
+            ftb_tangential=false,
             n_cg_iter=jnp.asarray(0, jnp.int32),
+            v_trial=zero,
+            model_error_f=zero,
+            model_error_v=zero,
+            funnel_violated=false,
+            demoted=false,
         )
 
 
@@ -309,6 +353,20 @@ class TrustFunnelSolver(
         without safeguard.
     normal_solver, tangential_solver
         The two sub-solvers.
+    cauchy_tol
+        Relative slack on the Cauchy ratios: ``cauchy_ok`` requires
+        ``Δm ≥ (1 − cauchy_tol) × (Cauchy decrease)``.
+    norm_estimate_iters
+        Power iterations spent on the ``‖Â‖₂`` / ``‖Ĥ‖₂`` estimates of the
+        ``funnel_step`` diagnostic record (only traced when the diagnostics
+        channel is on).
+
+    Besides the text log, an enabled diagnostics channel receives one
+    ``"funnel_step"`` record per solve carrying the criticality measures,
+    gates, radii, both sub-solver states, the scaled sub-steps, the
+    multipliers and the Lemma 3.5 / 3.9 Cauchy lower bounds evaluated with
+    power-iteration estimates of ``‖Â‖₂`` and ``‖Ĥ‖₂`` (see
+    :meth:`cauchy_lower_bounds`).
 
     Notes
     -----
@@ -350,12 +408,21 @@ class TrustFunnelSolver(
     tangential_solver: FunnelTangentialStepSolver = field(
         default_factory=FunnelTangentialStepSolver
     )
+    cauchy_tol: float = field(static=True, default=1e-6)
+    norm_estimate_iters: int = field(static=True, default=10)
 
     def __check_init__(self):
         def require(ok: bool, msg: str):
             if not ok:
                 raise ValueError(msg)
 
+        require(
+            self.cauchy_tol >= 0.0, f"cauchy_tol must be >= 0; got {self.cauchy_tol}"
+        )
+        require(
+            self.norm_estimate_iters >= 1,
+            f"norm_estimate_iters must be >= 1; got {self.norm_estimate_iters}",
+        )
         require(self.kappa_vf > 0.0, f"kappa_vf must be > 0; got {self.kappa_vf}")
         require(
             0.0 < self.kappa_B < 1.0, f"kappa_B must lie in (0, 1); got {self.kappa_B}"
@@ -619,6 +686,13 @@ class TrustFunnelSolver(
         def ratio(dm: Scalar, cauchy: Scalar) -> Scalar:
             return jnp.where(cauchy > 0.0, dm / jnp.maximum(cauchy, tiny), 1.0)
 
+        cauchy_ratio_v = ratio(dm_v_n, cauchy_v)
+        cauchy_ratio_f = ratio(dm_f_t, cauchy_f)
+        cauchy_ok = (cauchy_ratio_v >= 1.0 - self.cauchy_tol) & (
+            cauchy_ratio_f >= 1.0 - self.cauchy_tol
+        )
+        ftb_normal = normal_computed & normal_state.ftb_truncated
+        ftb_tangential = keep & ~zero_step & tang_state.ftb_truncated
         n_cg = normal_state.n_cg_iter + tang_state.n_cg_iter
         finite = (
             jnp.all(jnp.isfinite(step_primal.flatten()))
@@ -674,6 +748,97 @@ class TrustFunnelSolver(
             when=~finite,
             status=status,
         )
+        self.logger.warning(
+            "sub-step below its Cauchy decrease: cauchy_ratio_v={rv:.6f} "
+            "cauchy_ratio_f={rf:.6f} (tolerance {tol:.1e})",
+            when=~cauchy_ok,
+            rv=cauchy_ratio_v,
+            rf=cauchy_ratio_f,
+            tol=jnp.asarray(self.cauchy_tol),
+        )
+
+        def funnel_step_payload() -> dict:
+            a_norm, h_norm = self.operator_norms(subproblem)
+            bound_v, bound_f = self.cauchy_lower_bounds(
+                subproblem,
+                a_norm=a_norm,
+                h_norm=h_norm,
+                radius_v=radius_v,
+                radius_t=radius_t,
+                pi_f=pi_f,
+            )
+            nan = jnp.asarray(jnp.nan, dtype)
+            bound_ratio_v = jnp.where(
+                normal_computed & (bound_v > 0.0),
+                cauchy_v / jnp.maximum(bound_v, tiny),
+                nan,
+            )
+            lemma_3_9_applies = keep & ~zero_step & (chi_f >= self.kappa_chi * pi_f)
+            bound_ratio_f = jnp.where(
+                lemma_3_9_applies & (bound_f > 0.0),
+                cauchy_f / jnp.maximum(bound_f, tiny),
+                nan,
+            )
+            return {
+                "violation": v,
+                "pi_v": pi_v,
+                "chi_v": chi_v,
+                "pi_f": pi_f,
+                "chi_f": chi_f,
+                "pi_f_prev": st.pi_f_prev,
+                "radius_v": radius_v,
+                "radius_f": st.radius_f,
+                "radius_t": radius_t,
+                "v_max": st.v_max,
+                "eps_pi": st.eps_pi,
+                "eps_v": st.eps_v,
+                "gate_normal": gate_normal,
+                "gate_multiplier": gate_mult,
+                "normal_computed": normal_computed,
+                "tangential_computed": compute_tangential,
+                "very_relaxed": very_relaxed,
+                "tangential_rejected": tangential_rejected,
+                "tangential_reset": tangential_reset,
+                "in_td": in_td,
+                "in_d": in_d,
+                "multiplier_case": classification.case,
+                "multiplier_acceptable": classification.acceptable,
+                "kkt_satisfied": kkt,
+                "infeasible_stationary": infeasible_stationary,
+                "iteration_type": iteration_type,
+                "dm_f_n": dm_f_n,
+                "dm_f_t": dm_f_t,
+                "dm_v_n": dm_v_n,
+                "dm_v_d": dm_v_d,
+                "normal_norm": normal_norm,
+                "tangential_norm": tangential_norm,
+                "normal_ratio": jnp.where(
+                    pi_v > 0.0, normal_norm / jnp.maximum(pi_v, tiny), nan
+                ),
+                "cauchy_decrease_v": cauchy_v,
+                "cauchy_decrease_f": cauchy_f,
+                "cauchy_ratio_v": cauchy_ratio_v,
+                "cauchy_ratio_f": cauchy_ratio_f,
+                "cauchy_ok": cauchy_ok,
+                "a_norm": a_norm,
+                "h_norm": h_norm,
+                "cauchy_bound_v": bound_v,
+                "cauchy_bound_f": bound_f,
+                "cauchy_bound_ratio_v": bound_ratio_v,
+                "cauchy_bound_ratio_f": bound_ratio_f,
+                "ftb_normal": ftb_normal,
+                "ftb_tangential": ftb_tangential,
+                "normal_step": to_primal(w_n_flat),
+                "tangential_step": to_primal(t_flat),
+                "step": step_primal,
+                "multipliers": y,
+                "normal_state": normal_state,
+                "tangential_state": tang_state,
+                "cg_iters": n_cg,
+                "finite": finite,
+            }
+
+        self.logger.diagnostic("funnel_step", funnel_step_payload)
 
         new_state = cast(
             TrustFunnelSolverState,
@@ -712,7 +877,18 @@ class TrustFunnelSolver(
                     s.tangential_norm,
                     s.cauchy_ratio_v,
                     s.cauchy_ratio_f,
+                    s.cauchy_ok,
+                    s.gate_normal,
+                    s.gate_multiplier,
+                    s.very_relaxed,
+                    s.ftb_normal,
+                    s.ftb_tangential,
                     s.n_cg_iter,
+                    s.v_trial,
+                    s.model_error_f,
+                    s.model_error_v,
+                    s.funnel_violated,
+                    s.demoted,
                 ),
                 st,
                 (
@@ -747,13 +923,136 @@ class TrustFunnelSolver(
                     contraction_ok,
                     normal_norm,
                     tangential_norm,
-                    ratio(dm_v_n, cauchy_v),
-                    ratio(dm_f_t, cauchy_f),
+                    cauchy_ratio_v,
+                    cauchy_ratio_f,
+                    cauchy_ok,
+                    gate_normal,
+                    gate_mult,
+                    very_relaxed,
+                    ftb_normal,
+                    ftb_tangential,
                     st.n_cg_iter + n_cg,
+                    v,
+                    jnp.zeros((), dtype),
+                    jnp.zeros((), dtype),
+                    jnp.asarray(False),
+                    jnp.asarray(False),
                 ),
             ),
         )
         return (step_primal, y), new_state
+
+    # ------------------------------------------------------------------
+    # diagnostics helpers
+    # ------------------------------------------------------------------
+    def operator_norms(
+        self, subproblem: FunnelBarrierSubProblem
+    ) -> tuple[Scalar, Scalar]:
+        """Power-iteration estimates of ``‖Â‖₂`` and ``‖Ĥ‖₂``.
+
+        Both are lower bounds (see
+        :func:`~slsqp_jax.sqpdax.linalg.operator_norm.power_iteration_norm`)
+        after :attr:`norm_estimate_iters` iterations from a vector of ones.
+
+        Parameters
+        ----------
+        subproblem
+            Funnel subproblem providing ``jac_mvp`` / ``jac_t_mvp`` and
+            ``hess_mvp``.
+
+        Returns
+        -------
+        a_norm
+            Estimate of ``‖Â‖₂``.
+        h_norm
+            Estimate of ``‖Ĥ‖₂`` (dominant eigenvalue magnitude).
+        """
+        lag = subproblem.lagrangian
+        n, mineq, meq = lag.n, lag.mineq, lag.meq
+        ones = jnp.ones_like(lag.ref.flatten())
+
+        def to_primal(w: Array) -> InteriorPointPrimal:
+            return InteriorPointPrimal.from_flat(w, n, mineq)
+
+        a_norm = spectral_norm_estimate(
+            lambda w: subproblem.jac_mvp(to_primal(w)).flatten(),
+            lambda yv: subproblem.jac_t_mvp(
+                Dual.from_flat(yv, n, mineq, meq)
+            ).flatten(),
+            ones,
+            n_iter=self.norm_estimate_iters,
+        )
+        h_norm = power_iteration_norm(
+            lambda w: subproblem.hess_mvp(to_primal(w)).flatten(),
+            ones,
+            n_iter=self.norm_estimate_iters,
+        )
+        return a_norm, h_norm
+
+    def cauchy_lower_bounds(
+        self,
+        subproblem: FunnelBarrierSubProblem,
+        *,
+        a_norm: Scalar,
+        h_norm: Scalar,
+        radius_v: Scalar,
+        radius_t: Scalar,
+        pi_f: Scalar,
+    ) -> tuple[Scalar, Scalar]:
+        """Cauchy decrease lower bounds of Lemmas 3.5 and 3.9.
+
+        ```
+        m_v(0) − m_v(n_C) ≥ χᵛ min{πᵛ, δᵛ, 1 − κ_fbn} / (1 + ‖Â‖²)
+        m_f(n) − m_f(n + t_C) ≥ κ_ct πᶠ min{πᶠ, (1 − κ_B) δᵗ, (1 − κ_fbt) κ_fbn}
+        κ_ct = κ_χ² / (2 (1 + ‖Ĥ‖))
+        ```
+
+        The second bound assumes ``χᶠ ≥ κ_χ πᶠ`` (the tangential case of
+        (3.15)). With norm *estimates from below* the bounds are
+        overestimated, so a ratio slightly under ``1`` is not by itself a
+        violation.
+
+        Parameters
+        ----------
+        subproblem
+            Funnel subproblem (for ``πᵛ``, ``χᵛ``, ``κ_fbn``, ``κ_fbt``).
+        a_norm, h_norm
+            Estimates of ``‖Â‖₂`` and ``‖Ĥ‖₂``.
+        radius_v
+            Normal radius ``δᵛ`` used for the normal step.
+        radius_t
+            Tangential radius ``δᵗ`` of (3.38).
+        pi_f
+            ``πᶠ`` at the returned multipliers.
+
+        Returns
+        -------
+        bound_v
+            Lemma 3.5 bound.
+        bound_f
+            Lemma 3.9 bound.
+        """
+        pi_v = subproblem.pi_v()
+        chi_v = subproblem.chi_v()
+        kappa_fbn = jnp.asarray(subproblem.kappa_fbn)
+        kappa_fbt = jnp.asarray(subproblem.kappa_fbt)
+        bound_v = (
+            chi_v
+            * jnp.minimum(pi_v, jnp.minimum(radius_v, 1.0 - kappa_fbn))
+            / (1.0 + a_norm**2)
+        )
+        kappa_ct = self.kappa_chi**2 / (2.0 * (1.0 + h_norm))
+        bound_f = (
+            kappa_ct
+            * pi_f
+            * jnp.minimum(
+                pi_f,
+                jnp.minimum(
+                    (1.0 - self.kappa_B) * radius_t, (1.0 - kappa_fbt) * kappa_fbn
+                ),
+            )
+        )
+        return bound_v, bound_f
 
     @staticmethod
     def _unconstrained_cauchy_norm(

@@ -16,10 +16,15 @@ solver classes, so that every solver reuses one implementation:
   projection onto ``null(A)`` via CG on the normal equations
   (:func:`~slsqp_jax.sqpdax.linalg.projection.null_space_projector`,
   :func:`~slsqp_jax.sqpdax.linalg.projection.cg_normal_equations`).
+* :mod:`~slsqp_jax.sqpdax.linalg.operator_norm` — power-iteration
+  estimates of spectral norms used by the diagnostics
+  (:func:`~slsqp_jax.sqpdax.linalg.operator_norm.power_iteration_norm`,
+  :func:`~slsqp_jax.sqpdax.linalg.operator_norm.spectral_norm_estimate`).
 """
 
-from . import box, projection, steihaug
+from . import box, operator_norm, projection, steihaug
 from .box import box_fraction, box_ray_length
+from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector
 from .steihaug import (
     SteihaugCGResult,
@@ -30,8 +35,11 @@ from .steihaug import (
 
 __all__ = [
     "box",
+    "operator_norm",
     "projection",
     "steihaug",
+    "power_iteration_norm",
+    "spectral_norm_estimate",
     "SteihaugCGResult",
     "boundary_step_length",
     "steihaug_cg",

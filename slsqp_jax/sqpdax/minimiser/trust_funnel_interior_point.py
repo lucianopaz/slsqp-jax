@@ -32,6 +32,7 @@ from ..subproblem.solver import (
 )
 from ..types import Scalar, Vector_n
 from .base import OptimisationContext
+from .diagnostics import FunnelDiagnostics
 from .interior_point import InteriorPointMinimiser
 from .termination import TerminationFlags, TerminationMetrics
 
@@ -48,11 +49,13 @@ class TRUST_FUNNEL_INTERIOR_POINT_RESULTS(
 ):
     """Fine-grained outcomes for the trust-funnel interior-point minimiser.
 
-    ``infeasible_stationary_point``, ``stationarity_stall`` and
-    ``subproblem_nonfinite`` are raised by the minimiser's termination test.
-    The remaining codes name the invariant violations the funnel diagnostics
-    can promote to a fatal outcome (``v > v_max`` after an accepted step, a
-    sub-step below its Cauchy decrease, a failed multiplier solve).
+    ``infeasible_stationary_point``, ``stationarity_stall``,
+    ``multiplier_solve_failure`` and ``subproblem_nonfinite`` are raised by
+    the minimiser's termination test. ``funnel_invariant_violation`` and
+    ``cauchy_decrease_violation`` are the consistency checks of
+    :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`;
+    they are always logged as warnings and become fatal outcomes only when
+    the minimiser runs with ``strict_checks=True``.
     """
 
     infeasible_stationary_point = (
@@ -64,12 +67,16 @@ class TRUST_FUNNEL_INTERIOR_POINT_RESULTS(
     )
     subproblem_nonfinite = "The trust-funnel step was non-finite."
     funnel_invariant_violation = (
-        "An accepted step left the funnel (v > v_max) — model bookkeeping error."
+        "A funnel invariant failed (s > 0, c(x, s) >= 0, v <= v_max or "
+        "v_max nonincreasing) — model bookkeeping error."
     )
     cauchy_decrease_violation = (
         "A normal or tangential step failed its Cauchy decrease condition."
     )
-    multiplier_solve_failure = "The least-squares multiplier estimate failed."
+    multiplier_solve_failure = (
+        "Consecutive y-iterations with an inconsistent multiplier estimate "
+        "(none of (3.15a)-(3.15c), or pi_f not contracting)."
+    )
 
 
 class TrustFunnelTerminationMetrics(
@@ -111,7 +118,14 @@ class TrustFunnelTerminationMetrics(
         ``v > ε_v(μ)``.
     stationarity_stall
         Stalled while ``v ≤ ε_v(μ)`` (so ``πᶠ > ε_π(μ)`` is what blocks the
-        ``μ`` reduction).
+        ``μ`` reduction), and the y-iterations were healthy.
+    multiplier_failure
+        ``multiplier_failure_streak >= multiplier_failure_steps``: the
+        y-iterations of the stall carry an inconsistent multiplier estimate
+        (see :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`).
+    invariant_violated, cauchy_violated
+        Sticky consistency flags of the diagnostics carry; fatal only under
+        ``strict_checks``.
     has_min_steps
         ``True`` once ``step_count >= min_steps``.
     """
@@ -124,6 +138,9 @@ class TrustFunnelTerminationMetrics(
     stalled: Bool[Array, ""]
     infeasible_stationary: Bool[Array, ""]
     stationarity_stall: Bool[Array, ""]
+    multiplier_failure: Bool[Array, ""]
+    invariant_violated: Bool[Array, ""]
+    cauchy_violated: Bool[Array, ""]
     has_min_steps: Bool[Array, ""]
 
 
@@ -225,7 +242,26 @@ class TrustFunnelInteriorPointMinimiser(
     :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` is fed by a
     streak of steps at which both trust-region radii collapsed below
     ``radius_floor * max(1, ‖x‖)`` while unconverged, or the step was
-    rejected with a ratio below :attr:`model_failure_rho`.
+    rejected with a ratio below :attr:`model_failure_rho`, or (Lemmas
+    4.8–4.10) the governing radius collapsed while the matching criticality
+    measure was still above its tolerance.
+
+    **Diagnostics.** Every step folds the committed state into a
+    :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`
+    carry (:attr:`funnel_diagnostics`): iteration-type and rejection
+    counters, gate / fraction-to-boundary / multiplier-cap rates, the
+    model-error constants ``κ_G, κ_C`` of Lemma 4.5, the degeneracy proxy
+    ``‖P⁻¹n‖ / πᵛ`` and the invariant / Cauchy / y-iteration consistency
+    flags. Failed checks are logged as warnings; with
+    ``strict_checks=True`` an invariant or Cauchy failure also ends the run
+    with ``funnel_invariant_violation`` / ``cauchy_decrease_violation``. A
+    streak of :attr:`multiplier_failure_steps` unhealthy y-iterations
+    always ends the run with ``multiplier_solve_failure``. With the
+    diagnostics channel on, the ``"step"`` payload carries the whole carry
+    plus the multiplier statistics (``‖y‖``, ``min y``, ``‖Sy − μe‖``,
+    ``κ_y(μ)``, the ``κ_D(μ)`` cap hits), each ``μ`` reduction emits a
+    ``"barrier_update"`` record (``πᶠ, v`` against ``ε_π(μ), ε_v(μ)``), and
+    the solver emits one ``"funnel_step"`` record per solve.
 
     Attributes
     ----------
@@ -247,12 +283,23 @@ class TrustFunnelInteriorPointMinimiser(
         loop is declared stalled.
     radius_floor, model_failure_rho
         Model-stall detection constants (see above).
+    multiplier_failure_steps
+        Number of consecutive unhealthy y-iterations after which the run
+        ends with ``multiplier_solve_failure``.
+    strict_checks
+        Promote invariant and Cauchy check failures to fatal outcomes.
+    check_tol
+        Relative tolerance of the invariant checks (``v ≤ v_max``,
+        ``c(x, s) ≥ 0``, ``v_max`` monotone).
     consecutive_model_failures
         Dynamic count of consecutive model stalls reported to the secant
         reset policy as ``model_streak``.
     consecutive_y_iterations
         Dynamic count of consecutive y-iterations since the last primal
         move or ``μ`` reduction.
+    funnel_diagnostics
+        Dynamic :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`
+        carry.
     """
 
     barrier_update: FunnelBarrierUpdate = eqx.field(default_factory=FunnelBarrierUpdate)
@@ -274,11 +321,18 @@ class TrustFunnelInteriorPointMinimiser(
     # secant model-stall detection (feeds the ``model`` reset channel)
     radius_floor: float = eqx.field(static=True, default=1e-8)
     model_failure_rho: float = eqx.field(static=True, default=-1.0)
+    # diagnostics policy
+    multiplier_failure_steps: int = eqx.field(static=True, default=5)
+    strict_checks: bool = eqx.field(static=True, default=False)
+    check_tol: float = eqx.field(static=True, default=1e-6)
     consecutive_model_failures: Int[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
     consecutive_y_iterations: Int[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    funnel_diagnostics: FunnelDiagnostics = eqx.field(
+        default_factory=lambda: FunnelDiagnostics.zero(0.0)
     )
 
     def __check_init__(self) -> None:
@@ -304,6 +358,13 @@ class TrustFunnelInteriorPointMinimiser(
             )
         if self.stall_steps < 1:
             raise ValueError(f"stall_steps must be >= 1; got {self.stall_steps}")
+        if self.multiplier_failure_steps < 1:
+            raise ValueError(
+                "multiplier_failure_steps must be >= 1; got "
+                f"{self.multiplier_failure_steps}"
+            )
+        if self.check_tol < 0.0:
+            raise ValueError(f"check_tol must be >= 0; got {self.check_tol}")
 
     @property
     def result_adapter(self) -> TrustFunnelInteriorPointResultAdapter:
@@ -353,6 +414,21 @@ class TrustFunnelInteriorPointMinimiser(
             eps_pi=self.barrier_update.eps_pi(mu),
             eps_v=self.barrier_update.eps_v(mu),
             dtype=primal.x.dtype,
+        )
+
+    def _close_init(
+        self,
+        primal: InteriorPointPrimal,
+        dual: Dual,
+        solver_state: TrustFunnelSolverState,
+        problem: ProblemProtocol[InteriorPointPrimal],
+    ) -> Self:
+        """Seed the iterate (via super) and a fresh diagnostics carry."""
+        base = super()._close_init(primal, dual, solver_state, problem)
+        return eqx.tree_at(
+            lambda m: m.funnel_diagnostics,
+            base,
+            FunnelDiagnostics.zero(solver_state.v_max, dtype=solver_state.v_max.dtype),
         )
 
     # ================================ step =================================
@@ -493,19 +569,21 @@ class TrustFunnelInteriorPointMinimiser(
             ``consecutive_y_iterations`` refreshed.
         """
         lag_module = cast(InteriorPointLagrangian, ctx.lagrangian)
+        solver = cast(TrustFunnelSolver, ctx.solver)
         iterate = cast(InteriorPointPrimal, self.iterate)
         iterate, reset = self._reset_slacks(iterate, lag_module(iterate, step_dual))
         lagrangian = lag_module(iterate, step_dual)
         sub = cast(FunnelBarrierSubProblem, FunnelBarrierSubProblem(lagrangian))
         pi_f = sub.pi_f(sub._zero_primal(), step_dual)
         v = sub.violation()
+        old_mu = cast(Barrier, self.barrier).weight
         new_barrier, solved = self.barrier_update.update(
             cast(Barrier, self.barrier), lagrangian, pi_f=pi_f, v=v
         )
         new_mu = new_barrier.weight
 
-        state = cast(TrustFunnelSolverState, self.solver_state)
-        dtype = state.radius_v.dtype
+        controlled = cast(TrustFunnelSolverState, self.solver_state)
+        dtype = controlled.radius_v.dtype
 
         def reseed(fresh, current):
             return jnp.where(solved, jnp.asarray(fresh, dtype), current)
@@ -522,13 +600,13 @@ class TrustFunnelInteriorPointMinimiser(
                     s.eps_pi,
                     s.eps_v,
                 ),
-                state,
+                controlled,
                 (
-                    reseed(self.initial_radius_v, state.radius_v),
-                    reseed(self.initial_radius_f, state.radius_f),
-                    reseed(self._funnel_radius(v), state.v_max),
-                    state.sf_flag & ~solved,
-                    reseed(0.0, state.pi_f_prev),
+                    reseed(self.initial_radius_v, controlled.radius_v),
+                    reseed(self.initial_radius_f, controlled.radius_f),
+                    reseed(self._funnel_radius(v), controlled.v_max),
+                    controlled.sf_flag & ~solved,
+                    reseed(0.0, controlled.pi_f_prev),
                     self.barrier_update.eps_pi(new_mu).astype(dtype),
                     self.barrier_update.eps_v(new_mu).astype(dtype),
                 ),
@@ -539,7 +617,8 @@ class TrustFunnelInteriorPointMinimiser(
             self.barrier_update.optimality_residual(lagrangian, jnp.asarray(0.0))
             > self.atol
         )
-        x_scale = jnp.maximum(1.0, jnp.linalg.norm(iterate.x))
+        x_norm = jnp.linalg.norm(iterate.x)
+        x_scale = jnp.maximum(1.0, x_norm)
         radius = jnp.maximum(state.radius_v, state.radius_f)
         radius_collapse = (radius < self.radius_floor * x_scale) & unconverged
         model_failure = ~result.accepted & (state.rho < self.model_failure_rho)
@@ -551,6 +630,45 @@ class TrustFunnelInteriorPointMinimiser(
         y_streak = jnp.where(
             is_y & ~solved, self.consecutive_y_iterations + 1, 0
         ).astype(jnp.int32)
+
+        # --- diagnostics carry ---------------------------------------------------
+        stats = self._multiplier_stats(lagrangian, old_mu)
+        diagnostics = self.funnel_diagnostics.update(
+            controlled,
+            solver,
+            accepted=result.accepted,
+            solved=solved,
+            reset=reset,
+            slack_positive=self._slacks_positive(lagrangian),
+            residual_min=jnp.min(lagrangian.dual_grad.flatten()),
+            violation=v,
+            v_max_next=state.v_max,
+            x_norm=x_norm,
+            multiplier_norm=stats["multiplier_norm"],
+            kappa_y=stats["kappa_y"],
+            d_cap_hits=stats["d_cap_hits"],
+            radius_floor=self.radius_floor,
+            chi_tol=self.infeasibility_tol,
+            tol=self.check_tol,
+        )
+        self._log_diagnostics(diagnostics, solver, controlled, stats, v, old_mu)
+        self.logger.diagnostic(
+            "barrier_update",
+            lambda: {
+                "step": self.step_count,
+                "mu_old": old_mu,
+                "mu_new": new_mu,
+                "pi_f": pi_f,
+                "violation": v,
+                "eps_pi_old": controlled.eps_pi,
+                "eps_v_old": controlled.eps_v,
+                "eps_pi_new": state.eps_pi,
+                "eps_v_new": state.eps_v,
+                "v_max_new": state.v_max,
+                "diagnostics": diagnostics,
+            },
+            when=solved,
+        )
         self.logger.info(
             "slack reset applied: v={v:.3e}",
             when=reset,
@@ -593,9 +711,159 @@ class TrustFunnelInteriorPointMinimiser(
                 m.barrier_updated,
                 m.consecutive_model_failures,
                 m.consecutive_y_iterations,
+                m.funnel_diagnostics,
             ),
             self,
-            (iterate, state, new_barrier, solved, streak, y_streak),
+            (iterate, state, new_barrier, solved, streak, y_streak, diagnostics),
+        )
+
+    # ============================= diagnostics =============================
+
+    @staticmethod
+    def _slacks_positive(
+        lagrangian: InteriorPointEvaluatedLagrangian,
+    ) -> Bool[Array, ""]:
+        """``s > 0`` on the inequality slacks and the live bound slacks."""
+        slack = lagrangian.slack
+        return (
+            jnp.all(slack.s > 0.0)
+            & jnp.all((slack.s_lb > 0.0) | lagrangian.null_lb)
+            & jnp.all((slack.s_ub > 0.0) | lagrangian.null_ub)
+        )
+
+    def _multiplier_stats(
+        self, lagrangian: InteriorPointEvaluatedLagrangian, mu: Scalar
+    ) -> dict[str, Any]:
+        """Multiplier statistics of (3.10), (5.4) and Theorem 5.1.
+
+        Parameters
+        ----------
+        lagrangian
+            Barrier Lagrangian at the committed ``(x, s, y)``.
+        mu
+            Barrier weight the multipliers were computed for.
+
+        Returns
+        -------
+        dict
+            ``multiplier_norm`` (``‖y‖₂``), ``multiplier_min`` (smallest
+            inequality / live-bound multiplier, which must turn positive as
+            the slacks vanish), ``complementarity`` (``‖S y − μ e‖₂`` over
+            the live pairs), ``kappa_y`` (``κ_y(μ)``), ``kappa_d``
+            (``κ_D(μ)``) and ``d_cap_hits`` (number of live slack-curvature
+            entries above ``κ_D(μ)``; ``y / s`` in primal-dual mode,
+            ``μ / s²`` otherwise).
+        """
+        dual = lagrangian.dual
+        slack = lagrangian.slack
+        live_lb, live_ub = ~lagrangian.null_lb, ~lagrangian.null_ub
+        y_ineq = dual.ineq_multipliers
+        y_lb = jnp.where(live_lb, dual.lb_multipliers, jnp.inf)
+        y_ub = jnp.where(live_ub, dual.ub_multipliers, jnp.inf)
+        multiplier_min = jnp.min(jnp.concatenate([y_ineq, y_lb, y_ub]), initial=jnp.inf)
+        comp = jnp.concatenate(
+            [
+                slack.s * y_ineq - mu,
+                jnp.where(live_lb, slack.s_lb * dual.lb_multipliers - mu, 0.0),
+                jnp.where(live_ub, slack.s_ub * dual.ub_multipliers - mu, 0.0),
+            ]
+        )
+        if self.primal_dual:
+            curvature = jnp.concatenate(
+                [
+                    y_ineq / slack.s,
+                    jnp.where(live_lb, dual.lb_multipliers / slack.s_lb, 0.0),
+                    jnp.where(live_ub, dual.ub_multipliers / slack.s_ub, 0.0),
+                ]
+            )
+        else:
+            curvature = jnp.concatenate(
+                [
+                    mu / slack.s**2,
+                    jnp.where(live_lb, mu / slack.s_lb**2, 0.0),
+                    jnp.where(live_ub, mu / slack.s_ub**2, 0.0),
+                ]
+            )
+        kappa_d = self.barrier_update.kappa_D(mu)
+        return {
+            "multiplier_norm": jnp.linalg.norm(dual.flatten()),
+            "multiplier_min": multiplier_min,
+            "complementarity": jnp.linalg.norm(comp),
+            "kappa_y": self.barrier_update.kappa_y(mu),
+            "kappa_d": kappa_d,
+            "d_cap_hits": jnp.sum(curvature > kappa_d).astype(jnp.int32),
+        }
+
+    def _log_diagnostics(
+        self,
+        diagnostics: FunnelDiagnostics,
+        solver: TrustFunnelSolver,
+        state: TrustFunnelSolverState,
+        stats: dict[str, Any],
+        violation: Scalar,
+        mu: Scalar,
+    ) -> None:
+        """Warnings for the consistency checks that failed on this step."""
+        self.logger.warning(
+            "funnel invariant violated: slack_positive={sp} residual_nonnegative={rn} "
+            "in_funnel={inf} v_max_monotone={mono} controller_funnel_check={cf} "
+            "v={v:.3e} v_max={v_max:.3e} v_max_prev={v_max_prev:.3e}",
+            when=(
+                ~diagnostics.slack_positive
+                | ~diagnostics.residual_nonnegative
+                | ~diagnostics.in_funnel
+                | ~diagnostics.v_max_monotone
+                | state.funnel_violated
+            ),
+            sp=diagnostics.slack_positive,
+            rn=diagnostics.residual_nonnegative,
+            inf=diagnostics.in_funnel,
+            mono=diagnostics.v_max_monotone,
+            cf=~state.funnel_violated,
+            v=violation,
+            v_max=state.v_max,
+            v_max_prev=self.funnel_diagnostics.v_max_prev,
+        )
+        self.logger.warning(
+            "unhealthy y-iteration (streak {streak}): multiplier_case={case} "
+            "pi_f={pi_f:.3e} pi_f_prev={pi_f_prev:.3e} kappa_omega={kw:.2f} "
+            "tangential_computed={tc}",
+            when=diagnostics.unhealthy_y_iteration,
+            streak=diagnostics.multiplier_failure_streak,
+            case=state.multiplier_case,
+            pi_f=state.pi_f,
+            pi_f_prev=self.funnel_diagnostics.pi_f_last,
+            kw=jnp.asarray(solver.kappa_omega),
+            tc=state.tangential_computed,
+        )
+        self.logger.warning(
+            "radius collapsed with criticality bounded away (Lemmas 4.8-4.10, "
+            "streak {streak}): type={kind} radius_v={rv:.3e} radius_f={rf:.3e} "
+            "pi_f={pi_f:.3e} v={v:.3e} chi_v={chi_v:.3e}",
+            when=diagnostics.criticality_collapse,
+            streak=diagnostics.criticality_collapse_streak,
+            kind=state.iteration_type,
+            rv=state.radius_v,
+            rf=state.radius_f,
+            pi_f=state.pi_f,
+            v=state.violation,
+            chi_v=state.chi_v,
+        )
+        self.logger.warning(
+            "v-iteration outside D below the Lemma 4.6 radius threshold: "
+            "radius_t={rt:.3e} kappa_V={kv:.3e} kappa_C={kc:.3e}",
+            when=diagnostics.outside_d_small_radius,
+            rt=state.radius_t,
+            kv=diagnostics.kappa_v_threshold(solver),
+            kc=diagnostics.kappa_c,
+        )
+        self.logger.warning(
+            "multiplier estimate exceeds kappa_y(mu): |y|={norm:.3e} "
+            "kappa_y={ky:.3e} mu={mu:.3e}",
+            when=diagnostics.multiplier_bound_exceeded,
+            norm=stats["multiplier_norm"],
+            ky=stats["kappa_y"],
+            mu=mu,
         )
 
     def _step_log_fields(
@@ -624,6 +892,12 @@ class TrustFunnelInteriorPointMinimiser(
             "cg_total": state.n_cg_iter,
             "model_fail": self.consecutive_model_failures,
             "y_streak": self.consecutive_y_iterations,
+            "sf": self.funnel_diagnostics.n_sf,
+            "sv": self.funnel_diagnostics.n_sv,
+            "checks_ok": ~(
+                self.funnel_diagnostics.invariant_violated
+                | self.funnel_diagnostics.cauchy_violated
+            ),
         }
 
     def _diagnostic_fields(
@@ -636,12 +910,34 @@ class TrustFunnelInteriorPointMinimiser(
         octx: OptimisationContext[InteriorPointPrimal, TrustFunnelSolverState],
         metrics: TrustFunnelTerminationMetrics,
     ) -> dict[str, Any]:
-        """Base payload plus barrier weight, funnel state and slacks."""
+        """Base payload plus barrier weight, funnel state, slacks and diagnostics.
+
+        Besides the base keys, the record carries ``barrier_weight``,
+        ``barrier_updated``, ``radius_v``, ``radius_f``, ``v_max``, ``rho``,
+        ``iteration_type``, ``cg_total``, both streak counters, ``slack``,
+        the :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`
+        carry under ``funnel_diagnostics``, the multiplier statistics
+        ``multiplier_norm``, ``multiplier_min``, ``complementarity``,
+        ``kappa_y``, ``kappa_d``, ``d_cap_hits`` of :meth:`_multiplier_stats`,
+        the Lemma 4.6 threshold ``kappa_v_threshold`` and the
+        fraction-to-boundary / gate-skip rates ``ftb_normal_rate``,
+        ``ftb_tangential_rate``, ``normal_skip_rate``,
+        ``multiplier_skip_rate`` (counts over ``step_count``).
+        """
         fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
         state = cast(TrustFunnelSolverState, self.solver_state)
+        solver = cast(TrustFunnelSolver, ctx.solver)
+        lag = cast(InteriorPointEvaluatedLagrangian, octx.lagrangian)
+        mu = cast(Barrier, self.barrier).weight
+        diag = self.funnel_diagnostics
+        steps = jnp.maximum(1, self.step_count).astype(state.radius_v.dtype)
+
+        def rate(count: Int[Array, ""]) -> Scalar:
+            return count.astype(state.radius_v.dtype) / steps
+
         fields.update(
             {
-                "barrier_weight": cast(Barrier, self.barrier).weight,
+                "barrier_weight": mu,
                 "barrier_updated": metrics.barrier_updated,
                 "radius_v": state.radius_v,
                 "radius_f": state.radius_f,
@@ -652,19 +948,34 @@ class TrustFunnelInteriorPointMinimiser(
                 "consecutive_model_failures": self.consecutive_model_failures,
                 "consecutive_y_iterations": self.consecutive_y_iterations,
                 "slack": cast(InteriorPointPrimal, self.iterate).slack,
+                "funnel_diagnostics": diag,
+                "kappa_v_threshold": diag.kappa_v_threshold(solver),
+                "ftb_normal_rate": rate(diag.n_ftb_normal),
+                "ftb_tangential_rate": rate(diag.n_ftb_tangential),
+                "normal_skip_rate": rate(diag.n_normal_skipped),
+                "multiplier_skip_rate": rate(diag.n_multiplier_skipped),
             }
         )
+        fields.update(self._multiplier_stats(lag, mu))
         return fields
 
     def _secant_reset_signals(self) -> SecantResetSignals:
-        """Report model-quality stalls on the ``model`` channel only."""
+        """Report model-quality stalls on the ``model`` channel only.
+
+        The streak is the longer of the crude radius-collapse / negative-ratio
+        streak and the Lemma 4.8–4.10 criticality-collapse streak of the
+        diagnostics carry.
+        """
         zero = jnp.asarray(0, jnp.int32)
         return cast(
             SecantResetSignals,
             SecantResetSignals(
                 subproblem_streak=zero,
                 step_streak=zero,
-                model_streak=self.consecutive_model_failures,
+                model_streak=jnp.maximum(
+                    self.consecutive_model_failures,
+                    self.funnel_diagnostics.criticality_collapse_streak,
+                ),
             ),
         )
 
@@ -707,16 +1018,32 @@ class TrustFunnelInteriorPointMinimiser(
         infeasible_stationary = (violation > self.atol) & (
             (chi_v <= self.infeasibility_tol) | (stalled & (violation > eps_v))
         )
-        stationarity_stall = stalled & ~infeasible_stationary
+        diag = self.funnel_diagnostics
+        multiplier_failure = (
+            diag.multiplier_failure_streak >= self.multiplier_failure_steps
+        ) & ~infeasible_stationary
+        stationarity_stall = stalled & ~infeasible_stationary & ~multiplier_failure
         status = cast(TrustFunnelSolverState, ctx.solver_state).status
-        fatal_result = TRUST_FUNNEL_INTERIOR_POINT_RESULTS.where(
-            status != SUBPROBLEM_RESULTS.successful,
-            TRUST_FUNNEL_INTERIOR_POINT_RESULTS.subproblem_nonfinite,
-            TRUST_FUNNEL_INTERIOR_POINT_RESULTS.where(
-                infeasible_stationary,
-                TRUST_FUNNEL_INTERIOR_POINT_RESULTS.infeasible_stationary_point,
-                TRUST_FUNNEL_INTERIOR_POINT_RESULTS.stationarity_stall,
+        R = TRUST_FUNNEL_INTERIOR_POINT_RESULTS
+        fatal_result = R.where(
+            infeasible_stationary,
+            R.infeasible_stationary_point,
+            R.where(
+                multiplier_failure, R.multiplier_solve_failure, R.stationarity_stall
             ),
+        )
+        if self.strict_checks:
+            fatal_result = R.where(
+                diag.invariant_violated,
+                R.funnel_invariant_violation,
+                R.where(
+                    diag.cauchy_violated, R.cauchy_decrease_violation, fatal_result
+                ),
+            )
+        fatal_result = R.where(
+            status != SUBPROBLEM_RESULTS.successful,
+            R.subproblem_nonfinite,
+            fatal_result,
         )
         return cast(
             TrustFunnelTerminationMetrics,
@@ -729,6 +1056,9 @@ class TrustFunnelInteriorPointMinimiser(
                 stalled=stalled,
                 infeasible_stationary=infeasible_stationary,
                 stationarity_stall=stationarity_stall,
+                multiplier_failure=multiplier_failure,
+                invariant_violated=diag.invariant_violated,
+                cauchy_violated=diag.cauchy_violated,
                 nonfinite=nonfinite,
                 fatal_result=fatal_result,
                 has_min_steps=self.step_count >= self.min_steps,
@@ -742,9 +1072,11 @@ class TrustFunnelInteriorPointMinimiser(
     ) -> TerminationFlags[TRUST_FUNNEL_INTERIOR_POINT_RESULTS]:
         """Converge on ``E(·; 0) ≤ atol``; stop on Step 8, stalls and failures.
 
-        The infeasible-stationary and stall stops are gated by ``min_steps``
-        like the convergence test, so the loop always takes at least
-        ``min_steps`` steps before giving up.
+        The infeasible-stationary, multiplier-failure and stall stops are
+        gated by ``min_steps`` like the convergence test, so the loop always
+        takes at least ``min_steps`` steps before giving up. Under
+        ``strict_checks`` a failed invariant or Cauchy check is fatal
+        immediately.
 
         Parameters
         ----------
@@ -765,9 +1097,14 @@ class TrustFunnelInteriorPointMinimiser(
             != SUBPROBLEM_RESULTS.successful
         )
         stopped = (
-            metrics.infeasible_stationary | metrics.stationarity_stall
+            metrics.infeasible_stationary
+            | metrics.multiplier_failure
+            | metrics.stationarity_stall
         ) & metrics.has_min_steps
-        fatal = subproblem_fatal | recovery_fatal | stopped
+        checks_fatal = jnp.asarray(self.strict_checks) & (
+            metrics.invariant_violated | metrics.cauchy_violated
+        )
+        fatal = subproblem_fatal | recovery_fatal | stopped | checks_fatal
         converged = (
             (metrics.optimality_residual <= self.atol)
             & metrics.has_min_steps

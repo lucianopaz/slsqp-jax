@@ -578,9 +578,9 @@ def test_acceptance_kind_is_counted_and_exposed():
             merit=float(solver.best_merit),
         )
     assert bool(solver.last_ls_success)
-    assert bool(solver.last_ls_fallback)
-    assert int(solver.n_armijo_accepts) == 1
-    assert int(solver.n_fallback_accepts) == 1
+    assert bool(solver.diagnostics.last_ls_fallback)
+    assert int(solver.diagnostics.n_armijo_accepts) == 1
+    assert int(solver.diagnostics.n_fallback_accepts) == 1
 
 
 def test_postprocess_exposes_kkt_dual_qp_and_failure_statistics():
@@ -843,15 +843,15 @@ def test_prediction_seeds_the_qp_carry_and_lpeca_disables_expand(
                 seeded.solver_state.dual.lb_multipliers, dual_star.lb_multipliers
             )
         # Counters are advanced by the seeding itself (valid, uncapped, one bound).
-        assert int(seeded.n_lpeca_bypassed) == 0
-        assert int(seeded.n_lpeca_capped) == 0
-        assert int(seeded.n_lpeca_bounds_prefixed) == 1
+        assert int(seeded.diagnostics.n_lpeca_bypassed) == 0
+        assert int(seeded.diagnostics.n_lpeca_capped) == 0
+        assert int(seeded.diagnostics.n_lpeca_bounds_prefixed) == 1
     # The seeded solve returns the KKT point immediately.
     stepped = solver.step(problem)
     assert jnp.allclose(stepped.iterate.x, x_star, atol=1e-6)
     if method != "expand":
-        assert int(stepped.n_lpeca_bounds_prefixed) == 1
-        assert int(stepped.n_lpeca_bypassed) == 0
+        assert int(stepped.diagnostics.n_lpeca_bounds_prefixed) == 1
+        assert int(stepped.diagnostics.n_lpeca_bypassed) == 0
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ exposes the same solver to ``optimistix.minimise``.
 from . import (
     active_set_linesearch,
     base,
+    diagnostics,
     interface,
     interior_point,
     optimistix_compat,
@@ -26,6 +27,7 @@ from .active_set_linesearch import (
     ActiveSetLineSearchResultAdapter,
 )
 from .base import AbstractConstrainedMinimiser, CommonMinimiser, OptimisationContext
+from .diagnostics import ActiveSetLineSearchDiagnostics, FunnelDiagnostics
 from .interface import minimise
 from .interior_point import InteriorPointMinimiser
 from .optimistix_compat import OptimistixMinimiser, as_optimistix_minimiser
@@ -45,6 +47,7 @@ from .utils import minimiser_option_keys, solver_option_keys
 
 __all__ = [
     "base",
+    "diagnostics",
     "interface",
     "interior_point",
     "optimistix_compat",
@@ -71,6 +74,8 @@ __all__ = [
     "TrustRegionInteriorPointResultAdapter",
     "TrustFunnelInteriorPointResultAdapter",
     "TrustFunnelTerminationMetrics",
+    "ActiveSetLineSearchDiagnostics",
+    "FunnelDiagnostics",
     "minimiser_option_keys",
     "solver_option_keys",
 ]
