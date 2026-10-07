@@ -3,17 +3,20 @@
 from typing import Self, cast
 
 import jax
-from equinox import tree_at
+from equinox import field, tree_at
 from jax import numpy as jnp
 from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Scalar
 
 from ...dual import Dual
 from ...linalg import (
+    NormalEquationsStrategy,
+    ResolvedNormalEquationsStrategy,
     boundary_step_length,
     box_fraction,
     box_ray_length,
     null_space_projector,
+    resolve_normal_equations_strategy,
     steihaug_cg,
 )
 from ...primal import InteriorPointPrimal
@@ -126,11 +129,19 @@ class FunnelTangentialStepSolver(
       :meth:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem.tangential_box`.
     * **Projected CG** with Steihaug–Toint termination
       (:func:`~slsqp_jax.sqpdax.linalg.steihaug_cg`), warm-started at
-      ``w_n``: residuals are projected exactly onto ``null(Â)`` by a
-      matrix-free inner CG (:func:`~slsqp_jax.sqpdax.linalg.null_space_projector`),
-      so ``Â t = 0`` and ``m_v(w_n + t) = m_v(w_n)`` by construction, which
+      ``w_n``: residuals are projected exactly onto ``null(Â)``
+      (:func:`~slsqp_jax.sqpdax.linalg.null_space_projector`), so
+      ``Â t = 0`` and ``m_v(w_n + t) = m_v(w_n)`` by construction, which
       makes (3.19d) and (3.23d) inherit from the normal step. The iteration
-      stops at the ball, on negative curvature, or on convergence.
+      stops at the ball, on negative curvature, or on convergence. The
+      ``(Â Âᵀ)⁺`` solve behind the projector is selected by
+      :attr:`normal_equations`: the bound / slack rows of ``Â`` are
+      eliminated exactly, either through the explicit pseudo-inverse Schur
+      complement
+      (:class:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations.SchurNormalEquations`,
+      shared with the multiplier recovery when the orchestrator attaches it
+      to the subproblem) or matrix-free by nested PCG; ``"generic"`` keeps
+      the plain inner CG on ``Â Âᵀ``.
     * **Fraction to boundary**: the CG step is backtracked along its ray onto
       the box (ray scaling keeps ``null(Â)`` and, by convexity, the ball).
     * **Cauchy fallback** (3.19a)/(3.23a): the Cauchy point is returned
@@ -153,7 +164,18 @@ class FunnelTangentialStepSolver(
         Scale-invariant floor for the negative-curvature test
         ``pᵀ Ĥ p ≤ cg_regularization ‖p‖²``.
     proj_cg_max_iter, proj_cg_tol, proj_reg
-        Controls of the inner normal-equation CG behind the projector.
+        Controls of the Krylov solves behind the projector (``proj_reg`` is
+        the Tikhonov shift of the ``"generic"`` path only; the structured
+        paths never regularise).
+    normal_equations
+        ``"auto"`` (default), ``"schur"``, ``"matrix-free"`` or
+        ``"generic"``; ``"auto"`` picks ``"schur"`` when
+        ``m_E + m_I < schur_max_rows`` and ``"matrix-free"`` otherwise.
+    schur_max_rows
+        Threshold of the ``"auto"`` rule.
+    rcond
+        Relative eigenvalue cutoff of the Schur pseudo-inverse (``None`` =
+        ``m · eps``).
     """
 
     solver_state_class: type[FunnelTangentialStepState] = FunnelTangentialStepState
@@ -164,6 +186,18 @@ class FunnelTangentialStepSolver(
     proj_cg_max_iter: int = 100
     proj_cg_tol: float = 1e-10
     proj_reg: float = 0.0
+    normal_equations: NormalEquationsStrategy = field(static=True, default="auto")
+    schur_max_rows: int = field(static=True, default=100)
+    rcond: float | None = field(static=True, default=None)
+
+    def resolve_normal_equations(
+        self, subproblem: FunnelBarrierSubProblem
+    ) -> ResolvedNormalEquationsStrategy:
+        """Strategy actually used for ``subproblem`` (``"auto"`` resolved)."""
+        lag = subproblem.lagrangian
+        return resolve_normal_equations_strategy(
+            self.normal_equations, lag.meq + lag.mineq, self.schur_max_rows
+        )
 
     def solve(
         self,
@@ -236,12 +270,24 @@ class FunnelTangentialStepSolver(
         w_n_norm = jnp.linalg.norm(w_n)
         room = w_n_norm < radius
 
+        strategy = self.resolve_normal_equations(subproblem)
+        solve = (
+            None
+            if strategy == "generic"
+            else subproblem.normal_equations_solver(
+                strategy,
+                rcond=self.rcond,
+                tol=self.proj_cg_tol,
+                max_iter=self.proj_cg_max_iter,
+            )
+        )
         proj = null_space_projector(
             A,
             At,
             reg=self.proj_reg,
             tol=self.proj_cg_tol,
             max_iter=self.proj_cg_max_iter,
+            solve=solve,
         )
         r0 = proj(-g_n)
         rz0 = jnp.dot(r0, r0)

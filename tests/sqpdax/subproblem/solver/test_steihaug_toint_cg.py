@@ -65,6 +65,37 @@ def test_scaled_barrier_with_supplied_active_bounds():
     assert jnp.all(jnp.isfinite(step_p.flatten()))
 
 
+@pytest.mark.parametrize(
+    "active_lb",
+    [None, jnp.array([True, False])],
+    ids=["no-active-bounds", "x0-lower-active"],
+)
+def test_normal_equations_strategies_agree_with_active_bounds(active_lb):
+    """All three normal-equations strategies return the same masked step."""
+    sub = make_scaled_barrier_subproblem()
+    n = sub.lagrangian.n
+    warm = _zero_warm(sub)
+    active = None
+    if active_lb is not None:
+        active = (active_lb, jnp.zeros(n, dtype=bool))
+    steps = {}
+    for strategy in ("generic", "schur", "matrix-free"):
+        solver = SteihaugTointCGTangentialStepSolver(normal_equations=strategy)
+        (step_p, _), state = solver.solve(
+            sub, warm, make_steihaug_state(1.0, active_bounds=active)
+        )
+        assert bool(state.success)
+        steps[strategy] = step_p.flatten()
+        if active_lb is not None:
+            # Frozen coordinates stay put under every strategy.
+            assert jnp.allclose(steps[strategy][:n][active_lb], 0.0, atol=1e-7)
+    for strategy in ("schur", "matrix-free"):
+        assert jnp.allclose(steps[strategy], steps["generic"], rtol=1e-4, atol=1e-5)
+    assert (
+        SteihaugTointCGTangentialStepSolver().resolve_normal_equations(sub) == "schur"
+    )
+
+
 def test_active_set_subproblem_raises():
     """Active-set models are rejected with ``TypeError``."""
     sub = make_qp_subproblem()

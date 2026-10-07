@@ -277,6 +277,31 @@ def test_normal_step_outside_ball_yields_zero_step(problem_name: str):
     assert jnp.allclose(state.model_v_after, sub.model_v(w_n))
 
 
+@problem_ids
+def test_normal_equations_strategies_yield_the_same_step(problem_name: str):
+    """``schur``, ``matrix-free`` and ``generic`` projectors agree; ``auto``
+    resolves by the number of general rows and reuses a cached factor."""
+    sub = build(problem_name)
+    w_n, y = normal_step_and_multipliers(sub)
+    results = {
+        strategy: solve(sub, w_n, y, 5.0, normal_equations=strategy)
+        for strategy in ("generic", "schur", "matrix-free")
+    }
+    (t_ref, _), state_ref = results["generic"]
+    for (t, _), state in results.values():
+        assert jnp.allclose(t.flatten(), t_ref.flatten(), rtol=1e-4, atol=1e-4)
+        assert jnp.allclose(state.dm_f_t, state_ref.dm_f_t, rtol=1e-4, atol=1e-5)
+        assert jnp.allclose(state.model_v_after, state_ref.model_v_after, rtol=1e-4)
+    m = sub.lagrangian.meq + sub.lagrangian.mineq
+    assert FunnelTangentialStepSolver().resolve_normal_equations(sub) == "schur"
+    assert (
+        FunnelTangentialStepSolver(schur_max_rows=m).resolve_normal_equations(sub)
+        == "matrix-free"
+    )
+    (t_cached, _), _ = solve(sub.with_schur_normal_equations(), w_n, y, 5.0)
+    assert jnp.allclose(t_cached.flatten(), results["schur"][0][0].flatten())
+
+
 def test_rejects_non_funnel_subproblem():
     """Only a ``FunnelBarrierSubProblem`` carries the tangential-step geometry."""
     sub = make_scaled_barrier_subproblem()

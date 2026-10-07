@@ -6,7 +6,14 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Scalar
 
 from ...dual import Dual
-from ...linalg import box_fraction, null_space_projector, steihaug_cg
+from ...linalg import (
+    NormalEquationsStrategy,
+    ResolvedNormalEquationsStrategy,
+    box_fraction,
+    null_space_projector,
+    resolve_normal_equations_strategy,
+    steihaug_cg,
+)
 from ...primal import InteriorPointPrimal
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -55,9 +62,13 @@ class SteihaugTointCGTangentialStepSolver(
       constraint operator ``Â`` and its transpose (matrix-free; the dense
       ``Â`` is never assembled).
 
-    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` is realised with an
-    inner matrix-free CG on the normal equations (Tikhonov-regularised by
-    ``proj_reg``). CG iterates in ``null(Â)`` so a warm-started normal step
+    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` solves the normal
+    equations with the strategy selected by :attr:`normal_equations`: the
+    bound / slack rows of ``Â`` are eliminated exactly (explicit
+    pseudo-inverse Schur complement or matrix-free nested PCG, see
+    :mod:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations`), or, with
+    ``"generic"``, an inner matrix-free CG on ``Â Âᵀ`` (Tikhonov-regularised
+    by ``proj_reg``). CG iterates in ``null(Â)`` so a warm-started normal step
     keeps its linearised feasibility; Steihaug's rules stop at
     ``‖w‖ = radius`` or on negative curvature. The full step is finally
     backtracked once for the fraction-to-boundary rule (eq. 19.33e).
@@ -80,7 +91,12 @@ class SteihaugTointCGTangentialStepSolver(
     tau
         Fraction-to-boundary parameter (eq. 19.33e).
     proj_cg_max_iter, proj_cg_tol, proj_reg
-        Inner normal-equation CG controls.
+        Inner normal-equation CG controls (``proj_reg`` applies to the
+        ``"generic"`` path only).
+    normal_equations, schur_max_rows, rcond
+        Normal-equations strategy (``"auto"`` resolves to ``"schur"`` when
+        ``m_E + m_I < schur_max_rows``, else ``"matrix-free"``) and the
+        relative eigenvalue cutoff of the Schur pseudo-inverse.
     gradient_projection
         Bound-face identifier used when ``active_bounds`` is ``None``.
     """
@@ -97,7 +113,19 @@ class SteihaugTointCGTangentialStepSolver(
     proj_cg_max_iter: int = 100
     proj_cg_tol: float = 1e-10
     proj_reg: float = 0.0
+    normal_equations: NormalEquationsStrategy = field(static=True, default="auto")
+    schur_max_rows: int = field(static=True, default=100)
+    rcond: float | None = field(static=True, default=None)
     gradient_projection: GradientProjection = field(default_factory=GradientProjection)
+
+    def resolve_normal_equations(
+        self, subproblem: ScaledBarrierSubProblem
+    ) -> ResolvedNormalEquationsStrategy:
+        """Strategy actually used for ``subproblem`` (``"auto"`` resolved)."""
+        lag = subproblem.lagrangian
+        return resolve_normal_equations_strategy(
+            self.normal_equations, lag.meq + lag.mineq, self.schur_max_rows
+        )
 
     def solve(
         self,
@@ -207,10 +235,25 @@ class SteihaugTointCGTangentialStepSolver(
             ]
         )
 
-        # --- matrix-free projector P = I - A_freeᵀ (A_free A_freeᵀ)⁺ A_free ------
-        # ``A_free(p) = A(free_w ⊙ p)``.  The (Tikhonov-regularised) free-restricted
-        # normal equations are solved by an inner matrix-free CG; no dense Ahat /
-        # SVD is ever formed.
+        # --- projector P = I - A_freeᵀ (A_free A_freeᵀ)⁺ A_free -----------------
+        # ``A_free(p) = A(free_w ⊙ p)``.  The free-restricted normal equations are
+        # solved by the structured elimination (frozen ``x`` columns and their
+        # bound slacks removed) or, generically, by an inner matrix-free CG; no
+        # dense Ahat / SVD is ever formed.
+        strategy = self.resolve_normal_equations(subproblem)
+        solve = (
+            None
+            if strategy == "generic"
+            else subproblem.normal_equations_solver(
+                strategy,
+                free_x=free_x,
+                live_lb=free_lb,
+                live_ub=free_ub,
+                rcond=self.rcond,
+                tol=self.proj_cg_tol,
+                max_iter=self.proj_cg_max_iter,
+            )
+        )
         proj = null_space_projector(
             A,
             At,
@@ -218,6 +261,7 @@ class SteihaugTointCGTangentialStepSolver(
             reg=self.proj_reg,
             tol=self.proj_cg_tol,
             max_iter=self.proj_cg_max_iter,
+            solve=solve,
         )
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2

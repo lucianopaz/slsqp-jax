@@ -17,6 +17,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     FunnelTangentialStepSolver,
     IterationType,
+    KKTMultiplierRecovery,
     LinearForcing,
     MultiplierCase,
     ScaledNormalStepSolver,
@@ -604,6 +605,33 @@ def test_solve_is_jittable_and_matches_eager(problem_name):
     assert jnp.allclose(y_e.flatten(), y_j.flatten(), atol=1e-4)
     assert st_e.iteration_type == st_j.iteration_type
     assert float(st_e.dm_v_d) == pytest.approx(float(st_j.dm_v_d), abs=1e-5)
+
+
+@problem_ids
+def test_normal_equations_strategies_yield_the_same_funnel_step(problem_name):
+    """The bound-eliminated solves reproduce the generic step and multipliers,
+    and the attached factor is reported through the resolved strategy."""
+    sub = build(problem_name)
+    state = make_trust_funnel_state(0.5, 1.0, v_max=10.0)
+    results = {}
+    for strategy in ("generic", "schur", "matrix-free"):
+        solver = TrustFunnelSolver(
+            tangential_solver=FunnelTangentialStepSolver(normal_equations=strategy),
+            multiplier_recovery=KKTMultiplierRecovery(normal_equations=strategy),
+        )
+        attached, resolved, rank = solver._attach_normal_equations(sub)
+        assert resolved == strategy
+        assert (attached.schur_cache is not None) == (strategy == "schur")
+        assert int(rank) == (
+            int(attached.schur_cache.rank) if strategy == "schur" else -1
+        )
+        results[strategy] = solve(sub, state, solver)
+    (d_ref, y_ref), st_ref = results["generic"]
+    for (d, y), st in results.values():
+        assert jnp.allclose(d.flatten(), d_ref.flatten(), rtol=1e-4, atol=1e-5)
+        assert jnp.allclose(y.flatten(), y_ref.flatten(), rtol=1e-4, atol=1e-4)
+        assert st.iteration_type == st_ref.iteration_type
+        assert float(st.dm_v_d) == pytest.approx(float(st_ref.dm_v_d), abs=1e-5)
 
 
 def test_returned_multipliers_are_least_squares_estimate():

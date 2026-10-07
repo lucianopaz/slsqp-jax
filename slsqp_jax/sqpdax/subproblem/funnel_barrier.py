@@ -100,6 +100,7 @@ class FunnelBarrierSubProblem(ScaledBarrierSubProblem):
         self.kappa_fbn = kappa_fbn
         self.kappa_fbt = kappa_fbt
         self.tau = 1.0 - kappa_fbn
+        self.schur_cache = None
 
     # ------------------------------------------------------------------
     # helpers
