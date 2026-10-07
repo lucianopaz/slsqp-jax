@@ -134,6 +134,8 @@ FUNNEL_STEP_KEYS = {
     "tangential_state",
     "cg_iters",
     "finite",
+    "normal_equations_strategy",
+    "normal_equations_rank",
 }
 BARRIER_UPDATE_KEYS = {
     "step",
@@ -671,11 +673,16 @@ def test_run_emits_documented_diagnostic_records(case):
     assert isinstance(values["cauchy_ok"], bool)
     assert isinstance(values["multiplier_case"], str)
     assert values["a_norm"] >= 0.0 and values["h_norm"] >= 0.0
+    # Default ``"auto"`` resolves to the explicit Schur factor on small problems.
+    assert int(values["normal_equations_strategy"]) == 1
+    assert int(values["normal_equations_rank"]) >= 1
     assert all(bool(r.values["cauchy_ok"]) for r in funnel_steps)
     # Lemma 3.5 / 3.9 lower bounds hold wherever they apply. The operator
     # norms are power-iteration estimates *from below*, so the bounds are
-    # slightly overestimated (a few percent here); decreases at the
-    # roundoff floor of ``f ≈ 1`` are not informative.
+    # slightly overestimated (a few percent here). Bounds below ~1e-10 are
+    # built from ``πᵛ``/``πᶠ`` at the noise floor of an essentially
+    # converged iterate (``atol² = 1e-12`` with ``f ≈ 1``) and are not
+    # informative.
     checked = 0
     for r in funnel_steps:
         for key, bound in (
@@ -683,7 +690,7 @@ def test_run_emits_documented_diagnostic_records(case):
             ("cauchy_bound_ratio_f", "cauchy_bound_f"),
         ):
             ratio = r.values[key]
-            if np.isnan(ratio) or r.values[bound] < 1e-12:
+            if np.isnan(ratio) or r.values[bound] < 1e-10:
                 continue
             checked += 1
             assert ratio >= 0.9
@@ -842,7 +849,11 @@ def test_infeasible_run_reports_unhealthy_y_iterations_and_bound_hits():
     Step 8 keeps precedence in the result.
 
     Run in float32, where the loop ends through the y-iteration fixed point
-    (float64 reaches ``χᵛ ≤ infeasibility_tol`` before any y-iteration).
+    (float64 reaches ``χᵛ ≤ infeasibility_tol`` before any y-iteration), and
+    with the generic LSMR multiplier recovery: the exact pseudo-inverse
+    paths return the (large) least-squares multipliers of the incompatible
+    system and the ``κ_y`` cap of (3.10) absorbs them before any unhealthy
+    y-iteration arises.
     """
     handler = MemoryHandler()
     with jax.enable_x64(False):
@@ -852,7 +863,13 @@ def test_infeasible_run_reports_unhealthy_y_iterations_and_bound_hits():
             jnp.array([0.5, 0.3]),
             max_steps=80,
             throw=False,
-            options={"logging": {"level": "WARNING", "handler": handler}},
+            options={
+                "logging": {"level": "WARNING", "handler": handler},
+                "subproblem": {
+                    "tangential_solver": {"normal_equations": "generic"},
+                    "multiplier_recovery": {"normal_equations": "generic"},
+                },
+            },
         )
     assert sol.result == R.infeasible_stationary_point
     diag = sol.state.funnel_diagnostics

@@ -1,6 +1,7 @@
 """Scaled primal-dual interior-point trust-region subproblem."""
 
-from typing import cast
+from collections.abc import Callable
+from typing import Self, cast
 
 import equinox as eqx
 import jax
@@ -9,6 +10,11 @@ from jaxtyping import Array, Bool, Float
 
 from ..dual import Dual
 from ..lagrangian import InteriorPointEvaluatedLagrangian
+from ..linalg.scaled_normal_equations import (
+    ResolvedNormalEquationsStrategy,
+    SchurNormalEquations,
+    slack_eliminated_normal_solver,
+)
 from ..primal import InteriorPointPrimal, Slack
 from ..types import Scalar
 from .base import SubProblem
@@ -31,6 +37,12 @@ class ScaledBarrierSubProblem(SubProblem[InteriorPointPrimal]):
         Primal-dual interior-point Lagrangian at the reference point.
     tau
         Fraction-to-boundary parameter for :meth:`primal_box`.
+    schur_cache
+        Optional precomputed
+        :class:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations.SchurNormalEquations`
+        of the unmasked operator ``Â``, attached through
+        :meth:`with_schur_normal_equations` so that every solver working on
+        this subproblem instance shares one factorisation.
 
     Notes
     -----
@@ -45,6 +57,7 @@ class ScaledBarrierSubProblem(SubProblem[InteriorPointPrimal]):
 
     lagrangian: InteriorPointEvaluatedLagrangian
     tau: float = 0.995
+    schur_cache: SchurNormalEquations | None = None
 
     def __init__(
         self,
@@ -69,6 +82,140 @@ class ScaledBarrierSubProblem(SubProblem[InteriorPointPrimal]):
             raise ValueError("SubProblem must be used with a primal-dual lagrangian")
         self.lagrangian = lagrangian
         self.tau = tau
+        self.schur_cache = None
+
+    # ------------------------------------------------------------------
+    # structured solves of the scaled normal equations Â Âᵀ
+    # ------------------------------------------------------------------
+    def schur_normal_equations(
+        self,
+        *,
+        free_x: Bool[Array, " n"] | None = None,
+        live_lb: Bool[Array, " n"] | None = None,
+        live_ub: Bool[Array, " n"] | None = None,
+        rcond: float | None = None,
+    ) -> SchurNormalEquations:
+        """Explicit pseudo-inverse Schur complement of ``Â Âᵀ``.
+
+        Parameters
+        ----------
+        free_x
+            Optional mask of free ``x`` columns (frozen columns are removed
+            from ``Â``); ``None`` keeps every column.
+        live_lb, live_ub
+            Optional masks of bound rows whose slack column is live;
+            ``None`` uses the non-null bounds.
+        rcond
+            Relative eigenvalue cutoff; ``None`` uses the factor default.
+
+        Returns
+        -------
+        SchurNormalEquations
+            The cached :attr:`schur_cache` when no mask is given and the
+            cutoff matches, otherwise a freshly built factor.
+        """
+        unmasked = free_x is None and live_lb is None and live_ub is None
+        cache = self.schur_cache
+        if unmasked and cache is not None and (rcond is None or cache.rcond == rcond):
+            return cache
+        lag = self.lagrangian
+        return SchurNormalEquations.build(
+            lag.eq_fn_jac_val,
+            lag.ineq_fn_jac_val,
+            lag.slack.s,
+            lag.slack.s_lb,
+            lag.slack.s_ub,
+            live_lb=~lag.null_lb if live_lb is None else live_lb,
+            live_ub=~lag.null_ub if live_ub is None else live_ub,
+            free_x=free_x,
+            rcond=rcond,
+        )
+
+    def with_schur_normal_equations(self, *, rcond: float | None = None) -> Self:
+        """Return a copy carrying the unmasked Schur factor in :attr:`schur_cache`.
+
+        Parameters
+        ----------
+        rcond
+            Relative eigenvalue cutoff forwarded to
+            :meth:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations.SchurNormalEquations.build`.
+        """
+        factor = self.schur_normal_equations(rcond=rcond)
+        return cast(
+            Self,
+            eqx.tree_at(
+                lambda s: s.schur_cache, self, factor, is_leaf=lambda z: z is None
+            ),
+        )
+
+    def normal_equations_solver(
+        self,
+        strategy: ResolvedNormalEquationsStrategy,
+        *,
+        free_x: Bool[Array, " n"] | None = None,
+        live_lb: Bool[Array, " n"] | None = None,
+        live_ub: Bool[Array, " n"] | None = None,
+        rcond: float | None = None,
+        tol: float = 1e-10,
+        max_iter: int = 100,
+    ) -> Callable[[Float[Array, " m"]], Float[Array, " m"]]:
+        """Structured solve ``b ↦ (Â Âᵀ)⁺ b`` on the flat dual ``[eq | ineq | lb | ub]``.
+
+        This is the only place that knows how the row / column layout of
+        ``Â`` maps onto the Lagrangian's Jacobians, slacks and null masks.
+
+        Parameters
+        ----------
+        strategy
+            ``"schur"`` for the explicit pseudo-inverse Schur complement,
+            ``"matrix-free"`` for the nested PCG elimination.
+        free_x, live_lb, live_ub
+            Column / row masks, see :meth:`schur_normal_equations`.
+        rcond
+            Eigenvalue cutoff of the ``"schur"`` path.
+        tol, max_iter
+            Krylov controls of the ``"matrix-free"`` path.
+
+        Returns
+        -------
+        Callable
+            ``solve(rhs) -> y`` returning the minimum-norm solution.
+
+        Raises
+        ------
+        ValueError
+            If ``strategy`` is ``"generic"`` (the caller owns that path) or
+            unknown.
+        """
+        if strategy == "schur":
+            return self.schur_normal_equations(
+                free_x=free_x, live_lb=live_lb, live_ub=live_ub, rcond=rcond
+            ).solve
+        if strategy != "matrix-free":
+            raise ValueError(
+                "normal_equations_solver handles 'schur' and 'matrix-free'; got "
+                f"{strategy!r}"
+            )
+        lag = self.lagrangian
+        jac_eq, jac_ineq = lag.eq_fn_jac_val, lag.ineq_fn_jac_val
+        solve = slack_eliminated_normal_solver(
+            lambda v: jac_eq @ v,
+            lambda y: jac_eq.T @ y,
+            lambda v: jac_ineq @ v,
+            lambda y: jac_ineq.T @ y,
+            lag.slack.s,
+            lag.slack.s_lb,
+            lag.slack.s_ub,
+            live_lb=~lag.null_lb if live_lb is None else live_lb,
+            live_ub=~lag.null_ub if live_ub is None else live_ub,
+            free_x=free_x,
+            meq=lag.meq,
+            tol=tol,
+            max_iter=max_iter,
+        )
+        # ``solve(rhs, with_info=True)`` remains available to callers that
+        # want the iteration count; the default call returns the vector.
+        return cast(Callable[[Float[Array, " m"]], Float[Array, " m"]], solve)
 
     def primal_box(self) -> tuple[Float[Array, " n_p"], Float[Array, " n_p"]]:
         """Box for the scaled primal step ``[x | s̃ | s̃_lb | s̃_ub]``.

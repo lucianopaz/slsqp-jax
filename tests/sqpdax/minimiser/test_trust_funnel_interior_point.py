@@ -474,6 +474,33 @@ def test_minimise_converges_to_known_kkt_points(case, primal_dual):
         assert float(metrics.optimality_residual) <= 1e-6
 
 
+@pytest.mark.parametrize("case", ["box", "quartic"])
+def test_normal_equations_strategies_converge_alike(case):
+    """Forcing each ``(Â Âᵀ)⁺`` realisation through the options reaches the
+    same KKT point in a comparable number of steps, and the configured
+    strategy reaches both the tangential solver and the multiplier recovery."""
+    make_problem_fn, x0, x_star = CONVERGENCE_CASES[case]
+    steps = {}
+    with jax.enable_x64(True):
+        for strategy in ("generic", "schur", "matrix-free"):
+            options = {
+                "subproblem": {
+                    "tangential_solver": {"normal_equations": strategy},
+                    "multiplier_recovery": {"normal_equations": strategy},
+                }
+            }
+            sol = run(make_problem_fn(), x0, options=options)
+            sub_solver = sol.state._init_subproblem(make_problem_fn()).solver
+            assert sub_solver.tangential_solver.normal_equations == strategy
+            assert sub_solver.multiplier_recovery.normal_equations == strategy
+            assert bool(sol.state.result_adapter.is_successful(sol.result))
+            assert jnp.allclose(sol.value, jnp.asarray(x_star), atol=1e-5)
+            steps[strategy] = int(sol.stats["num_steps"])
+    reference = steps["generic"]
+    for strategy in ("schur", "matrix-free"):
+        assert abs(steps[strategy] - reference) <= max(3, reference // 4)
+
+
 @pytest.mark.parametrize(
     ("make_problem_fn", "case"),
     [
@@ -554,6 +581,9 @@ def test_step_logging_reports_funnel_columns_and_stalls():
     In float32 the infeasible problem ends through the fixed-point detector
     (the slacks cannot shrink far enough for ``χᵛ`` to vanish), which is the
     route that emits the streak warning; float64 reaches Step 8 directly.
+    The generic LSMR multiplier recovery is forced because the exact
+    pseudo-inverse paths hand the large least-squares multipliers of the
+    incompatible system to the ``κ_y`` cap instead of producing a y-streak.
     """
     problem = make_infeasible_problem()
     handler = MemoryHandler()
@@ -562,7 +592,13 @@ def test_step_logging_reports_funnel_columns_and_stalls():
             problem,
             [0.5, 0.3],
             max_steps=80,
-            options={"logging": {"level": "INFO", "handler": handler}},
+            options={
+                "logging": {"level": "INFO", "handler": handler},
+                "subproblem": {
+                    "tangential_solver": {"normal_equations": "generic"},
+                    "multiplier_recovery": {"normal_equations": "generic"},
+                },
+            },
         )
         metrics = sol.state.termination_metrics(
             sol.state._optimisation_context(problem)

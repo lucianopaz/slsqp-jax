@@ -4,11 +4,93 @@ from collections.abc import Callable
 
 import jax
 from jax import numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
-__all__ = ["cg_normal_equations", "null_space_projector"]
+__all__ = ["cg_normal_equations", "null_space_projector", "pcg"]
 
 Operator = Callable[[Float[Array, " n"]], Float[Array, " m"]]
+
+
+def pcg(
+    op: Callable[[Float[Array, " m"]], Float[Array, " m"]],
+    rhs: Float[Array, " m"],
+    *,
+    tol: float,
+    max_iter: int,
+    preconditioner: Callable[[Float[Array, " m"]], Float[Array, " m"]] | None = None,
+) -> tuple[Float[Array, " m"], Int[Array, ""]]:
+    """Preconditioned conjugate gradients on a symmetric positive semidefinite system.
+
+    Solves ``op(y) = rhs`` from ``y = 0`` and stops once
+    ``‖r‖² ≤ tol² max{‖rhs‖², 1}`` or after ``max_iter`` iterations. On a
+    consistent singular system the iterates stay in ``range(op)`` (in
+    ``range(M⁻¹ op)`` with a preconditioner ``M``), so the minimum-norm
+    solution is returned without any regularisation.
+
+    Parameters
+    ----------
+    op
+        Matrix-free product ``y ↦ M y`` with ``M`` symmetric PSD.
+    rhs
+        Right-hand side.
+    tol
+        Relative residual tolerance (with an absolute floor of ``tol``).
+    max_iter
+        Iteration cap (a static Python ``int``).
+    preconditioner
+        Optional product ``r ↦ P⁻¹ r`` with ``P`` symmetric positive
+        definite; ``None`` is plain CG.
+
+    Returns
+    -------
+    y
+        Approximate solution.
+    n_iter
+        Number of iterations performed.
+    """
+    dtype = rhs.dtype
+    tol_sq = jnp.asarray(tol, dtype) ** 2 * jnp.maximum(jnp.dot(rhs, rhs), 1.0)
+    prec = (lambda r: r) if preconditioner is None else preconditioner
+
+    def body(_j, carry):
+        y, r, p, rz, rr, k, done = carry
+
+        def do(c):
+            y, r, p, rz, _rr, k, _d = c
+            Ap = op(p)
+            pAp = jnp.dot(p, Ap)
+            alpha = jnp.where(pAp > 1e-30, rz / jnp.maximum(pAp, 1e-30), 0.0)
+            y_new = y + alpha * p
+            r_new = r - alpha * Ap
+            z_new = prec(r_new)
+            rz_new = jnp.dot(r_new, z_new)
+            rr_new = jnp.dot(r_new, r_new)
+            beta = jnp.where(rz > 1e-30, rz_new / jnp.maximum(rz, 1e-30), 0.0)
+            return (
+                y_new,
+                r_new,
+                z_new + beta * p,
+                rz_new,
+                rr_new,
+                k + 1,
+                rr_new < tol_sq,
+            )
+
+        return jax.lax.cond(done, lambda c: c, do, carry)
+
+    z0 = prec(rhs)
+    rr0 = jnp.dot(rhs, rhs)
+    init = (
+        jnp.zeros_like(rhs),
+        rhs,
+        z0,
+        jnp.dot(rhs, z0),
+        rr0,
+        jnp.asarray(0, jnp.int32),
+        rr0 < tol_sq,
+    )
+    y, _r, _p, _rz, _rr, n_iter, _done = jax.lax.fori_loop(0, max_iter, body, init)
+    return y, n_iter
 
 
 def cg_normal_equations(
@@ -17,10 +99,12 @@ def cg_normal_equations(
     *,
     tol: float,
     max_iter: int,
+    preconditioner: Callable[[Float[Array, " m"]], Float[Array, " m"]] | None = None,
 ) -> Float[Array, " m"]:
     """Conjugate gradients on a symmetric positive semidefinite system.
 
-    Solves ``normal_op(y) = rhs`` from ``y = 0`` and stops once
+    Thin wrapper around :func:`pcg` returning only the solution. Solves
+    ``normal_op(y) = rhs`` from ``y = 0`` and stops once
     ``‖r‖² ≤ tol² max{‖rhs‖², 1}`` or after ``max_iter`` iterations. On a
     consistent singular system the iterates stay in ``range(normal_op)``,
     which is what the projector below relies on.
@@ -35,34 +119,17 @@ def cg_normal_equations(
         Relative residual tolerance (with an absolute floor of ``tol``).
     max_iter
         Iteration cap (a static Python ``int``).
+    preconditioner
+        Optional ``r ↦ P⁻¹ r``; see :func:`pcg`.
 
     Returns
     -------
     Float[Array, " m"]
         Approximate solution.
     """
-    dtype = rhs.dtype
-    tol_sq = jnp.asarray(tol, dtype) ** 2 * jnp.maximum(jnp.dot(rhs, rhs), 1.0)
-
-    def body(_j, carry):
-        y, r, p, rz, done = carry
-
-        def do(c):
-            y, r, p, rz, _d = c
-            Ap = normal_op(p)
-            pAp = jnp.dot(p, Ap)
-            alpha = jnp.where(pAp > 1e-30, rz / jnp.maximum(pAp, 1e-30), 0.0)
-            y_new = y + alpha * p
-            r_new = r - alpha * Ap
-            rz_new = jnp.dot(r_new, r_new)
-            beta = jnp.where(rz > 1e-30, rz_new / jnp.maximum(rz, 1e-30), 0.0)
-            return (y_new, r_new, r_new + beta * p, rz_new, rz_new < tol_sq)
-
-        return jax.lax.cond(done, lambda c: c, do, carry)
-
-    rz0 = jnp.dot(rhs, rhs)
-    init = (jnp.zeros_like(rhs), rhs, rhs, rz0, rz0 < tol_sq)
-    y, *_ = jax.lax.fori_loop(0, max_iter, body, init)
+    y, _ = pcg(
+        normal_op, rhs, tol=tol, max_iter=max_iter, preconditioner=preconditioner
+    )
     return y
 
 
@@ -74,14 +141,20 @@ def null_space_projector(
     reg: float = 0.0,
     tol: float = 1e-10,
     max_iter: int = 100,
+    solve: Callable[[Float[Array, " m"]], Float[Array, " m"]] | None = None,
 ) -> Callable[[Float[Array, " n"]], Float[Array, " n"]]:
     """Build ``v ↦ (I − Aᵀ(A Aᵀ + reg I)⁻¹ A) v`` from matrix-free products.
 
-    The normal equations are solved by :func:`cg_normal_equations`, so the
-    dense ``A`` is never assembled. When ``free_mask`` is given, columns with
-    a zero mask are frozen: the projector acts on ``free_mask ⊙ v`` with the
-    restricted operator ``A_free = A ∘ diag(free_mask)`` and returns a vector
-    that is zero on frozen coordinates.
+    By default the normal equations are solved by :func:`cg_normal_equations`,
+    so the dense ``A`` is never assembled; an external ``solve`` for
+    ``(A Aᵀ)⁺`` (e.g. a
+    :class:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations.SchurNormalEquations`)
+    replaces the inner CG, in which case ``reg``, ``tol`` and ``max_iter``
+    are ignored. When ``free_mask`` is given, columns with a zero mask are
+    frozen: the projector acts on ``free_mask ⊙ v`` with the restricted
+    operator ``A_free = A ∘ diag(free_mask)`` and returns a vector that is
+    zero on frozen coordinates (an external ``solve`` must then be built for
+    the same restricted operator).
 
     Parameters
     ----------
@@ -92,9 +165,11 @@ def null_space_projector(
     free_mask
         Optional ``0/1`` float mask of the free columns.
     reg
-        Tikhonov regularisation added to ``A Aᵀ``.
+        Tikhonov regularisation added to ``A Aᵀ`` (inner-CG path only).
     tol, max_iter
         Inner CG controls, see :func:`cg_normal_equations`.
+    solve
+        Optional external solve ``b ↦ (A_free A_freeᵀ)⁺ b``.
 
     Returns
     -------
@@ -125,7 +200,10 @@ def null_space_projector(
 
     def proj(v: Float[Array, " n"]) -> Float[Array, " n"]:
         v = v if free_mask is None else free_mask * v
-        y = cg_normal_equations(normal_op, A_free(v), tol=tol, max_iter=max_iter)
+        if solve is None:
+            y = cg_normal_equations(normal_op, A_free(v), tol=tol, max_iter=max_iter)
+        else:
+            y = solve(A_free(v))
         return v - At_free(y)
 
     return proj

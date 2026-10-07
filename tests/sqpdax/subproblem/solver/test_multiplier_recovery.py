@@ -274,14 +274,15 @@ def test_barrier_safeguard_rejects_non_positive_max_norm():
 @pytest.mark.parametrize(
     "make_problem_", FUNNEL_PROBLEMS.values(), ids=FUNNEL_PROBLEMS.keys()
 )
+@pytest.mark.parametrize("strategy", ["generic", "schur", "matrix-free"])
 def test_kkt_recovery_on_funnel_subproblem_solves_the_scaled_least_squares(
-    make_problem_,
+    make_problem_, strategy
 ):
     """(2.7) of CGRT 2017: ``y = argmin ‖ĝ + Ĥ wₙ + Âᵀ y‖₂`` with ``wₙ`` the normal step.
 
-    Both the dense ``lstsq`` and the matrix-free LSMR path return the
-    minimum-norm solution, so they agree even when null bounds leave zero
-    rows in ``Â``.
+    The dense ``lstsq``, the LSMR path and both bound-eliminated normal
+    equations return the minimum-norm solution, so they agree even when
+    null bounds leave zero rows in ``Â``.
     """
     sub = make_funnel_barrier_subproblem(problem=make_problem_())
     g_hat, h_hat, a_hat, _ = dense_funnel_reference(sub)
@@ -290,12 +291,26 @@ def test_kkt_recovery_on_funnel_subproblem_solves_the_scaled_least_squares(
     rhs = -(g_hat + h_hat @ w_flat)
     expected, *_ = jnp.linalg.lstsq(a_hat.T, rhs)
 
-    y = KKTMultiplierRecovery(rtol=1e-8, atol=1e-8).recover(sub, None, w_n)
+    recovery = KKTMultiplierRecovery(rtol=1e-8, atol=1e-8, normal_equations=strategy)
+    assert recovery.resolve_normal_equations(sub) == strategy
+    y = recovery.recover(sub, None, w_n)
     assert jnp.allclose(y.flatten(), expected, atol=1e-4)
     # The subproblem's residual (3.13) at this dual is the least-squares residual.
     assert jnp.allclose(
         ravel_pytree(sub.r(w_n, y))[0], a_hat.T @ expected - rhs, atol=1e-4
     )
+
+
+def test_kkt_recovery_strategy_resolution():
+    """``auto`` → ``schur`` below the row cutoff; non-barrier models stay generic."""
+    sub = make_funnel_barrier_subproblem()
+    m = sub.lagrangian.meq + sub.lagrangian.mineq
+    assert KKTMultiplierRecovery().resolve_normal_equations(sub) == "schur"
+    assert (
+        KKTMultiplierRecovery(schur_max_rows=m).resolve_normal_equations(sub)
+        == "matrix-free"
+    )
+    assert KKTMultiplierRecovery().resolve_normal_equations(_as_free()) == "generic"
 
 
 @pytest.mark.parametrize(

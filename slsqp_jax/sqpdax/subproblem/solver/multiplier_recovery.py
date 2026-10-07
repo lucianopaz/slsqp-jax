@@ -19,9 +19,15 @@ Two linear-algebra paths share the same target and safeguard:
   the general block is solved exactly through the context's range-space
   solve on the free subspace and the bound block closes the fixed
   coordinates (today's projected-CG recovery);
-- without one, LSMR runs matrix-free on the full off-diagonal operator, so
-  any :class:`~slsqp_jax.sqpdax.subproblem.base.SubProblem` (including
-  interior-point models whose bound rows live on slacks) is a valid input.
+- without one, interior-point subproblems
+  (:class:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem`)
+  solve the normal equations ``Â Âᵀ λ = Â t`` with the structured
+  bound / slack-row elimination selected by ``normal_equations`` (see
+  :mod:`~slsqp_jax.sqpdax.linalg.scaled_normal_equations`), which returns
+  the minimum-norm least-squares multipliers exactly; every other
+  :class:`~slsqp_jax.sqpdax.subproblem.base.SubProblem` (and the
+  ``"generic"`` strategy) falls back to LSMR running matrix-free on the full
+  off-diagonal operator.
 
 Safeguards interpret the sign of the dual block, so they refuse subproblems
 that encode the Newton view
@@ -41,9 +47,15 @@ from lineax import AbstractLinearOperator, AbstractLinearSolver
 
 from ...dual import Dual
 from ...lagrangian.evaluated import InteriorPointEvaluatedLagrangian
+from ...linalg import (
+    NormalEquationsStrategy,
+    ResolvedNormalEquationsStrategy,
+    resolve_normal_equations_strategy,
+)
 from ...primal import PrimalType
 from ...types import InitializableModule
 from ..base import SubProblem
+from ..scaled_barrier import ScaledBarrierSubProblem
 from .projector import ProjectionContext
 
 __all__ = [
@@ -194,8 +206,21 @@ class MultiplierRecovery(InitializableModule):
     safeguard
         Optional :class:`Safeguard` applied to the final dual.
     rtol, atol, max_steps
-        LSMR tolerances for the matrix-free path (used when
-        :meth:`recover` is called without a projection context).
+        LSMR tolerances for the generic matrix-free path (used when
+        :meth:`recover` is called without a projection context on a
+        non-interior-point subproblem, or with ``normal_equations="generic"``).
+    normal_equations
+        Strategy for interior-point subproblems without a projection
+        context: ``"auto"`` (default) resolves to ``"schur"`` when
+        ``m_E + m_I < schur_max_rows`` and to ``"matrix-free"`` otherwise;
+        ``"generic"`` forces LSMR.
+    schur_max_rows
+        Threshold of the ``"auto"`` rule.
+    rcond
+        Relative eigenvalue cutoff of the Schur pseudo-inverse (``None`` =
+        ``m · eps``).
+    proj_cg_tol, proj_cg_max_iter
+        Krylov controls of the ``"matrix-free"`` elimination.
     """
 
     refinement_rounds: int = field(static=True, default=1)
@@ -203,6 +228,25 @@ class MultiplierRecovery(InitializableModule):
     rtol: float = field(static=True, default=1e-8)
     atol: float = field(static=True, default=1e-8)
     max_steps: int | None = field(static=True, default=None)
+    normal_equations: NormalEquationsStrategy = field(static=True, default="auto")
+    schur_max_rows: int = field(static=True, default=100)
+    rcond: float | None = field(static=True, default=None)
+    proj_cg_tol: float = field(static=True, default=1e-10)
+    proj_cg_max_iter: int = field(static=True, default=100)
+
+    def resolve_normal_equations(
+        self, subproblem: SubProblem
+    ) -> ResolvedNormalEquationsStrategy:
+        """Strategy used by the projector-free path on ``subproblem``.
+
+        Non-interior-point subproblems always resolve to ``"generic"``.
+        """
+        if not isinstance(subproblem, ScaledBarrierSubProblem):
+            return "generic"
+        lag = subproblem.lagrangian
+        return resolve_normal_equations_strategy(
+            self.normal_equations, lag.meq + lag.mineq, self.schur_max_rows
+        )
 
     @abstractmethod
     def stationarity_target(
@@ -271,9 +315,21 @@ class MultiplierRecovery(InitializableModule):
             return ravel_pytree(subproblem.kkt_mvp_lower_offdiag((v, zero_dual)))[0]
 
         if projector is None:
-            dual = self._recover_matrix_free(
-                At, A, unravel_dual, zero_dual_flat.shape[0], target
-            )
+            strategy = self.resolve_normal_equations(subproblem)
+            if strategy == "generic":
+                dual = self._recover_matrix_free(
+                    At, A, unravel_dual, zero_dual_flat.shape[0], target
+                )
+            else:
+                solve = cast(
+                    ScaledBarrierSubProblem, subproblem
+                ).normal_equations_solver(
+                    strategy,
+                    rcond=self.rcond,
+                    tol=self.proj_cg_tol,
+                    max_iter=self.proj_cg_max_iter,
+                )
+                dual = self._recover_structured(At, A, solve, unravel_dual, target)
         else:
             if target.shape[0] != projector.A.shape[1]:
                 raise TypeError(
@@ -319,6 +375,16 @@ class MultiplierRecovery(InitializableModule):
                 ub_multipliers=lam_ub,
             ),
         )
+
+    def _recover_structured(
+        self, At, A, solve, unravel_dual, target: Float[Array, " n_p"]
+    ) -> Dual:
+        # Normal equations ``Â Âᵀ λ = Â t`` solved by the structured elimination;
+        # the solve returns the minimum-norm solution, i.e. the LSMR limit.
+        lam = solve(A(target))
+        for _ in range(self.refinement_rounds):
+            lam = lam + solve(A(target - At(lam)))
+        return cast(Dual, unravel_dual(lam))
 
     def _recover_matrix_free(
         self,

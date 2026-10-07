@@ -9,7 +9,13 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Scalar
 
 from ...dual import Dual
-from ...linalg import power_iteration_norm, spectral_norm_estimate
+from ...linalg import (
+    ResolvedNormalEquationsStrategy,
+    SchurNormalEquations,
+    power_iteration_norm,
+    spectral_norm_estimate,
+    strategy_code,
+)
 from ...primal import InteriorPointPrimal
 from ..funnel_barrier import FunnelBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
@@ -364,9 +370,19 @@ class TrustFunnelSolver(
     Besides the text log, an enabled diagnostics channel receives one
     ``"funnel_step"`` record per solve carrying the criticality measures,
     gates, radii, both sub-solver states, the scaled sub-steps, the
-    multipliers and the Lemma 3.5 / 3.9 Cauchy lower bounds evaluated with
+    multipliers, the Lemma 3.5 / 3.9 Cauchy lower bounds evaluated with
     power-iteration estimates of ``‖Â‖₂`` and ``‖Ĥ‖₂`` (see
-    :meth:`cauchy_lower_bounds`).
+    :meth:`cauchy_lower_bounds`), and the resolved normal-equations
+    strategy (``normal_equations_strategy``: ``0`` generic, ``1`` schur,
+    ``2`` matrix-free) with the rank of the explicit Schur complement
+    (``normal_equations_rank``, ``-1`` when no explicit factor is built).
+
+    The ``(Â Âᵀ)⁺`` solves of the multiplier recovery and of the tangential
+    projector follow the ``normal_equations`` strategy of the respective
+    component; when either resolves to ``"schur"`` the factor is built once
+    per solve here and attached to the subproblem
+    (:meth:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem.with_schur_normal_equations`)
+    so both share it.
 
     Notes
     -----
@@ -525,6 +541,10 @@ class TrustFunnelSolver(
         n, mineq = lag.n, lag.mineq
         dtype = lag.ref.x.dtype
         tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype)
+        # Share one Schur factor of Â Âᵀ between the multiplier recovery and the
+        # tangential projector when either resolves to the explicit path; it
+        # is built once here, outside the ``lax.cond`` branches below.
+        subproblem, ne_strategy, ne_rank = self._attach_normal_equations(subproblem)
         zero_w = subproblem._zero_primal()
         zero_dual = subproblem._zero_dual()
         y_prev = lag.dual
@@ -836,6 +856,8 @@ class TrustFunnelSolver(
                 "tangential_state": tang_state,
                 "cg_iters": n_cg,
                 "finite": finite,
+                "normal_equations_strategy": strategy_code(ne_strategy),
+                "normal_equations_rank": ne_rank,
             }
 
         self.logger.diagnostic("funnel_step", funnel_step_payload)
@@ -941,6 +963,31 @@ class TrustFunnelSolver(
             ),
         )
         return (step_primal, y), new_state
+
+    # ------------------------------------------------------------------
+    # normal-equations strategy
+    # ------------------------------------------------------------------
+    def _attach_normal_equations(
+        self, subproblem: FunnelBarrierSubProblem
+    ) -> tuple[FunnelBarrierSubProblem, ResolvedNormalEquationsStrategy, Array]:
+        """Attach the shared Schur factor of ``Â Âᵀ`` when the explicit path is used.
+
+        Returns the (possibly updated) subproblem, the strategy resolved by
+        the tangential solver and the rank of the Schur complement (``-1``
+        when no explicit factor is built).
+        """
+        strategy = self.tangential_solver.resolve_normal_equations(subproblem)
+        rec_strategy = self.multiplier_recovery.resolve_normal_equations(subproblem)
+        rank = jnp.asarray(-1, jnp.int32)
+        if strategy == "schur" or rec_strategy == "schur":
+            rcond = (
+                self.tangential_solver.rcond
+                if strategy == "schur"
+                else self.multiplier_recovery.rcond
+            )
+            subproblem = subproblem.with_schur_normal_equations(rcond=rcond)
+            rank = cast(SchurNormalEquations, subproblem.schur_cache).rank
+        return subproblem, strategy, rank
 
     # ------------------------------------------------------------------
     # diagnostics helpers
