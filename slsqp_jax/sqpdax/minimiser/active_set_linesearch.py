@@ -42,6 +42,7 @@ from ..subproblem.solver import (
 )
 from ..types import Scalar
 from .base import CommonMinimiser, OptimisationContext
+from .diagnostics import ActiveSetLineSearchDiagnostics
 from .termination import TerminationFlags, TerminationMetrics, compute_mu_max
 
 __all__ = [
@@ -178,10 +179,11 @@ class ActiveSetLineSearchMinimiser(
         ``options['minimiser']['active_set_predictor']``, e.g.
         ``{"method": "lpeca", "warmup_steps": 2}``. In ``"lpeca"`` mode the
         working-set policy's EXPAND ramp is forced off.
-    n_lpeca_bypassed, n_lpeca_capped, n_lpeca_bounds_prefixed
-        Cumulative predictor diagnostics: steps whose prediction was
-        discarded (trust gate or warm-up), steps where the rank cap
-        truncated it, and bounds seeded into the working set.
+    diagnostics
+        :class:`~slsqp_jax.sqpdax.minimiser.diagnostics.active_set_linesearch.ActiveSetLineSearchDiagnostics`
+        carrying the cumulative Armijo / fallback acceptance and LPEC-A
+        predictor counters. Reporting only; nothing feeds back into the
+        iteration.
     initial_penalty
         Initial (and therefore minimum) L1 merit penalty ``ρ``.
     penalty_multiplier_margin
@@ -258,22 +260,9 @@ class ActiveSetLineSearchMinimiser(
     last_ls_success: Bool[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(False)
     )
-    last_ls_fallback: Bool[Array, ""] = eqx.field(
-        default_factory=lambda: jnp.asarray(False)
-    )
-    n_armijo_accepts: Array = eqx.field(
-        default_factory=lambda: jnp.asarray(0, jnp.int32)
-    )
-    n_fallback_accepts: Array = eqx.field(
-        default_factory=lambda: jnp.asarray(0, jnp.int32)
-    )
-    # LPEC-A diagnostics
-    n_lpeca_bypassed: Array = eqx.field(
-        default_factory=lambda: jnp.asarray(0, jnp.int32)
-    )
-    n_lpeca_capped: Array = eqx.field(default_factory=lambda: jnp.asarray(0, jnp.int32))
-    n_lpeca_bounds_prefixed: Array = eqx.field(
-        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    # Reporting-only line-search / LPEC-A counters.
+    diagnostics: ActiveSetLineSearchDiagnostics = eqx.field(
+        default_factory=ActiveSetLineSearchDiagnostics.zero
     )
 
     def __check_init__(self) -> None:
@@ -513,19 +502,9 @@ class ActiveSetLineSearchMinimiser(
         return cast(
             Self,
             eqx.tree_at(
-                lambda m: (
-                    m.solver_state,
-                    m.n_lpeca_bypassed,
-                    m.n_lpeca_capped,
-                    m.n_lpeca_bounds_prefixed,
-                ),
+                lambda m: (m.solver_state, m.diagnostics),
                 self,
-                (
-                    state,
-                    self.n_lpeca_bypassed + (~prediction.valid).astype(jnp.int32),
-                    self.n_lpeca_capped + prediction.capped.astype(jnp.int32),
-                    self.n_lpeca_bounds_prefixed + prediction.n_bounds_prefixed,
-                ),
+                (state, self.diagnostics.record_prediction(prediction)),
             ),
         )
 
@@ -748,8 +727,9 @@ class ActiveSetLineSearchMinimiser(
             0,
             jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
         )
-        fallback_accept = result.accepted & result.accepted_by_fallback
-        armijo_accept = result.accepted & ~result.accepted_by_fallback
+        diagnostics = self.diagnostics.record_step(
+            accepted=result.accepted, accepted_by_fallback=result.accepted_by_fallback
+        )
 
         self.logger.warning(
             "qp failure: result={qp_result} status={status} nonfinite={nonfinite} "
@@ -792,9 +772,7 @@ class ActiveSetLineSearchMinimiser(
                 m.consecutive_ls_failures,
                 m.last_step_size,
                 m.last_ls_success,
-                m.last_ls_fallback,
-                m.n_armijo_accepts,
-                m.n_fallback_accepts,
+                m.diagnostics,
             ),
             self,
             (
@@ -812,9 +790,7 @@ class ActiveSetLineSearchMinimiser(
                 ls_failures,
                 result.step_size,
                 result.accepted,
-                fallback_accept,
-                self.n_armijo_accepts + armijo_accept.astype(jnp.int32),
-                self.n_fallback_accepts + fallback_accept.astype(jnp.int32),
+                diagnostics,
             ),
             is_leaf=lambda z: z is None,
         )
@@ -880,7 +856,7 @@ class ActiveSetLineSearchMinimiser(
             "qp_result": solver_state.qp_result,
             "qp_iters": solver_state.last_n_iter,
             "cg_iters": solver_state.last_n_cg_iter,
-            "ls_fallback": self.last_ls_fallback,
+            "ls_fallback": self.diagnostics.last_ls_fallback,
             "qp_fail": self.consecutive_qp_failures,
             "ls_fail": self.consecutive_ls_failures,
             "stall": self.steps_without_improvement,
@@ -905,7 +881,8 @@ class ActiveSetLineSearchMinimiser(
                 "consecutive_zero_steps": self.consecutive_zero_steps,
                 "steps_without_improvement": self.steps_without_improvement,
                 "blowup_count": self.blowup_count,
-                "last_ls_fallback": self.last_ls_fallback,
+                "last_ls_fallback": self.diagnostics.last_ls_fallback,
+                "diagnostics": self.diagnostics,
                 "qp_result": solver_state.qp_result,
                 "qp_active_set": solver_state.active_set,
                 "qp_dual": solver_state.dual,
@@ -1100,15 +1077,10 @@ class ActiveSetLineSearchMinimiser(
             "kkt_feasibility_residual": solver_state.last_kkt_feasibility_residual,
             "kkt_n_refinements": solver_state.last_kkt_n_refinements,
             "kkt_reason": solver_state.last_kkt_reason,
-            "n_lpeca_bypassed": self.n_lpeca_bypassed,
-            "n_lpeca_capped": self.n_lpeca_capped,
-            "n_lpeca_bounds_prefixed": self.n_lpeca_bounds_prefixed,
+            **self.diagnostics.stats(),
             "merit_penalty": self.merit_penalty,
             "last_step_size": self.last_step_size,
             "last_ls_success": self.last_ls_success,
-            "last_ls_fallback": self.last_ls_fallback,
-            "n_armijo_accepts": self.n_armijo_accepts,
-            "n_fallback_accepts": self.n_fallback_accepts,
             "steps_without_improvement": self.steps_without_improvement,
             "blowup_count": self.blowup_count,
             "consecutive_qp_failures": self.consecutive_qp_failures,
