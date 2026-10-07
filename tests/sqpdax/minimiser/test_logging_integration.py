@@ -67,30 +67,73 @@ def _by_name(handler: MemoryHandler, name: str) -> list:
     return [r for r in handler.records if r.name == name]
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_logging_section_is_a_recognised_option(make_solver):
+# --- shared runs ----------------------------------------------------------------
+#
+# Each fixture runs one minimiser once per module with a given logging
+# configuration; the tests below assert on the recorded output instead of
+# re-running (and re-compiling) the same driver.
+
+
+@pytest.fixture(scope="module", params=_MINIMISERS)
+def make_solver(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def plain_run(make_solver):
+    """``options`` without a logging section."""
+    return _run(make_solver, None)
+
+
+@pytest.fixture(scope="module")
+def info_run(make_solver):
+    """INFO text logging into a :class:`MemoryHandler`: ``(sol, messages, handler)``."""
     handler = MemoryHandler()
     sol, messages = _run(make_solver, {"level": "INFO", "handler": handler})
+    return sol, messages, handler
+
+
+@pytest.fixture(scope="module")
+def debug_run(make_solver):
+    """DEBUG text logging into a :class:`MemoryHandler`: ``(sol, handler)``."""
+    handler = MemoryHandler()
+    sol, _ = _run(make_solver, {"level": "DEBUG", "handler": handler})
+    return sol, handler
+
+
+@pytest.fixture(scope="module")
+def diagnostics_run(make_solver):
+    """A bare :class:`MemoryDiagnosticsHandler` as the logging spec.
+
+    Returns ``(sol, messages, handler)`` with the handler already closed.
+    """
+    handler = MemoryDiagnosticsHandler()
+    sol, messages = _run(make_solver, handler)
+    handler.close()
+    return sol, messages, handler
+
+
+def test_logging_section_is_a_recognised_option(info_run):
+    sol, messages, handler = info_run
     assert not any("unknown option section" in m for m in messages)
     assert bool(sol.state.result_adapter.is_successful(sol.result))
     assert sol.state.logger.level == INFO
     assert sol.state.logger.handler is handler
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_disabled_logger_emits_nothing(make_solver):
-    handler = MemoryHandler()
-    sol, _ = _run(make_solver, None)
+def test_disabled_logger_emits_nothing(make_solver, plain_run):
+    sol, _ = plain_run
     assert sol.state.logger is Logger.disabled()
+    assert sol.state.logger.diagnostics_enabled is False
+    assert sol.state.logger.diagnostics_handler is None
     # A disabled logger given explicitly also stays silent.
+    handler = MemoryHandler()
     sol, _ = _run(make_solver, {"level": "off", "handler": handler})
     assert handler.records == []
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_info_summary_once_per_step_and_run_bookends(make_solver):
-    handler = MemoryHandler()
-    sol, _ = _run(make_solver, {"level": "INFO", "handler": handler})
+def test_info_summary_once_per_step_and_run_bookends(info_run):
+    sol, _, handler = info_run
     root = _by_name(handler, "minimiser")
     assert root[0].levelno == INFO
     assert root[0].message.startswith(type(sol.state).__name__)
@@ -111,7 +154,6 @@ def test_info_summary_once_per_step_and_run_bookends(make_solver):
     assert all(r.levelno >= INFO for r in handler.records)
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
 @pytest.mark.parametrize(
     ("child", "sibling"),
     [("subproblem", "step_controller"), ("step_controller", "subproblem")],
@@ -135,10 +177,8 @@ def test_child_levels_are_honoured_independently(make_solver, child, sibling):
     )
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_child_loggers_inherit_root_level(make_solver):
-    handler = MemoryHandler()
-    _run(make_solver, {"level": "DEBUG", "handler": handler})
+def test_child_loggers_inherit_root_level(debug_run):
+    _, handler = debug_run
     names = {r.name for r in handler.records}
     assert {"minimiser", "minimiser.subproblem", "minimiser.step_controller"} <= names
 
@@ -160,19 +200,26 @@ def test_max_steps_exhaustion_is_reported_as_warning():
 # --- diagnostics channel ------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "spec_for",
-    [lambda h: h, lambda h: {"level": "WARNING", "diagnostics": h}],
-    ids=["bare-handler", "mapping"],
-)
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_diagnostics_records_per_step_solve_and_run(make_solver, spec_for):
+def test_diagnostics_mapping_spec_attaches_the_handler():
+    """``{"level": ..., "diagnostics": handler}`` is the mapping form of the
+    bare-handler spec used by the shared ``diagnostics_run``."""
     handler = MemoryDiagnosticsHandler()
-    sol, messages = _run(make_solver, spec_for(handler))
+    sol, messages = _run(
+        lambda: ActiveSetLineSearchMinimiser(),
+        {"level": "WARNING", "diagnostics": handler},
+    )
+    assert not any("unknown option section" in m for m in messages)
+    assert sol.state.logger.level == WARNING
+    assert sol.state.logger.diagnostics_handler is handler
+    handler.close()
+    assert len(handler.select(kind="step")) == int(sol.stats["num_steps"])
+
+
+def test_diagnostics_records_per_step_solve_and_run(diagnostics_run):
+    sol, messages, handler = diagnostics_run
     assert not any("unknown option section" in m for m in messages)
     assert bool(sol.state.result_adapter.is_successful(sol.result))
     assert sol.state.logger.diagnostics_handler is handler
-    handler.close()
     n_steps = int(sol.stats["num_steps"])
     n_before = len(handler)
 
@@ -222,11 +269,8 @@ def test_diagnostics_records_per_step_solve_and_run(make_solver, spec_for):
         handler.emit(handler.records[0])
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_algorithm_specific_step_fields(make_solver):
-    handler = MemoryDiagnosticsHandler()
-    sol, _ = _run(make_solver, handler)
-    handler.close()
+def test_algorithm_specific_step_fields(diagnostics_run):
+    sol, _, handler = diagnostics_run
     payload = handler.select(kind="step")[-1].values
     expected = {
         ActiveSetLineSearchMinimiser: {"merit_penalty", "qp_result", "qp_active_set"},
@@ -236,7 +280,6 @@ def test_algorithm_specific_step_fields(make_solver):
     assert expected <= set(payload)
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
 def test_secant_fields_are_reported_when_curvature_is_inexact(make_solver):
     """Without an exact HVP the minimiser carries an L-BFGS secant, and both
     the INFO summary and the diagnostics payload report its state."""
@@ -265,23 +308,21 @@ def test_secant_fields_are_reported_when_curvature_is_inexact(make_solver):
     assert type(payload["secant_recovery"]) is type(sol.state.secant_recovery_state)
 
 
-@pytest.mark.parametrize(
-    "spec_for",
-    [
-        lambda: None,
-        lambda: {"level": "DEBUG", "handler": MemoryHandler()},
-        lambda: True,
-    ],
-    ids=["default", "text-only", "true"],
-)
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_no_diagnostics_without_a_handler(make_solver, spec_for, capsys):
-    sol, _ = _run(make_solver, spec_for())
+def test_text_only_logging_enables_no_diagnostics(debug_run):
+    """A text handler alone (the ``default`` case is covered by ``plain_run``)
+    leaves the diagnostics channel off."""
+    sol, _ = debug_run
     assert sol.state.logger.diagnostics_enabled is False
     assert sol.state.logger.diagnostics_handler is None
-    # Text output (when any) is unchanged by the diagnostics machinery.
-    out = capsys.readouterr().out
-    assert ("step=" in out) is (spec_for() is True)
+
+
+def test_logging_true_prints_summaries_without_diagnostics(make_solver, capsys):
+    """``options={"logging": True}`` prints the INFO rows; text output is
+    unchanged by the diagnostics machinery."""
+    sol, _ = _run(make_solver, True)
+    assert sol.state.logger.diagnostics_enabled is False
+    assert sol.state.logger.diagnostics_handler is None
+    assert "step=" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -293,13 +334,12 @@ def test_no_diagnostics_without_a_handler(make_solver, spec_for, capsys):
     ],
     ids=["subproblem-only", "all-but-subproblem", "both"],
 )
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_per_component_diagnostics_toggle(
-    make_solver, root_enabled, child_flag, expected_names
-):
+def test_per_component_diagnostics_toggle(root_enabled, child_flag, expected_names):
+    """The toggles are resolved by the common option plumbing, so one
+    minimiser is enough to exercise them."""
     handler = MemoryDiagnosticsHandler()
     sol, _ = _run(
-        make_solver,
+        lambda: ActiveSetLineSearchMinimiser(),
         {
             "diagnostics": {"handler": handler, "enabled": root_enabled},
             "subproblem": {"diagnostics": child_flag},
@@ -348,11 +388,8 @@ def test_qp_failure_record_is_emitted_at_the_failing_inner_iteration():
     assert all(r.values["qp_result"] == "kkt_solver_failure" for r in solves)
 
 
-@pytest.mark.parametrize("make_solver", _MINIMISERS)
-def test_successful_run_emits_no_solver_failure_records(make_solver):
-    handler = MemoryDiagnosticsHandler()
-    sol, _ = _run(make_solver, handler)
-    handler.close()
+def test_successful_run_emits_no_solver_failure_records(diagnostics_run):
+    sol, _, handler = diagnostics_run
     assert bool(sol.state.result_adapter.is_successful(sol.result))
     failure_kinds = {
         "normal_step_failure",

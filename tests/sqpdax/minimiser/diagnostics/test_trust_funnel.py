@@ -6,18 +6,16 @@ from __future__ import annotations
 from typing import Any
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from equinox._enum import EnumerationItem
 
 from slsqp_jax.sqpdax.barrier import FunnelBarrierUpdate
-from slsqp_jax.sqpdax.logging import MemoryDiagnosticsHandler, MemoryHandler
+from slsqp_jax.sqpdax.logging import MemoryHandler
 from slsqp_jax.sqpdax.minimiser import (
     TRUST_FUNNEL_INTERIOR_POINT_RESULTS,
     FunnelDiagnostics,
-    TrustFunnelInteriorPointMinimiser,
     minimise,
 )
 from slsqp_jax.sqpdax.primal import Slack
@@ -27,11 +25,10 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     TrustFunnelSolver,
     TrustFunnelSolverState,
 )
-from tests.sqpdax.minimiser.test_trust_funnel_interior_point import (
-    CONVERGENCE_CASES,
+from tests.sqpdax.minimiser.conftest import (
     constraint_residual,
+    funnel_minimiser,
     make_box_quadratic,
-    make_infeasible_problem,
 )
 
 R = TRUST_FUNNEL_INTERIOR_POINT_RESULTS
@@ -202,12 +199,6 @@ def update(
 
 def counters(diag: FunnelDiagnostics) -> dict[str, int]:
     return {name: int(getattr(diag, name)) for name in COUNTERS}
-
-
-def funnel_minimiser(**kwargs: Any) -> TrustFunnelInteriorPointMinimiser:
-    kwargs.setdefault("atol", 1e-6)
-    kwargs.setdefault("initial_mu", 0.1)
-    return TrustFunnelInteriorPointMinimiser(**kwargs)
 
 
 # --- FunnelDiagnostics.zero / update ---------------------------------------------
@@ -617,28 +608,14 @@ def test_invalid_diagnostic_options_are_rejected(kwargs):
 
 
 @pytest.mark.parametrize("case", ["box", "quartic"])
-def test_run_emits_documented_diagnostic_records(case):
+def test_run_emits_documented_diagnostic_records(funnel_run, case):
     """``step``, ``funnel_step`` and ``barrier_update`` records carry every
     documented key, and the counters are consistent with the run."""
-    make_problem_fn, x0, _ = CONVERGENCE_CASES[case]
-    handler = MemoryDiagnosticsHandler()
-    with jax.enable_x64(True):
-        sol = minimise(
-            make_problem_fn(),
-            funnel_minimiser(),
-            jnp.asarray(x0),
-            max_steps=120,
-            throw=False,
-            options={
-                "logging": {"diagnostics": handler},
-                "subproblem": {"norm_estimate_iters": 50},
-            },
-        )
-    handler.close()
+    run_ = funnel_run(case)
+    sol, handler, n_steps = run_.sol, run_.diagnostics, run_.n_steps
     assert sol.result == R.successful
-    n_steps = int(sol.stats["num_steps"])
 
-    steps = handler.select(name="minimiser", kind="step")
+    steps = run_.steps
     assert len(steps) == n_steps
     payload = steps[-1].values
     assert STEP_KEYS <= set(payload)
@@ -666,7 +643,7 @@ def test_run_emits_documented_diagnostic_records(case):
     assert not bool(final.invariant_violated)
     assert not bool(final.cauchy_violated)
 
-    funnel_steps = handler.select(name="minimiser.subproblem", kind="funnel_step")
+    funnel_steps = run_.funnel_steps
     assert len(funnel_steps) == n_steps
     values = funnel_steps[-1].values
     assert FUNNEL_STEP_KEYS <= set(values)
@@ -843,34 +820,17 @@ def test_injected_violations_fire_warnings_on_a_real_step():
     assert not bool(done)
 
 
-def test_infeasible_run_reports_unhealthy_y_iterations_and_bound_hits():
+def test_infeasible_run_reports_unhealthy_y_iterations_and_bound_hits(
+    infeasible_funnel_run,
+):
     """On the incompatible problem the multiplier estimate cannot satisfy
     (3.15): the carry records unhealthy y-iterations and ``κ_y`` hits, yet
     Step 8 keeps precedence in the result.
 
-    Run in float32, where the loop ends through the y-iteration fixed point
-    (float64 reaches ``χᵛ ≤ infeasibility_tol`` before any y-iteration), and
-    with the generic LSMR multiplier recovery: the exact pseudo-inverse
-    paths return the (large) least-squares multipliers of the incompatible
-    system and the ``κ_y`` cap of (3.10) absorbs them before any unhealthy
-    y-iteration arises.
+    See :class:`InfeasibleFunnelRun` for why the shared run is float32 with
+    the generic multiplier recovery.
     """
-    handler = MemoryHandler()
-    with jax.enable_x64(False):
-        sol = minimise(
-            make_infeasible_problem(),
-            funnel_minimiser(),
-            jnp.array([0.5, 0.3]),
-            max_steps=80,
-            throw=False,
-            options={
-                "logging": {"level": "WARNING", "handler": handler},
-                "subproblem": {
-                    "tangential_solver": {"normal_equations": "generic"},
-                    "multiplier_recovery": {"normal_equations": "generic"},
-                },
-            },
-        )
+    sol, handler = infeasible_funnel_run.sol, infeasible_funnel_run.handler
     assert sol.result == R.infeasible_stationary_point
     diag = sol.state.funnel_diagnostics
     assert int(diag.multiplier_failure_streak) >= 1
