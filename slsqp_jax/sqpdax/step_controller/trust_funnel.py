@@ -151,7 +151,11 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             iterate; ``solver_state`` carries the updated ``radius_v``,
             ``radius_f``, ``v_max``, ``sf_flag``, the final
             ``iteration_type`` and ``rho`` (``ρᶠ`` on f-iterations, ``ρᵛ``
-            on v-iterations, ``1`` on y-iterations).
+            on v-iterations, ``1`` on y-iterations), plus the diagnostics
+            ``v_trial``, ``model_error_f`` / ``model_error_v``
+            (``|f(x⁺) − m_f(d)|``, ``|v(x⁺) − m_v(d)|``; zero on
+            y-iterations), ``demoted`` ((2.10) held but (2.11) failed) and
+            ``funnel_violated`` (accepted with ``v⁺ > v_max``).
 
         Raises
         ------
@@ -252,6 +256,17 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
         x_new = jax.tree.map(lambda a, b: jnp.where(accepted, b, a), x0, x_trial)
         f_new = jnp.where(accepted, f_trial, f0)
 
+        # --- diagnostics: model errors (Lemma 4.5), demotion, funnel check -----
+        model_error_f = jnp.where(is_y, 0.0, jnp.abs((f0 - f_trial) - dm_f_d))
+        model_error_v = jnp.where(is_y, 0.0, jnp.abs((v0 - v_trial) - st.dm_v_d))
+        demoted = (
+            ~is_y
+            & (st.tangential_norm > 0.0)
+            & st.objective_decrease_ok
+            & (v_trial > st.v_max)
+        )
+        funnel_violated = accepted & (v_trial > v_max)
+
         self.logger.info(
             "funnel {kind}: rho={rho:.3e} accepted={accepted} f {f0:.6e} -> "
             "{f_new:.6e} v {v0:.3e} -> {v_new:.3e} radius_f {rf0:.3e} -> {rf:.3e} "
@@ -280,7 +295,7 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
         )
         self.logger.warning(
             "funnel invariant violated: accepted iterate has v={v:.3e} > v_max={vmax:.3e}",
-            when=accepted & (v_trial > v_max),
+            when=funnel_violated,
             v=v_trial,
             vmax=v_max,
         )
@@ -295,9 +310,26 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
                     s.sf_flag,
                     s.rho,
                     s.iteration_type,
+                    s.v_trial,
+                    s.model_error_f,
+                    s.model_error_v,
+                    s.funnel_violated,
+                    s.demoted,
                 ),
                 st,
-                (radius_v, radius_f, v_max, sf_flag, rho, iteration_type),
+                (
+                    radius_v,
+                    radius_f,
+                    v_max,
+                    sf_flag,
+                    rho,
+                    iteration_type,
+                    v_trial.astype(dtype),
+                    model_error_f.astype(dtype),
+                    model_error_v.astype(dtype),
+                    funnel_violated,
+                    demoted,
+                ),
             ),
         )
         return cast(
