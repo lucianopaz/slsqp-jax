@@ -25,6 +25,7 @@ extras = [
 ]
 dev = [
     {include-group = "extras"},
+    {include-group = "benchmark"},
     "pytest>=9.0.2",
     "pandas",
     "pytest-cov",
@@ -37,6 +38,13 @@ docs = [
     "sphinx-autodoc-typehints>=2.0",
     "sphinx-copybutton>=0.5",
     "furo>=2024.0",
+]
+benchmark = [
+    "sif2jax",
+    "pandas",
+    "altair>=5.0",
+    "marimo>=0.25",
+    "cloudpickle>=3.1.2",
 ]
 
 [build-system]
@@ -67,6 +75,8 @@ addopts = [
 testpaths = [
     "slsqp_jax/sqpdax",
     "tests/sqpdax",
+    "tests/benchmarks",
+    "benchmarks",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -88,5 +98,6 @@ include = [
 ]
 omit = [
   "tests/*",
+  "benchmarks/*",
   "slsqp_jax/_benchmark_bootstrap.py",
 ]
