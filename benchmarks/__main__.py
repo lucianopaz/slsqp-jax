@@ -137,6 +137,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 max_repeats=args.max_repeats,
                 slow_floor=args.slow_floor,
                 timeout_s=args.timeout,
+                feas_tol=args.feas_tol,
+                f_tol=args.f_tol,
+                repeat_unsolved=args.repeat_unsolved,
             )
             specs.append(spec)
             base = {k: v for k, v in rec.items() if k != "name"}
@@ -496,6 +499,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=300.0,
         help="per-task wall-clock timeout in seconds",
+    )
+    p.add_argument(
+        "--feas-tol",
+        type=float,
+        default=1e-6,
+        help="feasibility tolerance for 'solved'",
+    )
+    p.add_argument(
+        "--f-tol",
+        type=float,
+        default=1e-4,
+        help="relative objective-gap tolerance for 'solved'",
+    )
+    p.add_argument(
+        "--repeat-unsolved",
+        action="store_true",
+        help="time repeats even when the pilot did not solve the problem",
     )
     p.add_argument("--device", help="JAX platform (cpu, gpu, ...); sets JAX_PLATFORMS")
     p.add_argument("--catalog", help="alternative catalogue CSV")

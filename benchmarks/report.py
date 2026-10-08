@@ -368,6 +368,12 @@ def _(analysis, df, mo):
         "stat_inf",
         "compl",
         "time_median_s",
+        "stats_final_lagrangian_grad_norm",
+        "stats_secant_recovery_stage",
+        "stats_secant_last_condition",
+        "stats_last_qp_converged",
+        "stats_last_ls_success",
+        "stats_steps_without_improvement",
         "error",
     ]
     _cols = [c for c in _cols if c in df]
@@ -377,7 +383,9 @@ def _(analysis, df, mo):
             mo.md("## Unsolved tasks"),
             mo.md(
                 f"**Table 3.** The {len(_bad)} tasks that did not count as solved, with the raw "
-                "termination status and KKT metrics (empty for harness failures)."
+                "termination status, KKT metrics and the solver's own final statistics "
+                "(`stats_*`; empty for harness failures or families that do not report them). "
+                "Their time is the single pilot solve: failed tasks are not re-timed."
             ),
             mo.ui.table(_bad, selection=None, page_size=25),
             mo.md("**Table 4.** Raw termination statuses per configuration."),

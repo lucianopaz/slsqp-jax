@@ -8,7 +8,7 @@ import pytest
 from benchmarks import __main__ as cli
 from benchmarks.catalog import COLUMNS, TIERS, load_catalog, select, tier_of
 from benchmarks.configs import CONFIGS, get_configs
-from benchmarks.worker import TaskSpec, adaptive_repeats
+from benchmarks.worker import TaskSpec, _solved, adaptive_repeats
 
 
 @pytest.fixture(scope="module")
@@ -121,6 +121,85 @@ def test_adaptive_repeats(pilot_s, expected):
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (
+            {
+                "successful": True,
+                "feas": 0.0,
+                "f_gap": 1e-9,
+                "has_fstar": True,
+                "finite": True,
+            },
+            (True, None),
+        ),
+        (
+            {
+                "successful": True,
+                "feas": 0.0,
+                "f_gap": float("nan"),
+                "has_fstar": False,
+                "finite": True,
+            },
+            (True, None),
+        ),
+        (
+            {
+                "successful": False,
+                "feas": 0.0,
+                "f_gap": 0.0,
+                "has_fstar": True,
+                "finite": True,
+            },
+            (False, "unsuccessful"),
+        ),
+        (
+            {
+                "successful": True,
+                "feas": 1e-3,
+                "f_gap": 0.0,
+                "has_fstar": True,
+                "finite": True,
+            },
+            (False, "infeasible"),
+        ),
+        (
+            {
+                "successful": True,
+                "feas": 0.0,
+                "f_gap": 1.0,
+                "has_fstar": True,
+                "finite": True,
+            },
+            (False, "wrong_objective"),
+        ),
+        (
+            {
+                "successful": True,
+                "feas": float("nan"),
+                "f_gap": 0.0,
+                "has_fstar": True,
+                "finite": True,
+            },
+            (False, "infeasible"),
+        ),
+        (
+            {
+                "successful": True,
+                "feas": 0.0,
+                "f_gap": 0.0,
+                "has_fstar": True,
+                "finite": False,
+            },
+            (False, "non_finite"),
+        ),
+    ],
+)
+def test_worker_solved_rule(row, expected):
+    assert _solved(row, TaskSpec(problem="X")) == expected
 
 
 def test_adaptive_repeats_respects_caps():

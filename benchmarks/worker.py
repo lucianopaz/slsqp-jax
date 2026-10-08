@@ -8,10 +8,12 @@ Phases inside the child process:
 2. **warmup** - one call with ``max_steps=1``. Recorded as ``warmup_s`` and
    excluded from timing statistics and from the repeat computation.
 3. **pilot** - first call with the full step budget. Timed, counted as
-   repeat number one, and its solution provides the quality metrics.
+   repeat number one, and its solution provides the status, the solver
+   statistics and the quality metrics.
 4. **repeats** - ``repeats - 1`` further timed calls, where ``repeats`` is
    either the user-provided count or the budget rule in
-   :func:`adaptive_repeats`.
+   :func:`adaptive_repeats`. Skipped (``repeats_skipped`` records why) when
+   the pilot did not solve the problem, unless ``repeat_unsolved`` is set.
 
 The parent enforces a wall-clock timeout; the child also tracks the deadline
 and stops adding repeats early so a slow-but-finite task still returns.
@@ -72,6 +74,12 @@ class TaskSpec:
         Pilot duration above which only one timed run is required.
     timeout_s
         Wall-clock budget for the whole task (all phases).
+    feas_tol, f_tol
+        Feasibility and relative objective-gap tolerances used to decide
+        whether the pilot solve counts as *solved*.
+    repeat_unsolved
+        Time repeats even when the pilot did not solve the problem. Off by
+        default: a failed solve is reported from the pilot alone.
     """
 
     problem: str
@@ -84,6 +92,9 @@ class TaskSpec:
     slow_floor: int = 3
     slow_threshold_s: float = 60.0
     timeout_s: float = 300.0
+    feas_tol: float = 1e-6
+    f_tol: float = 1e-4
+    repeat_unsolved: bool = False
 
 
 def adaptive_repeats(
@@ -141,6 +152,47 @@ def _device_info() -> dict[str, Any]:
         "python": platform.python_version(),
         "machine": platform.machine(),
     }
+
+
+def _scalar_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the scalar entries of ``Solution.stats`` as ``stat_<name>`` columns."""
+    import numpy as np
+
+    out: dict[str, Any] = {}
+    for key, value in stats.items():
+        if key == "num_steps":
+            continue
+        try:
+            arr = np.asarray(value)
+        except Exception:  # noqa: BLE001 - non-array payloads are skipped
+            continue
+        if arr.ndim == 0 and arr.dtype.kind in "biuf":
+            out[f"stats_{key}"] = arr.item()
+    return out
+
+
+def _solved(row: dict[str, Any], spec: TaskSpec) -> tuple[bool, str | None]:
+    """Decide whether the pilot solve counts as solved.
+
+    Returns
+    -------
+    tuple[bool, str | None]
+        ``(solved, reason)`` where ``reason`` is ``None`` when solved and
+        otherwise one of ``"unsuccessful"``, ``"infeasible"``,
+        ``"wrong_objective"``, ``"non_finite"`` - the same classes the
+        analysis layer uses, evaluated here with the task's tolerances so the
+        worker can skip timing repeats on failures.
+    """
+    if not row.get("finite", True):
+        return False, "non_finite"
+    if not row["successful"]:
+        return False, "unsuccessful"
+    if not (row["feas"] <= spec.feas_tol):
+        return False, "infeasible"
+    f_gap = row.get("f_gap", float("nan"))
+    if row.get("has_fstar") and not (math.isnan(f_gap) or f_gap <= spec.f_tol):
+        return False, "wrong_objective"
+    return True, None
 
 
 def run_task_inprocess(
@@ -220,6 +272,27 @@ def run_task_inprocess(
     pilot_s = time.perf_counter() - t0
     times = [pilot_s]
 
+    row["status"] = result_name(sol.result)
+    row["successful"] = bool(is_successful(sol.result))
+    row["steps"] = int(sol.stats["num_steps"])
+    row.update(_scalar_stats(sol.stats))
+    dual = getattr(sol.state, "dual", None)
+    xstar = None
+    try:
+        xstar = raw.expected_result
+    except NotImplementedError:
+        pass
+    row.update(
+        quality_metrics(
+            problem,
+            sol.value,
+            dual,
+            fstar=meta.fstar if meta.has_fstar else None,
+            xstar=xstar,
+        )
+    )
+    row["solved"], row["repeats_skipped"] = _solved(row, spec)
+
     if spec.repeats is not None:
         n_repeats = max(1, int(spec.repeats))
     else:
@@ -230,6 +303,9 @@ def run_task_inprocess(
             slow_floor=spec.slow_floor,
             slow_threshold_s=spec.slow_threshold_s,
         )
+    if row["repeats_skipped"] is not None and not spec.repeat_unsolved:
+        # Timing a failed solve is not informative; keep only the pilot.
+        n_repeats = 1
 
     phase("repeats")
     row["phase"] = "repeats"
@@ -259,25 +335,6 @@ def run_task_inprocess(
             "time_q75_s": float(q75),
             "time_q90_s": float(q90),
         }
-    )
-
-    row["status"] = result_name(sol.result)
-    row["successful"] = bool(is_successful(sol.result))
-    row["steps"] = int(sol.stats["num_steps"])
-    dual = getattr(sol.state, "dual", None)
-    xstar = None
-    try:
-        xstar = raw.expected_result
-    except NotImplementedError:
-        pass
-    row.update(
-        quality_metrics(
-            problem,
-            sol.value,
-            dual,
-            fstar=meta.fstar if meta.has_fstar else None,
-            xstar=xstar,
-        )
     )
     row["error"] = None
     row["phase"] = "done"

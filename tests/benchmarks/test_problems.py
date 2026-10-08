@@ -56,10 +56,26 @@ def test_run_task_inprocess_solves_hs71(sif2jax, config):
     row = run_task_inprocess(spec)
     assert row["phase"] == "done"
     assert row["status"] == "successful" and row["successful"]
+    assert row["solved"] and row["repeats_skipped"] is None
     assert row["repeats"] == 2 and row["repeats_requested"] == 2
     assert row["feas"] < 1e-5 and row["f_gap"] < 1e-5
     assert row["compile_s"] > 0 and row["time_median_s"] > 0
     assert "times_s" not in row
+    assert any(k.startswith("stats_") for k in row)
+
+
+def test_run_task_inprocess_skips_repeats_when_unsolved(sif2jax):
+    """An impossibly tight objective tolerance makes every solve 'wrong' -> pilot only."""
+    jax.config.update("jax_enable_x64", True)
+    spec = TaskSpec(
+        problem="HS71", config="pasls", repeats=5, timeout_s=120.0, f_tol=0.0
+    )
+    row = run_task_inprocess(spec)
+    assert row["status"] == "successful"
+    assert not row["solved"] and row["repeats_skipped"] == "wrong_objective"
+    assert row["repeats"] == 1 and row["repeats_requested"] == 1
+    forced = run_task_inprocess(TaskSpec(**{**spec.__dict__, "repeat_unsolved": True}))
+    assert forced["repeats"] == 5
 
 
 def test_worker_pool_runs_and_reports_errors():

@@ -35,13 +35,19 @@ python -m benchmarks catalog                               # regenerate catalog.
 `repeats = clamp(ceil(2 s / t_pilot), floor, 1000)` with `floor = 3` for solves
 under a minute and `1` otherwise; `--repeats N` overrides. Timing excludes
 compilation and the warm-up call; the pilot solve counts as the first repeat
-and provides the quality metrics.
+and provides the status, solver statistics (`stats_*` columns) and quality
+metrics. Repeats are skipped when the pilot did not solve the problem
+(`repeats_skipped` records `unsuccessful`, `infeasible`, `wrong_objective` or
+`non_finite`; `--repeat-unsolved` forces timing anyway).
 
 ## Published results
 
 `.github/workflows/benchmark.yml` runs the `tiny` tier after every successful
 release and weekly when code under `slsqp_jax/`, `pyproject.toml`, `uv.lock`
-or `benchmarks/` changed. Results land on the `benchmark-results` branch:
+or `benchmarks/` changed. Repository admins can also start a run (or a
+render-only pass) from the Actions tab via "Run workflow"; the gate job
+rejects manual triggers from anyone below admin. Results land on the
+`benchmark-results` branch:
 
 ```
 index.html                 interactive dashboard (marimo + Pyodide)

@@ -75,7 +75,9 @@ def add_solved(
     -------
     pandas.DataFrame
         Copy of ``frame`` with boolean ``solved`` and categorical
-        ``outcome``.
+        ``outcome``. The worker also writes a ``solved`` column (with its
+        own tolerances, used to skip timing repeats); it is recomputed here
+        so reports can vary the tolerances.
 
     Examples
     --------
