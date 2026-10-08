@@ -216,3 +216,8 @@ docs/_build/
 # Myst nb
 .jupyter_cache/
 jupyter_execute/
+
+# benchmark outputs (python -m benchmarks run/publish)
+/results/
+/shards/
+/runs/
