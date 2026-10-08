@@ -45,7 +45,8 @@ class FunnelDiagnostics(eqx.Module):
     Robinson & Toint (2017) as follows.
 
     **Invariants (2.1), Lemmas 3.4 / 3.7.** ``slack_positive`` (``s > 0``),
-    ``residual_nonnegative`` (``c(x, s) ≥ 0`` after the slack reset),
+    ``residual_nonnegative`` (``c(x, s) ≥ 0`` on the slacked rows —
+    inequalities and bounds, not equalities — after the slack reset),
     ``in_funnel`` (``v ≤ v_max``) and ``v_max_monotone`` (``v_max`` never
     grows within one barrier subproblem). ``invariant_violated`` is the
     sticky disjunction of their failures and of the controller's
@@ -265,7 +266,9 @@ class FunnelDiagnostics(eqx.Module):
         slack_positive
             ``s > 0`` on every live slack of the committed iterate.
         residual_min
-            ``min_i c_i(x, s)`` at the committed (reset) iterate.
+            ``min_i c_i(x, s)`` over the slacked rows (inequalities and
+            bounds; equality residuals carry no sign) at the committed
+            (reset) iterate.
         violation
             ``v = ‖c(x, s)‖₂`` at the committed iterate.
         v_max_next

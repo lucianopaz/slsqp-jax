@@ -1115,5 +1115,13 @@ class TrustFunnelSolver(
             )
         ).flatten()
         curv = jnp.dot(ad, ad)
-        alpha_star = jnp.where(curv > tiny, pi_v_sq / jnp.maximum(curv, tiny), 0.0)
+        # ``curv / πᵛ²`` is the Rayleigh quotient of ``Â Âᵀ`` along ``d``. Near
+        # an infeasible stationary point ``d = Âᵀ ĉ`` is rounding noise and
+        # ``Â d`` suffers catastrophic cancellation, so ``curv`` can sit many
+        # orders of magnitude below ``πᵛ²`` while still above ``tiny``; the
+        # resulting ``α*`` would reset the radius to ``1/noise``. Require the
+        # quotient to clear the working precision instead of ``tiny``.
+        eps = jnp.asarray(jnp.finfo(ad.dtype).eps, ad.dtype)
+        meaningful = curv > jnp.maximum(eps * pi_v_sq, tiny)
+        alpha_star = jnp.where(meaningful, pi_v_sq / jnp.maximum(curv, tiny), 0.0)
         return alpha_star * jnp.sqrt(pi_v_sq)

@@ -277,7 +277,9 @@ class TrustFunnelInteriorPointMinimiser(
     eta1, eta2, gamma1, gamma2, grow_factor, max_radius, kappa_t1, kappa_t2
         Forwarded to :class:`~slsqp_jax.sqpdax.step_controller.trust_funnel.TrustFunnelManager`.
     infeasibility_tol
-        Threshold on ``χᵛ`` for the infeasible-stationary test.
+        Threshold on ``χᵛ`` for the infeasible-stationary test, floored at
+        ``10 eps`` of the working dtype (``χᵛ`` is rounding noise below
+        that).
     stall_steps
         Number of consecutive y-iterations at fixed ``μ`` after which the
         loop is declared stalled.
@@ -365,6 +367,19 @@ class TrustFunnelInteriorPointMinimiser(
             )
         if self.check_tol < 0.0:
             raise ValueError(f"check_tol must be >= 0; got {self.check_tol}")
+
+    def _chi_tol(self, dtype: jnp.dtype) -> float:
+        """Effective ``χᵛ`` threshold of the Step 8 test for ``dtype``.
+
+        ``χᵛ = πᵛ / v`` is a relative criticality measure and cannot be
+        resolved below the rounding floor of the working precision: near an
+        infeasible stationary point ``Âᵀĉ`` is pure cancellation noise of
+        order ``eps``, so :attr:`infeasibility_tol` is floored at a small
+        multiple of ``eps(dtype)``. In float64 the floor (``~2e-15``) never
+        binds for the default tolerance; in float32 (``eps ~ 1.2e-7``) the
+        default ``1e-8`` would otherwise be unattainable.
+        """
+        return max(self.infeasibility_tol, 10.0 * float(jnp.finfo(dtype).eps))
 
     @property
     def result_adapter(self) -> TrustFunnelInteriorPointResultAdapter:
@@ -640,7 +655,7 @@ class TrustFunnelInteriorPointMinimiser(
             solved=solved,
             reset=reset,
             slack_positive=self._slacks_positive(lagrangian),
-            residual_min=jnp.min(lagrangian.dual_grad.flatten()),
+            residual_min=self._slacked_residual_min(lagrangian),
             violation=v,
             v_max_next=state.v_max,
             x_norm=x_norm,
@@ -648,7 +663,7 @@ class TrustFunnelInteriorPointMinimiser(
             kappa_y=stats["kappa_y"],
             d_cap_hits=stats["d_cap_hits"],
             radius_floor=self.radius_floor,
-            chi_tol=self.infeasibility_tol,
+            chi_tol=self._chi_tol(dtype),
             tol=self.check_tol,
         )
         self._log_diagnostics(diagnostics, solver, controlled, stats, v, old_mu)
@@ -730,6 +745,28 @@ class TrustFunnelInteriorPointMinimiser(
             & jnp.all((slack.s_lb > 0.0) | lagrangian.null_lb)
             & jnp.all((slack.s_ub > 0.0) | lagrangian.null_ub)
         )
+
+    @staticmethod
+    def _slacked_residual_min(
+        lagrangian: InteriorPointEvaluatedLagrangian,
+    ) -> Scalar:
+        """``min_i [c(x, s)]_i`` over the slacked rows (inequalities and bounds).
+
+        The sign invariant (2.1) only concerns rows that carry a slack: an
+        equality residual ``c_E(x)`` has no sign and is covered by the
+        violation alone, so it is left out (the same rows
+        :meth:`_reset_slacks` acts on). ``+inf`` when there are no slacked
+        rows.
+        """
+        residual = lagrangian.dual_grad
+        rows = jnp.concatenate(
+            [
+                jnp.ravel(residual.ineq_multipliers),
+                jnp.ravel(residual.lb_multipliers),
+                jnp.ravel(residual.ub_multipliers),
+            ]
+        )
+        return jnp.min(rows, initial=jnp.inf)
 
     def _multiplier_stats(
         self, lagrangian: InteriorPointEvaluatedLagrangian, mu: Scalar
@@ -1016,7 +1053,7 @@ class TrustFunnelInteriorPointMinimiser(
         stalled = self.consecutive_y_iterations >= self.stall_steps
         eps_v = self.barrier_update.eps_v(cast(Barrier, self.barrier).weight)
         infeasible_stationary = (violation > self.atol) & (
-            (chi_v <= self.infeasibility_tol) | (stalled & (violation > eps_v))
+            (chi_v <= self._chi_tol(chi_v.dtype)) | (stalled & (violation > eps_v))
         )
         diag = self.funnel_diagnostics
         multiplier_failure = (

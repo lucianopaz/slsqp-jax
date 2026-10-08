@@ -151,6 +151,72 @@ def make_infeasible_problem() -> Problem:
     )
 
 
+def make_zero_jacobian_infeasible_problem() -> Problem:
+    """``min ‖x‖²`` subject to ``x₀² + 1 = 0``: infeasible, and at ``x = 0``
+    both the constraint Jacobian and ``∇f`` vanish exactly.
+
+    Starting there, every step is a y-iteration (``πᵛ = πᶠ = 0`` with
+    ``v = 1``) in any precision, which makes the y-streak route of the funnel
+    minimiser deterministic.
+    """
+    n = 2
+
+    def zero_rows(m: int):
+        return lambda x, *a: jnp.zeros((m, n), x.dtype)
+
+    return Problem(
+        fn=lambda x: (jnp.sum(x**2), None),
+        grad=lambda x: 2.0 * x,
+        hvp=lambda x, v: 2.0 * v,
+        eq_fn=lambda x: x[:1] ** 2 + 1.0,
+        eq_fn_jac=lambda x: jnp.array([[2.0 * x[0], 0.0]], x.dtype),
+        eq_fn_hvp=lambda x, v: 2.0 * v[0] * jnp.array([[1.0, 0.0]], x.dtype),
+        ineq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        ineq_fn_jac=zero_rows(0),
+        ineq_fn_hvp=zero_rows(0),
+        lb=jnp.array([-jnp.inf, -jnp.inf]),
+        ub=jnp.array([jnp.inf, jnp.inf]),
+        null_lb=jnp.array([True, True]),
+        null_ub=jnp.array([True, True]),
+        n=n,
+        meq=1,
+        mineq=0,
+    )
+
+
+def make_shifted_equality_problem() -> Problem:
+    """``min x₀² + x₁² + x₁`` subject to ``x₀ = 4``.
+
+    At ``x = 0`` the least-squares multiplier is ``y = 0``, so
+    ``πᶠ = ‖P∇f‖ = 1`` while ``πᵛ = ‖Aᵀc‖ = 4`` and (3.15b) holds. With the
+    normal step gated off this gives a y-iteration whose multiplier estimate
+    fails the (3.16) health test.
+    """
+    n = 2
+
+    def zero_rows(m: int):
+        return lambda x, *a: jnp.zeros((m, n), x.dtype)
+
+    return Problem(
+        fn=lambda x: (jnp.sum(x**2) + x[1], None),
+        grad=lambda x: 2.0 * x + jnp.array([0.0, 1.0], x.dtype),
+        hvp=lambda x, v: 2.0 * v,
+        eq_fn=lambda x: x[:1] - 4.0,
+        eq_fn_jac=lambda x: jnp.array([[1.0, 0.0]], x.dtype),
+        eq_fn_hvp=zero_rows(1),
+        ineq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        ineq_fn_jac=zero_rows(0),
+        ineq_fn_hvp=zero_rows(0),
+        lb=jnp.array([-jnp.inf, -jnp.inf]),
+        ub=jnp.array([jnp.inf, jnp.inf]),
+        null_lb=jnp.array([True, True]),
+        null_ub=jnp.array([True, True]),
+        n=n,
+        meq=1,
+        mineq=0,
+    )
+
+
 # ``x0`` / ``x_star`` are plain lists: parametrize arguments are built at
 # import time, before the x64 contexts of the convergence tests are entered.
 CONVERGENCE_CASES: dict[str, tuple[Callable[[], Problem], list[float], list[float]]] = {
@@ -267,13 +333,18 @@ def funnel_run() -> Callable[[str], FunnelRun]:
 class InfeasibleFunnelRun:
     """The float32 funnel run on :func:`make_infeasible_problem` with INFO logging.
 
-    In float32 the incompatible problem ends through the y-iteration fixed
-    point (the slacks cannot shrink far enough for ``χᵛ`` to vanish), which
-    is the route that emits the streak warning; float64 reaches Step 8
-    directly. The generic LSMR multiplier recovery is forced because the
-    exact pseudo-inverse paths hand the large least-squares multipliers of
-    the incompatible system to the ``κ_y`` cap instead of producing a
-    y-streak.
+    The run ends with ``infeasible_stationary_point``, but *which* route gets
+    there is rounding-dependent: ``Âᵀĉ`` is cancellation noise near the
+    stationary point of the violation, so depending on the platform the
+    noise either rounds ``πᵛ`` to exactly zero (y-iterations, ending through
+    the streak fallback) or leaves it at ``~eps`` (tiny ``f``/``v`` steps,
+    ending through the ``eps``-floored Step 8 test). Tests on this run must
+    only assert what holds on both routes; the streak and the unhealthy
+    y-iteration diagnostics are exercised deterministically on
+    :func:`make_zero_jacobian_infeasible_problem` and
+    :func:`make_shifted_equality_problem`. The generic LSMR multiplier
+    recovery is forced so the large least-squares multipliers of the
+    incompatible system hit the ``κ_y`` cap in a reproducible way.
     """
 
     problem: Problem
