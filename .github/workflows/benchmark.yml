@@ -1,0 +1,321 @@
+name: benchmarks
+
+# Benchmarks the sqpdax minimisers on the sif2jax (CUTEst) catalogue and
+# publishes the results to the `benchmark-results` branch (served by GitHub
+# Pages). See benchmarks/README.md.
+#
+# Triggers
+#   - release-pipeline finished successfully for a release  -> full run
+#   - release deleted                                        -> cancel the run for that tag
+#   - weekly schedule                                        -> run only if benchmark-relevant code changed
+#   - manual                                                 -> run or render on demand
+
+on:
+  workflow_run:
+    workflows: [release-pipeline]
+    types: [completed]
+  release:
+    types: [deleted]
+  schedule:
+  - cron: 0 3 * * 1
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: largest problem-size tier to run
+        type: choice
+        options: [tiny, small, medium]
+        default: tiny
+      solvers:
+        description: comma-separated solver configs (empty = all seven)
+        type: string
+        default: ''
+      mode:
+        description: run the solvers, or only re-render the stored results
+        type: choice
+        options: [run, render]
+        default: run
+      force:
+        description: skip the "did code change?" gate
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  RESULTS_BRANCH: benchmark-results
+  DEFAULT_TIER: tiny
+  CHUNKS: '3'
+  # Paths whose changes invalidate stored numbers (weekly gate). Rename the
+  # package here when slsqp_jax becomes sqpdax.
+  CODE_PATHS: |
+    slsqp_jax/
+    pyproject.toml
+    uv.lock
+    benchmarks/
+  # Subset of CODE_PATHS that only changes how numbers are displayed.
+  RENDER_ONLY_PATHS: |
+    benchmarks/report.py
+    benchmarks/dashboard.py
+    benchmarks/README.md
+
+# A release and its later deletion share one group so the deletion cancels
+# the in-flight benchmark. Scheduled/manual runs get a unique group.
+concurrency:
+  group: benchmark-${{ github.event_name == 'release' && github.event.release.tag_name || (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'release' }}
+
+jobs:
+  cancel-deleted-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+    - name: Cancel benchmark runs for the deleted tag
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow benchmarks \
+                      --status in_progress --json databaseId,headBranch \
+                      --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId"); do
+          echo "cancelling run $id for tag $TAG"
+          gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
+        done
+
+  gate:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      sha: ${{ steps.decide.outputs.sha }}
+      tag: ${{ steps.decide.outputs.tag }}
+      tier: ${{ steps.decide.outputs.tier }}
+      run_id: ${{ steps.decide.outputs.run_id }}
+      configs: ${{ steps.decide.outputs.configs }}
+      chunks: ${{ steps.decide.outputs.chunks }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Decide what to do
+      id: decide
+      env:
+        EVENT: ${{ github.event_name }}
+        WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        WR_EVENT: ${{ github.event.workflow_run.event }}
+        WR_SHA: ${{ github.event.workflow_run.head_sha }}
+        WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        IN_TIER: ${{ inputs.tier }}
+        IN_SOLVERS: ${{ inputs.solvers }}
+        IN_MODE: ${{ inputs.mode }}
+        IN_FORCE: ${{ inputs.force }}
+      run: |
+        set -euo pipefail
+        mode=skip; sha="$GITHUB_SHA"; tag=""; tier="$DEFAULT_TIER"; solvers=""
+        case "$EVENT" in
+          workflow_run)
+            if [ "$WR_CONCLUSION" = success ] && [ "$WR_EVENT" = release ]; then
+              mode=run; sha="$WR_SHA"; tag="$WR_BRANCH"
+            fi ;;
+          workflow_dispatch)
+            mode="$IN_MODE"; tier="${IN_TIER:-$DEFAULT_TIER}"; solvers="$IN_SOLVERS"
+            if [ "$IN_FORCE" != true ] && [ "$mode" = run ]; then
+              mode=gate
+            fi ;;
+          schedule)
+            mode=gate ;;
+        esac
+
+        if [ "$mode" = gate ]; then
+          # Compare HEAD with the commit of the last published run.
+          last=""
+          if git fetch --quiet origin "$RESULTS_BRANCH" 2>/dev/null; then
+            last=$(git show FETCH_HEAD:results/index.json 2>/dev/null \
+                   | python3 -c 'import json,sys; e=json.load(sys.stdin); print(e[-1]["sha"] if e else "")' || true)
+          fi
+          if [ -z "$last" ] || ! git cat-file -e "$last^{commit}" 2>/dev/null; then
+            echo "no previous benchmark commit found -> run"
+            mode=run
+          else
+            changed=$(git diff --name-only "$last" "$sha")
+            echo "files changed since $last:"; echo "$changed"
+            mode=skip
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              hit=""
+              while IFS= read -r p; do [ -n "$p" ] && [[ "$f" == "$p"* ]] && hit=1; done <<< "$CODE_PATHS"
+              [ -z "$hit" ] && continue
+              render=""
+              while IFS= read -r p; do [ -n "$p" ] && [[ "$f" == "$p" ]] && render=1; done <<< "$RENDER_ONLY_PATHS"
+              if [ -n "$render" ]; then
+                [ "$mode" = skip ] && mode=render
+              else
+                mode=run
+              fi
+            done <<< "$changed"
+          fi
+        fi
+
+        configs='["asls-pcg","asls-craig","asls-minresqlp","asls-pcg-exact","pasls","trip","tfip"]'
+        if [ -n "$solvers" ]; then
+          configs=$(python3 -c 'import json,sys; print(json.dumps([s.strip() for s in sys.argv[1].split(",") if s.strip()]))' "$solvers")
+        fi
+        chunks=$(python3 -c 'import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))' "$CHUNKS")
+        run_id="$(date -u +%Y%m%dT%H%M%SZ)_${sha:0:7}"
+
+        echo "mode=$mode sha=$sha tag=$tag tier=$tier run_id=$run_id configs=$configs"
+        {
+          echo "mode=$mode"; echo "sha=$sha"; echo "tag=$tag"; echo "tier=$tier"
+          echo "run_id=$run_id"; echo "configs=$configs"; echo "chunks=$chunks"
+        } >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: gate
+    if: needs.gate.outputs.mode == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.gate.outputs.configs) }}
+        chunk: ${{ fromJSON(needs.gate.outputs.chunks) }}
+    env:
+      BENCH_SHA: ${{ needs.gate.outputs.sha }}
+      BENCH_TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ needs.gate.outputs.sha }}
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: '3.12'
+        enable-cache: true
+    - name: Install
+      run: uv sync --locked --group benchmark
+    - name: Run shard ${{ matrix.config }} ${{ matrix.chunk }}/${{ env.CHUNKS }}
+      run: |
+        uv run python -m benchmarks run \
+          --tier "${{ needs.gate.outputs.tier }}" \
+          --configs "${{ matrix.config }}" \
+          --chunk "${{ matrix.chunk }}/${{ env.CHUNKS }}" \
+          --jobs 2 --device cpu \
+          --out shard --flat --run-id "${{ needs.gate.outputs.run_id }}"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: shard-${{ matrix.config }}-${{ matrix.chunk }}
+        path: shard
+        retention-days: 90
+        if-no-files-found: warn
+
+  publish:
+    needs: [gate, bench]
+    # Publish partial results when some shards failed, but not when the run
+    # was skipped or cancelled (e.g. the release was deleted).
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode == 'render' || needs.bench.result == 'success' || needs.bench.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MODE: ${{ needs.gate.outputs.mode }}
+      RUN_ID: ${{ needs.gate.outputs.run_id }}
+      BENCH_SHA: ${{ needs.gate.outputs.sha }}
+      BENCH_TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ needs.gate.outputs.sha }}
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: '3.12'
+        enable-cache: true
+    - name: Install
+      run: uv sync --locked --group benchmark
+
+    - name: Check out the results branch
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        mkdir site && cd site
+        git init -q -b "$RESULTS_BRANCH"
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        if git fetch -q origin "$RESULTS_BRANCH"; then
+          git reset -q --hard FETCH_HEAD
+        else
+          echo "creating orphan branch $RESULTS_BRANCH"
+        fi
+        touch .nojekyll
+
+    - uses: actions/download-artifact@v4
+      if: env.MODE == 'run'
+      with:
+        pattern: shard-*
+        path: shards
+
+    - name: Merge shards and publish the run
+      if: env.MODE == 'run'
+      run: |
+        set -euo pipefail
+        ls shards
+        uv run python -m benchmarks merge shards/shard-* --out "runs/$RUN_ID" --run-id "$RUN_ID"
+        uv run python -m benchmarks publish "runs/$RUN_ID" --results-dir site/results --dashboard
+    - uses: actions/upload-artifact@v4
+      if: env.MODE == 'run'
+      with:
+        name: run-${{ env.RUN_ID }}
+        path: site/results/${{ env.RUN_ID }}
+        retention-days: 90
+
+    - name: Re-render stored runs
+      if: env.MODE == 'render'
+      run: uv run python -m benchmarks render --results-dir site/results
+
+    - name: Commit and push
+      run: |
+        set -euo pipefail
+        cd site
+        git add -A
+        if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+        if [ "$MODE" = run ]; then
+          git commit -q -m "benchmark run $RUN_ID (${BENCH_TAG:-$GITHUB_EVENT_NAME})"
+        else
+          git commit -q -m "re-render reports from ${BENCH_SHA:0:7}"
+        fi
+        for attempt in 1 2 3; do
+          if git push -q origin "$RESULTS_BRANCH"; then exit 0; fi
+          echo "push failed (attempt $attempt), rebasing"
+          git fetch -q origin "$RESULTS_BRANCH" && git rebase FETCH_HEAD
+        done
+        exit 1
+
+    - name: Summary
+      if: env.MODE == 'run'
+      run: |
+        uv run python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+        import json, os
+        from pathlib import Path
+        run = Path("site/results") / os.environ["RUN_ID"]
+        meta = json.loads((run / "run.json").read_text())
+        summary = json.loads((run / "summary.json").read_text())["by_config"]
+        print(f"## Benchmark run `{run.name}`\n")
+        print(f"commit `{str(meta.get('sha',''))[:7]}`, tier `{meta.get('tier')}`, "
+              f"{meta.get('n_tasks')} tasks, status counts: `{meta.get('status_counts')}`\n")
+        print("| config | tasks | solved | rate | median time [s] | median steps |")
+        print("|---|---|---|---|---|---|")
+        for r in summary:
+            t = r.get("median_time_s"); s = r.get("median_steps")
+            print(f"| {r['config']} | {r['n_tasks']} | {r['n_solved']} | {r['solve_rate']:.3f} | "
+                  f"{'' if t is None else f'{t:.3g}'} | {'' if s is None else f'{s:.0f}'} |")
+        print(f"\nReport: `results/{run.name}/report.html` on the `{os.environ['RESULTS_BRANCH']}` branch.")
+        EOF
