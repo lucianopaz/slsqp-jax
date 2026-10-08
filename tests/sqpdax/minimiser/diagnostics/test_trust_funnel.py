@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from tests.sqpdax.minimiser.conftest import (
     constraint_residual,
     funnel_minimiser,
     make_box_quadratic,
+    make_shifted_equality_problem,
 )
 
 R = TRUST_FUNNEL_INTERIOR_POINT_RESULTS
@@ -820,19 +822,97 @@ def test_injected_violations_fire_warnings_on_a_real_step():
     assert not bool(done)
 
 
-def test_infeasible_run_reports_unhealthy_y_iterations_and_bound_hits(
-    infeasible_funnel_run,
-):
-    """On the incompatible problem the multiplier estimate cannot satisfy
-    (3.15): the carry records unhealthy y-iterations and ``κ_y`` hits, yet
-    Step 8 keeps precedence in the result.
+def test_infeasible_run_reports_multiplier_bound_hits(infeasible_funnel_run):
+    """On the incompatible problem the least-squares multipliers blow up: the
+    carry counts ``κ_y`` hits and warns about them, yet Step 8 keeps
+    precedence in the result.
 
-    See :class:`InfeasibleFunnelRun` for why the shared run is float32 with
-    the generic multiplier recovery.
+    See :class:`InfeasibleFunnelRun` for why the shared run is float32 and
+    which of its properties are platform independent.
     """
     sol, handler = infeasible_funnel_run.sol, infeasible_funnel_run.handler
     assert sol.result == R.infeasible_stationary_point
     diag = sol.state.funnel_diagnostics
-    assert int(diag.multiplier_failure_streak) >= 1
     assert int(diag.n_multiplier_bound) >= 1
+    assert bool(diag.multiplier_bound_exceeded)
+    assert any(
+        r.message.startswith("multiplier estimate exceeds kappa_y")
+        for r in handler.records
+    )
+
+
+@pytest.mark.parametrize("x64", [False, True], ids=["float32", "float64"])
+def test_gated_y_iteration_failing_the_health_test_is_unhealthy(x64):
+    """A y-iteration whose multipliers satisfy (3.15b) but not (3.16) is
+    recorded as unhealthy and starts the multiplier-failure streak.
+
+    At ``x = 0`` of :func:`make_shifted_equality_problem` ``πᶠ = 1`` and
+    ``πᵛ = 4``: pushing ``πᶠ_{k−1}`` and ``v_max`` up gates the normal step
+    off through (3.2), (3.15b) sets the tangential step to zero, and the
+    y-iteration fails ``πᶠ ≤ κ_ω πᶠ_{k−1}`` against the carry's
+    ``πᶠ_last = 0``.
+    """
+    problem = make_shifted_equality_problem()
+    handler = MemoryHandler()
+    with jax.enable_x64(x64):
+        solver = funnel_minimiser(min_steps=0).init(
+            problem,
+            jnp.zeros(2),
+            options={"logging": {"level": "WARNING", "handler": handler}},
+        )
+        dtype = solver.solver_state.radius_v.dtype
+        big = jnp.asarray(1e3, dtype)
+        solver = eqx.tree_at(
+            lambda m: (
+                m.solver_state.pi_f_prev,
+                m.solver_state.v_max,
+                m.funnel_diagnostics.v_max_prev,
+            ),
+            solver,
+            (big, big, big),
+        )
+        solver = solver.step(problem)
+    state = solver.solver_state
+    assert state.iteration_type == IterationType.y_iteration
+    assert state.multiplier_case == MultiplierCase.skip_tangential
+    assert not bool(state.tangential_computed)
+    diag = solver.funnel_diagnostics
+    assert bool(diag.unhealthy_y_iteration)
+    assert int(diag.multiplier_failure_streak) == 1
+    assert int(solver.consecutive_y_iterations) == 1
     assert any(r.message.startswith("unhealthy y-iteration") for r in handler.records)
+    # The violated equality has no sign invariant: not an invariant breach.
+    assert bool(diag.residual_nonnegative)
+    assert not bool(diag.invariant_violated)
+    assert not any(
+        r.message.startswith("funnel invariant violated") for r in handler.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_problem", "x0", "slack_shift", "expected"),
+    [
+        (make_shifted_equality_problem, [0.0, 0.0], 0.0, 0.0),
+        (make_box_quadratic, [0.5, 0.0, 0.5], 0.0, 0.0),
+        (make_box_quadratic, [0.5, 0.0, 0.5], -0.25, -0.25),
+    ],
+    ids=["violated-equality", "slacked-feasible", "slacked-negative"],
+)
+def test_slacked_residual_min_ignores_equality_rows(
+    make_problem, x0, slack_shift, expected
+):
+    """``residual_min`` is taken over inequality and bound rows only.
+
+    A violated equality (``c_E = −4`` at ``x = 0``) does not show up: only
+    the dead bound rows (zero residual) remain. Shrinking an inequality
+    slack below ``−c(x)`` is reported as the negative residual it is.
+    """
+    problem = make_problem()
+    solver = funnel_minimiser().init(problem, jnp.asarray(x0))
+    if slack_shift:
+        solver = eqx.tree_at(
+            lambda m: m.iterate.slack.s, solver, solver.iterate.slack.s + slack_shift
+        )
+    lagrangian = solver._optimisation_context(problem).lagrangian
+    residual_min = float(solver._slacked_residual_min(lagrangian))
+    assert residual_min == pytest.approx(expected, abs=1e-6)

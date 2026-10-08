@@ -11,6 +11,7 @@ import optimistix as optx
 import pytest
 
 from slsqp_jax.sqpdax.barrier import FunnelBarrierUpdate, LogBarrier
+from slsqp_jax.sqpdax.logging import MemoryHandler
 from slsqp_jax.sqpdax.minimiser import (
     TRUST_FUNNEL_INTERIOR_POINT_RESULTS,
     InteriorPointMinimiser,
@@ -38,6 +39,7 @@ from .conftest import (
     make_infeasible_problem,
     make_scaled_quartic,
     make_unconstrained_quadratic,
+    make_zero_jacobian_infeasible_problem,
 )
 
 
@@ -533,15 +535,15 @@ def test_unconstrained_and_equality_converge_in_float32(case):
 # --- logging / integration -------------------------------------------------------
 
 
-def test_step_logging_reports_funnel_columns_and_stalls(infeasible_funnel_run):
-    """INFO rows carry the funnel measures; a y-streak logs a WARNING.
+def test_step_logging_reports_funnel_columns(infeasible_funnel_run):
+    """INFO rows carry the funnel measures, one row per outer step.
 
-    See :class:`InfeasibleFunnelRun` for why the shared run is float32 with
-    the generic multiplier recovery.
+    See :class:`InfeasibleFunnelRun` for why the shared run is float32 and
+    which of its properties are platform independent.
     """
     sol, handler = infeasible_funnel_run.sol, infeasible_funnel_run.handler
     assert sol.result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.infeasible_stationary_point
-    assert bool(infeasible_funnel_run.metrics.stalled)
+    assert int(sol.stats["num_steps"]) < 80
     steps = [r.message for r in handler.records if r.message.startswith("step=")]
     assert len(steps) == int(sol.stats["num_steps"])
     for column in (
@@ -554,6 +556,37 @@ def test_step_logging_reports_funnel_columns_and_stalls(infeasible_funnel_run):
         "y_streak=",
     ):
         assert column in steps[-1]
+
+
+@pytest.mark.parametrize("x64", [False, True], ids=["float32", "float64"])
+def test_y_iteration_streak_logs_warning_and_stalls(x64):
+    """A run of ``stall_steps`` y-iterations logs a WARNING and ends the run.
+
+    At ``x = 0`` of :func:`make_zero_jacobian_infeasible_problem` both
+    ``πᵛ`` and ``πᶠ`` vanish exactly while ``v = 1``, so Algorithm 2 sits at
+    a fixed point from the first step in either precision; ``min_steps``
+    keeps the loop alive past Step 8 long enough for the streak to form.
+    """
+    problem = make_zero_jacobian_infeasible_problem()
+    handler = MemoryHandler()
+    with jax.enable_x64(x64):
+        sol = run(
+            problem,
+            [0.0, 0.0],
+            max_steps=20,
+            options={"logging": {"level": "INFO", "handler": handler}},
+            min_steps=3,
+            stall_steps=2,
+        )
+        metrics = sol.state.termination_metrics(
+            sol.state._optimisation_context(problem)
+        )
+    assert sol.result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.infeasible_stationary_point
+    assert int(sol.stats["num_steps"]) == 3
+    assert int(sol.state.consecutive_y_iterations) == 3
+    assert bool(metrics.stalled)
+    steps = [r.message for r in handler.records if r.message.startswith("step=")]
+    assert all("type=y_iteration" in m for m in steps)
     warnings_ = [r.message for r in handler.records if r.levelno >= 30]
     assert any("consecutive y-iterations" in m for m in warnings_)
 
