@@ -1,0 +1,349 @@
+{
+ "by_config": [
+  {
+   "config": "asls-craig",
+   "n_tasks": 323,
+   "n_solved": 114,
+   "solve_rate": 0.3529411765,
+   "median_time_s": 0.0050054892,
+   "median_steps": 8.0,
+   "median_compile_s": 3.992567081
+  },
+  {
+   "config": "asls-minresqlp",
+   "n_tasks": 323,
+   "n_solved": 155,
+   "solve_rate": 0.479876161,
+   "median_time_s": 0.0100496645,
+   "median_steps": 9.0,
+   "median_compile_s": 4.152572747
+  },
+  {
+   "config": "asls-pcg",
+   "n_tasks": 323,
+   "n_solved": 129,
+   "solve_rate": 0.399380805,
+   "median_time_s": 0.002738495,
+   "median_steps": 8.0,
+   "median_compile_s": 3.815645857
+  },
+  {
+   "config": "asls-pcg-exact",
+   "n_tasks": 323,
+   "n_solved": 106,
+   "solve_rate": 0.3281733746,
+   "median_time_s": 0.0004502915,
+   "median_steps": 5.0,
+   "median_compile_s": 2.25824739
+  },
+  {
+   "config": "pasls",
+   "n_tasks": 323,
+   "n_solved": 153,
+   "solve_rate": 0.4736842105,
+   "median_time_s": 0.003753531,
+   "median_steps": 11.0,
+   "median_compile_s": 4.7456623815
+  },
+  {
+   "config": "tfip",
+   "n_tasks": 323,
+   "n_solved": 102,
+   "solve_rate": 0.3157894737,
+   "median_time_s": 0.0143111628,
+   "median_steps": 31.5,
+   "median_compile_s": 6.1963514595
+  },
+  {
+   "config": "trip",
+   "n_tasks": 323,
+   "n_solved": 73,
+   "solve_rate": 0.226006192,
+   "median_time_s": 0.003148773,
+   "median_steps": 14.0,
+   "median_compile_s": 3.8700255815
+  }
+ ],
+ "by_collection_config": [
+  {
+   "collection": "bounded",
+   "config": "asls-craig",
+   "n_tasks": 74,
+   "n_solved": 13,
+   "solve_rate": 0.1756756757,
+   "median_time_s": 0.002153494,
+   "median_steps": 7.0,
+   "median_compile_s": 3.504555307
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-minresqlp",
+   "n_tasks": 74,
+   "n_solved": 28,
+   "solve_rate": 0.3783783784,
+   "median_time_s": 0.0139688047,
+   "median_steps": 14.0,
+   "median_compile_s": 3.7143170245
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg",
+   "n_tasks": 74,
+   "n_solved": 13,
+   "solve_rate": 0.1756756757,
+   "median_time_s": 0.0021355095,
+   "median_steps": 7.0,
+   "median_compile_s": 3.373493402
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg-exact",
+   "n_tasks": 74,
+   "n_solved": 13,
+   "solve_rate": 0.1756756757,
+   "median_time_s": 0.0003552965,
+   "median_steps": 3.0,
+   "median_compile_s": 1.991371
+  },
+  {
+   "collection": "bounded",
+   "config": "pasls",
+   "n_tasks": 74,
+   "n_solved": 30,
+   "solve_rate": 0.4054054054,
+   "median_time_s": 0.0050734765,
+   "median_steps": 14.0,
+   "median_compile_s": 4.121798765
+  },
+  {
+   "collection": "bounded",
+   "config": "tfip",
+   "n_tasks": 74,
+   "n_solved": 10,
+   "solve_rate": 0.1351351351,
+   "median_time_s": 0.014249266,
+   "median_steps": 29.5,
+   "median_compile_s": 5.356643197
+  },
+  {
+   "collection": "bounded",
+   "config": "trip",
+   "n_tasks": 74,
+   "n_solved": 5,
+   "solve_rate": 0.0675675676,
+   "median_time_s": 0.00396498,
+   "median_steps": 16.0,
+   "median_compile_s": 3.4545162595
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-craig",
+   "n_tasks": 3,
+   "n_solved": 3,
+   "solve_rate": 1.0,
+   "median_time_s": 0.003339849,
+   "median_steps": 7.0,
+   "median_compile_s": 2.954744424
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.002306704,
+   "median_steps": 2.0,
+   "median_compile_s": 3.496028463
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg",
+   "n_tasks": 3,
+   "n_solved": 3,
+   "solve_rate": 1.0,
+   "median_time_s": 0.0029140385,
+   "median_steps": 7.0,
+   "median_compile_s": 3.45954505
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 3,
+   "n_solved": 3,
+   "solve_rate": 1.0,
+   "median_time_s": 0.000627523,
+   "median_steps": 4.0,
+   "median_compile_s": 1.840886636
+  },
+  {
+   "collection": "bqp",
+   "config": "pasls",
+   "n_tasks": 3,
+   "n_solved": 3,
+   "solve_rate": 1.0,
+   "median_time_s": 0.003215924,
+   "median_steps": 6.0,
+   "median_compile_s": 4.64019727
+  },
+  {
+   "collection": "bqp",
+   "config": "tfip",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.005922133,
+   "median_steps": 22.0,
+   "median_compile_s": 5.526348366
+  },
+  {
+   "collection": "bqp",
+   "config": "trip",
+   "n_tasks": 3,
+   "n_solved": 0,
+   "solve_rate": 0.0,
+   "median_time_s": null,
+   "median_steps": null,
+   "median_compile_s": 3.113112106
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-craig",
+   "n_tasks": 224,
+   "n_solved": 93,
+   "solve_rate": 0.4151785714,
+   "median_time_s": 0.005152072,
+   "median_steps": 8.0,
+   "median_compile_s": 4.173101695
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-minresqlp",
+   "n_tasks": 224,
+   "n_solved": 120,
+   "solve_rate": 0.5357142857,
+   "median_time_s": 0.0091240072,
+   "median_steps": 9.0,
+   "median_compile_s": 4.257418561
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg",
+   "n_tasks": 224,
+   "n_solved": 109,
+   "solve_rate": 0.4866071429,
+   "median_time_s": 0.002766999,
+   "median_steps": 8.0,
+   "median_compile_s": 3.999413873
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg-exact",
+   "n_tasks": 224,
+   "n_solved": 85,
+   "solve_rate": 0.3794642857,
+   "median_time_s": 0.00044561,
+   "median_steps": 5.0,
+   "median_compile_s": 2.321551668
+  },
+  {
+   "collection": "constrained",
+   "config": "pasls",
+   "n_tasks": 224,
+   "n_solved": 115,
+   "solve_rate": 0.5133928571,
+   "median_time_s": 0.003536896,
+   "median_steps": 11.0,
+   "median_compile_s": 5.0592905745
+  },
+  {
+   "collection": "constrained",
+   "config": "tfip",
+   "n_tasks": 224,
+   "n_solved": 86,
+   "solve_rate": 0.3839285714,
+   "median_time_s": 0.0143111628,
+   "median_steps": 32.0,
+   "median_compile_s": 6.424558866
+  },
+  {
+   "collection": "constrained",
+   "config": "trip",
+   "n_tasks": 224,
+   "n_solved": 67,
+   "solve_rate": 0.2991071429,
+   "median_time_s": 0.002956381,
+   "median_steps": 14.0,
+   "median_compile_s": 3.899097703
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-craig",
+   "n_tasks": 22,
+   "n_solved": 5,
+   "solve_rate": 0.2272727273,
+   "median_time_s": 0.014248375,
+   "median_steps": 5.0,
+   "median_compile_s": 5.057098308
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 22,
+   "n_solved": 6,
+   "solve_rate": 0.2727272727,
+   "median_time_s": 0.0178674618,
+   "median_steps": 5.0,
+   "median_compile_s": 5.3330763565
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg",
+   "n_tasks": 22,
+   "n_solved": 4,
+   "solve_rate": 0.1818181818,
+   "median_time_s": 0.008456514,
+   "median_steps": 3.5,
+   "median_compile_s": 4.441296506
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 22,
+   "n_solved": 5,
+   "solve_rate": 0.2272727273,
+   "median_time_s": 0.002298682,
+   "median_steps": 1.0,
+   "median_compile_s": 3.083852898
+  },
+  {
+   "collection": "cqp",
+   "config": "pasls",
+   "n_tasks": 22,
+   "n_solved": 5,
+   "solve_rate": 0.2272727273,
+   "median_time_s": 0.002208758,
+   "median_steps": 5.0,
+   "median_compile_s": 5.329383318
+  },
+  {
+   "collection": "cqp",
+   "config": "tfip",
+   "n_tasks": 22,
+   "n_solved": 5,
+   "solve_rate": 0.2272727273,
+   "median_time_s": 0.016878624,
+   "median_steps": 38.0,
+   "median_compile_s": 8.345711688
+  },
+  {
+   "collection": "cqp",
+   "config": "trip",
+   "n_tasks": 22,
+   "n_solved": 1,
+   "solve_rate": 0.0454545455,
+   "median_time_s": 0.0037908515,
+   "median_steps": 14.0,
+   "median_compile_s": 5.1477480875
+  }
+ ]
+}
