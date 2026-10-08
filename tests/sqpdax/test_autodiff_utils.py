@@ -288,6 +288,30 @@ def test_autodiff_wrapper_jax_mode(
         assert jnp.allclose(got_hvp, exp_hvp)
 
 
+@pytest.mark.parametrize(
+    ("fn", "x", "expected_shape"),
+    [
+        (lambda x: jnp.array([3.0 - x[0] - x[1] - 2.0 * x[2]]), jnp.ones(3), (1, 3)),
+        (lambda x: jnp.sum(2.0 * x) + 1.0, jnp.ones(4), (4,)),
+        (lambda p: jnp.sum(2.0 * p.x), Primal(x=jnp.ones(2)), (2,)),
+    ],
+    ids=["linear-constraint", "linear-objective", "linear-primal"],
+)
+def test_autodiff_wrapper_jax_mode_linear_hvp_is_dense_zero(fn, x, expected_shape):
+    """A linear callable has a constant Jacobian; its forced HVP must be dense zeros.
+
+    ``eqx.filter_jvp`` reports the symbolic-zero tangent as ``None``, which
+    downstream Lagrangian code cannot contract with multipliers.
+    """
+    _, _, hvp = autodiff_wrapper(fn, autodiff_mode="jax", force_hvp_in_jax_mode=True)
+    assert hvp is not None
+    got = hvp(x, x)
+    got = got.x if isinstance(got, Primal) else got
+    assert got is not None
+    assert got.shape == expected_shape
+    assert jnp.all(got == 0.0)
+
+
 @pytest.mark.parametrize("with_hvp", [True, False])
 def test_autodiff_wrapper_custom_mode(with_hvp: bool):
     """``autodiff_mode='custom'`` delegates to :func:`fn_proxy_autodiff`."""

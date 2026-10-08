@@ -323,11 +323,22 @@ def autodiff_wrapper(
         else:
 
             def _hvp(x: Any, tangent: Any, *args: Any, **kwargs: Any) -> Any:
-                return eqx.filter_jvp(
+                primal_out, tangent_out = eqx.filter_jvp(
                     lambda z: _grad(z, *args, **kwargs),
                     (x,),
                     (tangent,),
-                )[1]
+                )
+                # ``filter_jvp`` reports symbolic-zero tangents as ``None``
+                # (e.g. the Jacobian of a linear constraint does not depend
+                # on ``x``); callers expect dense arrays, so materialise them.
+                return jtu.tree_map(
+                    lambda p, t: jnp.zeros_like(p)
+                    if t is None and eqx.is_array(p)
+                    else t,
+                    primal_out,
+                    tangent_out,
+                    is_leaf=lambda node: node is None,
+                )
 
             resolved_hvp = _hvp
 
