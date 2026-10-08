@@ -8,7 +8,7 @@ name: benchmarks
 #   - release-pipeline finished successfully for a release  -> full run
 #   - release deleted                                        -> cancel the run for that tag
 #   - weekly schedule                                        -> run only if benchmark-relevant code changed
-#   - manual                                                 -> run or render on demand
+#   - manual (repository admins only)                        -> run or render on demand
 
 on:
   workflow_run:
@@ -101,6 +101,21 @@ jobs:
       with:
         fetch-depth: 0
         persist-credentials: false
+    - name: Require admin for manual runs
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        # Anyone with write access can press "Run workflow"; restrict manual
+        # runs to repository admins (owners of a user/org repo report as
+        # "admin" through this endpoint).
+        permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${GITHUB_ACTOR}/permission" --jq .permission)"
+        echo "actor ${GITHUB_ACTOR} has permission: ${permission}"
+        if [ "$permission" != admin ]; then
+          echo "::error::Manual benchmark runs are restricted to repository admins (actor ${GITHUB_ACTOR} has '${permission}')."
+          exit 1
+        fi
     - name: Decide what to do
       id: decide
       env:
