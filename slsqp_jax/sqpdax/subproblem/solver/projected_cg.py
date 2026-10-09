@@ -238,7 +238,7 @@ class ProjectedCGSubProblemSolver(
         # ``r`` carries N&W's preconditioned residual ``g = P r`` with the sign of
         # the search direction ``d = -g`` folded in (``r = -P(G d + c)``).
         neg_grad0 = -(H(d0) + g0)
-        r0 = project(neg_grad0)
+        r0, w0 = ctx.project_pair(neg_grad0)
         # N&W ``rᵀg`` = ``dot(raw_residual, preconditioned_residual)``.  With the
         # sign folded in this is ``dot(neg_grad, r)``; for ``M = I`` it equals
         # ``‖r‖²`` because ``P`` is then an orthogonal projector.
@@ -250,28 +250,28 @@ class ProjectedCGSubProblemSolver(
             jnp.asarray(self.rtol, dtype) ** 2 * jnp.maximum(rz0, 0.0),
         )
 
-        # Round-off floor detector.  ``P`` is ``M``-self-adjoint and
-        # idempotent, so in exact arithmetic ``rz = neg_gradᵀ P neg_grad =
-        # rᵀ M r``.  Once CG has solved the reduced system to working
-        # precision the recomputed ``r`` is round-off of size
-        # ``eps · ‖G d + c‖`` — *not* in ``null(A)`` — and ``rz`` is then
-        # dominated by the contamination ``‖neg_grad‖ · ‖r_noise‖`` while
-        # ``rᵀ M r`` stays at ``‖r_noise‖²``: the two disagree by orders of
-        # magnitude.  Continuing would step along the noise direction with
-        # ``alpha = rz / pᵀBp`` of two meaningless quantities and drag the
-        # iterate out of the constraint subspace while the model keeps
-        # "decreasing" (the decrease is bought with infeasibility).  Neither
-        # ``tol`` nor ``rtol`` sees this floor reliably because it scales with
-        # ``‖c‖``, not with the (possibly much smaller) projected residual.
-        apply_M = (
-            (lambda v: v)
-            if self.preconditioner is None
-            else self.preconditioner.pushforward
-        )
-
-        def at_floor(rz_val: jax.Array, r_val: Vector_n) -> jax.Array:
-            rMr = jnp.dot(r_val, apply_M(r_val))
-            return (rz_val > 4.0 * rMr) | (rz_val < 0.25 * rMr)
+        # Round-off floor detector.  With ``P = M̃⁻¹ Q`` (``Q`` idempotent,
+        # ``P`` symmetric; see ``ProjectionContext.project_pair``) exact
+        # arithmetic gives ``rz = neg_gradᵀ P neg_grad = (Q neg_grad)ᵀ r``.
+        # Once CG has solved the reduced system to working precision the
+        # recomputed ``r`` is round-off of size ``eps · ‖G d + c‖`` — *not*
+        # in ``null(A)`` — and ``rz`` is then dominated by the contamination
+        # ``‖neg_grad‖ · ‖r_noise‖`` while ``(Q neg_grad)ᵀ r`` stays at
+        # ``‖noise‖²``: the two disagree by orders of magnitude.  Continuing
+        # would step along the noise direction with ``alpha = rz / pᵀBp`` of
+        # two meaningless quantities and drag the iterate out of the
+        # constraint subspace while the model keeps "decreasing" (the decrease
+        # is bought with infeasibility).  Neither ``tol`` nor ``rtol`` sees
+        # this floor reliably because it scales with ``‖c‖``, not with the
+        # (possibly much smaller) projected residual.  The check must use the
+        # projector's own masked metric: ``rᵀ M r`` with the full ``M`` is
+        # wrong as soon as active bounds fix variables under a non-diagonal
+        # preconditioner (the inverse of a principal block of ``M⁻¹`` is not
+        # the principal block of ``M``), and fired spuriously on every bound-
+        # constrained PASLS iterate.
+        def at_floor(rz_val: jax.Array, r_val: Vector_n, w_val: Vector_n) -> jax.Array:
+            wr = jnp.dot(w_val, r_val)
+            return (rz_val > 4.0 * wr) | (rz_val < 0.25 * wr)
 
         def model(d: Vector_n, neg_grad: Vector_n) -> jax.Array:
             # QP model ``q(d) = ½ dᵀ G d + cᵀ d`` evaluated from the already
@@ -320,7 +320,7 @@ class ProjectedCGSubProblemSolver(
                 # N&W eq. 16.28c-d (r⁺ = r + αG d; g⁺ = P r⁺) recomputed from
                 # scratch instead of via the recurrence (see note above).
                 neg_grad_new = -(H(d_new) + g0)
-                r_new = project(neg_grad_new)
+                r_new, w_new = ctx.project_pair(neg_grad_new)
                 rz_new = jnp.dot(neg_grad_new, r_new)  # N&W ``(r⁺)ᵀg⁺``
                 beta = rz_new / jnp.maximum(
                     rz, 1e-30
@@ -343,7 +343,12 @@ class ProjectedCGSubProblemSolver(
                 # The step just taken is sound; a residual at the round-off
                 # floor means the reduced system is solved: keep ``d_new`` and
                 # stop before the next (noise) direction is used.
-                conv = (rz_new < tol_sq) | freeze | take_neg | at_floor(rz_new, r_new)
+                conv = (
+                    (rz_new < tol_sq)
+                    | freeze
+                    | take_neg
+                    | at_floor(rz_new, r_new, w_new)
+                )
                 return (
                     jnp.where(freeze, d, d_new),
                     jnp.where(freeze, r, r_new),
@@ -366,7 +371,7 @@ class ProjectedCGSubProblemSolver(
             r0,
             rz0,
             q0,
-            jnp.reshape((rz0 < tol_sq) | at_floor(rz0, r0), ()),
+            jnp.reshape((rz0 < tol_sq) | at_floor(rz0, r0, w0), ()),
             jnp.zeros((), jnp.int32),
         )
         dx, _, _, rz_f, _, converged_flag, n_cg = jax.lax.fori_loop(
