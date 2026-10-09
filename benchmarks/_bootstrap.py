@@ -19,6 +19,11 @@ def worker_loop(task_queue: Any, result_queue: Any) -> None:
     Messages sent back on ``result_queue`` are ``(task_id, kind, payload)``
     with ``kind`` in ``{"phase", "ok", "error"}``.
 
+    A spec that defines a ``run(report)`` method is executed through it;
+    anything else is treated as a :class:`~benchmarks.worker.TaskSpec`.
+    This lets other tools (e.g. diagnostic re-runs) reuse the pool's
+    timeout and crash isolation.
+
     Parameters
     ----------
     task_queue
@@ -43,7 +48,11 @@ def worker_loop(task_queue: Any, result_queue: Any) -> None:
             result_queue.put((_task_id, kind, payload))
 
         try:
-            result = run_task_inprocess(spec, report)
+            runner = getattr(spec, "run", None)
+            if callable(runner):
+                result = runner(report)
+            else:
+                result = run_task_inprocess(spec, report)
             result_queue.put((task_id, "ok", result))
         except BaseException:  # noqa: BLE001 - always report back to the parent
             result_queue.put((task_id, "error", traceback.format_exc()))

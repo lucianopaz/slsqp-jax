@@ -12,13 +12,14 @@ from ...dual import Dual
 from ...primal import InteriorPointPrimal, Slack
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
-from .dogleg import DogLegSolver, DogLegSolverState
+from .dogleg import DogLegSolverState
 from .gradient_projection import GradientProjection
 from .multiplier_recovery import (
     BarrierSafeguard,
     LeastSquaresMultiplierRecovery,
     MultiplierRecovery,
 )
+from .scaled_normal_step import ScaledNormalStepSolver, ScaledNormalStepState
 from .steihaug_toint_cg import (
     SteihaugTointCGTangentialStepSolver,
     SteihaugTointCGTangentialStepSolverState,
@@ -130,8 +131,14 @@ class TrustRegionInteriorPointSolver(
         run matrix-free on ``Âᵀ`` since the primal carries slacks). Its
         ``rtol`` / ``atol`` / ``max_steps`` are the LSMR tolerances.
     normal_solver
-        Feasibility-step solver (default
-        :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolver`).
+        Feasibility-step solver. The default
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.scaled_normal_step.ScaledNormalStepSolver`
+        works in the scaled ``(x, s̃)`` space on every row of the barrier
+        problem (eq. 19.34), so the slacks move with ``x`` and the linear
+        bound rows stay consistent. A solver returning a plain ``x``-space
+        :class:`~slsqp_jax.sqpdax.primal.Primal` (e.g.
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolver`) is
+        still accepted; its step is lifted with zero slack components.
     tangential_solver
         Optimality-step solver (default
         :class:`~slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg.SteihaugTointCGTangentialStepSolver`).
@@ -151,7 +158,7 @@ class TrustRegionInteriorPointSolver(
             safeguard=BarrierSafeguard()
         )
     )
-    normal_solver: SubProblemSolver = field(default_factory=DogLegSolver)
+    normal_solver: SubProblemSolver = field(default_factory=ScaledNormalStepSolver)
     tangential_solver: SubProblemSolver = field(
         default_factory=SteihaugTointCGTangentialStepSolver
     )
@@ -237,26 +244,17 @@ class TrustRegionInteriorPointSolver(
 
         # --- composite step: normal (feasibility) then tangential (optimality) ---
         # The normal solver runs at the reduced radius zeta * radius (eq. 19.34b).
-        # DogLegSolver returns an x-space feasibility step for the general (eq +
-        # ineq) constraints; it is lifted into the scaled (x, s_tilde) space with
-        # zero slack components to warm-start the tangential CG.
+        # The default ScaledNormalStepSolver works directly in the scaled
+        # (x, s_tilde) space on all rows [eq | ineq | lb | ub] and already honours
+        # the fraction-to-boundary box, so its step warm-starts the tangential CG
+        # as is.  An x-space normal solver (DogLegSolver: general constraints only)
+        # is lifted with zero slack components.
         #
         # The active variable-bound faces are identified once here (N&W A(x^c)) and
         # threaded into both sub-solvers so they freeze the same set and GP is not
         # re-run per sub-solve.
         active_bounds = self.gradient_projection.find_active_bounds(subproblem)
-        normal_state = cast(
-            DogLegSolverState,
-            DogLegSolverState(
-                n_iter=zero_i,
-                n_cg_iter=zero_i,
-                on_boundary=false_,
-                success=false_,
-                status=RESULTS.successful,
-                radius=self.zeta * radius,
-                active_bounds=active_bounds,
-            ),
-        )
+        normal_state = self._normal_state(radius, active_bounds, dtype)
         (normal_primal, _), normal_new_state = self.normal_solver.solve(
             subproblem, x0, normal_state
         )
@@ -273,17 +271,20 @@ class TrustRegionInteriorPointSolver(
             },
             when=~normal_new_state.success | ~normal_finite,
         )
-        w_normal_primal = cast(
-            InteriorPointPrimal,
-            InteriorPointPrimal(
-                x=normal_primal.x,
-                slack=Slack(
-                    s=jnp.zeros((mineq,), dtype),
-                    s_lb=jnp.zeros((n,), dtype),
-                    s_ub=jnp.zeros((n,), dtype),
+        if isinstance(normal_primal, InteriorPointPrimal):
+            w_normal_primal = normal_primal
+        else:
+            w_normal_primal = cast(
+                InteriorPointPrimal,
+                InteriorPointPrimal(
+                    x=normal_primal.x,
+                    slack=Slack(
+                        s=jnp.zeros((mineq,), dtype),
+                        s_lb=jnp.zeros((n,), dtype),
+                        s_ub=jnp.zeros((n,), dtype),
+                    ),
                 ),
-            ),
-        )
+            )
         tang_state = cast(
             SteihaugTointCGTangentialStepSolverState,
             SteihaugTointCGTangentialStepSolverState(
@@ -426,3 +427,46 @@ class TrustRegionInteriorPointSolver(
             ),
         )
         return step, new_state
+
+    def _normal_state(
+        self,
+        radius: Scalar,
+        active_bounds: tuple[Bool[Array, " n"], Bool[Array, " n"]],
+        dtype: jnp.dtype,
+    ) -> SubProblemSolverState:
+        """Cold carry for :attr:`normal_solver` at radius ``zeta * radius``.
+
+        Parameters
+        ----------
+        radius
+            Trust-region radius of the composite step.
+        active_bounds
+            ``(active_lb, active_ub)`` masks from the gradient projection,
+            threaded into x-space solvers that freeze bound faces.
+        dtype
+            Floating dtype of the scalar fields.
+
+        Returns
+        -------
+        SubProblemSolverState
+            A :class:`~slsqp_jax.sqpdax.subproblem.solver.scaled_normal_step.ScaledNormalStepState`
+            or a :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolverState`
+            matching ``normal_solver.solver_state_class``.
+        """
+        normal_radius = self.zeta * radius
+        state_cls = self.normal_solver.solver_state_class
+        if issubclass(state_cls, ScaledNormalStepState):
+            return state_cls.cold(normal_radius, dtype)
+        zero_i = jnp.asarray(0, jnp.int32)
+        return cast(
+            SubProblemSolverState,
+            DogLegSolverState(
+                n_iter=zero_i,
+                n_cg_iter=zero_i,
+                on_boundary=jnp.asarray(False),
+                success=jnp.asarray(False),
+                status=RESULTS.successful,
+                radius=normal_radius,
+                active_bounds=active_bounds,
+            ),
+        )
