@@ -101,7 +101,12 @@ def test_active_lower_bound_fixes_component():
         # ``tol`` loose enough that an exact 1-D solve meets it in both
         # float32 and float64 rather than freezing on its roundoff floor.
         ({"tol": 1e-6}, 0.0, KKT_SOLVER_RESULTS.converged, RESULTS.successful),
-        ({"tol": 0.0}, 0.0, KKT_SOLVER_RESULTS.residual_floor, RESULTS.successful),
+        (
+            {"tol": 0.0, "rtol": 0.0},
+            0.0,
+            KKT_SOLVER_RESULTS.residual_floor,
+            RESULTS.successful,
+        ),
         (
             {"max_iter": 0},
             0.0,
@@ -177,7 +182,13 @@ def test_craig_projector_reproduces_the_svd_step(preconditioner):
     assert jnp.allclose(dx_c.x, dx_s.x, atol=1e-5)
     assert jnp.allclose(lam_c.flatten(), lam_s.flatten(), atol=1e-4)
     assert bool(st_c.success)
-    assert st_c.reason == st_s.reason
+    # Both backends solve the reduced system to working precision; whether
+    # the last residual lands just under ``tol`` or on the round-off floor
+    # first depends on the backend's rounding, so only the solved-ness is
+    # compared.
+    solved = (KKT_SOLVER_RESULTS.converged, KKT_SOLVER_RESULTS.residual_floor)
+    assert any(st_c.reason == s for s in solved)
+    assert any(st_s.reason == s for s in solved)
     # CRAIG's bidiagonalisation steps are folded into the iteration count on
     # top of the carried count and the CG steps. The SVD run is not a valid
     # baseline: how many roundoff-floor CG iterations run before the freeze

@@ -11,7 +11,7 @@ from jaxtyping import Array, Bool, Float, Scalar
 from ...dual import Dual
 from ...linalg import box_fraction, steihaug_cg
 from ...primal import InteriorPointPrimal
-from ..funnel_barrier import FunnelBarrierSubProblem
+from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
 
 __all__ = [
@@ -89,7 +89,7 @@ class ScaledNormalStepState(SubProblemSolverState):
 
 class ScaledNormalStepSolver(
     SubProblemSolver[
-        InteriorPointPrimal, FunnelBarrierSubProblem, ScaledNormalStepState
+        InteriorPointPrimal, ScaledBarrierSubProblem, ScaledNormalStepState
     ]
 ):
     """Inexact normal step of Curtis, Gould, Robinson & Toint (2017), Sect. 3.1.
@@ -97,11 +97,17 @@ class ScaledNormalStepSolver(
     Approximately solves, in the scaled step ``w = P⁻¹ n``,
 
     ```
-    min_w  ½ ‖ĉ + Â w‖²₂    s.t.  ‖w‖₂ ≤ δᵛ,   w_s ≥ −(1 − κ_fbn) e
+    min_w  ½ ‖ĉ + Â w‖²₂    s.t.  ‖w‖₂ ≤ δᵛ,   w_s ≥ −τ e
     ```
 
     with ``ĉ = c(x, s)`` and ``Â = J(x, s) P`` taken matrix-free from a
-    :class:`~slsqp_jax.sqpdax.subproblem.funnel_barrier.FunnelBarrierSubProblem`.
+    :class:`~slsqp_jax.sqpdax.subproblem.scaled_barrier.ScaledBarrierSubProblem`
+    (the trust-funnel subclass sets ``τ = 1 − κ_fbn``). All rows of the
+    barrier problem — equalities, slacked inequalities and the linear
+    bound rows ``x − lb − s_lb = 0``, ``ub − x − s_ub = 0`` — are reduced
+    together, through ``x`` *and* the slacks, which is what makes this the
+    normal step of both the trust-funnel loop and the composite-step
+    trust-region loop (Nocedal & Wright eq. 19.34).
     The algorithm is conjugate gradients on the normal equations
     ``ÂᵀÂ w = −Âᵀĉ`` (CGLS) started from ``w = 0`` with Steihaug–Toint
     termination (:func:`~slsqp_jax.sqpdax.linalg.steihaug_cg`): CG iterate
@@ -143,7 +149,7 @@ class ScaledNormalStepSolver(
 
     def solve(
         self,
-        subproblem: FunnelBarrierSubProblem,
+        subproblem: ScaledBarrierSubProblem,
         x0: tuple[InteriorPointPrimal, Dual],
         initial_state: ScaledNormalStepState,
     ) -> tuple[tuple[InteriorPointPrimal, Dual], ScaledNormalStepState]:
@@ -152,7 +158,7 @@ class ScaledNormalStepSolver(
         Parameters
         ----------
         subproblem
-            Funnel barrier subproblem at the current iterate.
+            Scaled barrier subproblem at the current iterate.
         x0
             Unused warm start (CGLS must start from ``0`` for the
             Steihaug–Toint and range-space guarantees); kept for the
@@ -171,12 +177,12 @@ class ScaledNormalStepSolver(
         Raises
         ------
         TypeError
-            If ``subproblem`` is not a ``FunnelBarrierSubProblem``.
+            If ``subproblem`` is not a ``ScaledBarrierSubProblem``.
         """
         del x0
-        if not isinstance(subproblem, FunnelBarrierSubProblem):
+        if not isinstance(subproblem, ScaledBarrierSubProblem):
             raise TypeError(
-                "subproblem must be a FunnelBarrierSubProblem. Got "
+                "subproblem must be a ScaledBarrierSubProblem. Got "
                 f"{type(subproblem)} instead."
             )
         lag = subproblem.lagrangian

@@ -70,8 +70,11 @@ class InteriorPointMinimiser(
     ----------
     initial_mu
         Initial barrier weight ``μ``.
-    initial_slack
-        Floor used when seeding inequality / bound slacks.
+    slack_push
+        Relative interior push ``κ₁`` used when seeding the slacks: ``x₀`` is
+        moved at least ``κ₁·max(1, |bound|)`` inside each finite bound and
+        inequality slacks are floored at ``κ₁·max(1, |h(x₀)|)`` (IPOPT's
+        ``bound_push``).
     primal_dual
         If ``True``, use the primal-dual slack-slack KKT block.
     barrier_update
@@ -92,7 +95,7 @@ class InteriorPointMinimiser(
     """
 
     initial_mu: float = eqx.field(static=True, default=1.0)
-    initial_slack: float = eqx.field(static=True, default=1.0)
+    slack_push: float = eqx.field(static=True, default=1e-2)
     primal_dual: bool = eqx.field(static=True, default=True)
     barrier_update: BarrierUpdate = eqx.field(default_factory=MonotoneBarrierUpdate)
     barrier_updated: Bool[Array, ""] = eqx.field(
@@ -151,28 +154,49 @@ class InteriorPointMinimiser(
     def _init_primal(
         self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
     ) -> InteriorPointPrimal:
-        """Strictly-interior default slacks for inequalities and finite bounds.
+        """Consistent, strictly-interior slacks for inequalities and bounds.
 
-        The seeds satisfy ``c(x₀, s₀) ≥ 0`` componentwise (``s ≥ −h(x₀)``,
+        Bounds are handled as in IPOPT: ``x₀`` is first pushed into the
+        interior of ``[lb, ub]`` by at least ``κ₁·max(1, |bound|)`` (capped at
+        ``κ₂·(ub − lb)`` for two-sided bounds, ``κ₁ = slack_push``,
+        ``κ₂ = 0.01``) and the bound slacks are then set *exactly*, ``s_lb =
+        x₀ − lb``, ``s_ub = ub − x₀``, so the linear rows ``x − lb − s_lb =
+        0`` and ``ub − x − s_ub = 0`` hold from the start. Inequality slacks
+        are the natural value ``−h(x₀)`` floored at ``κ₁·max(1, |h(x₀)|)``:
+        an infeasible start keeps a positive slack and a non-zero residual
+        ``h(x₀) + s₀`` that the normal step has to remove. Null bound rows
+        get a unit slack. Fixed variables (``lb == ub``) cannot carry a
+        consistent positive slack; both of their bound slacks are seeded at
+        ``κ₁`` so the barrier stays finite (the rows keep a residual of
+        ``κ₁`` that no step can remove — convert such variables to equality
+        constraints or eliminate them upstream).
+
+        All seeds satisfy ``c(x₀, s₀) ≥ 0`` componentwise (``s ≥ −h(x₀)``,
         ``s_lb ≥ x₀ − lb``, ``s_ub ≥ ub − x₀``), which is the funnel
         invariant (2.1) of Curtis et al. and harmless for the trust-region
         loop.
         """
-        h0 = problem.ineq_fn(x0)
-        s = jnp.maximum(-h0, self.initial_slack)
-        s_lb = jnp.where(
-            problem.null_lb,
-            self.initial_slack,
-            jnp.maximum(x0 - problem.lb, self.initial_slack),
-        )
-        s_ub = jnp.where(
-            problem.null_ub,
-            self.initial_slack,
-            jnp.maximum(problem.ub - x0, self.initial_slack),
-        )
+        kappa1 = self.slack_push
+        kappa2 = 0.01
+        lb = problem.lb
+        ub = problem.ub
+        two_sided = ~problem.null_lb & ~problem.null_ub
+        width = jnp.where(two_sided, ub - lb, jnp.inf)
+        push_l = jnp.minimum(kappa1 * jnp.maximum(1.0, jnp.abs(lb)), kappa2 * width)
+        push_u = jnp.minimum(kappa1 * jnp.maximum(1.0, jnp.abs(ub)), kappa2 * width)
+        lo = jnp.where(problem.null_lb, -jnp.inf, lb + push_l)
+        hi = jnp.where(problem.null_ub, jnp.inf, ub - push_u)
+        x = jnp.clip(x0, lo, hi)
+        # ``x - lb`` / ``ub - x`` are > 0 after the push unless the variable is
+        # fixed (zero width): floor those at kappa1 to keep the barrier finite.
+        s_lb = jnp.where(problem.null_lb, 1.0, jnp.where(x > lb, x - lb, kappa1))
+        s_ub = jnp.where(problem.null_ub, 1.0, jnp.where(ub > x, ub - x, kappa1))
+
+        h0 = problem.ineq_fn(x)
+        s = jnp.maximum(-h0, kappa1 * jnp.maximum(1.0, jnp.abs(h0)))
         return cast(
             InteriorPointPrimal,
-            InteriorPointPrimal(x=x0, slack=Slack(s=s, s_lb=s_lb, s_ub=s_ub)),
+            InteriorPointPrimal(x=x, slack=Slack(s=s, s_lb=s_lb, s_ub=s_ub)),
         )
 
     def _init_dual(self, problem: ProblemProtocol[InteriorPointPrimal]) -> Dual:

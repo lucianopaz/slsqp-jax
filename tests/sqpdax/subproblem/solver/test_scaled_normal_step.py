@@ -242,12 +242,34 @@ def test_feasible_point_returns_zero_step():
     assert not state.on_boundary
 
 
-def test_rejects_non_funnel_subproblem():
-    """Only a ``FunnelBarrierSubProblem`` carries the normal-step geometry."""
+def test_accepts_plain_scaled_barrier_subproblem():
+    """Any ``ScaledBarrierSubProblem`` carries the normal-step geometry.
+
+    The trust-region composite-step loop uses the solver on the plain scaled
+    barrier subproblem; the returned step must reduce the full residual
+    ``[eq | ineq | lb | ub]`` and respect the fraction-to-boundary box.
+    """
     sub = make_scaled_barrier_subproblem()
     zero = jax.tree.map(jnp.zeros_like, (sub.lagrangian.ref, sub.lagrangian.dual))
-    with pytest.raises(TypeError, match="FunnelBarrierSubProblem"):
-        ScaledNormalStepSolver().solve(sub, zero, make_scaled_normal_state(1.0))
+    (w, _), state = ScaledNormalStepSolver().solve(
+        sub, zero, make_scaled_normal_state(10.0)
+    )
+    assert state.success
+    c_hat = sub.dual_grad().flatten()
+    after = c_hat + sub.jac_mvp(w).flatten()
+    assert float(jnp.linalg.norm(after)) <= float(jnp.linalg.norm(c_hat)) + 1e-12
+    lo, _ = sub.primal_box()
+    assert bool(jnp.all(w.flatten() >= lo - 1e-12))
+
+
+def test_rejects_non_barrier_subproblem():
+    """A non-scaled-barrier subproblem is rejected up front."""
+    with pytest.raises(TypeError, match="ScaledBarrierSubProblem"):
+        ScaledNormalStepSolver().solve(
+            object(),  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            make_scaled_normal_state(1.0),
+        )
 
 
 def test_logging_emits_debug_summary_and_no_warning_when_finite():

@@ -103,63 +103,7 @@ class FunnelBarrierSubProblem(ScaledBarrierSubProblem):
         self.schur_cache = None
 
     # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-    def _zero_dual(self) -> Dual:
-        return cast(Dual, jax.tree.map(jnp.zeros_like, self.lagrangian.dual))
-
-    def _zero_primal(self) -> InteriorPointPrimal:
-        return cast(
-            InteriorPointPrimal, jax.tree.map(jnp.zeros_like, self.lagrangian.ref)
-        )
-
-    def hess_mvp(self, w: InteriorPointPrimal) -> InteriorPointPrimal:
-        """Scaled Hessian product ``Ĥ w = P G P w``.
-
-        Parameters
-        ----------
-        w
-            Scaled primal step.
-
-        Returns
-        -------
-        InteriorPointPrimal
-            ``Ĥ w`` in the same layout as ``w``.
-        """
-        return self.kkt_mvp_primal((w, self._zero_dual()))
-
-    def jac_mvp(self, w: InteriorPointPrimal) -> Dual:
-        """Scaled Jacobian product ``Â w = J(x, s) P w``.
-
-        Parameters
-        ----------
-        w
-            Scaled primal step.
-
-        Returns
-        -------
-        Dual
-            Linearised constraint change, rows ordered as :meth:`dual_grad`.
-        """
-        return self.kkt_mvp_lower_offdiag((w, self._zero_dual()))
-
-    def jac_t_mvp(self, y: Dual) -> InteriorPointPrimal:
-        """Scaled transposed Jacobian product ``Âᵀ y = P J(x, s)ᵀ y``.
-
-        Parameters
-        ----------
-        y
-            Dual vector (multipliers or constraint residual).
-
-        Returns
-        -------
-        InteriorPointPrimal
-            ``Âᵀ y`` in scaled primal layout.
-        """
-        return self.kkt_mvp_upper_offdiag((self._zero_primal(), y))
-
-    # ------------------------------------------------------------------
-    # models
+    # models (``hess_mvp`` / ``jac_mvp`` / ``jac_t_mvp`` are inherited)
     # ------------------------------------------------------------------
     def model_f_grad(self, w_n: InteriorPointPrimal) -> InteriorPointPrimal:
         """Scaled gradient of the barrier model at ``w_n``: ``ĝ + Ĥ w_n``.

@@ -81,6 +81,10 @@ class ProjectedCGSubProblemSolver(
         Maximum CG iterations.
     tol
         Absolute projected-residual tolerance.
+    rtol
+        Relative projected-residual tolerance: CG also stops once
+        ``‖r‖_M ≤ rtol · ‖r₀‖_M``, i.e. the reduced system is solved to
+        working precision relative to its initial residual.
     cg_regularization
         Scale-invariant floor for the curvature check ``pᵀ H p``.
     preconditioner
@@ -102,6 +106,7 @@ class ProjectedCGSubProblemSolver(
 
     max_iter: int = 100
     tol: float = 1e-10
+    rtol: float = 1e-8
     cg_regularization: float = 1e-6
     # Preconditioner ``M`` for the reduced Hessian (N&W eq. 16.26).  ``invert``
     # supplies ``M⁻¹``.  ``None`` is the identity (unpreconditioned Algorithm
@@ -238,13 +243,49 @@ class ProjectedCGSubProblemSolver(
         # sign folded in this is ``dot(neg_grad, r)``; for ``M = I`` it equals
         # ``‖r‖²`` because ``P`` is then an orthogonal projector.
         rz0 = jnp.dot(neg_grad0, r0)
-        tol_sq = jnp.asarray(self.tol, dtype) ** 2
+        # Stop test on the squared ``M``-norm of the projected residual:
+        # absolute ``tol²`` or relative ``rtol² · rz0``, whichever is looser.
+        tol_sq = jnp.maximum(
+            jnp.asarray(self.tol, dtype) ** 2,
+            jnp.asarray(self.rtol, dtype) ** 2 * jnp.maximum(rz0, 0.0),
+        )
+
+        # Round-off floor detector.  ``P`` is ``M``-self-adjoint and
+        # idempotent, so in exact arithmetic ``rz = neg_gradᵀ P neg_grad =
+        # rᵀ M r``.  Once CG has solved the reduced system to working
+        # precision the recomputed ``r`` is round-off of size
+        # ``eps · ‖G d + c‖`` — *not* in ``null(A)`` — and ``rz`` is then
+        # dominated by the contamination ``‖neg_grad‖ · ‖r_noise‖`` while
+        # ``rᵀ M r`` stays at ``‖r_noise‖²``: the two disagree by orders of
+        # magnitude.  Continuing would step along the noise direction with
+        # ``alpha = rz / pᵀBp`` of two meaningless quantities and drag the
+        # iterate out of the constraint subspace while the model keeps
+        # "decreasing" (the decrease is bought with infeasibility).  Neither
+        # ``tol`` nor ``rtol`` sees this floor reliably because it scales with
+        # ``‖c‖``, not with the (possibly much smaller) projected residual.
+        apply_M = (
+            (lambda v: v)
+            if self.preconditioner is None
+            else self.preconditioner.pushforward
+        )
+
+        def at_floor(rz_val: jax.Array, r_val: Vector_n) -> jax.Array:
+            rMr = jnp.dot(r_val, apply_M(r_val))
+            return (rz_val > 4.0 * rMr) | (rz_val < 0.25 * rMr)
+
+        def model(d: Vector_n, neg_grad: Vector_n) -> jax.Array:
+            # QP model ``q(d) = ½ dᵀ G d + cᵀ d`` evaluated from the already
+            # available ``neg_grad = -(G d + c)``:
+            # ``q = ½ dᵀ(G d + c) + ½ cᵀ d = -½ dᵀ neg_grad + ½ g0ᵀ d``.
+            return 0.5 * (jnp.dot(g0, d) - jnp.dot(d, neg_grad))
+
+        q0 = model(d0, neg_grad0)
 
         def cg_body(_i: int, carry):
-            d, r, p, rz, converged, n_cg = carry
+            d, r, p, rz, q, converged, n_cg = carry
 
             def do(carry):
-                d, r, p, rz, _, n_cg = carry
+                d, r, p, rz, q, _, n_cg = carry
                 # N&W denominator ``dᵀ G d`` (eq. 16.28a).  ``p`` already lies in
                 # ``null(A)`` (``project`` maps there), so ``G p`` needs no extra
                 # projection — and projecting it with the (non-orthogonal)
@@ -254,9 +295,26 @@ class ProjectedCGSubProblemSolver(
                 pp = jnp.dot(p, p)
                 # SNOPT-style scale-invariant curvature guard.
                 bad = pBp <= self.cg_regularization * pp
+                # Negative / vanishing curvature on the very first CG step
+                # (``d`` is still the particular solution, zero on an interior
+                # iterate): returning ``d`` unchanged would hand the outer
+                # loop a zero step although ``p = -P ∇q`` is a descent
+                # direction.  Use the curvature with its sign flipped
+                # (``|G|`` modification of modified-Newton methods): the step
+                # that would be Newton's on the convexified model.  Later
+                # negative-curvature encounters keep the progress made so far
+                # (Steihaug-style stop).
+                first = n_cg == 0
+                alpha_pd = rz / jnp.maximum(pBp, 1e-30)
+                alpha_neg = rz / jnp.maximum(
+                    jnp.abs(pBp), self.cg_regularization * jnp.maximum(pp, 1e-30)
+                )
+                take_neg = bad & first
                 # N&W eq. 16.28a: α = rᵀg / dᵀG d.
                 alpha = jnp.where(
-                    bad, jnp.asarray(0.0, dtype), rz / jnp.maximum(pBp, 1e-30)
+                    bad,
+                    jnp.where(take_neg, alpha_neg, jnp.asarray(0.0, dtype)),
+                    alpha_pd,
                 )
                 d_new = d + alpha * p  # N&W eq. 16.28b: x ← x + α d
                 # N&W eq. 16.28c-d (r⁺ = r + αG d; g⁺ = P r⁺) recomputed from
@@ -268,19 +326,30 @@ class ProjectedCGSubProblemSolver(
                     rz, 1e-30
                 )  # N&W eq. 16.28e: β = (r⁺)ᵀg⁺ / rᵀg
                 p_new = r_new + beta * p  # N&W eq. 16.28f: d ← -g⁺ + β d
-                # Freeze on bad curvature or once the (true) residual stops
-                # decreasing.  Once CG reaches its floor the next step has a
-                # meaningless curvature ``pᵀBp`` that produces a huge spurious
-                # ``alpha``; keeping the *previous* iterate makes the loop
-                # return the best iterate seen and never accepts that
-                # corrupting step.
-                freeze = bad | (rz_new >= rz)
-                conv = (rz_new < tol_sq) | freeze
+                q_new = model(d_new, neg_grad_new)
+                # Freeze on bad curvature or once the QP model stops
+                # decreasing.  In exact arithmetic every CG step with positive
+                # curvature lowers ``q`` by ``½ rz² / pᵀBp > 0`` while the
+                # (preconditioned) residual norm ``rz`` is *not* monotone, so
+                # the model — not ``rz`` — is the quantity that detects the
+                # round-off floor.  Freezing on ``rz_new >= rz`` stopped the
+                # solve after one or two iterations on well-posed systems and
+                # returned a near-zero step labelled ``residual_floor``.  Once
+                # CG reaches its floor the next step has a meaningless
+                # curvature ``pᵀBp`` that produces a huge spurious ``alpha``;
+                # keeping the *previous* iterate makes the loop return the
+                # best iterate seen and never accepts that corrupting step.
+                freeze = (~take_neg & (bad | (q_new >= q))) | ~jnp.isfinite(q_new)
+                # The step just taken is sound; a residual at the round-off
+                # floor means the reduced system is solved: keep ``d_new`` and
+                # stop before the next (noise) direction is used.
+                conv = (rz_new < tol_sq) | freeze | take_neg | at_floor(rz_new, r_new)
                 return (
                     jnp.where(freeze, d, d_new),
                     jnp.where(freeze, r, r_new),
                     jnp.where(freeze, p, p_new),
                     jnp.where(freeze, rz, rz_new),
+                    jnp.where(freeze, q, q_new),
                     conv,
                     n_cg + 1,
                 )
@@ -289,17 +358,18 @@ class ProjectedCGSubProblemSolver(
 
         # ``n_cg`` counts CG steps that actually ran (the ``do`` branch); once
         # converged/frozen the ``lax.cond`` short-circuits and stops counting.
-        # ``converged_flag`` is True on tol success *or* a residual-floor /
+        # ``converged_flag`` is True on tol success *or* a model-floor /
         # negative-curvature freeze — that is the solver's termination signal.
         init = (
             d0,
             r0,
             r0,
             rz0,
-            jnp.reshape(rz0 < tol_sq, ()),
+            q0,
+            jnp.reshape((rz0 < tol_sq) | at_floor(rz0, r0), ()),
             jnp.zeros((), jnp.int32),
         )
-        dx, _, _, rz_f, converged_flag, n_cg = jax.lax.fori_loop(
+        dx, _, _, rz_f, _, converged_flag, n_cg = jax.lax.fori_loop(
             0, self.max_iter, cg_body, init
         )
         # ``rz`` is a squared ``M``-norm; roundoff can drive it slightly
