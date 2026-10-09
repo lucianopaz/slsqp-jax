@@ -49,7 +49,9 @@ def test_to_sqpdax_sign_conventions(sif2jax):
     assert jnp.all(jnp.isfinite(sq.ineq_fn_hvp(x0, v)))
 
 
-@pytest.mark.parametrize("config", ["pasls", "tfip"])
+@pytest.mark.parametrize(
+    "config", ["pasls", "tfip", "scipy-slsqp", "scipy-trust-constr"]
+)
 def test_run_task_inprocess_solves_hs71(sif2jax, config):
     jax.config.update("jax_enable_x64", True)
     spec = TaskSpec(problem="HS71", config=config, repeats=2, timeout_s=120.0)

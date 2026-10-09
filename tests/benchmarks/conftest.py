@@ -50,6 +50,30 @@ def kkt_problem() -> tuple[Problem, Array, Dual, float]:
 
 
 @pytest.fixture
+def hs71_problem() -> tuple[Problem, Array, float]:
+    """Hock-Schittkowski 71 written directly in sqpdax form, with exact HVPs.
+
+    ``min x0 x3 (x0 + x1 + x2) + x2`` subject to ``sum x^2 = 40``,
+    ``prod x >= 25`` and ``1 <= x <= 5``; the lower bound on ``x0`` is active
+    at the optimum (``f* = 17.0140173``), so every multiplier block of
+    :class:`~slsqp_jax.sqpdax.dual.Dual` is exercised.
+    """
+    problem = build_problem(
+        lambda x: x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2],
+        n=4,
+        meq=1,
+        mineq=1,
+        eq_fn=lambda x: jnp.array([jnp.sum(x**2) - 40.0]),
+        ineq_fn=lambda x: jnp.array([25.0 - jnp.prod(x)]),
+        lb=jnp.ones(4),
+        ub=5.0 * jnp.ones(4),
+        autodiff_mode="jax",
+        force_hvp_in_jax_mode=True,
+    )
+    return problem, jnp.array([1.0, 5.0, 5.0, 1.0]), 17.0140173
+
+
+@pytest.fixture
 def toy_results() -> pd.DataFrame:
     """Two instances x three configs covering every outcome class."""
     return pd.DataFrame(

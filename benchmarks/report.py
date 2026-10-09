@@ -59,11 +59,25 @@ def _(meta, mo, raw, run_dir):
         f"**timeout** {meta.get('timeout_s', '?')} s, **configs** {', '.join(f'`{c}`' for c in meta.get('configs', []))}",
         f"- **tasks** {len(raw)} rows, status counts: "
         + ", ".join(f"`{k}`={v}" for k, v in sorted(_counts.items())),
+    ]
+    _baselines = (
+        sorted(raw.loc[raw["backend"] == "scipy", "config"].dropna().unique())
+        if "backend" in raw
+        else []
+    )
+    if _baselines:
+        _lines.append(
+            f"- **baselines** {', '.join(f'`{c}`' for c in _baselines)} "
+            "(SciPy solvers driven with the same jitted problem callbacks)"
+        )
+    _lines += [
         "",
         "Every task is one catalogue instance (a CUTEst problem and a starting "
         "point) solved by one solver configuration. Timing excludes compilation "
         "and a one-step warm-up call; the reported time is the median over the "
-        "repeated full solves.",
+        "repeated full solves. SciPy baseline configurations solve the identical "
+        "problem through `scipy.optimize.minimize`; their time includes the "
+        "Python-level overhead of the SciPy drivers.",
     ]
     mo.md("\n".join(_lines))
     return
@@ -269,7 +283,9 @@ the step budget). Hover for problem name, status and KKT metrics."""
             mo.ui.altair_chart(_compile),
             mo.md(
                 """**Figure 4.** One-off XLA compile time of `minimise` (y, log) against n (x, log).
-Compilation happens once per task and is excluded from every other timing figure."""
+Compilation happens once per task and is excluded from every other timing figure. For the
+SciPy baselines this is the time to compile the jitted problem callbacks (objective,
+gradient, constraints, Jacobians and Hessian-vector products) rather than a solver."""
             ),
         ]
     )
@@ -374,6 +390,11 @@ def _(analysis, df, mo):
         "stats_last_qp_converged",
         "stats_last_ls_success",
         "stats_steps_without_improvement",
+        "stats_nfev",
+        "stats_njev",
+        "stats_nhev",
+        "stats_optimality",
+        "stats_constr_violation",
         "error",
     ]
     _cols = [c for c in _cols if c in df]
@@ -384,7 +405,9 @@ def _(analysis, df, mo):
             mo.md(
                 f"**Table 3.** The {len(_bad)} tasks that did not count as solved, with the raw "
                 "termination status, KKT metrics and the solver's own final statistics "
-                "(`stats_*`; empty for harness failures or families that do not report them). "
+                "(`stats_*`; empty for harness failures or families that do not report them; "
+                "`stats_nfev`/`stats_njev`/`stats_nhev`/`stats_optimality`/`stats_constr_violation` "
+                "come from the SciPy baselines). "
                 "Their time is the single pilot solve: failed tasks are not re-timed."
             ),
             mo.ui.table(_bad, selection=None, page_size=25),

@@ -1,8 +1,9 @@
 name: benchmarks
 
-# Benchmarks the sqpdax minimisers on the sif2jax (CUTEst) catalogue and
-# publishes the results to the `benchmark-results` branch (served by GitHub
-# Pages). See benchmarks/README.md.
+# Benchmarks the sqpdax minimisers (plus the SciPy SLSQP / trust-constr
+# baselines) on the sif2jax (CUTEst) catalogue and publishes the results to
+# the `benchmark-results` branch (served by GitHub Pages). See
+# benchmarks/README.md.
 #
 # Triggers
 #   - release-pipeline finished successfully for a release  -> full run
@@ -26,7 +27,7 @@ on:
         options: [tiny, small, medium]
         default: tiny
       solvers:
-        description: comma-separated solver configs (empty = all seven)
+        description: comma-separated solver configs (empty = all nine, incl. the scipy-slsqp / scipy-trust-constr baselines)
         type: string
         default: ''
       mode:
@@ -175,7 +176,10 @@ jobs:
           fi
         fi
 
-        configs='["asls-pcg","asls-craig","asls-minresqlp","asls-pcg-exact","pasls","trip","tfip"]'
+        # Keep in sync with benchmarks/configs.py (sqpdax configs, then the
+        # SciPy baselines). Each config runs in its own matrix shards, so a
+        # baseline can be run alone with solvers=scipy-slsqp.
+        configs='["asls-pcg","asls-craig","asls-minresqlp","asls-pcg-exact","pasls","trip","tfip","scipy-slsqp","scipy-trust-constr"]'
         if [ -n "$solvers" ]; then
           configs=$(python3 -c 'import json,sys; print(json.dumps([s.strip() for s in sys.argv[1].split(",") if s.strip()]))' "$solvers")
         fi
