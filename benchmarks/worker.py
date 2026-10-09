@@ -1,12 +1,16 @@
 """Execute one ``(problem, y0_iD, config)`` benchmark task in isolation.
 
-Phases inside the child process:
+Phases inside the child process (each driven through the config's *runner*,
+see :mod:`benchmarks.runners` and :mod:`benchmarks.baselines`):
 
-1. **compile** - ``jax.jit`` of ``minimise`` lowered and compiled once, with
-   ``max_steps`` a traced ``int32`` so the same executable serves every
-   later phase. Timed as ``compile_s``; never part of the timing sample.
-2. **warmup** - one call with ``max_steps=1``. Recorded as ``warmup_s`` and
-   excluded from timing statistics and from the repeat computation.
+1. **compile** - for sqpdax configs, ``jax.jit`` of ``minimise`` lowered and
+   compiled once, with ``max_steps`` a traced ``int32`` so the same
+   executable serves every later phase; for the SciPy baselines, one
+   evaluation of every jitted problem callback. Timed as ``compile_s``;
+   never part of the timing sample.
+2. **warmup** - one call with ``max_steps=1`` (``maxiter=1`` for SciPy).
+   Recorded as ``warmup_s`` and excluded from timing statistics and from
+   the repeat computation.
 3. **pilot** - first call with the full step budget. Timed, counted as
    repeat number one, and its solution provides the status, the solver
    statistics and the quality metrics.
@@ -38,6 +42,7 @@ __all__ = [
     "TaskSpec",
     "WorkerPool",
     "adaptive_repeats",
+    "make_runner",
     "run_task",
     "run_task_inprocess",
     "run_tasks",
@@ -171,6 +176,42 @@ def _scalar_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def make_runner(cfg: Any, problem: Any, x0: Any) -> Any:
+    """Instantiate the runner for a configuration.
+
+    Parameters
+    ----------
+    cfg
+        A :class:`benchmarks.configs.BenchConfig`.
+    problem
+        The sqpdax :class:`~slsqp_jax.sqpdax.problem.Problem`.
+    x0
+        Starting point.
+
+    Returns
+    -------
+    Runner
+        :class:`~benchmarks.runners.SqpdaxRunner` for ``backend="sqpdax"``,
+        :class:`~benchmarks.baselines.ScipyRunner` for ``backend="scipy"``.
+
+    Raises
+    ------
+    ValueError
+        For an unknown backend.
+    """
+    minimiser = cfg.make_minimiser()
+    options = cfg.make_options()
+    if cfg.backend == "sqpdax":
+        from .runners import SqpdaxRunner
+
+        return SqpdaxRunner(problem, x0, minimiser, options)
+    if cfg.backend == "scipy":
+        from .baselines import ScipyRunner
+
+        return ScipyRunner(problem, x0, minimiser, options)
+    raise ValueError(f"unknown backend {cfg.backend!r} for config {cfg.name!r}")
+
+
 def _solved(row: dict[str, Any], spec: TaskSpec) -> tuple[bool, str | None]:
     """Decide whether the pilot solve counts as solved.
 
@@ -216,15 +257,11 @@ def run_task_inprocess(
         Flat result row (see :mod:`benchmarks.results` for the schema).
     """
     import jax
-    import jax.numpy as jnp
     import numpy as np
     import sif2jax
 
-    from slsqp_jax.sqpdax.minimiser import minimise
-    from slsqp_jax.sqpdax.results import is_successful
-
     from .configs import CONFIGS
-    from .metrics import quality_metrics, result_name
+    from .metrics import quality_metrics
     from .problems import to_sqpdax
 
     jax.config.update("jax_enable_x64", True)
@@ -244,39 +281,29 @@ def run_task_inprocess(
     if spec.y0_iD != raw.y0_iD:
         raw = type(raw)(y0_iD=spec.y0_iD)
     row.update({k: v for k, v in meta.as_dict().items() if k != "name"})
-    solver = cfg.make_minimiser()
-    options = cfg.make_options()
-
-    def solve(x, max_steps):
-        return minimise(
-            problem, solver, x, max_steps=max_steps, throw=False, options=options
-        )
+    runner = make_runner(cfg, problem, x0)
 
     phase("compile")
     row["phase"] = "compile"
-    t0 = time.perf_counter()
-    compiled = jax.jit(solve).lower(x0, jnp.asarray(1, jnp.int32)).compile()
-    row["compile_s"] = time.perf_counter() - t0
+    row["compile_s"] = runner.compile()
 
     phase("warmup")
     row["phase"] = "warmup"
     t0 = time.perf_counter()
-    jax.block_until_ready(compiled(x0, jnp.asarray(1, jnp.int32)))
+    runner.warmup()
     row["warmup_s"] = time.perf_counter() - t0
 
     phase("pilot")
     row["phase"] = "pilot"
-    budget = jnp.asarray(spec.max_steps, jnp.int32)
     t0 = time.perf_counter()
-    sol = jax.block_until_ready(compiled(x0, budget))
+    out = runner.solve(spec.max_steps)
     pilot_s = time.perf_counter() - t0
     times = [pilot_s]
 
-    row["status"] = result_name(sol.result)
-    row["successful"] = bool(is_successful(sol.result))
-    row["steps"] = int(sol.stats["num_steps"])
-    row.update(_scalar_stats(sol.stats))
-    dual = getattr(sol.state, "dual", None)
+    row["status"] = out.status
+    row["successful"] = out.successful
+    row["steps"] = out.steps
+    row.update(_scalar_stats(out.stats))
     xstar = None
     try:
         xstar = raw.expected_result
@@ -285,8 +312,8 @@ def run_task_inprocess(
     row.update(
         quality_metrics(
             problem,
-            sol.value,
-            dual,
+            out.x,
+            out.dual,
             fstar=meta.fstar if meta.has_fstar else None,
             xstar=xstar,
         )
@@ -315,7 +342,7 @@ def run_task_inprocess(
             truncated = True
             break
         t0 = time.perf_counter()
-        jax.block_until_ready(compiled(x0, budget))
+        runner.solve(spec.max_steps)
         times.append(time.perf_counter() - t0)
 
     arr = np.asarray(times, dtype=float)

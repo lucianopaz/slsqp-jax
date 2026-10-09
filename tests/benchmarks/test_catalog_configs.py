@@ -73,7 +73,7 @@ def test_select_chunks_partition(catalog):
 
 
 def test_configs_registry():
-    assert len(CONFIGS) == 7
+    assert len(CONFIGS) == 9
     assert list(CONFIGS) == [
         "asls-pcg",
         "asls-craig",
@@ -82,10 +82,22 @@ def test_configs_registry():
         "pasls",
         "trip",
         "tfip",
+        "scipy-slsqp",
+        "scipy-trust-constr",
     ]
     assert [c.name for c in CONFIGS.values() if c.curvature == "exact"] == [
-        "asls-pcg-exact"
+        "asls-pcg-exact",
+        "scipy-trust-constr",
     ]
+    assert [c.name for c in CONFIGS.values() if c.backend == "scipy"] == [
+        "scipy-slsqp",
+        "scipy-trust-constr",
+    ]
+    assert all(
+        c.backend == "sqpdax" and c.family != "scipy"
+        for c in CONFIGS.values()
+        if not c.name.startswith("scipy-")
+    )
     assert get_configs(None) == list(CONFIGS.values())
     assert [c.name for c in get_configs(["tfip", "pasls"])] == ["tfip", "pasls"]
     with pytest.raises(KeyError):
@@ -100,6 +112,7 @@ def test_config_factories_build(config):
     assert isinstance(options, dict)
     tags = config.tags()
     assert tags["config"] == config.name and tags["curvature"] == config.curvature
+    assert tags["backend"] == config.backend
 
 
 @pytest.mark.parametrize(
