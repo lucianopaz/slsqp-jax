@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import pytest
 
 from slsqp_jax.sqpdax.preconditioner import IdentityPreconditioner, MatrixPreconditioner
+from slsqp_jax.sqpdax.problem import build_problem
 from slsqp_jax.sqpdax.subproblem.base import SubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     CraigProjectionContext,
@@ -187,6 +188,71 @@ RANK_DEFICIENT = {
     "active-set-parallel-rows": _active_set_with_bounds,
     "scaled-barrier-overdetermined": lambda: make_scaled_barrier_subproblem(),
 }
+
+
+def _wide_active_set(fix_first: bool) -> SubProblem:
+    # Four variables, one equality row and (optionally) ``x0`` pinned at its
+    # lower bound: ``A_work = [[0, 1, 1, 1]]`` leaves a two-dimensional null
+    # space, so ``P v`` is not round-off and the metric identity is testable.
+    lb = jnp.array([0.0, -jnp.inf, -jnp.inf, -jnp.inf])
+    problem = build_problem(
+        lambda x: jnp.sum(x**2),
+        n=4,
+        meq=1,
+        eq_fn=lambda x: jnp.array([jnp.sum(x) - 1.0]),
+        lb=lb,
+        ub=jnp.full(4, jnp.inf),
+        autodiff_mode="jax",
+        force_hvp_in_jax_mode=True,
+    )
+    return make_qp_subproblem(
+        problem=problem, active_lb=(fix_first, False, False, False)
+    )
+
+
+WIDE_SUBPROBLEMS = {
+    "all-free": lambda: _wide_active_set(fix_first=False),
+    "one-fixed": lambda: _wide_active_set(fix_first=True),
+}
+WIDE_PRECONDITIONERS = {
+    "none": lambda: None,
+    "identity": lambda: IdentityPreconditioner(jnp.zeros(4)),
+    "matrix": lambda: MatrixPreconditioner(make_spd_matrix(4)),
+}
+
+
+@pytest.mark.parametrize("projector", [SVDProjector(), CraigProjector()])
+@pytest.mark.parametrize(
+    "make_pre", WIDE_PRECONDITIONERS.values(), ids=WIDE_PRECONDITIONERS.keys()
+)
+@pytest.mark.parametrize(
+    "make_sub", WIDE_SUBPROBLEMS.values(), ids=WIDE_SUBPROBLEMS.keys()
+)
+def test_project_pair_satisfies_the_masked_metric_identity(
+    make_sub, make_pre, projector
+):
+    """``(P v, Q v)`` reproduces ``project`` and obeys ``vᵀ P v = (Q v)ᵀ P v``.
+
+    The identity is the projected-CG round-off floor detector.  It must hold
+    with a fixed variable under a non-diagonal ``M`` (``one-fixed`` ×
+    ``matrix``), where the naive ``(P v)ᵀ M (P v)`` does *not*: the inverse
+    of a principal block of ``M⁻¹`` is not the principal block of ``M``.
+    """
+    sub = make_sub()
+    pre = make_pre()
+    ctx = projector.build(sub, pre)
+
+    v = jnp.array([0.7, -1.3, 0.4, 2.1])
+    pv, qv = ctx.project_pair(v)
+    assert jnp.allclose(pv, ctx.project(v), atol=1e-5)
+    assert jnp.allclose(ctx.A_work @ pv, 0.0, atol=1e-5)
+    vpv = jnp.vdot(v, pv)
+    assert float(vpv) > 0.1  # non-trivial null-space component
+    assert jnp.isclose(vpv, jnp.vdot(qv, pv), rtol=1e-4)
+    if ctx.is_preconditioned and not bool(jnp.all(ctx.free_mask)):
+        assert pre is not None
+        naive = jnp.vdot(pv, pre.pushforward(pv))
+        assert not jnp.isclose(vpv, naive, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

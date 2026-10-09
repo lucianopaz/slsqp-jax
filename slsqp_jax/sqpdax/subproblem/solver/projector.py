@@ -172,6 +172,44 @@ class ProjectionContext(Module):
             self.A_work.T @ self.solve_preconditioned_normal(self.A_work @ mv)
         )
 
+    def project_pair(self, v: Vector_n) -> tuple[Vector_n, Vector_n]:
+        """Project ``v`` and also return the range-space-corrected ``Q v``.
+
+        Writing the projector as ``P = M̃⁻¹ Q`` with
+        ``Q = I − A_workᵀ (A_work M̃⁻¹ A_workᵀ)⁺ A_work M̃⁻¹`` and
+        ``M̃⁻¹ = F M⁻¹ F`` (``F`` masks the fixed variables), ``Q`` is an
+        idempotent matrix and ``P`` is symmetric, so for every ``v``
+
+        ```
+        vᵀ P v = (Q v)ᵀ M̃⁻¹ (Q v) = (Q v)ᵀ (P v)
+        ```
+
+        holds in exact arithmetic.  Callers use the pair ``(P v, Q v)`` to test
+        that identity as a round-off floor detector.  It is valid for *any*
+        masked metric — unlike ``(P v)ᵀ M (P v)``, which uses the principal
+        block of ``M`` where the inverse of the principal block of ``M⁻¹``
+        would be needed, and therefore fails as soon as a non-diagonal
+        preconditioner meets an active bound.
+
+        Parameters
+        ----------
+        v
+            Decision-variable vector.
+
+        Returns
+        -------
+        tuple[Vector_n, Vector_n]
+            ``(P v, Q v)``.  Unpreconditioned, ``P`` is the orthogonal
+            projector onto the free null space and ``Q v`` is returned as
+            ``P v`` itself (``(P v)ᵀ(P v) = vᵀ P v`` already holds).
+        """
+        if not self.is_preconditioned:
+            pv = self.project(v)
+            return pv, pv
+        mv = self.apply_Minv(v)
+        aty = self.A_work.T @ self.solve_preconditioned_normal(self.A_work @ mv)
+        return mv - self.apply_Minv(aty), v - aty
+
     def effective_rhs(self, b: Float[Array, " m"]) -> Float[Array, " m"]:
         """Constraint right-hand side after eliminating the fixed variables.
 
