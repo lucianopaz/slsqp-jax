@@ -166,6 +166,12 @@ class ProximalActiveSetLineSearchMinimiser(
         residual = jnp.maximum(
             _inf_norm(lag_k.x_grad), self._feasibility_from_lagrangian(lag_k)
         )
+        # Back off the proximal parameter after each rejected line search: the
+        # rejected direction is recomputed at the same iterate, so shrinking
+        # the residual that drives ``μ`` (floored at ``mu_min`` by the solver)
+        # changes the next QP. The streak resets on acceptance.
+        j = self.consecutive_ls_failures.astype(residual.dtype)
+        residual = residual * jnp.asarray(1e-2, residual.dtype) ** j
         state = eqx.tree_at(
             lambda s: s.kkt_residual,
             ctx.state,
