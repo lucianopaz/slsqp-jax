@@ -153,7 +153,7 @@ def test_fraction_to_boundary_beta(w, slack_mask, n, tau, expected):
     assert jnp.isclose(beta, expected, atol=1e-8)
 
 
-@pytest.mark.parametrize("scale_error", [1e-4, 1e-6, 1e-8])
+@pytest.mark.parametrize("scale_error", [1e-1, 1e-2, 1e-3])
 def test_refined_projector_reduces_null_space_leakage(scale_error: float):
     """A leaky projector is refined; an accurate one is left untouched.
 
