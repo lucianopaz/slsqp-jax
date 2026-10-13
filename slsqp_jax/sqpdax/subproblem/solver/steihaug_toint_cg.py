@@ -21,7 +21,7 @@ from .base import RESULTS, SubProblemSolver, SubProblemSolverState
 from .gradient_projection import GradientProjection
 
 
-def refined_projector(
+def _refined_projector(
     proj: Callable[[Float[Array, " n"]], Float[Array, " n"]],
 ) -> Callable[[Float[Array, " n"]], Float[Array, " n"]]:
     """Apply a null-space projector twice (one step of iterative refinement).
@@ -45,7 +45,7 @@ def refined_projector(
     Examples
     --------
     >>> import jax.numpy as jnp
-    >>> proj = refined_projector(lambda v: v * jnp.array([1.0, 0.0]))
+    >>> proj = _refined_projector(lambda v: v * jnp.array([1.0, 0.0]))
     >>> proj(jnp.array([1.0, 2.0])).tolist()
     [1.0, 0.0]
     """
@@ -95,7 +95,7 @@ class SteihaugTointCGTangentialStepSolver(
       ``Â`` is never assembled).
 
     The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` is applied with one step
-    of iterative refinement, ``v ↦ P(P v)`` (see :func:`refined_projector`):
+    of iterative refinement, ``v ↦ P(P v)`` (see :func:`_refined_projector`):
     near a KKT point the gradient lies almost entirely in range(Âᵀ), so
     ``P ĝ`` is tiny and the absolute error of a single projection is a large
     *relative* error that leaks the tangential step out of null(Â).  It solves the normal
@@ -299,7 +299,7 @@ class SteihaugTointCGTangentialStepSolver(
             max_iter=self.proj_cg_max_iter,
             solve=solve,
         )
-        proj = refined_projector(proj1)
+        proj = _refined_projector(proj1)
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2
 
