@@ -10,7 +10,7 @@
 #   hyp.sh drop <name>           remove the worktree (non-forced), keep the branch
 #   hyp.sh list                  worktrees and hyp/* branches
 #
-# Env: SQPDAX_BASE (default local_bench_cleanup), SQPDAX_REQUIRED (space separated paths that
+# Env: SQPDAX_WTROOT (worktree folder), SQPDAX_MERGE_DIR (checkout of $BASE), SQPDAX_BASE (default local_bench_cleanup), SQPDAX_REQUIRED (space separated paths that
 # must exist in $BASE; default lists the tooling files).
 set -euo pipefail
 
@@ -19,7 +19,10 @@ die() { echo "hyp.sh: $*" >&2; exit 1; }
 COMMON=$(git rev-parse --git-common-dir)
 MAIN=$(cd "$COMMON/.." && pwd)
 BASE=${SQPDAX_BASE:-local_bench_cleanup}
-WTROOT=$MAIN/.worktrees
+WTROOT=${SQPDAX_WTROOT:-$MAIN/.worktrees}
+# Checkout in which $BASE is checked out and merges happen (default: the main checkout). A second stream uses
+# its own checkout and its own $BASE branch (see orchestration/hyp_b.sh).
+MERGE_DIR=${SQPDAX_MERGE_DIR:-$MAIN}
 # Allowed paths (regex, git pathspec relative): sqpdax code + its tests + bookkeeping. Report branches
 # (hyp/report-*) may additionally edit the report script.
 ALLOWED=${SQPDAX_ALLOWED:-'^(slsqp_jax/sqpdax/|tests/sqpdax/|orchestration/(ledger\.jsonl|queue\.md|CONTEXT\.md|hypotheses/))'}
@@ -98,18 +101,18 @@ case "$cmd" in
     ;;
   merge)
     name=${1:?usage: hyp.sh merge <name>}
-    [[ $(git -C "$MAIN" branch --show-current) == "$BASE" ]] || die "main checkout is not on $BASE"
+    [[ $(git -C "$MERGE_DIR" branch --show-current) == "$BASE" ]] || die "main checkout is not on $BASE"
     # bookkeeping files are written in the main checkout during a session; they never conflict with a hypothesis branch
-    [[ -z $(git -C "$MAIN" status --porcelain --untracked-files=no -- . ':!orchestration/ledger.jsonl' ':!orchestration/queue.md' ':!orchestration/CONTEXT.md') ]] || die "main checkout has tracked changes; commit or move them first"
-    git -C "$MAIN" rev-parse --verify -q "refs/heads/hyp/$name" >/dev/null || die "no branch hyp/$name"
+    [[ -z $(git -C "$MERGE_DIR" status --porcelain --untracked-files=no -- . ':!orchestration/ledger.jsonl' ':!orchestration/queue.md' ':!orchestration/CONTEXT.md') ]] || die "main checkout has tracked changes; commit or move them first"
+    git -C "$MERGE_DIR" rev-parse --verify -q "refs/heads/hyp/$name" >/dev/null || die "no branch hyp/$name"
     "$0" scope "$name" || die "branch hyp/$name changes files outside the allowed scope; not merged"
     wt=$(wt_path "$name")
     if [[ -d $wt && -n $(git -C "$wt" status --porcelain --untracked-files=no) ]]; then die "worktree $wt has uncommitted tracked changes"; fi
-    if ! git -C "$MAIN" merge --no-ff -m "Merge hyp/$name into $BASE" "hyp/$name"; then
-      git -C "$MAIN" merge --abort || true
+    if ! git -C "$MERGE_DIR" merge --no-ff -m "Merge hyp/$name into $BASE" "hyp/$name"; then
+      git -C "$MERGE_DIR" merge --abort || true
       die "merge conflict; merge aborted, nothing changed. Resolve with the user."
     fi
-    git -C "$MAIN" log --oneline -1
+    git -C "$MERGE_DIR" log --oneline -1
     ;;
   drop)
     name=${1:?usage: hyp.sh drop <name>}
