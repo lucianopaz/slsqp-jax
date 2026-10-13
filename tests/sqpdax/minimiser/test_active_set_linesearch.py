@@ -1173,14 +1173,39 @@ def test_restoration_fallback_runs_only_for_rejected_infeasible_steps(enabled):
         assert float(penalty) == pytest.approx(han_powell)
     else:
         assert not bool(result.accepted)
-    # An accepted QP step is never overridden.
-    accepted = replace(rejected, accepted=jnp.asarray(True))
-    same, restored, penalty = solver._restoration_fallback(
+
+
+@pytest.mark.parametrize(
+    ("step_size", "step_norm", "expect_restored"),
+    [(1.0, 1.0, False), (1.0, 0.0, True), (0.0, 1.0, True)],
+    ids=["real-step", "null-direction", "null-step-size"],
+)
+def test_restoration_fallback_overrides_only_accepted_null_steps(
+    step_size, step_norm, expect_restored
+):
+    """An accepted QP step is kept unless it is a null step at an infeasible point."""
+    problem = make_shifted_equality_problem()
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.zeros(2))
+    ctx = solver._init_subproblem(problem)
+    _, step_dual, solver_state = solver._solve_direction(ctx)
+    accepted = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(True),
+        merit_val=jnp.asarray(4.0),
+        solver_state=solver_state,
+        step_size=jnp.asarray(step_size),
+        proposed_step_norm=jnp.asarray(step_norm),
+        accepted_by_fallback=jnp.asarray(False),
+    )
+    result, restored, penalty = solver._restoration_fallback(
         ctx, step_dual, solver_state, accepted
     )
-    assert not bool(restored)
-    assert bool(same.accepted)
-    assert float(penalty) == pytest.approx(float(solver.merit_penalty))
+    assert bool(restored) is expect_restored
+    assert bool(result.accepted)
+    if expect_restored:
+        assert float(result.x.x[0]) > 0.0
+    else:
+        assert float(penalty) == pytest.approx(float(solver.merit_penalty))
 
 
 def test_restoration_raises_the_penalty_when_the_objective_opposes_the_step():

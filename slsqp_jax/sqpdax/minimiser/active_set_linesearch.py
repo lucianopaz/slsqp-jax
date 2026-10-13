@@ -630,7 +630,12 @@ class ActiveSetLineSearchMinimiser(
             return result, jnp.asarray(False), self.merit_penalty
         lagrangian = ctx.subproblem.lagrangian
         infeasible = self._feasibility_from_lagrangian(lagrangian) > self.atol
-        attempt = infeasible & ~result.accepted
+        # An accepted null step (``alpha * ‖d‖ < atol``) leaves an infeasible
+        # iterate where it is, so it must trigger restoration like a rejection.
+        null_step = result.accepted & (
+            result.step_size * result.proposed_step_norm < self.atol
+        )
+        attempt = infeasible & (~result.accepted | null_step)
         direction, predicted_decrease = self._restoration_step(lagrangian)
         slope_f = jnp.dot(lagrangian.grad_val, direction)
         rho = self._next_merit_penalty(step_dual, solver_state)
