@@ -65,6 +65,22 @@ def test_init_subproblem_residual_matches_definition():
     assert jnp.allclose(ctx.state.kkt_residual, expected)
 
 
+def test_rejected_step_lowers_next_prox_residual():
+    """Each consecutive rejected line search scales the residual driving ``mu`` by 1e-2."""
+    problem = make_equality_quadratic()
+    solver = ProximalActiveSetLineSearchMinimiser().init(problem, jnp.array([0.0, 0.0]))
+    solver = eqx.tree_at(lambda m: m.dual.eq_multipliers, solver, jnp.asarray([0.5]))
+    base = solver._init_subproblem(problem).state.kkt_residual
+    for j in (1, 2):
+        failed = eqx.tree_at(
+            lambda m: m.consecutive_ls_failures,
+            solver,
+            jnp.asarray(j, solver.consecutive_ls_failures.dtype),
+        )
+        res = failed._init_subproblem(problem).state.kkt_residual
+        assert jnp.allclose(res, base * 1e-2**j)
+
+
 @pytest.mark.parametrize(
     ("problem_factory", "x0", "expected"),
     [
