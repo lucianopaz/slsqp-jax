@@ -22,4 +22,6 @@ below come from `diagnostics/v2` and are stale.
 | G7 | Artefacts and performance | closed (out of scope) | `unbounded`, `reference_mismatch`, `local_minimum_consensus`, `problem_infeasible`, `evaluation_error`, `stationarity_scale_f`; `compile_timeout`, `run_timeout`. Benchmark side is frozen; reopen a label only if the digest shows a sqpdax defect behind it. `compile_timeout`/`run_timeout` are sqpdax performance and stay open. |
 | G8 | `trust_region_collapse` (was `unclassified`) | open | trip 36, tfip 6; 34 of 42 solved by scipy SLSQP, all end `trust_region_collapse`. Classifier has no rule for it (`scripts/` is a tool; narrative entry added in `PRIORITIES`). |
 
+Streams (see `STREAMS.md`): A = G3, G5, G6, G1 asls leftovers; B = G8, G2, G4, G1 trip items, HS55 false success. Pending waivers (stream A): `hyp/termination_missed-lbfgs-relfloor` (G3 H1), `hyp/merit_stagnation-decaying-penalty` (G6 H1).
+
 Order of `G*` follows the report's `PRIORITIES`; re-sort after Q1 by the per-config deficit to scipy-slsqp (`gap.py`, `digest.py` scipy columns), largest first.
