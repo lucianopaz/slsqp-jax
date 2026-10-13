@@ -96,8 +96,8 @@ def test_penalty_options_replace_the_stateless_names():
     assert float(solver.merit_penalty) == pytest.approx(2.0)
 
 
-def test_penalty_update_is_monotone_sign_clamped_and_trust_gated():
-    """Only finite, successful, dual-feasible multiplier magnitudes ratchet rho."""
+def test_penalty_update_is_decaying_sign_clamped_and_trust_gated():
+    """Only finite, successful, dual-feasible multiplier magnitudes move rho."""
     problem = make_unconstrained_quadratic()
     solver = ActiveSetLineSearchMinimiser(
         initial_penalty=2.0, penalty_multiplier_margin=1.1
@@ -113,7 +113,8 @@ def test_penalty_update_is_monotone_sign_clamped_and_trust_gated():
 
     raised = eqx.tree_at(lambda m: m.merit_penalty, solver, rho)
     smaller = jax.tree.map(lambda leaf: 0.1 * leaf, dual)
-    assert float(raised._next_merit_penalty(smaller, state)) == pytest.approx(5.5)
+    # Powell rule: max(c=0.55, (5.5 + 0.55) / 2, initial=2.0) = 3.025.
+    assert float(raised._next_merit_penalty(smaller, state)) == pytest.approx(3.025)
 
     failed = eqx.tree_at(lambda s: s.success, state, jnp.asarray(False))
     assert float(solver._next_merit_penalty(dual, failed)) == pytest.approx(2.0)
@@ -123,6 +124,34 @@ def test_penalty_update_is_monotone_sign_clamped_and_trust_gated():
         jnp.asarray([jnp.nan, 4.0]),
     )
     assert float(solver._next_merit_penalty(nonfinite, state)) == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    "rho, multiplier",
+    [
+        (1000.0, 1.0),  # spike: halve the excess over c = 1.1
+        (1.0e-3, 10.0),  # growth jumps straight to c
+        (2.0, 0.1),  # floored at initial_penalty
+    ],
+)
+def test_penalty_spike_decays_geometrically(rho, multiplier):
+    """A transient multiplier spike decays towards c, never below the floor."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        initial_penalty=2.0, penalty_multiplier_margin=1.1
+    ).init(problem, jnp.ones(2))
+    state = eqx.tree_at(lambda s: s.success, solver.solver_state, jnp.asarray(True))
+    dual = eqx.tree_at(
+        lambda d: d.lb_multipliers, solver.dual, jnp.asarray([multiplier, 0.0])
+    )
+    solver = eqx.tree_at(lambda m: m.merit_penalty, solver, jnp.asarray(rho))
+    expected_rho = max(2.0, 1.1 * multiplier, 0.5 * (rho + 1.1 * multiplier))
+    assert float(solver._next_merit_penalty(dual, state)) == pytest.approx(expected_rho)
+    for _ in range(40):
+        solver = eqx.tree_at(
+            lambda m: m.merit_penalty, solver, solver._next_merit_penalty(dual, state)
+        )
+    assert float(solver.merit_penalty) == pytest.approx(max(2.0, 1.1 * multiplier))
 
 
 def test_penalty_increase_revalues_best_iterate_before_progress_comparison():

@@ -196,8 +196,9 @@ class ActiveSetLineSearchMinimiser(
     initial_penalty
         Initial (and therefore minimum) L1 merit penalty ``ρ``.
     penalty_multiplier_margin
-        Han--Powell multiplier margin used in the monotone update
-        ``ρ_next = max(ρ, margin * ‖λ_QP‖_∞)``.
+        Han--Powell multiplier margin used in the decaying update
+        ``ρ_next = max(ρ_0, c, (ρ + c) / 2)`` with
+        ``c = margin * ‖λ_QP‖_∞`` (Powell's decaying rule, as in scipy SLSQP).
     armijo_c1
         Armijo sufficient-decrease constant.
     armijo_backtrack
@@ -243,7 +244,7 @@ class ActiveSetLineSearchMinimiser(
     active_set_predictor: LPECAPredictor = eqx.field(
         static=True, default_factory=LPECAPredictor
     )
-    # Monotone Han--Powell L1-merit penalty schedule.
+    # Decaying Han--Powell L1-merit penalty schedule.
     initial_penalty: float = eqx.field(static=True, default=1.0)
     penalty_multiplier_margin: float = eqx.field(static=True, default=1.1)
     merit_penalty: Scalar = eqx.field(default_factory=lambda: jnp.asarray(1.0))
@@ -858,7 +859,7 @@ class ActiveSetLineSearchMinimiser(
         step_dual: Dual,
         solver_state: ActiveSetStateType,
     ) -> StepController[Primal, ActiveSetStateType]:
-        """Armijo line search on the monotonically updated L1 merit."""
+        """Armijo line search on the adaptively updated L1 merit."""
         return cast(
             StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
@@ -894,7 +895,14 @@ class ActiveSetLineSearchMinimiser(
         step_dual: Dual,
         solver_state: ActiveSetStateType,
     ) -> Scalar:
-        """Return the trusted monotone Han--Powell penalty for this QP.
+        """Return the trusted decaying Han--Powell penalty for this QP.
+
+        With ``c = margin * ||lambda_QP||_inf`` the update is Powell's
+        (scipy SLSQP, Kraft 1988) rule
+        ``rho_next = max(initial_penalty, c, (rho + c) / 2)``. It rises to
+        ``c`` at once when multipliers grow, but a transient spike decays
+        geometrically (halving the excess per step) towards ``c`` and never
+        below ``initial_penalty``.
 
         Equality multipliers enter by magnitude. Inequality and bound
         multipliers are clamped to their dual-feasible non-negative sign for
@@ -912,7 +920,10 @@ class ActiveSetLineSearchMinimiser(
         )
         finite = jnp.all(jnp.isfinite(penalty_multipliers))
         candidate = self.penalty_multiplier_margin * _inf_norm(penalty_multipliers)
-        updated = jnp.maximum(self.merit_penalty, candidate)
+        updated = jnp.maximum(
+            jnp.maximum(candidate, 0.5 * (self.merit_penalty + candidate)),
+            self.initial_penalty,
+        )
         return jnp.where(solver_state.success & finite, updated, self.merit_penalty)
 
     def _feasibility_error(
