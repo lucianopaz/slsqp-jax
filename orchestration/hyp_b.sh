@@ -4,7 +4,8 @@
 #   orchestration/hyp_b.sh new|base|check|run|scope|merge|drop|list ...
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-MAIN=$(cd "$(git -C "$HERE" rev-parse --git-common-dir)/.." && pwd)
+COMMON=$(git -C "$HERE" rev-parse --path-format=absolute --git-common-dir)
+MAIN=$(cd "$COMMON/.." && pwd)
 export SQPDAX_BASE=${SQPDAX_BASE:-stream/b}
 export SQPDAX_MERGE_DIR=${SQPDAX_MERGE_DIR:-$(dirname "$MAIN")/slsqp-jax-streamB}
 export SQPDAX_WTROOT=${SQPDAX_WTROOT:-$SQPDAX_MERGE_DIR/.worktrees}
