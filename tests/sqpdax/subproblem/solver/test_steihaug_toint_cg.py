@@ -6,10 +6,12 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from slsqp_jax.sqpdax.linalg import null_space_projector
 from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     SteihaugTointCGTangentialStepSolver,
 )
+from slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg import refined_projector
 from tests.sqpdax.subproblem.conftest import (
     make_scaled_barrier_subproblem,
     make_zero_dual,
@@ -149,3 +151,27 @@ def test_fraction_to_boundary_beta(w, slack_mask, n, tau, expected):
         w, slack_mask, n, tau
     )
     assert jnp.isclose(beta, expected, atol=1e-8)
+
+
+@pytest.mark.parametrize("delta", [1e-7, 1e-9, 1e-11])
+def test_refined_projector_reduces_null_space_leakage(delta: float):
+    """``P(P v)`` leaks far less than ``P v`` when ``P v`` is tiny.
+
+    ``v = Aᵀλ + δ t`` is almost entirely in range(Aᵀ); with an inexact inner
+    solve the single-projection leak is large relative to ``||P v||``.
+    """
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3 = jax.random.split(key, 3)
+    M = jax.random.normal(k1, (3, 8))
+    lam = jax.random.normal(k2, (3,))
+    t = jax.random.normal(k3, (8,))
+    t = t - M.T @ jnp.linalg.solve(M @ M.T, M @ t)  # exactly in null(M)
+    v = M.T @ lam + delta * t
+
+    proj1 = null_space_projector(lambda x: M @ x, lambda y: M.T @ y, tol=1e-6)
+    leak1 = jnp.linalg.norm(M @ proj1(v))
+    leak2 = jnp.linalg.norm(M @ refined_projector(proj1)(v))
+
+    assert leak1 > 0.0
+    assert leak2 <= 1e-3 * leak1
+    assert leak2 <= 1e-12 * jnp.linalg.norm(v)
