@@ -317,12 +317,13 @@ class SteihaugTointCGTangentialStepSolver(
             max_iter=self.proj_cg_max_iter,
             solve=solve,
         )
-        # The second pass only pays off when the first has headroom below
-        # sqrt(eps); in float32 it measurably degrades the projection.
-        eps = float(jnp.finfo(dtype).eps)
+        # The second pass only pays off in double precision (in float32 it
+        # measurably degrades the projection) and when the first pass leaks
+        # more than 1e-6 of its own norm (the order of the KKT tolerance);
+        # accurate projections are left untouched.
         proj = (
-            _refined_projector(proj1, lambda p: A(free_w * p), eps**0.5)
-            if eps < 1e-10
+            _refined_projector(proj1, lambda p: A(free_w * p), 1e-6)
+            if jnp.finfo(dtype).eps < 1e-10
             else proj1
         )
 
