@@ -20,6 +20,7 @@ from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
     ACTIVE_SET_LINE_SEARCH_RESULTS,
 )
 from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.problem import build_problem
 from slsqp_jax.sqpdax.secant import FailureRecoverySchedule
 from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem.solver import (
@@ -35,7 +36,13 @@ from slsqp_jax.sqpdax.subproblem.solver import (
 )
 
 from ..conftest import make_shifted_box_quadratic
-from .conftest import make_equality_quadratic, make_unconstrained_quadratic
+from .conftest import (
+    make_equality_quadratic,
+    make_infeasible_problem,
+    make_shifted_equality_problem,
+    make_unconstrained_quadratic,
+    make_zero_jacobian_infeasible_problem,
+)
 
 
 def test_init_builds_primal_dual_and_qp_state():
@@ -300,7 +307,13 @@ def test_mu_max_option_changes_kkt_scale_and_exposes_ratio():
     solver = ActiveSetLineSearchMinimiser(use_mu_max=True).init(
         problem, jnp.asarray([0.25, 0.25])
     )
-    solver = eqx.tree_at(lambda m: m.dual.eq_multipliers, solver, jnp.asarray([100.0]))
+    # Pretend the multipliers come from a converged QP (the cold state says
+    # otherwise, which would make the scale fall back to the objective's).
+    solver = eqx.tree_at(
+        lambda m: (m.dual.eq_multipliers, m.solver_state.success),
+        solver,
+        (jnp.asarray([100.0]), jnp.asarray(True)),
+    )
     mu_metrics = solver.termination_metrics(solver._optimisation_context(problem))
     classical = replace(solver, use_mu_max=False)
     classical_metrics = classical.termination_metrics(
@@ -342,6 +355,7 @@ def _execute_synthetic_step(
     step_size: float | None = None,
     proposed_step_norm: float = 1.0,
     accepted_by_fallback: bool = False,
+    rounding_level: bool = False,
 ):
     """Exercise phase four with a controlled line-search/QP outcome."""
     ctx = solver._init_subproblem(problem)
@@ -369,6 +383,7 @@ def _execute_synthetic_step(
         ),
         proposed_step_norm=jnp.asarray(proposed_step_norm),
         accepted_by_fallback=jnp.asarray(accepted_by_fallback),
+        rounding_level=jnp.asarray(rounding_level),
     )
     return solver._execute_step(ctx, solver.dual, result)
 
@@ -488,6 +503,145 @@ def test_mixed_failure_channels_do_not_restart_global_recovery():
     assert bool(done)
     assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure)
     assert jnp.array_equal(solver.secant_stats.n_resets, jnp.ones(3, jnp.int32))
+
+
+def test_rounding_level_rejections_do_not_advance_the_line_search_streak():
+    """Rejections with an unresolvable predicted decrease are not failures.
+
+    Two genuine rejections build a streak of two; a rounding-level rejection
+    clears it (the secant reset policy fires on any positive streak, so the
+    recovery must not see one), and further rounding-level rejections keep
+    it at zero, so the recovery never turns fatal; a genuine rejection then
+    starts a fresh streak.
+    """
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        rtol=-1.0, curvature="secant", stagnation_patience=100
+    ).init(problem, jnp.ones(2))
+
+    def reject(solver, rounding_level):
+        return _execute_synthetic_step(
+            solver,
+            problem,
+            accepted=False,
+            qp_success=True,
+            qp_status=RESULTS.successful,
+            x=solver.iterate.x,
+            merit=float(solver.best_merit),
+            rounding_level=rounding_level,
+        )
+
+    solver = reject(reject(solver, False), False)
+    assert int(solver.consecutive_ls_failures) == 2
+    for _ in range(4):
+        solver = reject(solver, True)
+        assert int(solver.consecutive_ls_failures) == 0
+    assert not bool(solver.secant_recovery_state.fatal)
+    assert int(solver.secant_recovery_state.failure_streak) == 0
+    done, _ = solver.terminate(problem)
+    assert not bool(done)
+    solver = reject(solver, False)
+    assert int(solver.consecutive_ls_failures) == 1
+
+
+def test_kkt_test_outranks_an_exhausted_secant_recovery():
+    """A KKT point is reported as a success even with a fatal recovery flag."""
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(curvature="secant", min_steps=0).init(
+        problem, jnp.zeros(2)
+    )
+    exhausted = eqx.tree_at(
+        lambda m: m.secant_recovery_state.fatal, solver, jnp.asarray(True)
+    )
+    done, result = exhausted.terminate(problem)
+    assert bool(done)
+    assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.successful)
+    # Away from the solution the fatal flag still ends the run as a failure,
+    # even when the (untrustworthy) QP model claims optimality after a full
+    # accepted step: only the measured KKT residual outranks the flag.
+    away = eqx.tree_at(
+        lambda m: (m.iterate, m.qp_optimal, m.last_ls_success, m.last_step_size),
+        exhausted,
+        (
+            Primal(jnp.ones(2)),
+            jnp.asarray(True),
+            jnp.asarray(True),
+            jnp.asarray(1.0),
+        ),
+    )
+    done, result = away.terminate(problem)
+    assert bool(done)
+    assert bool(result == ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure)
+
+
+@pytest.mark.parametrize("qp_success", [True, False], ids=["converged-qp", "failed-qp"])
+def test_stationarity_scale_ignores_multipliers_of_an_unconverged_qp(qp_success):
+    """``|L|`` scales the test only when the multipliers come from a converged QP.
+
+    Multipliers of a QP whose working set did not settle (or whose KKT solve
+    failed) can be arbitrarily large; letting them into the relative scale
+    would pass any gradient. The scale then falls back to ``max(|f|, 1)``.
+    """
+    problem = make_equality_quadratic()
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.array([3.0, 3.0]))
+    solver = eqx.tree_at(
+        lambda m: (m.dual.eq_multipliers, m.solver_state.success),
+        solver,
+        (jnp.array([1e6]), jnp.asarray(qp_success)),
+    )
+    ctx = solver._optimisation_context(problem)
+    metrics = solver.termination_metrics(ctx)
+    f_scale = max(abs(float(ctx.lagrangian.fn_val)), 1.0)
+    l_scale = max(abs(float(ctx.lagrangian.value)), 1.0)
+    assert l_scale > 10 * f_scale  # the multiplier does inflate ``|L|`` here
+    expected = l_scale if qp_success else f_scale
+    assert float(metrics.stationarity_scale) == pytest.approx(expected)
+
+
+def test_stagnation_measures_progress_relative_to_the_merit_magnitude():
+    """Decrements of a tiny merit are progress; below ``stagnation_tol * atol`` not.
+
+    With the merit near ``1e-14`` (an ``f* = 0`` problem close to its
+    solution) a decrease of ``1e-16`` per step is a relative improvement of
+    ``1e-2`` and must reset the patience counter, which the former
+    ``max(|merit|, 1)`` scale (threshold ``1e-12``) never did.
+    """
+    problem = make_unconstrained_quadratic()
+    solver = ActiveSetLineSearchMinimiser(
+        rtol=-1.0,
+        min_steps=1,
+        zero_step_patience=100,
+        stagnation_patience=3,
+        stagnation_tol=1e-12,
+        atol=1e-6,
+    ).init(problem, 1e-7 * jnp.ones(2))
+    base = float(solver.best_merit)  # ‖x0‖² = 2e-14
+    assert base == pytest.approx(2e-14, rel=1e-3)
+
+    def accept(solver, merit):
+        # The iterate is kept, so the stored best merit is re-evaluated at
+        # ``base`` every step and ``merit`` is compared against it directly.
+        return _execute_synthetic_step(
+            solver,
+            problem,
+            accepted=True,
+            qp_success=True,
+            qp_status=RESULTS.successful,
+            x=solver.iterate.x,
+            merit=merit,
+            step_size=1.0,
+            proposed_step_norm=1.0,
+        )
+
+    for _ in range(5):
+        solver = accept(solver, base - 1e-16)
+        assert int(solver.steps_without_improvement) == 0
+    assert not bool(solver.merit_stagnation)
+    # Improvements below ``stagnation_tol * max(|merit|, atol) = 1e-18`` stall.
+    for k in range(3):
+        solver = accept(solver, base - 1e-19)
+        assert int(solver.steps_without_improvement) == k + 1
+    assert bool(solver.merit_stagnation)
 
 
 @pytest.mark.parametrize("bad_merit", [100.0, jnp.inf], ids=["growth", "nonfinite"])
@@ -892,12 +1046,180 @@ def test_single_exchange_solves_the_inconsistent_refresh_problem(
         sol.stats["multipliers_ineq"], dual_star.ineq_multipliers, atol=1e-3
     )
 
-    # The default all-at-once refresh stalls on this problem.
+    # The uncapped all-at-once refresh stalls on this problem (the capped
+    # default refresh with the independence screen solves it as well).
     default = minimise(
         problem,
         minimiser_cls(rtol=1e-6, atol=1e-6, min_steps=1),
         jnp.array([0.5, 0.5, 0.5]),
         max_steps=40,
         throw=False,
+        options={"subproblem": {"working_set_policy": {"cap_working_set": False}}},
     )
     assert not bool(default.state.result_adapter.is_successful(default.result))
+
+
+@pytest.mark.parametrize(
+    ("make_problem_fn", "x", "expected"),
+    [
+        # Midpoint of ``x₀ <= 0`` and ``x₀ >= 1``: both violations pull equally.
+        (make_infeasible_problem, [0.5, 0.0], 0.0),
+        # ``c⁺ = (0.2, 0.8)``, ``∇ψ = (0.2 - 0.8, 0)``, divided by ``‖c⁺‖₂``.
+        (make_infeasible_problem, [0.2, 0.0], 0.6 / (0.68**0.5)),
+        # On the bound: the descent direction leaves the box, so it is projected.
+        (make_infeasible_problem, [1.0, 0.0], 0.0),
+        # Zero Jacobian: the violation cannot be reduced to first order.
+        (make_zero_jacobian_infeasible_problem, [0.0, 0.0], 0.0),
+        (make_equality_quadratic, [0.5, 0.5], 0.0),
+    ],
+    ids=["midpoint", "pulled", "projected", "zero-jacobian", "feasible"],
+)
+def test_violation_stationarity_is_the_normalised_projected_gradient(
+    make_problem_fn, x, expected
+):
+    """``violation_stationarity`` measures first-order progress on ``½‖c⁺‖²``."""
+    problem = make_problem_fn()
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.asarray(x))
+    metrics = solver.termination_metrics(solver._optimisation_context(problem))
+    assert float(metrics.violation_stationarity) == pytest.approx(expected, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "minimiser_cls",
+    [ActiveSetLineSearchMinimiser, ProximalActiveSetLineSearchMinimiser],
+    ids=["active-set", "proximal"],
+)
+def test_infeasible_stationary_requires_a_stationary_violation_measure(
+    minimiser_cls,
+):
+    """Lagrangian stationarity alone no longer certifies infeasibility."""
+    problem = make_infeasible_problem()
+    solver = minimiser_cls(min_steps=0, zero_step_patience=0).init(
+        problem, jnp.asarray([0.2, 0.0])
+    )
+    metrics = solver.termination_metrics(solver._optimisation_context(problem))
+    stationary = jnp.asarray(True)
+    feasible = jnp.asarray(False)
+    assert not bool(solver._infeasible_stationary(metrics, stationary, feasible))
+    at_minimiser = eqx.tree_at(lambda m: m.iterate.x, solver, jnp.asarray([0.5, 0.0]))
+    metrics = at_minimiser.termination_metrics(
+        at_minimiser._optimisation_context(problem)
+    )
+    assert bool(at_minimiser._infeasible_stationary(metrics, stationary, feasible))
+    # ``x₀² + 1 = 0`` from ``x = 0``: the Jacobian vanishes, so the violation
+    # cannot be reduced to first order and the certificate is legitimate.
+    sol = minimise(
+        make_zero_jacobian_infeasible_problem(),
+        minimiser_cls(),
+        jnp.zeros(2),
+        max_steps=50,
+        throw=False,
+    )
+    assert sol.stats["sqpdax_result"] == (
+        ACTIVE_SET_LINE_SEARCH_RESULTS.infeasible_stationary
+    )
+    assert float(sol.stats["violation_stationarity"]) <= 1e-3
+
+
+def test_restoration_direction_is_the_bounded_gauss_newton_normal_step():
+    """``c⁺ = (0.2, 0.8)`` has the least-squares step ``0.3``; the box clip lands on ``lb``."""
+    problem = make_infeasible_problem()
+    solver = ActiveSetLineSearchMinimiser().init(problem, jnp.asarray([0.2, 0.0]))
+    lagrangian = solver._optimisation_context(problem).lagrangian
+    direction = solver._restoration_direction(lagrangian)
+    assert jnp.allclose(direction, jnp.asarray([0.8, 0.0]), atol=1e-6)
+    # The radius bounds the step before the box clip is applied.
+    small = replace(solver, restoration_radius=0.1)
+    assert jnp.allclose(
+        small._restoration_direction(lagrangian), jnp.asarray([0.8, 0.0]), atol=1e-6
+    )
+    far = ActiveSetLineSearchMinimiser(restoration_radius=0.1).init(
+        make_shifted_equality_problem(), jnp.zeros(2)
+    )
+    far_direction = far._restoration_direction(
+        far._optimisation_context(make_shifted_equality_problem()).lagrangian
+    )
+    assert jnp.allclose(far_direction, jnp.asarray([0.1, 0.0]), atol=1e-6)
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["restoration", "off"])
+def test_restoration_fallback_runs_only_for_rejected_infeasible_steps(enabled):
+    """A rejected QP direction at an infeasible point is replaced by restoration."""
+    problem = make_shifted_equality_problem()
+    solver = ActiveSetLineSearchMinimiser(restoration=enabled).init(
+        problem, jnp.zeros(2)
+    )
+    ctx = solver._init_subproblem(problem)
+    step_primal, step_dual, solver_state = solver._solve_direction(ctx)
+    rejected = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(False),
+        merit_val=jnp.asarray(4.0),
+        solver_state=solver_state,
+        step_size=jnp.asarray(0.0),
+        proposed_step_norm=jnp.linalg.norm(step_primal.x),
+        accepted_by_fallback=jnp.asarray(False),
+    )
+    result, restored, penalty = solver._restoration_fallback(
+        ctx, step_dual, solver_state, rejected
+    )
+    assert bool(restored) is enabled
+    han_powell = float(solver._next_merit_penalty(step_dual, solver_state))
+    if enabled:
+        assert bool(result.accepted)
+        assert float(result.x.x[0]) > 0.0
+        # ``∇f = (0, 1)`` is orthogonal to the step: the restoration keeps the
+        # Han--Powell penalty of this step, without any extra increase.
+        assert float(penalty) == pytest.approx(han_powell)
+    else:
+        assert not bool(result.accepted)
+    # An accepted QP step is never overridden.
+    accepted = replace(rejected, accepted=jnp.asarray(True))
+    same, restored, penalty = solver._restoration_fallback(
+        ctx, step_dual, solver_state, accepted
+    )
+    assert not bool(restored)
+    assert bool(same.accepted)
+    assert float(penalty) == pytest.approx(float(solver.merit_penalty))
+
+
+def test_restoration_raises_the_penalty_when_the_objective_opposes_the_step():
+    """``min x₀`` s.t. ``x₀ = 4`` from ``0``: ``∇fᵀd > 0`` forces ``ρ_R = 2∇fᵀd/Δv``."""
+    n = 2
+
+    def zero_rows(m):
+        return lambda x, *a: jnp.zeros((m, n), x.dtype)
+
+    problem = build_problem(
+        n=n,
+        meq=1,
+        fn=lambda x: 3.0 * x[0] + x[1] ** 2,
+        grad=lambda x: jnp.array([3.0, 2.0 * x[1]], x.dtype),
+        hvp=lambda x, v: jnp.array([0.0, 2.0 * v[1]], x.dtype),
+        eq_fn=lambda x: x[:1] - 4.0,
+        eq_fn_jac=lambda x: jnp.array([[1.0, 0.0]], x.dtype),
+        eq_fn_hvp=zero_rows(1),
+    )
+    solver = ActiveSetLineSearchMinimiser(restoration_radius=0.25).init(
+        problem, jnp.zeros(n)
+    )
+    ctx = solver._init_subproblem(problem)
+    _, step_dual, solver_state = solver._solve_direction(ctx)
+    rejected = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(False),
+        merit_val=jnp.asarray(4.0),
+        solver_state=solver_state,
+        step_size=jnp.asarray(0.0),
+        proposed_step_norm=jnp.asarray(1.0),
+        accepted_by_fallback=jnp.asarray(False),
+    )
+    result, restored, penalty = solver._restoration_fallback(
+        ctx, step_dual, solver_state, rejected
+    )
+    # d = (0.25, 0): slope 0.75, predicted decrease 0.25 -> rho_R = max(rho, 6).
+    assert bool(restored)
+    han_powell = float(solver._next_merit_penalty(step_dual, solver_state))
+    assert float(penalty) == pytest.approx(max(han_powell, 6.0))
+    assert float(penalty) >= 6.0
+    assert float(result.x.x[0]) == pytest.approx(0.25)

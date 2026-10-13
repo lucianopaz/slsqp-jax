@@ -147,6 +147,9 @@ BARRIER_UPDATE_KEYS = {
     "eps_pi_new",
     "eps_v_new",
     "v_max_new",
+    "kkt_error_mu",
+    "kappa_eps",
+    "forced",
     "diagnostics",
 }
 
@@ -678,11 +681,15 @@ def test_run_emits_documented_diagnostic_records(funnel_run, case):
     updates = handler.select(name="minimiser", kind="barrier_update")
     assert len(updates) == c["n_mu_updates"] > 0
     for r in updates:
-        assert BARRIER_UPDATE_KEYS <= set(r.values)
-        assert r.values["mu_new"] < r.values["mu_old"]
-        assert r.values["pi_f"] <= r.values["eps_pi_old"]
-        assert r.values["violation"] <= r.values["eps_v_old"]
-        assert r.values["eps_pi_new"] < r.values["eps_pi_old"]
+        v = r.values
+        assert BARRIER_UPDATE_KEYS <= set(v)
+        assert v["mu_new"] < v["mu_old"]
+        assert v["eps_pi_new"] < v["eps_pi_old"]
+        # ``μ`` is reduced by (3.15a), by the scaled KKT test
+        # ``E(·; μ) <= κ_ε μ`` or by the inner-loop exit (``forced``).
+        by_315a = v["pi_f"] <= v["eps_pi_old"] and v["violation"] <= v["eps_v_old"]
+        by_kkt = v["kkt_error_mu"] <= v["kappa_eps"] * v["mu_old"]
+        assert by_315a or by_kkt or bool(v["forced"])
 
 
 def test_no_diagnostics_traced_without_a_handler():

@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import pytest
 from jax import Array
 
+from slsqp_jax.sqpdax.barrier import FunnelBarrierUpdate
 from slsqp_jax.sqpdax.logging import MemoryDiagnosticsHandler, MemoryHandler
 from slsqp_jax.sqpdax.minimiser import (
     ActiveSetLineSearchMinimiser,
@@ -344,7 +345,10 @@ class InfeasibleFunnelRun:
     :func:`make_zero_jacobian_infeasible_problem` and
     :func:`make_shifted_equality_problem`. The generic LSMR multiplier
     recovery is forced so the large least-squares multipliers of the
-    incompatible system hit the ``κ_y`` cap in a reproducible way.
+    incompatible system hit the ``κ_y`` cap in a reproducible way, and the
+    barrier update's KKT test is disabled (``kappa_eps=0``) so ``μ`` stays
+    at ``μ₀`` long enough for them to do so (with the test on, ``μ`` drops
+    on the second step and Step 8 ends the run before the cap is reached).
     """
 
     problem: Problem
@@ -361,7 +365,7 @@ def infeasible_funnel_run() -> InfeasibleFunnelRun:
         problem = make_infeasible_problem()
         sol = minimise(
             problem,
-            funnel_minimiser(),
+            funnel_minimiser(barrier_update=FunnelBarrierUpdate(kappa_eps=0.0)),
             jnp.array([0.5, 0.3]),
             max_steps=80,
             throw=False,

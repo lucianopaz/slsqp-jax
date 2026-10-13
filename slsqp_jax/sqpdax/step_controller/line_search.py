@@ -11,7 +11,7 @@ from jaxtyping import Array, Bool, Int, Scalar
 
 from ..primal import Primal
 from ..subproblem.solver import SubProblemSolverState
-from .base import MeritStepController, StepResult
+from .base import MeritStepController, StepResult, at_rounding_level
 
 
 class LineSearchState(Module):
@@ -171,6 +171,9 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
             both cases. A non-finite ``direction`` is rejected without
             evaluating any trial; non-finite merits at individual trial
             points are simply not accepted and backtracking continues.
+            ``rounding_level`` flags a full-step slope ``∇φᵀd`` below the
+            rounding level of ``φ(x0)`` (see
+            :func:`~slsqp_jax.sqpdax.step_controller.base.at_rounding_level`).
 
         Examples
         --------
@@ -255,6 +258,7 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
         accepted = self.stop_search(state)
         accepted_by_fallback = accepted & self.accepted_by_fallback(state)
         proposed_step_norm = jnp.linalg.norm(state.step.x)
+        rounding_level = at_rounding_level(merit0_grad_dot_step, merit0_val)
         self.logger.info(
             "accepted alpha={alpha:.3e} after {trials} trial(s): "
             "merit {merit0:.6e} -> {merit:.6e} fallback={fallback}",
@@ -286,6 +290,7 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
                 step_size=state.alpha,
                 proposed_step_norm=proposed_step_norm,
                 accepted_by_fallback=accepted_by_fallback,
+                rounding_level=rounding_level,
             ),
             lambda: StepResult(
                 x=x0,
@@ -295,6 +300,7 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
                 step_size=jnp.asarray(0.0),
                 proposed_step_norm=proposed_step_norm,
                 accepted_by_fallback=jnp.asarray(False),
+                rounding_level=rounding_level,
             ),
         )
         return cast(StepResult[Primal, SubProblemSolverState], result)

@@ -77,6 +77,10 @@ class TRUST_FUNNEL_INTERIOR_POINT_RESULTS(
         "Consecutive y-iterations with an inconsistent multiplier estimate "
         "(none of (3.15a)-(3.15c), or pi_f not contracting)."
     )
+    trust_region_collapse = (
+        "The trust region collapsed on a barrier subproblem whose parameter is "
+        "already below the tolerance."
+    )
 
 
 class TrustFunnelTerminationMetrics(
@@ -166,6 +170,10 @@ class TrustFunnelInteriorPointResultAdapter(
                 TRUST_FUNNEL_INTERIOR_POINT_RESULTS.multiplier_solve_failure,
                 optx.RESULTS.singular,
             ),
+            (
+                TRUST_FUNNEL_INTERIOR_POINT_RESULTS.trust_region_collapse,
+                optx.RESULTS.stagnation,
+            ),
         )
         for native, optimistix in mappings:
             coarse = optx.RESULTS.where(result == native, optimistix, coarse)
@@ -238,13 +246,27 @@ class TrustFunnelInteriorPointMinimiser(
     and reported as ``stationarity_stall`` otherwise. There is no relative
     tolerance, so passing ``rtol`` raises.
 
-    When the model uses a secant, the ``model`` channel of
-    :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` is fed by a
-    streak of steps at which both trust-region radii collapsed below
-    ``radius_floor * max(1, ‖x‖)`` while unconverged, or the step was
-    rejected with a ratio below :attr:`model_failure_rho`, or (Lemmas
-    4.8–4.10) the governing radius collapsed while the matching criticality
-    measure was still above its tolerance.
+    The inner loop also has an ``xtol``-style exit (trust-constr's
+    ``tr_radius < xtol``): when both trust-region radii have fallen below
+    ``radius_floor * max(1, ‖x‖)``, or an f-iteration was rejected with a
+    predicted barrier decrease at the rounding level of the barrier value
+    (``StepResult.rounding_level``; a rounding-level v-iteration only says
+    the violation is already at its floor), the current barrier subproblem
+    is solved to working precision whatever (3.15a) says. ``μ`` is then
+    reduced through :attr:`barrier_update` (``force=True``) and Algorithm 2
+    restarts exactly as after an ordinary ``μ`` reduction. The run stops
+    with :attr:`TRUST_FUNNEL_INTERIOR_POINT_RESULTS.trust_region_collapse`
+    when the exit fires again with ``μ`` already at or below ``atol`` and
+    no step was accepted since the previous exit, or when the schedule
+    could not reduce ``μ`` any further.
+
+    When the model uses a secant, a radius collapse on a *rejected* step
+    whose predicted decrease was above rounding level (the model claimed a
+    decrease that never materialised, down to the floor) is reported to the
+    ``model`` channel of
+    :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` as a model
+    stall (switch with :attr:`collapse_resets_secant`). Ordinary rejections
+    only shrink the radii and are not reported.
 
     **Diagnostics.** Every step folds the committed state into a
     :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`
@@ -260,8 +282,10 @@ class TrustFunnelInteriorPointMinimiser(
     diagnostics channel on, the ``"step"`` payload carries the whole carry
     plus the multiplier statistics (``‖y‖``, ``min y``, ``‖Sy − μe‖``,
     ``κ_y(μ)``, the ``κ_D(μ)`` cap hits), each ``μ`` reduction emits a
-    ``"barrier_update"`` record (``πᶠ, v`` against ``ε_π(μ), ε_v(μ)``), and
-    the solver emits one ``"funnel_step"`` record per solve.
+    ``"barrier_update"`` record (``πᶠ, v`` against ``ε_π(μ), ε_v(μ)``, the
+    scaled KKT error against ``κ_ε μ`` and whether the inner-loop exit
+    forced the reduction), and the solver emits one ``"funnel_step"``
+    record per solve.
 
     Attributes
     ----------
@@ -283,8 +307,11 @@ class TrustFunnelInteriorPointMinimiser(
     stall_steps
         Number of consecutive y-iterations at fixed ``μ`` after which the
         loop is declared stalled.
-    radius_floor, model_failure_rho
-        Model-stall detection constants (see above).
+    radius_floor
+        Relative radius floor of the inner-loop exit (see above).
+    collapse_resets_secant
+        Report a radius collapse on a rejected, non-rounding-level step as a
+        model stall to the secant reset policy.
     multiplier_failure_steps
         Number of consecutive unhealthy y-iterations after which the run
         ends with ``multiplier_solve_failure``.
@@ -299,6 +326,12 @@ class TrustFunnelInteriorPointMinimiser(
     consecutive_y_iterations
         Dynamic count of consecutive y-iterations since the last primal
         move or ``μ`` reduction.
+    exit_without_progress
+        Dynamic flag: the last inner-loop exit has not been followed by an
+        accepted step yet.
+    trust_region_collapsed
+        Dynamic flag set when the inner-loop exit exhausted the barrier
+        schedule (see above); read by :meth:`termination_flags`.
     funnel_diagnostics
         Dynamic :class:`~slsqp_jax.sqpdax.minimiser.funnel_diagnostics.FunnelDiagnostics`
         carry.
@@ -320,9 +353,9 @@ class TrustFunnelInteriorPointMinimiser(
     kappa_t2: float = eqx.field(static=True, default=0.5)
     infeasibility_tol: float = eqx.field(static=True, default=1e-8)
     stall_steps: int = eqx.field(static=True, default=5)
-    # secant model-stall detection (feeds the ``model`` reset channel)
+    # inner-loop exit and secant model-stall detection
     radius_floor: float = eqx.field(static=True, default=1e-8)
-    model_failure_rho: float = eqx.field(static=True, default=-1.0)
+    collapse_resets_secant: bool = eqx.field(static=True, default=True)
     # diagnostics policy
     multiplier_failure_steps: int = eqx.field(static=True, default=5)
     strict_checks: bool = eqx.field(static=True, default=False)
@@ -332,6 +365,12 @@ class TrustFunnelInteriorPointMinimiser(
     )
     consecutive_y_iterations: Int[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    exit_without_progress: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    trust_region_collapsed: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
     )
     funnel_diagnostics: FunnelDiagnostics = eqx.field(
         default_factory=lambda: FunnelDiagnostics.zero(0.0)
@@ -398,13 +437,18 @@ class TrustFunnelInteriorPointMinimiser(
     def _init_dynamics(
         self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
     ) -> Self:
-        """Seed the secant and barrier (via super) and zero both streaks."""
+        """Seed the secant and barrier (via super) and clear the stall carry."""
         base = super()._init_dynamics(problem, x0)
         zero = jnp.asarray(0, jnp.int32)
         return eqx.tree_at(
-            lambda m: (m.consecutive_model_failures, m.consecutive_y_iterations),
+            lambda m: (
+                m.consecutive_model_failures,
+                m.consecutive_y_iterations,
+                m.exit_without_progress,
+                m.trust_region_collapsed,
+            ),
             base,
-            (zero, zero),
+            (zero, zero, jnp.asarray(False), jnp.asarray(False)),
         )
 
     def _funnel_radius(self, violation: Scalar) -> Scalar:
@@ -561,11 +605,18 @@ class TrustFunnelInteriorPointMinimiser(
         ``solver_state`` were committed. The slack reset rewrites the
         committed iterate (``x`` is untouched, so the secant pair just
         appended is unaffected). The barrier test is then evaluated at the
-        reset iterate; when it passes, ``μ`` is reduced and Algorithm 2 is
-        restarted: both radii return to their initial values, ``v_max`` is
-        re-seeded from the current violation, the ``S_f`` flag and
-        ``πᶠ_{k−1}`` are cleared, and the state's tolerances follow the new
-        ``μ``.
+        reset iterate; when it passes — or the inner-loop exit fires (both
+        radii below ``radius_floor * max(1, ‖x‖)`` or a rounding-level
+        f-iteration rejection, while the unperturbed KKT error is still
+        above ``atol``) — ``μ`` is reduced and Algorithm 2 is restarted:
+        both radii return to their initial values, ``v_max`` is re-seeded
+        from the current violation, the ``S_f`` flag and ``πᶠ_{k−1}`` are
+        cleared, and the state's tolerances follow the new ``μ``. An
+        inner-loop exit with ``μ`` already at or below ``atol`` and no
+        accepted step since the previous exit, or one at which ``μ`` could
+        not be reduced, raises :attr:`trust_region_collapsed`. The
+        model-stall streak counts consecutive collapses on rejected steps
+        whose predicted decrease was above rounding level.
 
         Parameters
         ----------
@@ -580,8 +631,9 @@ class TrustFunnelInteriorPointMinimiser(
         -------
         Self
             Minimiser with ``iterate``, ``solver_state``, ``barrier``,
-            ``barrier_updated``, ``consecutive_model_failures`` and
-            ``consecutive_y_iterations`` refreshed.
+            ``barrier_updated``, ``consecutive_model_failures``,
+            ``consecutive_y_iterations``, ``exit_without_progress`` and
+            ``trust_region_collapsed`` refreshed.
         """
         lag_module = cast(InteriorPointLagrangian, ctx.lagrangian)
         solver = cast(TrustFunnelSolver, ctx.solver)
@@ -592,13 +644,35 @@ class TrustFunnelInteriorPointMinimiser(
         pi_f = sub.pi_f(sub._zero_primal(), step_dual)
         v = sub.violation()
         old_mu = cast(Barrier, self.barrier).weight
-        new_barrier, solved = self.barrier_update.update(
-            cast(Barrier, self.barrier), lagrangian, pi_f=pi_f, v=v
-        )
-        new_mu = new_barrier.weight
 
         controlled = cast(TrustFunnelSolverState, self.solver_state)
         dtype = controlled.radius_v.dtype
+        unconverged = (
+            self.barrier_update.optimality_residual(lagrangian, jnp.asarray(0.0))
+            > self.atol
+        )
+        x_norm = jnp.linalg.norm(iterate.x)
+        x_scale = jnp.maximum(1.0, x_norm)
+        radius = jnp.maximum(controlled.radius_v, controlled.radius_f)
+        collapsed = radius < self.radius_floor * x_scale
+        rejected = ~result.accepted
+        # xtol-style exit: the barrier subproblem is solved to working precision.
+        # Only an f-iteration's rounding-level rejection speaks about BSP(μ).
+        rounding_f = result.rounding_level & (
+            controlled.iteration_type == IterationType.f_iteration
+        )
+        finished = (collapsed | (rejected & rounding_f)) & unconverged
+        new_barrier, solved = self.barrier_update.update(
+            cast(Barrier, self.barrier), lagrangian, pi_f=pi_f, v=v, force=finished
+        )
+        new_mu = new_barrier.weight
+        # The previous exit is still "without progress" if this step was not
+        # accepted either; a second exit then shows that reducing ``μ`` did
+        # not unlock anything. A ``μ`` the schedule cannot reduce is final.
+        no_progress = self.exit_without_progress & rejected
+        exhausted = finished & (
+            ((old_mu <= self.atol) & no_progress) | (new_mu >= old_mu)
+        )
 
         def reseed(fresh, current):
             return jnp.where(solved, jnp.asarray(fresh, dtype), current)
@@ -628,16 +702,11 @@ class TrustFunnelInteriorPointMinimiser(
             ),
         )
 
-        unconverged = (
-            self.barrier_update.optimality_residual(lagrangian, jnp.asarray(0.0))
-            > self.atol
-        )
-        x_norm = jnp.linalg.norm(iterate.x)
-        x_scale = jnp.maximum(1.0, x_norm)
-        radius = jnp.maximum(state.radius_v, state.radius_f)
-        radius_collapse = (radius < self.radius_floor * x_scale) & unconverged
-        model_failure = ~result.accepted & (state.rho < self.model_failure_rho)
-        stall = radius_collapse | model_failure
+        # A collapse on a rejected step whose model still claimed a decrease is
+        # evidence against the model; one at rounding level is not.
+        stall = collapsed & rejected & ~result.rounding_level & unconverged
+        if not self.collapse_resets_secant:
+            stall = jnp.asarray(False)
         streak = jnp.where(stall, self.consecutive_model_failures + 1, 0).astype(
             jnp.int32
         )
@@ -680,6 +749,11 @@ class TrustFunnelInteriorPointMinimiser(
                 "eps_pi_new": state.eps_pi,
                 "eps_v_new": state.eps_v,
                 "v_max_new": state.v_max,
+                "kkt_error_mu": self.barrier_update.scaled_optimality_residual(
+                    lagrangian, old_mu
+                ),
+                "kappa_eps": self.barrier_update.kappa_eps,
+                "forced": finished,
                 "diagnostics": diagnostics,
             },
             when=solved,
@@ -690,16 +764,22 @@ class TrustFunnelInteriorPointMinimiser(
             v=v,
         )
         self.logger.warning(
-            "model stall: radius_collapse={collapse} model_failure={failure} "
+            "model stall: trust region collapsed on a rejected step "
             "rho={rho:.3e} radius_v={radius_v:.3e} radius_f={radius_f:.3e} "
             "consecutive={streak}",
             when=stall,
-            collapse=radius_collapse,
-            failure=model_failure,
-            rho=state.rho,
-            radius_v=state.radius_v,
-            radius_f=state.radius_f,
+            rho=controlled.rho,
+            radius_v=controlled.radius_v,
+            radius_f=controlled.radius_f,
             streak=streak,
+        )
+        self.logger.info(
+            "inner-loop exit: collapsed={collapsed} rounding_level={rounding} "
+            "mu={mu:.3e}",
+            when=finished,
+            collapsed=collapsed,
+            rounding=result.rounding_level,
+            mu=old_mu,
         )
         self.logger.info(
             "barrier subproblem solved: pi_f={pi_f:.3e} v={v:.3e}; mu={mu:.3e} "
@@ -726,10 +806,22 @@ class TrustFunnelInteriorPointMinimiser(
                 m.barrier_updated,
                 m.consecutive_model_failures,
                 m.consecutive_y_iterations,
+                m.exit_without_progress,
+                m.trust_region_collapsed,
                 m.funnel_diagnostics,
             ),
             self,
-            (iterate, state, new_barrier, solved, streak, y_streak, diagnostics),
+            (
+                iterate,
+                state,
+                new_barrier,
+                solved,
+                streak,
+                y_streak,
+                finished | no_progress,
+                self.trust_region_collapsed | exhausted,
+                diagnostics,
+            ),
         )
 
     # ============================= diagnostics =============================
@@ -1113,7 +1205,13 @@ class TrustFunnelInteriorPointMinimiser(
         gated by ``min_steps`` like the convergence test, so the loop always
         takes at least ``min_steps`` steps before giving up. Under
         ``strict_checks`` a failed invariant or Cauchy check is fatal
-        immediately.
+        immediately. Convergence is decided from the KKT error of the
+        current iterate alone and outranks the fatal flags of the last step
+        (``classify_termination`` ranks ``converged`` above ``fatal``), so a
+        rejected step or an exhausted secant recovery at a solution still
+        terminates successfully. A raised :attr:`trust_region_collapsed`
+        flag is fatal with ``trust_region_collapse`` and outranks the other
+        fatal codes.
 
         Parameters
         ----------
@@ -1141,17 +1239,22 @@ class TrustFunnelInteriorPointMinimiser(
         checks_fatal = jnp.asarray(self.strict_checks) & (
             metrics.invariant_violated | metrics.cauchy_violated
         )
-        fatal = subproblem_fatal | recovery_fatal | stopped | checks_fatal
+        collapsed = self.trust_region_collapsed
+        fatal = subproblem_fatal | recovery_fatal | stopped | checks_fatal | collapsed
         converged = (
             (metrics.optimality_residual <= self.atol)
             & metrics.has_min_steps
             & ~nonfinite
-            & ~fatal
         )
         fatal_result = TRUST_FUNNEL_INTERIOR_POINT_RESULTS.where(
             recovery_fatal,
             TRUST_FUNNEL_INTERIOR_POINT_RESULTS.secant_recovery_failure,
             metrics.fatal_result,
+        )
+        fatal_result = TRUST_FUNNEL_INTERIOR_POINT_RESULTS.where(
+            collapsed,
+            TRUST_FUNNEL_INTERIOR_POINT_RESULTS.trust_region_collapse,
+            fatal_result,
         )
         return cast(
             TerminationFlags,

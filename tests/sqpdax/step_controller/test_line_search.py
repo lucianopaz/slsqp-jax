@@ -183,6 +183,23 @@ def test_nonfinite_direction_skips_trial_evaluations(direction):
     assert ascent == baseline + ls.max_steps
 
 
+@pytest.mark.parametrize(
+    ("x0", "expected"),
+    [(1e-9, True), (1.0, False)],
+    ids=["rounding-level-slope", "resolvable-slope"],
+)
+def test_line_search_flags_rounding_level_slopes(x0, expected):
+    """``rounding_level`` is ``|∇φᵀd| <= 100 eps max(1, |φ(x0)|)`` on ``f = ‖x‖²``.
+
+    From ``x0 = 1e-9`` with ``d = -x0`` the slope is ``-2e-18``, far below the
+    rounding level of ``φ = 1e-18``; from ``x0 = 1`` it is ``-2``.
+    """
+    ls = make_armijo(max_steps=20)
+    x = Primal(jnp.array([x0, 0.0]))
+    result = ls.step(x, Primal(-x.x))
+    assert bool(result.rounding_level) is expected
+
+
 def test_armijo_small_alpha_decrease_fallback():
     """Strict ``c1`` can fail Armijo while the α < 0.1 decrease fallback accepts."""
     ls = make_armijo(max_steps=20)

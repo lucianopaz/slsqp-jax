@@ -3,7 +3,12 @@
 Commands
 --------
 catalog
-    Regenerate ``benchmarks/catalog.csv`` from the installed sif2jax.
+    Regenerate ``benchmarks/catalog.csv`` from the installed sif2jax
+    (validation columns of the existing CSV are carried over).
+validate
+    Check every instance's inequality sign convention and reference
+    objective against scipy SLSQP / trust-constr and record the outcome in
+    the catalogue (``ineq_flip``, validated ``fstar``, ``valid``).
 run
     Benchmark a selection of catalogue instances against solver configs,
     appending rows to ``<out>/results.jsonl`` as they complete.
@@ -79,14 +84,55 @@ def _fmt_time(seconds: float | None) -> str:
 
 # -------------------------------------------------------------------------- commands
 def cmd_catalog(args: argparse.Namespace) -> int:
+    import pandas as pd
+
     from .catalog import CATALOG_PATH, COLLECTIONS, build_catalog
 
     collections = _csv_list(args.collections) or list(COLLECTIONS)
-    frame = build_catalog(collections)
     out = Path(args.out) if args.out else CATALOG_PATH
+    previous = None
+    if not args.drop_validation and out.exists():
+        previous = pd.read_csv(out)
+    frame = build_catalog(collections, previous=previous)
     frame.to_csv(out, index=False)
     print(f"wrote {len(frame)} instances to {out}")
     print(frame.groupby(["collection", "tier"]).size().to_string())
+    if "validation" in frame:
+        print(frame["validation"].value_counts().to_string())
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    from .catalog import CATALOG_PATH
+    from .validate import validate_catalog_file
+
+    _configure_environment(args.device, args.jobs)
+    path = Path(args.catalog) if args.catalog else CATALOG_PATH
+    frame = validate_catalog_file(
+        path,
+        out=Path(args.out) if args.out else None,
+        jobs=args.jobs,
+        max_steps=args.max_steps,
+        timeout_s=args.timeout,
+        tc_max_n=args.tc_max_n,
+        max_n=args.max_n,
+        names=_csv_list(args.problems),
+    )
+    print(frame["validation"].value_counts().to_string())
+    flipped = frame[frame["ineq_flip"].astype(str).str.len() > 0]
+    if len(flipped):
+        print(f"{len(flipped)} instances with flipped inequality rows:")
+        print(
+            flipped[["name", "y0_iD", "ineq_flip", "validation"]].to_string(index=False)
+        )
+    invalid = frame[~frame["valid"].astype(bool)]
+    if len(invalid):
+        print(f"{len(invalid)} instances marked invalid:")
+        print(
+            invalid[["name", "y0_iD", "validation", "validation_note"]].to_string(
+                index=False
+            )
+        )
     return 0
 
 
@@ -443,7 +489,32 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("catalog", help="regenerate benchmarks/catalog.csv")
     p.add_argument("--collections", help="comma-separated subset of collections")
     p.add_argument("--out", help="output CSV path (default: benchmarks/catalog.csv)")
+    p.add_argument(
+        "--drop-validation",
+        action="store_true",
+        help="do not carry the validation columns over from the existing CSV",
+    )
     p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser(
+        "validate",
+        help="validate sign conventions and reference values with scipy (updates the CSV)",
+    )
+    p.add_argument("--catalog", help="catalogue CSV (default: benchmarks/catalog.csv)")
+    p.add_argument("--out", help="destination CSV (default: overwrite --catalog)")
+    p.add_argument("--problems", help="comma-separated problem names to validate")
+    p.add_argument("--max-n", type=int, help="skip instances with more variables")
+    p.add_argument(
+        "--tc-max-n",
+        type=int,
+        default=300,
+        help="largest n for which trust-constr is run (default: 300)",
+    )
+    p.add_argument("--max-steps", type=int, default=500, help="scipy maxiter")
+    p.add_argument("--timeout", type=float, default=600.0, help="per-instance seconds")
+    p.add_argument("--jobs", type=int, default=1, help="concurrent worker processes")
+    p.add_argument("--device", help="JAX platform (cpu, gpu, ...); sets JAX_PLATFORMS")
+    p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("run", help="run benchmark tasks")
     p.add_argument(

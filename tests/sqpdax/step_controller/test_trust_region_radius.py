@@ -107,6 +107,22 @@ def test_trust_region_grow_respects_max_radius():
     assert jnp.isclose(result.solver_state.radius, 3.0)
 
 
+@pytest.mark.parametrize(
+    ("predicted_in_eps", "expected"),
+    [(10.0, True), (1e6, False)],
+    ids=["rounding-level", "resolvable"],
+)
+def test_trust_region_flags_rounding_level_predictions(predicted_in_eps, expected):
+    """A tiny predicted reduction is reported as ``rounding_level`` (merit ``1``)."""
+    mgr = make_tr_manager()
+    x0 = Primal(jnp.array([1.0, 0.0]))
+    eps = float(jnp.finfo(x0.x.dtype).eps)
+    state0 = make_tr_state(radius=1.0, predicted_reduction=predicted_in_eps * eps)
+    result = mgr.step(x0, Primal(jnp.array([1e-3, 0.0])), state0)
+    assert not bool(result.accepted)
+    assert bool(result.rounding_level) is expected
+
+
 def test_trust_region_requires_trust_region_state():
     """Wrong / missing solver state raises ``TypeError``."""
     mgr = make_tr_manager()

@@ -22,6 +22,7 @@ from slsqp_jax.sqpdax.minimiser import (
     minimise,
 )
 from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Slack
+from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem import FunnelBarrierSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     IterationType,
@@ -349,6 +350,197 @@ def test_termination_classifies_y_iteration_streaks(y_streak, violation, expecte
         assert result == getattr(TRUST_FUNNEL_INTERIOR_POINT_RESULTS, expected)
 
 
+def _advance(
+    solver,
+    problem,
+    *,
+    radius,
+    accepted,
+    rounding_level,
+    mu=None,
+    iteration_type=IterationType.f_iteration,
+    prior_exit=False,
+):
+    """Run ``_advance_dynamics`` on a synthetic step outcome.
+
+    ``_execute_step`` commits the controller state before calling
+    ``_advance_dynamics``, so the synthetic state is set on the solver too.
+    """
+    state = eqx.tree_at(
+        lambda s: (s.radius_v, s.radius_f, s.rho, s.iteration_type),
+        solver.solver_state,
+        (jnp.asarray(radius), jnp.asarray(radius), jnp.asarray(-5.0), iteration_type),
+    )
+    solver = eqx.tree_at(
+        lambda m: (m.solver_state, m.exit_without_progress),
+        solver,
+        (state, jnp.asarray(prior_exit)),
+    )
+    if mu is not None:
+        solver = eqx.tree_at(
+            lambda m: m.barrier.weight,
+            solver,
+            jnp.asarray(mu, solver.barrier.weight.dtype),
+        )
+    ctx = solver._init_subproblem(problem)
+    result = StepResult(
+        x=solver.iterate,
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(0.0),
+        solver_state=state,
+        step_size=jnp.asarray(1.0 if accepted else 0.0),
+        proposed_step_norm=jnp.asarray(1.0),
+        rounding_level=jnp.asarray(rounding_level),
+    )
+    return solver._advance_dynamics(ctx, result, solver.dual)
+
+
+@pytest.mark.parametrize(
+    (
+        "radius",
+        "accepted",
+        "rounding_level",
+        "iteration_type",
+        "atol",
+        "collapse_resets_secant",
+        "expected_streak",
+        "expected_exit",
+    ),
+    [
+        (1e-12, False, False, IterationType.f_iteration, 1e-6, True, 3, True),
+        (1e-12, False, False, IterationType.f_iteration, 1e-6, False, 0, True),
+        (1e-12, False, True, IterationType.f_iteration, 1e-6, True, 0, True),
+        (1e-12, True, False, IterationType.f_iteration, 1e-6, True, 0, True),
+        (1e-12, False, False, IterationType.f_iteration, 1e6, True, 0, False),
+        (1.0, False, True, IterationType.f_iteration, 1e-6, True, 0, True),
+        (1.0, False, True, IterationType.v_iteration, 1e-6, True, 0, False),
+        (1.0, False, False, IterationType.f_iteration, 1e-6, True, 0, False),
+    ],
+    ids=[
+        "collapse-rejected",
+        "collapse-rejected-no-secant-signal",
+        "collapse-rejected-at-rounding-level",
+        "collapse-accepted",
+        "collapse-converged",
+        "rounding-level-f-rejection",
+        "rounding-level-v-rejection",
+        "healthy-rejection",
+    ],
+)
+def test_advance_dynamics_inner_loop_exit_and_model_stall_streak(
+    radius,
+    accepted,
+    rounding_level,
+    iteration_type,
+    atol,
+    collapse_resets_secant,
+    expected_streak,
+    expected_exit,
+):
+    """The xtol exit reduces ``μ`` and restarts the funnel; stalls are narrower.
+
+    The exit fires on a collapse of both radii or a rounding-level
+    f-iteration rejection while unconverged (``atol=1e6`` silences both; a
+    rounding-level v-iteration is not an exit). Only a collapse on a
+    rejected step with a resolvable predicted decrease extends the
+    model-stall streak (never with ``collapse_resets_secant=False``). The
+    counter is seeded at ``2`` so an increment is distinguishable from a
+    reset. ``kappa_eps=0`` disables the alternative KKT test of the funnel
+    update so that only (3.15a) or the forced exit can reduce ``μ``; the
+    quartic's start point does not satisfy (3.15a) at ``μ = 0.1``.
+    """
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = funnel_minimiser(
+        atol=atol,
+        initial_radius_v=2.0,
+        initial_radius_f=3.0,
+        collapse_resets_secant=collapse_resets_secant,
+        barrier_update=FunnelBarrierUpdate(kappa_eps=0.0),
+    ).init(problem, jnp.array([0.5, 0.3, 0.2]))
+    solver = eqx.tree_at(
+        lambda m: m.consecutive_model_failures, solver, jnp.asarray(2, jnp.int32)
+    )
+    mu_old = float(solver.barrier.weight)
+
+    advanced = _advance(
+        solver,
+        problem,
+        radius=radius,
+        accepted=accepted,
+        rounding_level=rounding_level,
+        iteration_type=iteration_type,
+    )
+
+    assert int(advanced.consecutive_model_failures) == expected_streak
+    assert int(advanced._secant_reset_signals().model_streak) == expected_streak
+    assert not bool(advanced.trust_region_collapsed)
+    assert bool(advanced.barrier_updated) is expected_exit
+    assert bool(advanced.exit_without_progress) is expected_exit
+    if expected_exit:
+        assert float(advanced.barrier.weight) < mu_old
+        assert float(advanced.solver_state.radius_v) == pytest.approx(2.0)
+        assert float(advanced.solver_state.radius_f) == pytest.approx(3.0)
+    else:
+        assert float(advanced.barrier.weight) == pytest.approx(mu_old)
+        assert float(advanced.solver_state.radius_v) == pytest.approx(radius)
+
+
+@pytest.mark.parametrize(
+    ("mu", "prior_exit", "exhausted"),
+    [
+        (1e-8, True, True),
+        (1e-8, False, False),
+        (1e-3, True, False),
+        (1e-11, False, True),
+    ],
+    ids=["repeat-below-atol", "first-below-atol", "repeat-above-atol", "mu-floor"],
+)
+def test_collapse_below_barrier_tolerance_terminates_with_dedicated_result(
+    mu, prior_exit, exhausted
+):
+    """A collapse ends the run with ``trust_region_collapse`` only once
+    ``μ <= atol`` and the previous exit saw no accepted step, or ``μ`` sits
+    at ``mu_min`` and cannot be reduced."""
+    problem = make_scaled_quartic(with_curvature=False)
+    x0 = jnp.array([0.5, 0.3, 0.2])
+    solver = funnel_minimiser(min_steps=0).init(problem, x0)
+    advanced = _advance(
+        solver,
+        problem,
+        radius=1e-12,
+        accepted=False,
+        rounding_level=False,
+        mu=mu,
+        prior_exit=prior_exit,
+    )
+    assert bool(advanced.exit_without_progress)
+    assert bool(advanced.trust_region_collapsed) is exhausted
+    done, result = advanced.terminate(problem)
+    assert bool(done) is exhausted
+    if exhausted:
+        assert result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.trust_region_collapse
+        assert not bool(advanced.result_adapter.is_successful(result))
+    fresh = advanced.init(problem, x0)
+    assert not bool(fresh.trust_region_collapsed)
+    assert not bool(fresh.exit_without_progress)
+
+
+def test_kkt_test_outranks_an_exhausted_secant_recovery():
+    """``E(·; 0) <= atol`` at the iterate is a success even with a fatal flag."""
+    problem = make_unconstrained_quadratic()
+    solver = funnel_minimiser(min_steps=0).init(problem, jnp.zeros(2))
+    exhausted = eqx.tree_at(
+        lambda m: m.secant_recovery_state.fatal, solver, jnp.asarray(True)
+    )
+    done, result = exhausted.terminate(problem)
+    assert bool(done)
+    assert result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.successful
+    away = eqx.tree_at(lambda m: m.iterate.x, exhausted, jnp.ones(2))
+    done, result = away.terminate(problem)
+    assert bool(done)
+    assert result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.secant_recovery_failure
+
+
 def test_infeasible_problem_terminates_as_infeasible_stationary():
     """Incompatible constraints end at Step 8 rather than exhausting the budget."""
     problem = make_infeasible_problem()
@@ -583,7 +775,9 @@ def test_y_iteration_streak_logs_warning_and_stalls(x64):
         )
     assert sol.result == TRUST_FUNNEL_INTERIOR_POINT_RESULTS.infeasible_stationary_point
     assert int(sol.stats["num_steps"]) == 3
-    assert int(sol.state.consecutive_y_iterations) == 3
+    # ``E(·; μ₀) = v = 1 = κ_ε μ₀`` sits exactly on the KKT test of the barrier
+    # update, so the first step may reduce ``μ`` and restart the streak.
+    assert 2 <= int(sol.state.consecutive_y_iterations) <= 3
     assert bool(metrics.stalled)
     steps = [r.message for r in handler.records if r.message.startswith("step=")]
     assert all("type=y_iteration" in m for m in steps)

@@ -62,13 +62,25 @@ class BarrierUpdate(KindRegistryMixin, Module):
     :class:`~typing.ClassVar` via
     :class:`~slsqp_jax.sqpdax.registry.KindRegistryMixin` and can be built
     with :meth:`from_spec`.
+
+    Attributes
+    ----------
+    scale_max
+        ``s_max`` of the multiplier scaling in
+        :meth:`scaled_optimality_residual` (IPOPT's default is ``100``).
     """
 
     _registry: ClassVar[dict] = {}
 
+    scale_max: float = eqx.field(default=100.0)
+
     @abstractmethod
     def update(
-        self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
+        self,
+        barrier: Barrier,
+        lag: InteriorPointEvaluatedLagrangian,
+        *,
+        force: Bool[Array, ""] | None = None,
     ) -> tuple[Barrier, Bool[Array, ""]]:
         """Return a copy of ``barrier`` with an updated weight.
 
@@ -78,6 +90,11 @@ class BarrierUpdate(KindRegistryMixin, Module):
             Current unevaluated barrier (source of ``μ = barrier.weight``).
         lag
             Interior-point Lagrangian evaluation at the current iterate.
+        force
+            When ``True`` the barrier subproblem is declared finished
+            regardless of the policy's own test and ``μ`` is reduced: the
+            minimiser uses this when its trust region has collapsed on the
+            current subproblem (the ``xtol``-style exit of the inner loop).
 
         Returns
         -------
@@ -91,6 +108,10 @@ class BarrierUpdate(KindRegistryMixin, Module):
             interior-point minimiser reads as part of its convergence check.
         """
         ...  # pragma: no cover
+
+    @staticmethod
+    def _forced(force: Bool[Array, ""] | None) -> Bool[Array, ""]:
+        return jnp.asarray(False) if force is None else jnp.asarray(force)
 
     def complementarity(self, lag: InteriorPointEvaluatedLagrangian) -> Scalar:
         """Average complementarity ``sᵀ z / m`` over non-null slack/mult pairs.
@@ -116,16 +137,10 @@ class BarrierUpdate(KindRegistryMixin, Module):
         m = slack.s.shape[-1] + jnp.sum(~lag.null_lb) + jnp.sum(~lag.null_ub)
         return (comp_ineq + comp_lb + comp_ub) / jnp.maximum(m, 1)
 
-    def optimality_residual(
+    def residual_components(
         self, lag: InteriorPointEvaluatedLagrangian, mu: Scalar
-    ) -> Scalar:
-        """KKT error ``E(x, s; μ)`` of the perturbed system (N&W eq. 19.8–19.9).
-
-        The max of the inf-norms of (i) the dual stationarity residual
-        ``∇_x L``, (ii) the primal-feasibility residual (constraint values
-        stored on ``dual_grad``), and (iii) the perturbed complementarity
-        ``s ⊙ z − μ`` over the non-null pairs. Unscaled: the N&W ``s_d`` /
-        ``s_c`` scaling factors are a documented extension.
+    ) -> tuple[Scalar, Scalar, Scalar]:
+        """Stationarity, feasibility and complementarity parts of ``E(x, s; μ)``.
 
         Parameters
         ----------
@@ -136,8 +151,9 @@ class BarrierUpdate(KindRegistryMixin, Module):
 
         Returns
         -------
-        Scalar
-            ``max(‖∇_x L‖_∞, ‖c‖_∞, ‖s ⊙ z − μ‖_∞)``.
+        tuple[Scalar, Scalar, Scalar]
+            ``(‖∇_x L‖_∞, ‖c‖_∞, ‖s ⊙ z − μ‖_∞)`` with the complementarity
+            taken over the non-null slack / multiplier pairs.
         """
         stationarity = _inf_norm(lag.x_grad)
 
@@ -161,16 +177,94 @@ class BarrierUpdate(KindRegistryMixin, Module):
         complementarity = jnp.max(
             jnp.stack([_inf_norm(comp_ineq), _inf_norm(comp_lb), _inf_norm(comp_ub)])
         )
+        return stationarity, feasibility, complementarity
 
-        return jnp.max(jnp.stack([stationarity, feasibility, complementarity]))
+    def optimality_residual(
+        self, lag: InteriorPointEvaluatedLagrangian, mu: Scalar
+    ) -> Scalar:
+        """KKT error ``E(x, s; μ)`` of the perturbed system (N&W eq. 19.8–19.9).
+
+        The max of the inf-norms of (i) the dual stationarity residual
+        ``∇_x L``, (ii) the primal-feasibility residual (constraint values
+        stored on ``dual_grad``), and (iii) the perturbed complementarity
+        ``s ⊙ z − μ`` over the non-null pairs. Unscaled; see
+        :meth:`scaled_optimality_residual` for the multiplier-scaled form.
+
+        Parameters
+        ----------
+        lag
+            Interior-point Lagrangian evaluation at the current iterate.
+        mu
+            Barrier parameter used in the complementarity residual.
+
+        Returns
+        -------
+        Scalar
+            ``max(‖∇_x L‖_∞, ‖c‖_∞, ‖s ⊙ z − μ‖_∞)``.
+        """
+        return jnp.max(jnp.stack(self.residual_components(lag, mu)))
+
+    def scaled_optimality_residual(
+        self, lag: InteriorPointEvaluatedLagrangian, mu: Scalar
+    ) -> Scalar:
+        """Multiplier-scaled KKT error of the barrier problem.
+
+        The stationarity and complementarity parts of
+        :meth:`optimality_residual` are divided by the IPOPT scaling factors
+
+        ```
+        s_d = max(s_max, (‖y‖₁ + ‖z‖₁) / (m + p)) / s_max
+        s_c = max(s_max, ‖z‖₁ / p) / s_max
+        ```
+
+        (Wächter & Biegler 2006, eq. 5; N&W §19.3 ``s_d`` / ``s_c``), where
+        ``y`` are the ``m`` equality multipliers, ``z`` the ``p``
+        multipliers of the non-null slack pairs (general inequalities and
+        bounds) and ``s_max`` = :attr:`scale_max`. Large multipliers
+        otherwise make the stationarity residual of a well-solved barrier
+        problem look large relative to ``μ``, so this is the error the
+        ``μ``-proportional inner tests compare against ``kappa_eps * μ``.
+
+        Parameters
+        ----------
+        lag
+            Interior-point Lagrangian evaluation at the current iterate.
+        mu
+            Barrier parameter used in the complementarity residual.
+
+        Returns
+        -------
+        Scalar
+            ``max(‖∇_x L‖_∞ / s_d, ‖c‖_∞, ‖s ⊙ z − μ‖_∞ / s_c)``.
+        """
+        stationarity, feasibility, complementarity = self.residual_components(lag, mu)
+        dual = lag.dual
+        z_sum = (
+            jnp.sum(jnp.abs(dual.ineq_multipliers))
+            + jnp.sum(jnp.where(lag.null_lb, 0.0, jnp.abs(dual.lb_multipliers)))
+            + jnp.sum(jnp.where(lag.null_ub, 0.0, jnp.abs(dual.ub_multipliers)))
+        )
+        y_sum = jnp.sum(jnp.abs(dual.eq_multipliers))
+        p = jnp.maximum(
+            lag.slack.s.shape[-1] + jnp.sum(~lag.null_lb) + jnp.sum(~lag.null_ub), 1
+        )
+        m = dual.eq_multipliers.shape[-1]
+        s_max = jnp.asarray(self.scale_max, stationarity.dtype)
+        s_d = jnp.maximum(s_max, (y_sum + z_sum) / (m + p)) / s_max
+        s_c = jnp.maximum(s_max, z_sum / p) / s_max
+        return jnp.max(
+            jnp.stack([stationarity / s_d, feasibility, complementarity / s_c])
+        )
 
 
 class MonotoneBarrierUpdate(BarrierUpdate):
     """Fiacco–McCormick monotone reduction (N&W Algorithm 19.6).
 
     Reduces ``μ`` by ``sigma`` once the current barrier subproblem is solved
-    to the tolerance ``E(x, s; μ) ≤ kappa_eps * μ``; otherwise ``μ`` is held
-    so the current subproblem can be solved further. Floored at ``mu_min``.
+    to the tolerance ``E(x, s; μ) ≤ kappa_eps * μ`` on the multiplier-scaled
+    error of :meth:`~BarrierUpdate.scaled_optimality_residual`; otherwise
+    ``μ`` is held so the current subproblem can be solved further. Floored
+    at ``mu_min``.
 
     Attributes
     ----------
@@ -191,7 +285,11 @@ class MonotoneBarrierUpdate(BarrierUpdate):
     mu_min: float = eqx.field(default=1e-11)
 
     def update(
-        self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
+        self,
+        barrier: Barrier,
+        lag: InteriorPointEvaluatedLagrangian,
+        *,
+        force: Bool[Array, ""] | None = None,
     ) -> tuple[Barrier, Bool[Array, ""]]:
         """Reduce ``μ`` by ``sigma`` when the barrier subproblem is solved.
 
@@ -201,20 +299,24 @@ class MonotoneBarrierUpdate(BarrierUpdate):
             Current barrier; ``weight`` is the current ``μ``.
         lag
             Interior-point Lagrangian evaluation used to form ``E(x, s; μ)``.
+        force
+            Declare the subproblem finished regardless of the test.
 
         Returns
         -------
         barrier
             Copy with ``weight = max(sigma * μ, mu_min)`` if
-            ``E ≤ kappa_eps * μ``, otherwise the same ``weight``.
+            ``E ≤ kappa_eps * μ`` (or ``force``), otherwise the same
+            ``weight``.
         updated
-            Whether ``E(x, s; μ) ≤ kappa_eps * μ``, i.e. whether the current
-            barrier subproblem counts as solved. Because the tolerance is
-            proportional to ``μ``, it tightens automatically as ``μ`` shrinks.
+            Whether ``E(x, s; μ) ≤ kappa_eps * μ`` (or ``force``), i.e.
+            whether the current barrier subproblem counts as solved. Because
+            the tolerance is proportional to ``μ``, it tightens automatically
+            as ``μ`` shrinks.
         """
         mu = barrier.weight
-        e_mu = self.optimality_residual(lag, mu)
-        subproblem_solved = e_mu <= self.kappa_eps * mu
+        e_mu = self.scaled_optimality_residual(lag, mu)
+        subproblem_solved = (e_mu <= self.kappa_eps * mu) | self._forced(force)
         new_mu = jnp.where(
             subproblem_solved,
             jnp.maximum(self.sigma * mu, self.mu_min),
@@ -244,7 +346,11 @@ class AdaptiveBarrierUpdate(BarrierUpdate):
     mu_min: float = eqx.field(default=1e-11)
 
     def update(
-        self, barrier: Barrier, lag: InteriorPointEvaluatedLagrangian
+        self,
+        barrier: Barrier,
+        lag: InteriorPointEvaluatedLagrangian,
+        *,
+        force: Bool[Array, ""] | None = None,
     ) -> tuple[Barrier, Bool[Array, ""]]:
         """Set ``μ`` from a fraction of current average complementarity.
 
@@ -255,6 +361,8 @@ class AdaptiveBarrierUpdate(BarrierUpdate):
             is replaced).
         lag
             Interior-point Lagrangian evaluation providing complementarity.
+        force
+            Ignored: this schedule moves ``μ`` on every call.
 
         Returns
         -------
@@ -282,9 +390,15 @@ class FunnelBarrierUpdate(BarrierUpdate):
     πᶠ ≤ ε_π(μ) = ζ₁ μ^α    and    v ≤ ε_v(μ) = ζ₂ μ^β,            (5.3)
     ```
 
-    in which case ``μ ← max{γ_μ μ, μ_min}`` (Algorithm 3, Step 8). The other
-    ``μ``-dependent constants of Table 1 are exposed as schedules satisfying
-    the limits (5.1)–(5.2):
+    in which case ``μ ← max{γ_μ μ, μ_min}`` (Algorithm 3, Step 8). The
+    subproblem also counts as solved when the multiplier-scaled barrier KKT
+    error of :meth:`~BarrierUpdate.scaled_optimality_residual` satisfies the
+    Fiacco--McCormick test ``E(x, s; μ) ≤ kappa_eps * μ``: ``πᶠ`` is a
+    scaled projected-gradient norm that a secant model may never drive
+    below ``ζ₁ μ`` at a vertex-like barrier minimiser, while the KKT error
+    of the same point (stationarity, ``‖c(x, s)‖``, ``‖S z − μ e‖``) is
+    already proportional to ``μ``. The other ``μ``-dependent constants of
+    Table 1 are exposed as schedules satisfying the limits (5.1)–(5.2):
 
     ```
     κ_fbn(μ) = min{κ_fb_max, κ_fb_scale μ^{κ_fb_power}}  → 0
@@ -319,12 +433,16 @@ class FunnelBarrierUpdate(BarrierUpdate):
         ``power > 0``.
     kappa_y_scale, kappa_D_scale
         Scales of the diverging caps ``κ_y(μ)``, ``κ_D(μ)``; both ``> 0``.
+    kappa_eps
+        Factor of the alternative KKT test ``E(x, s; μ) ≤ kappa_eps * μ``;
+        ``0`` disables it and leaves (3.15a) as the only test.
     """
 
     kind: ClassVar[str] = "funnel"
 
     gamma_mu: float = eqx.field(default=0.2)
     mu_min: float = eqx.field(default=1e-11)
+    kappa_eps: float = eqx.field(static=True, default=10.0)
     zeta1: float = eqx.field(default=0.5)
     alpha: float = eqx.field(default=1.0)
     zeta2: float = eqx.field(default=1.0)
@@ -345,6 +463,7 @@ class FunnelBarrierUpdate(BarrierUpdate):
             f"gamma_mu must be in (0, 1); got {self.gamma_mu}",
         )
         require(self.mu_min > 0.0, f"mu_min must be > 0; got {self.mu_min}")
+        require(self.kappa_eps >= 0.0, f"kappa_eps must be >= 0; got {self.kappa_eps}")
         require(0.0 < self.zeta1 < 1.0, f"zeta1 must be in (0, 1); got {self.zeta1}")
         require(self.alpha >= 1.0, f"alpha must be >= 1; got {self.alpha}")
         require(self.zeta2 > 0.0, f"zeta2 must be > 0; got {self.zeta2}")
@@ -412,8 +531,13 @@ class FunnelBarrierUpdate(BarrierUpdate):
         *,
         pi_f: Scalar | None = None,
         v: Scalar | None = None,
+        force: Bool[Array, ""] | None = None,
     ) -> tuple[Barrier, Bool[Array, ""]]:
-        """Reduce ``μ`` by ``γ_μ`` once the barrier subproblem meets (3.15a).
+        """Reduce ``μ`` by ``γ_μ`` once the barrier subproblem is solved.
+
+        The subproblem counts as solved when (3.15a) holds, when the scaled
+        KKT error satisfies ``E(x, s; μ) ≤ kappa_eps * μ``, or when
+        ``force`` is set.
 
         Parameters
         ----------
@@ -429,13 +553,15 @@ class FunnelBarrierUpdate(BarrierUpdate):
         v
             Constraint violation ``‖c(x, s)‖₂``. Defaults to the norm of
             ``lag.dual_grad``.
+        force
+            Declare the subproblem finished regardless of the tests.
 
         Returns
         -------
         barrier
             Copy with ``weight = max(γ_μ μ, μ_min)`` when solved, else unchanged.
         solved
-            Whether ``πᶠ ≤ ε_π(μ)`` and ``v ≤ ε_v(μ)`` held.
+            Whether any of the three conditions held.
         """
         if pi_f is None or v is None:
             # Local import: the subproblem package depends on this module.
@@ -447,6 +573,9 @@ class FunnelBarrierUpdate(BarrierUpdate):
             if v is None:
                 v = sub.violation()
         mu = barrier.weight
-        is_solved = self.solved(mu, pi_f, v)
+        is_solved = self.solved(mu, pi_f, v) | self._forced(force)
+        if self.kappa_eps > 0.0:
+            e_mu = self.scaled_optimality_residual(lag, mu)
+            is_solved = is_solved | (e_mu <= self.kappa_eps * mu)
         new_mu = jnp.where(is_solved, jnp.maximum(self.gamma_mu * mu, self.mu_min), mu)
         return eqx.tree_at(lambda b: b.weight, barrier, new_mu), is_solved

@@ -8,7 +8,7 @@ from jax import numpy as jnp
 
 from ..primal import Primal
 from ..subproblem.solver.trust_region import TrustRegionSolverState
-from .base import MeritStepController, StepResult
+from .base import MeritStepController, StepResult, at_rounding_level
 
 
 class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
@@ -92,7 +92,9 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
         StepResult
             New (or retained) iterate, acceptance flag, merit at that
             iterate, and updated solver state (new ``radius`` /
-            ``success`` / ``rho``).
+            ``success`` / ``rho``). ``rounding_level`` flags a predicted
+            reduction below the rounding level of the merit (see
+            :func:`~slsqp_jax.sqpdax.step_controller.base.at_rounding_level`).
 
         Raises
         ------
@@ -204,5 +206,6 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
                 solver_state=new_state,
                 step_size=jnp.where(accepted, jnp.asarray(1.0), jnp.asarray(0.0)),
                 proposed_step_norm=proposed_step_norm,
+                rounding_level=at_rounding_level(pred, merit0),
             ),
         )

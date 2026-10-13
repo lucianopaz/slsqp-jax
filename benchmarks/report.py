@@ -17,13 +17,11 @@ app = marimo.App(width="medium", app_title="sqpdax benchmark report")
 
 @app.cell
 def _():
-    import json
     import sys
     from pathlib import Path
 
     import altair as alt
     import marimo as mo
-    import pandas as pd
 
     _root = Path(__file__).resolve().parent.parent
     if str(_root) not in sys.path:
@@ -32,7 +30,7 @@ def _():
     from benchmarks.results import load_run
 
     alt.data_transformers.disable_max_rows()
-    return Path, alt, analysis, json, load_run, mo, pd
+    return Path, alt, analysis, load_run, mo
 
 
 @app.cell
@@ -132,12 +130,12 @@ def _(alt, analysis, df, f_tol, feas_tol, mo):
             mo.ui.altair_chart(_chart),
             mo.md(
                 f"""**Figure 1.** Stacked count of tasks per solver configuration (x axis), split by
-outcome. `solved` requires the minimiser to report success *and* the returned point to
-be feasible (max violation ≤ {feas_tol.value:g}) *and*, when a reference optimum is
-known, to match it (relative gap ≤ {f_tol.value:g}). `claimed_but_infeasible` /
-`claimed_but_wrong` are reported successes that fail those checks; `max_steps` hit the
-iteration budget; `solver_failure` groups every other solver-reported termination;
-`timeout`, `compile_error`, `runtime_error` are harness-level failures."""
+    outcome. `solved` requires the minimiser to report success *and* the returned point to
+    be feasible (max violation ≤ {feas_tol.value:g}) *and*, when a reference optimum is
+    known, to match it (relative gap ≤ {f_tol.value:g}). `claimed_but_infeasible` /
+    `claimed_but_wrong` are reported successes that fail those checks; `max_steps` hit the
+    iteration budget; `solver_failure` groups every other solver-reported termination;
+    `timeout`, `compile_error`, `runtime_error` are harness-level failures."""
             ),
         ]
     )
@@ -204,12 +202,12 @@ def _(alt, analysis, df, mo):
             ),
             mo.md(
                 """**Figure 2.** Dolan-Moré performance profiles. For each instance the cost of a
-configuration is divided by the smallest cost among the configurations that solved it;
-the curve shows, for every ratio τ on the (logarithmic) x axis, the fraction of all
-instances the configuration solved within τ times the best cost. The value at τ = 1 is
-the share of instances on which the configuration was the fastest; the right-hand
-plateau is its overall solve rate. Left: median wall time per solve. Right: number of
-outer iterations."""
+    configuration is divided by the smallest cost among the configurations that solved it;
+    the curve shows, for every ratio τ on the (logarithmic) x axis, the fraction of all
+    instances the configuration solved within τ times the best cost. The value at τ = 1 is
+    the share of instances on which the configuration was the fastest; the right-hand
+    plateau is its overall solve rate. Left: median wall time per solve. Right: number of
+    outer iterations."""
             ),
         ]
     )
@@ -276,16 +274,16 @@ def _(alt, df, mo):
             mo.ui.altair_chart(_chart),
             mo.md(
                 """**Figure 3.** Median wall time of one full solve (y, log) against the number of
-variables (x, log), one point per task, coloured by configuration and shaped by outcome.
-Points for unsolved tasks still show the time the solver took to terminate (or to hit
-the step budget). Hover for problem name, status and KKT metrics."""
+    variables (x, log), one point per task, coloured by configuration and shaped by outcome.
+    Points for unsolved tasks still show the time the solver took to terminate (or to hit
+    the step budget). Hover for problem name, status and KKT metrics."""
             ),
             mo.ui.altair_chart(_compile),
             mo.md(
                 """**Figure 4.** One-off XLA compile time of `minimise` (y, log) against n (x, log).
-Compilation happens once per task and is excluded from every other timing figure. For the
-SciPy baselines this is the time to compile the jitted problem callbacks (objective,
-gradient, constraints, Jacobians and Hessian-vector products) rather than a solver."""
+    Compilation happens once per task and is excluded from every other timing figure. For the
+    SciPy baselines this is the time to compile the jitted problem callbacks (objective,
+    gradient, constraints, Jacobians and Hessian-vector products) rather than a solver."""
             ),
         ]
     )
@@ -349,19 +347,19 @@ def _(alt, df, mo):
             mo.ui.altair_chart(_chart),
             mo.md(
                 """**Figure 5.** For tasks whose minimiser *reported* success: maximum constraint
-violation at the returned point (x, log; equalities, inequalities and bounds) against the
-infinity norm of the Lagrangian gradient evaluated with the returned multipliers (y, log).
-The same stationarity expression is used for every family, independent of any barrier
-term the interior-point methods minimise internally. Points far from the lower-left corner
-are successes whose KKT conditions are not actually satisfied. Values are floored at 1e-16
-for the log scale."""
+    violation at the returned point (x, log; equalities, inequalities and bounds) against the
+    infinity norm of the Lagrangian gradient evaluated with the returned multipliers (y, log).
+    The same stationarity expression is used for every family, independent of any barrier
+    term the interior-point methods minimise internally. Points far from the lower-left corner
+    are successes whose KKT conditions are not actually satisfied. Values are floored at 1e-16
+    for the log scale."""
             ),
             mo.ui.altair_chart(_gap),
             mo.md(
                 """**Figure 6.** Distribution (box = quartiles, whiskers = min/max) of the relative
-objective gap to the reference optimum shipped with sif2jax, per configuration, for
-reported successes on problems with a known reference. A gap well above the tolerance
-flags convergence to a different (possibly local) minimiser or a false success."""
+    objective gap to the reference optimum shipped with sif2jax, per configuration, for
+    reported successes on problems with a known reference. A gap well above the tolerance
+    flags convergence to a different (possibly local) minimiser or a false success."""
             ),
         ]
     )
@@ -415,6 +413,39 @@ def _(analysis, df, mo):
             mo.ui.table(analysis.status_table(df).reset_index(), selection=None),
         ]
     )
+    return
+
+
+@app.cell
+def _(raw):
+    # raw.status == "successful"
+    wdf = raw.assign(
+        success=raw.status == "successful",
+        algo=raw.backend
+        + "-"
+        + raw.family
+        + "-"
+        + raw.subproblem
+        + "-"
+        + raw.curvature,
+    ).drop_duplicates(["problem", "algo"], keep="last")
+    wdf.groupby(["tier", "algo"])["successful"].mean()
+    return
+
+
+@app.cell
+def _(raw):
+    raw
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
     return
 
 

@@ -266,6 +266,57 @@ def test_v_iteration_updates(rho_target):
     assert not bool(st.sf_flag)
 
 
+@pytest.mark.parametrize("kind", ["f", "v", "y"])
+@pytest.mark.parametrize(
+    ("predicted_in_eps", "expected"),
+    [(10.0, True), (1e8, False)],
+    ids=["rounding-level", "resolvable"],
+)
+def test_rounding_level_follows_the_governing_prediction(
+    kind, predicted_in_eps, expected
+):
+    """``Δm_f`` (f) / ``Δm_v`` (v) at the rounding level is flagged; y never is."""
+    manager = make_funnel_manager(PROBLEM)
+    eps = float(jnp.finfo(X0.x.dtype).eps)
+    predicted = predicted_in_eps * eps
+    if kind == "f":
+        direction = f_direction(sign=-1.0)
+        state = make_funnel_state(
+            1.0,
+            1.0,
+            1e3,
+            tangential_norm=0.3,
+            normal_norm=0.0,
+            dm_f_n=0.0,
+            dm_f_t=predicted,
+            objective_decrease_ok=True,
+            dm_v_d=0.0,
+            contraction_ok=False,
+        )
+    elif kind == "v":
+        direction = v_direction(sign=-1.0)
+        state = make_funnel_state(
+            1.0,
+            1.0,
+            10.0,
+            tangential_norm=0.0,
+            normal_norm=0.2,
+            dm_v_n=predicted,
+            dm_v_d=predicted,
+            contraction_ok=True,
+            dm_f_n=0.0,
+            dm_f_t=0.0,
+            objective_decrease_ok=False,
+        )
+    else:
+        direction = jax.tree.map(jnp.zeros_like, X0)
+        state = make_funnel_state(1.0, 1.0, 10.0, dm_f_t=predicted, dm_v_d=predicted)
+        expected = False
+    result = manager.step(X0, direction, state)
+    assert not bool(result.accepted)
+    assert bool(result.rounding_level) is expected
+
+
 @pytest.mark.parametrize(
     "normal_norm, contraction_ok",
     [(0.0, True), (0.2, False)],

@@ -18,11 +18,14 @@ import pandas as pd
 __all__ = [
     "CATALOG_PATH",
     "COLLECTIONS",
+    "COLUMNS",
     "TIERS",
+    "VALIDATION_COLUMNS",
     "build_catalog",
     "load_catalog",
     "select",
     "tier_of",
+    "with_validation_columns",
 ]
 
 CATALOG_PATH = Path(__file__).with_name("catalog.csv")
@@ -55,6 +58,24 @@ COLUMNS: tuple[str, ...] = (
     "has_xstar",
     "tier",
 )
+"""Structural columns computed by :func:`build_catalog`."""
+
+VALIDATION_COLUMNS: tuple[str, ...] = (
+    "ineq_flip",
+    "fstar_sif",
+    "fstar_source",
+    "valid",
+    "validation",
+    "validation_note",
+    "ref_slsqp_f",
+    "ref_slsqp_feas",
+    "ref_tc_f",
+    "ref_tc_feas",
+)
+"""Columns filled by ``python -m benchmarks validate`` (:mod:`benchmarks.validate`).
+
+``fstar`` itself is overwritten by the validated reference; ``fstar_sif``
+keeps sif2jax's value."""
 
 
 def tier_of(n: int) -> str:
@@ -96,6 +117,7 @@ def build_catalog(
     collections: Sequence[str] = tuple(COLLECTIONS),
     *,
     log: bool = True,
+    previous: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compute the catalogue by instantiating every sif2jax problem.
 
@@ -105,11 +127,16 @@ def build_catalog(
         Catalogue collections to include (keys of :data:`COLLECTIONS`).
     log
         Print a progress line per collection to stderr.
+    previous
+        An earlier catalogue whose :data:`VALIDATION_COLUMNS` (and validated
+        ``fstar``) are carried over by ``(name, y0_iD)`` so a structural
+        rebuild does not discard the validation results.
 
     Returns
     -------
     pandas.DataFrame
-        One row per ``(name, y0_iD)`` with the columns in :data:`COLUMNS`.
+        One row per ``(name, y0_iD)`` with the columns in :data:`COLUMNS`
+        followed by :data:`VALIDATION_COLUMNS`.
     """
     import jax
 
@@ -119,7 +146,7 @@ def build_catalog(
     rows: list[dict[str, Any]] = []
     for collection, problem, y0_iD in _iter_instances(collections):
         try:
-            _, _, meta = to_sqpdax(problem, y0_iD=y0_iD)
+            _, _, meta = to_sqpdax(problem, y0_iD=y0_iD, use_catalog=False)
         except Exception as exc:  # noqa: BLE001 - catalogue must survive bad problems
             if log:
                 print(
@@ -137,7 +164,71 @@ def build_catalog(
             print(f"[catalog] {len(rows)} instances", file=sys.stderr)
     frame = pd.DataFrame(rows, columns=list(COLUMNS))
     frame = frame.drop_duplicates(subset=["name", "y0_iD"], keep="first")
-    return frame.sort_values(["collection", "name", "y0_iD"]).reset_index(drop=True)
+    frame = frame.sort_values(["collection", "name", "y0_iD"]).reset_index(drop=True)
+    return with_validation_columns(frame, previous)
+
+
+def with_validation_columns(
+    frame: pd.DataFrame, previous: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Append :data:`VALIDATION_COLUMNS` with defaults, copying any from ``previous``.
+
+    Parameters
+    ----------
+    frame
+        Structural catalogue (columns :data:`COLUMNS`).
+    previous
+        Earlier catalogue to copy validation results from, matched on
+        ``(name, y0_iD)``. Rows without a match keep the defaults
+        (``fstar_sif = fstar``, ``fstar_source = "sif2jax"``, ``valid``,
+        ``validation = "unvalidated"``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``frame`` with every validation column present.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from benchmarks.catalog import with_validation_columns
+    >>> base = pd.DataFrame({"name": ["A"], "y0_iD": [0], "fstar": [1.0]})
+    >>> out = with_validation_columns(base)
+    >>> row = out.loc[0]
+    >>> (float(row["fstar_sif"]), row["fstar_source"], bool(row["valid"]),
+    ...  row["validation"])
+    (1.0, 'sif2jax', True, 'unvalidated')
+    """
+    out = frame.copy()
+    defaults: dict[str, Any] = {
+        "ineq_flip": "",
+        "fstar_sif": out["fstar"],
+        "fstar_source": "sif2jax",
+        "valid": True,
+        "validation": "unvalidated",
+        "validation_note": "",
+        "ref_slsqp_f": float("nan"),
+        "ref_slsqp_feas": float("nan"),
+        "ref_tc_f": float("nan"),
+        "ref_tc_feas": float("nan"),
+    }
+    for column, default in defaults.items():
+        if column not in out.columns:
+            out[column] = default
+    if previous is not None and "fstar_source" in previous.columns:
+        keep = [c for c in (*VALIDATION_COLUMNS, "fstar", "has_fstar") if c in previous]
+        prev = previous.drop_duplicates(subset=["name", "y0_iD"]).set_index(
+            ["name", "y0_iD"]
+        )[keep]
+        idx = pd.MultiIndex.from_frame(out[["name", "y0_iD"]])
+        matched = prev.reindex(idx)
+        hit = matched["fstar_source"].notna().to_numpy()
+        for column in keep:
+            values = matched[column].to_numpy()
+            out.loc[hit, column] = values[hit]
+    out["ineq_flip"] = out["ineq_flip"].fillna("").astype(str)
+    out["valid"] = out["valid"].fillna(True).astype(bool)
+    return out
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> pd.DataFrame:
@@ -164,6 +255,7 @@ def select(
     names: Sequence[str] | None = None,
     max_n: int | None = None,
     chunk: tuple[int, int] | None = None,
+    include_invalid: bool = False,
 ) -> pd.DataFrame:
     """Filter the catalogue down to the instances to benchmark.
 
@@ -185,6 +277,10 @@ def select(
     chunk
         ``(index, count)`` to keep only the ``index``-th of ``count`` equal
         slices of the sorted selection (for CI sharding).
+    include_invalid
+        Keep instances the validation marked ``valid == False`` (unbounded
+        or infeasible as converted, NaN at the start). Explicit ``names``
+        always bypass this filter.
 
     Returns
     -------
@@ -193,6 +289,8 @@ def select(
         balanced in problem size.
     """
     frame = catalog
+    if not include_invalid and not names and "valid" in frame.columns:
+        frame = frame[frame["valid"].fillna(True).astype(bool)]
     if tier is not None:
         order = [*TIERS, "large"]
         if tier not in order:

@@ -125,10 +125,9 @@ def test_step_reduces_merit_on_unconstrained():
 def test_minimise_converges_successfully(make_problem, x0, expected, min_steps):
     """The driver reaches the KKT point and reports ``successful``.
 
-    Convergence fires only once the barrier subproblem has been solved to
-    ``kappa_eps * μ`` *and* the unperturbed KKT error ``E(x, s, y, z; 0)``
-    (N&W eq. 19.10) is below ``atol``, so a ``successful`` status here pins
-    both halves of the Algorithm 19.4 stopping test.
+    Convergence fires once the unperturbed KKT error ``E(x, s, y, z; 0)``
+    (N&W eq. 19.10) is below ``atol``, the outer stopping test of Algorithm
+    19.4.
     """
     sol = minimise(
         make_problem(),
@@ -155,6 +154,39 @@ def test_minimiser_raises_on_rtol():
         TrustRegionInteriorPointMinimiser(rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "blocker", ["none", "barrier_not_updated", "recovery_fatal"], ids=str
+)
+def test_kkt_test_decides_convergence_alone(blocker):
+    """``E(·; 0) <= atol`` at the iterate converges whatever the last step did.
+
+    The unconstrained quadratic has no slacks, so ``x = 0`` has a zero KKT
+    error at any ``μ``; neither the inner barrier test of the previous step
+    nor an exhausted secant recovery may turn that into a failure.
+    """
+    problem = make_unconstrained_quadratic()
+    solver = TrustRegionInteriorPointMinimiser(atol=1e-6, min_steps=0).init(
+        problem, jnp.zeros(2)
+    )
+    if blocker == "barrier_not_updated":
+        solver = eqx.tree_at(lambda m: m.barrier_updated, solver, jnp.asarray(False))
+    elif blocker == "recovery_fatal":
+        solver = eqx.tree_at(
+            lambda m: m.secant_recovery_state.fatal, solver, jnp.asarray(True)
+        )
+    done, result = solver.terminate(problem)
+    assert bool(done)
+    assert bool(result == TRUST_REGION_INTERIOR_POINT_RESULTS.successful)
+    if blocker == "recovery_fatal":
+        # Away from the solution the fatal flag still ends the run as a failure.
+        away = eqx.tree_at(lambda m: m.iterate.x, solver, jnp.ones(2))
+        done, result = away.terminate(problem)
+        assert bool(done)
+        assert bool(
+            result == TRUST_REGION_INTERIOR_POINT_RESULTS.secant_recovery_failure
+        )
+
+
 # --- secant model-stall detection -------------------------------------------
 
 
@@ -177,40 +209,12 @@ def _with_pairs(solver):
     return eqx.tree_at(lambda m: m.secant, solver, secant)
 
 
-@pytest.mark.parametrize(
-    ("radius", "rho", "accepted", "atol", "expected_streak"),
-    [
-        (1e-12, 1.0, True, 1e-6, 3),
-        (1e-12, 1.0, True, 1e6, 0),
-        (1.0, -jnp.inf, False, 1e-6, 3),
-        (1.0, -5.0, False, 1e-6, 3),
-        (1.0, -0.5, False, 1e-6, 0),
-        (1.0, 1.0, True, 1e-6, 0),
-        (1.0, -jnp.inf, True, 1e-6, 0),
-    ],
-    ids=[
-        "radius-collapse-unconverged",
-        "radius-collapse-converged",
-        "rejected-nonpositive-pred",
-        "rejected-very-negative-rho",
-        "healthy-rejection",
-        "accepted-sound-radius",
-        "accepted-ignores-rho",
-    ],
-)
-def test_advance_dynamics_tracks_model_stall_streak(
-    radius, rho, accepted, atol, expected_streak
+def _advance(
+    solver, problem, *, radius, accepted, rounding_level, rho=-5.0, prior_exit=False
 ):
-    """Only radius collapse (while unconverged) or a model failure extend the streak.
-
-    The counter is seeded at ``2`` so an increment (``3``) is distinguishable
-    from a reset to zero. ``atol=1e6`` makes the current iterate count as
-    converged, which must silence the radius-collapse branch.
-    """
-    problem = make_scaled_quartic(with_curvature=False)
-    solver = _secant_model_solver(atol=atol)
+    """Run ``_advance_dynamics`` on a synthetic step outcome."""
     solver = eqx.tree_at(
-        lambda m: m.consecutive_model_failures, solver, jnp.asarray(2, jnp.int32)
+        lambda m: m.exit_without_progress, solver, jnp.asarray(prior_exit)
     )
     ctx = solver._init_subproblem(problem)
     state = eqx.tree_at(
@@ -225,15 +229,149 @@ def test_advance_dynamics_tracks_model_stall_streak(
         solver_state=state,
         step_size=jnp.asarray(1.0 if accepted else 0.0),
         proposed_step_norm=jnp.asarray(1.0),
+        rounding_level=jnp.asarray(rounding_level),
     )
+    return solver._advance_dynamics(ctx, result, solver.dual)
 
-    advanced = solver._advance_dynamics(ctx, result, solver.dual)
+
+@pytest.mark.parametrize(
+    (
+        "radius",
+        "accepted",
+        "rounding_level",
+        "atol",
+        "collapse_resets_secant",
+        "expected_streak",
+        "expected_exit",
+    ),
+    [
+        (1e-12, False, False, 1e-6, True, 3, True),
+        (1e-12, False, False, 1e-6, False, 0, True),
+        (1e-12, False, True, 1e-6, True, 0, True),
+        (1e-12, True, False, 1e-6, True, 0, True),
+        (1e-12, False, False, 1e6, True, 0, False),
+        (1.0, False, True, 1e-6, True, 0, True),
+        (1.0, False, False, 1e-6, True, 0, False),
+        (1.0, True, False, 1e-6, True, 0, False),
+    ],
+    ids=[
+        "collapse-rejected",
+        "collapse-rejected-no-secant-signal",
+        "collapse-rejected-at-rounding-level",
+        "collapse-accepted",
+        "collapse-converged",
+        "rounding-level-rejection",
+        "healthy-rejection",
+        "accepted-sound-radius",
+    ],
+)
+def test_advance_dynamics_inner_loop_exit_and_model_stall_streak(
+    radius,
+    accepted,
+    rounding_level,
+    atol,
+    collapse_resets_secant,
+    expected_streak,
+    expected_exit,
+):
+    """The xtol exit reduces ``μ`` and reseeds the radius; stalls are narrower.
+
+    The inner-loop exit fires on a radius collapse or a rounding-level
+    rejection while the iterate is unconverged (``atol=1e6`` makes it count
+    as converged and silences both). Only a collapse on a rejected step whose
+    predicted decrease was above rounding level extends the model-stall
+    streak, and not at all with ``collapse_resets_secant=False``. The
+    counter is seeded at ``2`` so an increment (``3``) is distinguishable
+    from a reset to zero.
+    """
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = _secant_model_solver(
+        atol=atol, initial_radius=2.0, collapse_resets_secant=collapse_resets_secant
+    )
+    solver = eqx.tree_at(
+        lambda m: m.consecutive_model_failures, solver, jnp.asarray(2, jnp.int32)
+    )
+    mu_old = float(solver.barrier.weight)
+
+    advanced = _advance(
+        solver,
+        problem,
+        radius=radius,
+        accepted=accepted,
+        rounding_level=rounding_level,
+    )
 
     assert int(advanced.consecutive_model_failures) == expected_streak
     signals = advanced._secant_reset_signals()
     assert int(signals.model_streak) == expected_streak
     assert int(signals.subproblem_streak) == 0
     assert int(signals.step_streak) == 0
+    assert not bool(advanced.trust_region_collapsed)
+    assert bool(advanced.exit_without_progress) is expected_exit
+    if expected_exit:
+        assert bool(advanced.barrier_updated)
+        assert float(advanced.barrier.weight) < mu_old
+        assert float(advanced.solver_state.radius) == pytest.approx(2.0)
+    else:
+        assert float(advanced.solver_state.radius) == pytest.approx(radius)
+
+
+@pytest.mark.parametrize(
+    ("mu", "prior_exit", "exhausted"),
+    [
+        (1e-8, True, True),
+        (1e-8, False, False),
+        (1e-3, True, False),
+        (1e-11, False, True),
+    ],
+    ids=["repeat-below-atol", "first-below-atol", "repeat-above-atol", "mu-floor"],
+)
+def test_collapse_below_barrier_tolerance_terminates_with_dedicated_result(
+    mu, prior_exit, exhausted
+):
+    """A collapse ends the run with ``trust_region_collapse`` only once
+    ``μ <= atol`` and the previous exit saw no accepted step, or ``μ`` sits
+    at ``mu_min`` and cannot be reduced."""
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = _secant_model_solver(atol=1e-6, min_steps=0)
+    solver = eqx.tree_at(
+        lambda m: m.barrier.weight, solver, jnp.asarray(mu, solver.barrier.weight.dtype)
+    )
+    advanced = _advance(
+        solver,
+        problem,
+        radius=1e-12,
+        accepted=False,
+        rounding_level=False,
+        prior_exit=prior_exit,
+    )
+    assert bool(advanced.exit_without_progress)
+    assert bool(advanced.trust_region_collapsed) is exhausted
+    done, result = advanced.terminate(problem)
+    assert bool(done) is exhausted
+    if exhausted:
+        assert bool(result == TRUST_REGION_INTERIOR_POINT_RESULTS.trust_region_collapse)
+        assert not bool(advanced.result_adapter.is_successful(result))
+    # Re-initialising clears the carry.
+    fresh = advanced.init(problem, jnp.array([0.5, 0.3, 0.2]))
+    assert not bool(fresh.trust_region_collapsed)
+    assert not bool(fresh.exit_without_progress)
+
+
+def test_accepted_step_clears_the_exit_without_progress_flag():
+    """An accepted step after an inner-loop exit means ``μ`` unlocked progress."""
+    problem = make_scaled_quartic(with_curvature=False)
+    solver = _secant_model_solver(atol=1e-6)
+    advanced = _advance(
+        solver,
+        problem,
+        radius=1.0,
+        accepted=True,
+        rounding_level=False,
+        prior_exit=True,
+    )
+    assert not bool(advanced.exit_without_progress)
+    assert not bool(advanced.trust_region_collapsed)
 
 
 def test_model_stalls_use_global_recovery_and_report_post_identity_failure():
