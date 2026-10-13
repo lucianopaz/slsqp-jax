@@ -301,7 +301,10 @@ class FunnelTangentialStepSolver(
         r_hat = g_n + At(y.flatten())
         pi_f = jnp.linalg.norm(r_hat)
         d_c = -r0
-        slope = jnp.dot(g_n, d_c)  # = ‖proj(ĝ + Ĥ w_n)‖² ≥ 0 (χᶠ πᶠ for exact y)
+        # ‖proj(ĝ + Ĥ w_n)‖² ≥ 0 (χᶠ πᶠ for exact y).  Evaluated as ``rz0``, not as
+        # ``g_nᵀ d_c``: that dot product cancels to ``eps ‖g_n‖²`` and turns negative
+        # near a KKT point (``‖proj g_n‖ ~ 1e-8 ‖g_n‖``), which zeroes the Cauchy step.
+        slope = rz0
         curv = jnp.dot(d_c, H(d_c))
         alpha_star = jnp.where(
             curv > tiny, slope / jnp.maximum(curv, tiny), jnp.asarray(jnp.inf, dtype)
