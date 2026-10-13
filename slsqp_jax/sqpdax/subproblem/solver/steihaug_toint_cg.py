@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -18,6 +19,55 @@ from ...primal import InteriorPointPrimal
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
 from .gradient_projection import GradientProjection
+
+
+def _refined_projector(
+    proj: Callable[[Float[Array, " n"]], Float[Array, " n"]],
+    A_free: Callable[[Float[Array, " n"]], Float[Array, " m"]],
+    rel_tol: float,
+) -> Callable[[Float[Array, " n"]], Float[Array, " n"]]:
+    """Apply a null-space projector, refining only when its result leaks.
+
+    A single projection has an absolute error of order ``eps * kappa * ||v||``.
+    When ``||P v|| << ||v||`` this is a large relative error in the projected
+    direction, so ``Â (P v)`` is not small compared with ``P v``. In that case
+    the result is projected again, which reduces the leak to
+    ``O(eps) * ||P v||`` (Gould, Hribar and Nocedal, 2001; Nocedal and Wright,
+    section 16.3). When the first pass already satisfies
+    ``||Â (P v)|| <= rel_tol * ||P v||`` it is returned unchanged, so well
+    conditioned (and low-precision) solves are not perturbed.
+
+    Parameters
+    ----------
+    proj
+        Projector ``v ↦ P v``.
+    A_free
+        Constraint product restricted to the free columns, ``p ↦ Â p``.
+    rel_tol
+        Relative leak ``||Â p|| / ||p||`` above which the second pass is applied.
+
+    Returns
+    -------
+    Callable
+        The conditionally refined projector.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> M = jnp.array([[1.0, 1.0]])
+    >>> leaky = lambda v: v - 0.9 * M.T @ (M @ v) / 2.0
+    >>> proj = _refined_projector(leaky, lambda p: M @ p, 1e-3)
+    >>> bool(jnp.abs(M @ proj(jnp.array([1.0, 0.0]))).max() < 0.1)
+    True
+    """
+
+    def refined(v: Float[Array, " n"]) -> Float[Array, " n"]:
+        p = proj(v)
+        leak = jnp.linalg.norm(A_free(p))
+        needs = leak > rel_tol * jnp.linalg.norm(p)
+        return jax.lax.cond(needs, proj, lambda q: q, p)
+
+    return refined
 
 
 class SteihaugTointCGTangentialStepSolverState(SubProblemSolverState):
@@ -62,7 +112,11 @@ class SteihaugTointCGTangentialStepSolver(
       constraint operator ``Â`` and its transpose (matrix-free; the dense
       ``Â`` is never assembled).
 
-    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` solves the normal
+    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` is applied with a conditional step
+    of iterative refinement, ``v ↦ P(P v)`` (see :func:`_refined_projector`):
+    near a KKT point the gradient lies almost entirely in range(Âᵀ), so
+    ``P ĝ`` is tiny and the absolute error of a single projection is a large
+    *relative* error that leaks the tangential step out of null(Â).  It solves the normal
     equations with the strategy selected by :attr:`normal_equations`: the
     bound / slack rows of ``Â`` are eliminated exactly (explicit
     pseudo-inverse Schur complement or matrix-free nested PCG, see
@@ -254,7 +308,7 @@ class SteihaugTointCGTangentialStepSolver(
                 max_iter=self.proj_cg_max_iter,
             )
         )
-        proj = null_space_projector(
+        proj1 = null_space_projector(
             A,
             At,
             free_mask=free_w,
@@ -262,6 +316,15 @@ class SteihaugTointCGTangentialStepSolver(
             tol=self.proj_cg_tol,
             max_iter=self.proj_cg_max_iter,
             solve=solve,
+        )
+        # The second pass only pays off in double precision (in float32 it
+        # measurably degrades the projection) and when the first pass leaks
+        # more than 1e-6 of its own norm (the order of the KKT tolerance);
+        # accurate projections are left untouched.
+        proj = (
+            _refined_projector(proj1, lambda p: A(free_w * p), 1e-6)
+            if jnp.finfo(dtype).eps < 1e-10
+            else proj1
         )
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2
