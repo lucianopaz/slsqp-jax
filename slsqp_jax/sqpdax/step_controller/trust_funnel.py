@@ -10,7 +10,12 @@ from jaxtyping import Scalar
 from ..merit import ConstraintViolation, Merit
 from ..primal import InteriorPointPrimal
 from ..subproblem.solver.trust_funnel import IterationType, TrustFunnelSolverState
-from .base import StepController, StepResult, at_rounding_level
+from .base import (
+    ROUNDING_LEVEL_FACTOR,
+    StepController,
+    StepResult,
+    at_rounding_level,
+)
 
 __all__ = ["TrustFunnelManager"]
 
@@ -208,7 +213,17 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
         rho = jnp.where(is_f, rho_f, jnp.where(is_v, rho_v, jnp.ones((), dtype)))
 
         # --- acceptance ----------------------------------------------------------
-        success_f = is_f & (rho_f >= self.eta1)
+        # When the predicted decrease is at the rounding level of the barrier
+        # objective, ``rho_f`` is noise: rejecting would shrink ``radius_f`` to
+        # zero (the tangential step vanishes and the run ends in a y-iteration
+        # streak). Accept the step if the merit did not increase beyond rounding.
+        rounding_noise = (
+            ROUNDING_LEVEL_FACTOR * jnp.finfo(dtype).eps * jnp.maximum(1.0, jnp.abs(f0))
+        )
+        noise_accept = (
+            is_f & at_rounding_level(dm_f_d, f0) & (f_trial - f0 <= rounding_noise)
+        )
+        success_f = is_f & ((rho_f >= self.eta1) | noise_accept)
         contraction = (st.normal_norm > 0.0) & st.contraction_ok  # (2.15)
         success_v = is_v & (rho_v >= self.eta1) & contraction
         accepted = success_f | success_v
