@@ -176,15 +176,14 @@ def test_refined_projector_reduces_null_space_leakage(scale_error: float):
     def inexact_solve(b):
         return (1.0 - scale_error) * jnp.linalg.solve(G, b)
 
-    def exact_solve(b):
-        return jnp.linalg.solve(G, b)
-
     proj1 = null_space_projector(A, lambda y: M.T @ y, solve=inexact_solve)
     leak1 = jnp.linalg.norm(M @ proj1(v))
     leak2 = jnp.linalg.norm(M @ _refined_projector(proj1, A, 1e-10)(v))
     assert leak1 > 0.0
     assert leak2 <= 2.0 * scale_error * leak1
 
-    # Already accurate: below the relative-leak threshold, the pass is skipped.
-    proj_ok = null_space_projector(A, lambda y: M.T @ y, solve=exact_solve)
-    assert jnp.allclose(_refined_projector(proj_ok, A, 1e-6)(v), proj_ok(v))
+    # Leak below the (large) relative threshold: the second pass is skipped.
+    assert jnp.array_equal(
+        _refined_projector(proj1, A, 1e6)(v),
+        proj1(v),
+    )
