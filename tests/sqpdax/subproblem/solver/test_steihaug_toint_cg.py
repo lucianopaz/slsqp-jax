@@ -6,10 +6,12 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from slsqp_jax.sqpdax.linalg import null_space_projector
 from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     SteihaugTointCGTangentialStepSolver,
 )
+from slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg import _refined_projector
 from tests.sqpdax.subproblem.conftest import (
     make_scaled_barrier_subproblem,
     make_zero_dual,
@@ -149,3 +151,39 @@ def test_fraction_to_boundary_beta(w, slack_mask, n, tau, expected):
         w, slack_mask, n, tau
     )
     assert jnp.isclose(beta, expected, atol=1e-8)
+
+
+@pytest.mark.parametrize("scale_error", [1e-1, 1e-2, 1e-3])
+def test_refined_projector_reduces_null_space_leakage(scale_error: float):
+    """A leaky projector is refined; an accurate one is left untouched.
+
+    ``v = Aᵀλ + δ t`` is almost entirely in range(Aᵀ).  An inexact inner solve
+    (scaled by ``1 - scale_error``) leaks ``scale_error * ||A Aᵀ λ||`` out of
+    null(A) on one pass and ``scale_error`` times less on the second pass.
+    """
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3 = jax.random.split(key, 3)
+    M = jax.random.normal(k1, (3, 8))
+    lam = jax.random.normal(k2, (3,))
+    t = jax.random.normal(k3, (8,))
+    t = t - M.T @ jnp.linalg.solve(M @ M.T, M @ t)  # exactly in null(M)
+    v = M.T @ lam + 1e-9 * t
+    G = M @ M.T
+
+    def A(x):
+        return M @ x
+
+    def inexact_solve(b):
+        return (1.0 - scale_error) * jnp.linalg.solve(G, b)
+
+    proj1 = null_space_projector(A, lambda y: M.T @ y, solve=inexact_solve)
+    leak1 = jnp.linalg.norm(M @ proj1(v))
+    leak2 = jnp.linalg.norm(M @ _refined_projector(proj1, A, 1e-10)(v))
+    assert leak1 > 0.0
+    assert leak2 <= 2.0 * scale_error * leak1
+
+    # Leak below the (large) relative threshold: the second pass is skipped.
+    assert jnp.array_equal(
+        _refined_projector(proj1, A, 1e6)(v),
+        proj1(v),
+    )
