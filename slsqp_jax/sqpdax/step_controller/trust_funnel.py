@@ -236,8 +236,13 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             factor = jnp.where(rho_value < 0.0, self.gamma1, self.gamma2)
             return factor * radius
 
+        # A tangential-only step (no normal step was computed) that fails the
+        # objective-decrease test is classified as a v-iteration, but it carries
+        # no information about the normal trust region: shrinking ``radius_v``
+        # would drive ``radius_td`` to zero.  Charge the failure to ``radius_f``.
+        tangential_only_v = is_v & ~(st.normal_norm > 0.0)
         radius_f = jnp.where(
-            is_f,
+            is_f | tangential_only_v,
             jnp.where(
                 success_f,
                 jnp.where(rho_f >= self.eta2, grown(st.radius_f), st.radius_f),
@@ -246,7 +251,7 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             st.radius_f,
         )
         radius_v = jnp.where(
-            is_v,
+            is_v & ~tangential_only_v,
             jnp.where(
                 success_v,
                 jnp.where(rho_v >= self.eta2, grown(st.radius_v), st.radius_v),
