@@ -153,12 +153,13 @@ def test_fraction_to_boundary_beta(w, slack_mask, n, tau, expected):
     assert jnp.isclose(beta, expected, atol=1e-8)
 
 
-@pytest.mark.parametrize("delta", [1e-7, 1e-9, 1e-11])
-def test_refined_projector_reduces_null_space_leakage(delta: float):
-    """``P(P v)`` leaks far less than ``P v`` when ``P v`` is tiny.
+@pytest.mark.parametrize("scale_error", [1e-4, 1e-6, 1e-8])
+def test_refined_projector_reduces_null_space_leakage(scale_error: float):
+    """A leaky projector is refined; an accurate one is left untouched.
 
-    ``v = Aᵀλ + δ t`` is almost entirely in range(Aᵀ); with an inexact inner
-    solve the single-projection leak is large relative to ``||P v||``.
+    ``v = Aᵀλ + δ t`` is almost entirely in range(Aᵀ).  An inexact inner solve
+    (scaled by ``1 - scale_error``) leaks ``scale_error * ||A Aᵀ λ||`` out of
+    null(A) on one pass and ``scale_error`` times less on the second pass.
     """
     key = jax.random.PRNGKey(0)
     k1, k2, k3 = jax.random.split(key, 3)
@@ -166,12 +167,24 @@ def test_refined_projector_reduces_null_space_leakage(delta: float):
     lam = jax.random.normal(k2, (3,))
     t = jax.random.normal(k3, (8,))
     t = t - M.T @ jnp.linalg.solve(M @ M.T, M @ t)  # exactly in null(M)
-    v = M.T @ lam + delta * t
+    v = M.T @ lam + 1e-9 * t
+    G = M @ M.T
 
-    proj1 = null_space_projector(lambda x: M @ x, lambda y: M.T @ y, tol=1e-6)
+    def A(x):
+        return M @ x
+
+    def inexact_solve(b):
+        return (1.0 - scale_error) * jnp.linalg.solve(G, b)
+
+    def exact_solve(b):
+        return jnp.linalg.solve(G, b)
+
+    proj1 = null_space_projector(A, lambda y: M.T @ y, solve=inexact_solve)
     leak1 = jnp.linalg.norm(M @ proj1(v))
-    leak2 = jnp.linalg.norm(M @ _refined_projector(proj1)(v))
-
+    leak2 = jnp.linalg.norm(M @ _refined_projector(proj1, A, 1e-10)(v))
     assert leak1 > 0.0
-    assert leak2 <= 1e-3 * leak1
-    assert leak2 <= 1e-12 * jnp.linalg.norm(v)
+    assert leak2 <= 2.0 * scale_error * leak1
+
+    # Already accurate: below the relative-leak threshold, the pass is skipped.
+    proj_ok = null_space_projector(A, lambda y: M.T @ y, solve=exact_solve)
+    assert jnp.allclose(_refined_projector(proj_ok, A, 1e-6)(v), proj_ok(v))
