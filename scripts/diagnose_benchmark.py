@@ -701,7 +701,7 @@ CAUSES: dict[str, tuple[str, str, str]] = {
         "`successful` at a non-stationary point because the active-set test "
         "is `||grad_x L||_inf <= rtol * max(|f|, 1)` (`use_mu_max=False`): "
         "with `|f| = 1e3 ... 1e17` a Lagrangian gradient of `1e-3 ... 1e9` "
-        "passes. After the CG fix nearly all of these (50 of 51) are tasks no "
+        "passes. On the `new_run` data all 9 of these are tasks no "
         "scipy baseline solves either: the unbounded (sign-flipped) minimax "
         "instances on which `asls-pcg-exact` declares success with `f = -1e6` "
         "instead of running to `-inf` like the other configurations, plus the "
@@ -901,15 +901,16 @@ CAUSES: dict[str, tuple[str, str, str]] = {
         "so the outer loop never shrinks `mu`; the iterates converge to the "
         "minimiser of the current barrier problem and the trust-region / "
         "funnel machinery then fails on rounding-level model reductions "
-        "(69 of 88 end `secant_recovery_failure`, 19 `max_steps_reached`). "
-        "Now the largest interior-point group (tfip 52, trip 36) and, unlike "
-        "the infeasible residue above, a solver deficit: 38 tasks are solved "
-        "by scipy SLSQP and 46 by trust-constr; the end points are feasible "
+        "(47 of 49 end `max_steps_reached`, 2 `secant_recovery_failure`). "
+        "Now the largest interior-point group (trip 25, tfip 24) and, unlike "
+        "the infeasible residue above, a solver deficit: 28 tasks are solved "
+        "by scipy SLSQP and 27 by trust-constr; the end points are feasible "
         "and `kkt_last` is dominated by `compl ~ mu` (CANTILVR: `kkt = 1.20`, "
         "`compl = 1.198`, `mu = 1`, 500 steps; HS100: `kkt = compl = 0.040 = "
-        "mu`). 45 tasks never reduce `mu` once (`mu_updates = 0`), i.e. the "
-        "first barrier problem is never declared converged although its "
-        "iterates have stopped moving. scipy's trust-constr decides the `mu` "
+        "mu`). Only 3 tasks never reduce `mu` (`mu_updates = 0`); the rest reduce "
+        "it 1-4 times and then stall at `mu` between 0.2 and 0.0016 "
+        "(median update count 3), i.e. a later barrier problem is never "
+        "declared converged although its iterates have stopped moving. scipy's trust-constr decides the `mu` "
         "update on the *barrier* KKT error with tolerance "
         "`BARRIER_DECAY_RATIO * mu` and additionally forces it whenever the "
         "trust radius falls below `xtol`; sqpdax has no radius-collapse exit "
@@ -1617,6 +1618,31 @@ RECOMMENDATIONS: dict[str, str] = {
 
 PRIORITIES: list[tuple[str, list[str], str]] = [
     (
+        "Globalisation / scaling improvements (penalty hysteresis, Shanno-Phua secant scaling, "
+        "direction checks)",
+        [
+            "cycling",
+            "slow_progress",
+            "step_collapse",
+            "secant_recovery_stuck",
+            "merit_stagnation",
+            "local_minimum",
+        ],
+        "merit / secant modules",
+    ),
+    (
+        "Run the KKT test before step acceptance and do not count rounding-level rejections as "
+        "secant failures (cheap wins: 54 of the 69 `termination_missed` tasks are solved by "
+        "scipy SLSQP, 13 of the 13 `merit_stagnation_near_opt`)",
+        [
+            "termination_missed",
+            "secant_recovery_premature",
+            "merit_stagnation_near_opt",
+            "loose_tolerance",
+        ],
+        "`minimiser/base.py` secant recovery, termination tests",
+    ),
+    (
         "Handle infeasible starts with over-determined violated working sets: relaxed / "
         "elastic QP (SLSQP's `xi`), restoration phase with a bounded normal step, "
         "regularised Craig / MINRES-QLP solves, and certify `infeasible_stationary` with the "
@@ -1645,16 +1671,24 @@ PRIORITIES: list[tuple[str, list[str], str]] = [
         "`barrier/update.py`",
     ),
     (
-        "Run the KKT test before step acceptance and do not count rounding-level rejections as "
-        "secant failures (cheap wins: 43 of the 57 `termination_missed` tasks are solved by "
-        "scipy SLSQP, 22 of the 24 `merit_stagnation_near_opt`)",
-        [
-            "termination_missed",
-            "secant_recovery_premature",
-            "merit_stagnation_near_opt",
-            "loose_tolerance",
-        ],
-        "`minimiser/base.py` secant recovery, termination tests",
+        "Trust-funnel / interior-point `trust_region_collapse` (currently `unclassified`: "
+        "36 trip and 6 tfip tasks, 34 of 42 solved by scipy SLSQP): the radius collapses "
+        "before a stationary point is reached; add a classifier rule and diagnose the "
+        "radius update after rejected steps",
+        ["unclassified"],
+        "`minimiser/trust_region_interior_point.py`, `minimiser/trust_funnel_interior_point.py`, "
+        "`subproblem/solver/trust_funnel.py`",
+    ),
+    (
+        "Break the funnel y-iteration deadlock (`always_normal` + shrink `v_max` on y-iterations)",
+        ["multiplier_failure"],
+        "`subproblem/solver/trust_funnel.py` Step 10",
+    ),
+    (
+        "Require a converged QP and check complementarity before the `qp_kkt` guard declares "
+        "success",
+        ["false_convergence", "qp_inactive_multipliers"],
+        "`minimiser/active_set_linesearch.py::termination_flags`",
     ),
     (
         "Fix the sif2jax L-type constraint sign in the benchmark adapter and validate `f*`/`x*` "
@@ -1669,30 +1703,6 @@ PRIORITIES: list[tuple[str, list[str], str]] = [
             "stationarity_scale_f",
         ],
         "`benchmarks/problems.py`, `benchmarks/catalog.py`",
-    ),
-    (
-        "Break the funnel y-iteration deadlock (`always_normal` + shrink `v_max` on y-iterations)",
-        ["multiplier_failure"],
-        "`subproblem/solver/trust_funnel.py` Step 10",
-    ),
-    (
-        "Require a converged QP and check complementarity before the `qp_kkt` guard declares "
-        "success",
-        ["false_convergence", "qp_inactive_multipliers"],
-        "`minimiser/active_set_linesearch.py::termination_flags`",
-    ),
-    (
-        "Globalisation / scaling improvements (penalty hysteresis, Shanno-Phua secant scaling, "
-        "direction checks)",
-        [
-            "cycling",
-            "slow_progress",
-            "step_collapse",
-            "secant_recovery_stuck",
-            "merit_stagnation",
-            "local_minimum",
-        ],
-        "merit / secant modules",
     ),
     (
         "Performance",
