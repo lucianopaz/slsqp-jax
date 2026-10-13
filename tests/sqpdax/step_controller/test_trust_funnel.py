@@ -341,7 +341,15 @@ def test_v_iteration_requires_215(normal_norm, contraction_ok):
     assert float(st.rho) == pytest.approx(1.0, rel=1e-4)
     assert not bool(result.accepted)
     assert jax.tree.all(jax.tree.map(jnp.array_equal, result.x, X0))
-    assert float(st.radius_v) == pytest.approx(manager.gamma2)  # ρ ≥ 0 shrink
+    if normal_norm > 0.0:
+        assert float(st.radius_v) == pytest.approx(manager.gamma2)  # ρ ≥ 0 shrink
+        assert float(st.radius_f) == pytest.approx(1.0)
+    else:
+        # A tangential-only step carries no information about the normal trust
+        # region: the failure is charged to ``radius_f`` (no predicted
+        # objective decrease: ρᶠ = -inf, shrink by ``gamma1``).
+        assert float(st.radius_v) == pytest.approx(1.0)
+        assert float(st.radius_f) == pytest.approx(manager.gamma1)
     assert float(st.v_max) == pytest.approx(10.0)
 
 

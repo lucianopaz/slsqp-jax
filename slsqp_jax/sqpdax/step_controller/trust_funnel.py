@@ -10,7 +10,12 @@ from jaxtyping import Scalar
 from ..merit import ConstraintViolation, Merit
 from ..primal import InteriorPointPrimal
 from ..subproblem.solver.trust_funnel import IterationType, TrustFunnelSolverState
-from .base import StepController, StepResult, at_rounding_level
+from .base import (
+    ROUNDING_LEVEL_FACTOR,
+    StepController,
+    StepResult,
+    at_rounding_level,
+)
 
 __all__ = ["TrustFunnelManager"]
 
@@ -208,7 +213,17 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
         rho = jnp.where(is_f, rho_f, jnp.where(is_v, rho_v, jnp.ones((), dtype)))
 
         # --- acceptance ----------------------------------------------------------
-        success_f = is_f & (rho_f >= self.eta1)
+        # When the predicted decrease is at the rounding level of the barrier
+        # objective, ``rho_f`` is noise: rejecting would shrink ``radius_f`` to
+        # zero (the tangential step vanishes and the run ends in a y-iteration
+        # streak). Accept the step if the merit did not increase beyond rounding.
+        rounding_noise = (
+            ROUNDING_LEVEL_FACTOR * jnp.finfo(dtype).eps * jnp.maximum(1.0, jnp.abs(f0))
+        )
+        noise_accept = (
+            is_f & at_rounding_level(dm_f_d, f0) & (f_trial - f0 <= rounding_noise)
+        )
+        success_f = is_f & ((rho_f >= self.eta1) | noise_accept)
         contraction = (st.normal_norm > 0.0) & st.contraction_ok  # (2.15)
         success_v = is_v & (rho_v >= self.eta1) & contraction
         accepted = success_f | success_v
@@ -221,8 +236,13 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             factor = jnp.where(rho_value < 0.0, self.gamma1, self.gamma2)
             return factor * radius
 
+        # A tangential-only step (no normal step was computed) that fails the
+        # objective-decrease test is classified as a v-iteration, but it carries
+        # no information about the normal trust region: shrinking ``radius_v``
+        # would drive ``radius_td`` to zero.  Charge the failure to ``radius_f``.
+        tangential_only_v = is_v & ~(st.normal_norm > 0.0)
         radius_f = jnp.where(
-            is_f,
+            is_f | tangential_only_v,
             jnp.where(
                 success_f,
                 jnp.where(rho_f >= self.eta2, grown(st.radius_f), st.radius_f),
@@ -231,7 +251,7 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             st.radius_f,
         )
         radius_v = jnp.where(
-            is_v,
+            is_v & ~tangential_only_v,
             jnp.where(
                 success_v,
                 jnp.where(rho_v >= self.eta2, grown(st.radius_v), st.radius_v),
