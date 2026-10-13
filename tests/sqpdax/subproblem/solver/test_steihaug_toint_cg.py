@@ -11,7 +11,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     RESULTS,
     SteihaugTointCGTangentialStepSolver,
 )
-from slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg import refined_projector
+from slsqp_jax.sqpdax.subproblem.solver.steihaug_toint_cg import _refined_projector
 from tests.sqpdax.subproblem.conftest import (
     make_scaled_barrier_subproblem,
     make_zero_dual,
@@ -170,7 +170,7 @@ def test_refined_projector_reduces_null_space_leakage(delta: float):
 
     proj1 = null_space_projector(lambda x: M @ x, lambda y: M.T @ y, tol=1e-6)
     leak1 = jnp.linalg.norm(M @ proj1(v))
-    leak2 = jnp.linalg.norm(M @ refined_projector(proj1)(v))
+    leak2 = jnp.linalg.norm(M @ _refined_projector(proj1)(v))
 
     assert leak1 > 0.0
     assert leak2 <= 1e-3 * leak1
