@@ -322,12 +322,21 @@ def test_single_exchange_survives_an_inconsistent_all_at_once_refresh(
     assert jnp.array_equal(state.active_set.active_lb, jnp.array([False, True, False]))
     assert not jnp.any(state.active_set.active_ub)
 
-    # The all-at-once refresh cannot solve the same QP.
+    # The uncapped all-at-once refresh cannot solve the same QP; with the
+    # row cap and independence screen the default refresh recovers too.
+    uncapped = solver_cls(
+        working_set_policy=ThresholdWorkingSetPolicy(
+            tol=1e-8, max_iter=10, cap_working_set=False
+        )
+    )
+    (dx_uncapped, _), _ = uncapped.solve(sub, warm, make_state())
+    assert not jnp.allclose(primal.x + dx_uncapped.x, x_star, atol=1e-3)
     default = solver_cls(
         working_set_policy=ThresholdWorkingSetPolicy(tol=1e-8, max_iter=10)
     )
-    (dx_default, _), _ = default.solve(sub, warm, make_state())
-    assert not jnp.allclose(primal.x + dx_default.x, x_star, atol=1e-3)
+    (dx_default, _), default_state = default.solve(sub, warm, make_state())
+    assert bool(default_state.success)
+    assert jnp.allclose(primal.x + dx_default.x, x_star, atol=1e-3)
 
 
 @pytest.mark.parametrize("safeguard", [None, ClampSafeguard()], ids=["raw", "clamped"])

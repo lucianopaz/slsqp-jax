@@ -399,6 +399,9 @@ class ActiveSetQPSolver(
                 ),
             )
             x0 = (x0[0], initial_state.dual)
+        # Keep the initial set solvable: at most ``n - meq`` rows (see
+        # ``WorkingSetPolicy.cap_working_set``).
+        active0 = policy.initial_set(lag, active0)
 
         # Per-solve budget: the inner counter starts from zero so the
         # cumulative ``n_cg_iter`` on the carry never starves a later solve.

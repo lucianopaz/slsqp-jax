@@ -8,11 +8,17 @@ import pytest
 
 from slsqp_jax.sqpdax.active_set import ActiveSet
 from slsqp_jax.sqpdax.dual import Dual
+from slsqp_jax.sqpdax.lagrangian import Lagrangian
 from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.problem import build_problem
 from slsqp_jax.sqpdax.subproblem.solver import (
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
     WorkingSetPolicyState,
+)
+from slsqp_jax.sqpdax.subproblem.solver.working_set_policy import (
+    cap_rows,
+    independent_rows,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
 from tests.sqpdax.subproblem.conftest import make_evaluated_lagrangian, make_zero_dual
@@ -82,9 +88,9 @@ def _reference_masks(lag, step, current, tol):
     ids=["add", "drop", "bounds"],
 )
 def test_default_policy_reproduces_fixed_threshold_refresh(bounded, current, step):
-    """Defaults give the classic all-at-once threshold update and never cycle."""
+    """Without the row cap the defaults give the classic all-at-once refresh."""
     lag = _lagrangian(bounded=bounded)
-    policy = ThresholdWorkingSetPolicy(tol=TOL)
+    policy = ThresholdWorkingSetPolicy(tol=TOL, cap_working_set=False)
     state = policy.init_state(current)
     next_set, new_state, cycled = policy.update(lag, step, current, state)
 
@@ -252,11 +258,160 @@ def _mask_count(active: ActiveSet) -> int:
 def test_single_exchange_changes_at_most_one_row(current, step, expected):
     """One-at-a-time exchange: add the worst violation, else drop the worst multiplier."""
     lag = _lagrangian(bounded=True)
-    policy = SingleExchangeWorkingSetPolicy(tol=TOL)
+    policy = SingleExchangeWorkingSetPolicy(tol=TOL, cap_working_set=False)
     next_set, _, cycled = policy.update(lag, step, current, policy.init_state(current))
     assert bool(eqx.tree_equal(next_set, expected))
     assert abs(_mask_count(next_set) - _mask_count(current)) <= 1
     assert not bool(cycled)
+
+
+# The default NLP has n = 2 and meq = 1, so the row cap is a single row.
+@pytest.mark.parametrize(
+    "policy_cls", [ThresholdWorkingSetPolicy, SingleExchangeWorkingSetPolicy]
+)
+@pytest.mark.parametrize(
+    ("current", "step", "expected"),
+    [
+        # Two violated inequalities: only the more violated row 1 fits.
+        (_active(), _step([2.0, -3.0]), _active(ineq=(False, True))),
+        # A row already in the set is kept in preference to a new violation.
+        (
+            _active(ineq=(True, False)),
+            _step([0.0, -3.0], ineq=(1.0, 0.0)),
+            _active(ineq=(True, False)),
+        ),
+        # A dropped row (negative multiplier) frees the slot for the violation
+        # under the all-at-once refresh; the single exchange drops first.
+        (
+            _active(ineq=(True, False)),
+            _step([0.0, -3.0], ineq=(-1.0, 0.0)),
+            None,
+        ),
+    ],
+    ids=["two-violations", "keep-current", "drop-then-add"],
+)
+def test_cap_limits_the_working_set_to_the_degrees_of_freedom(
+    policy_cls, current, step, expected
+):
+    lag = _lagrangian(bounded=False)
+    policy = policy_cls(tol=TOL)
+    assert policy.cap_working_set
+    next_set, _, _ = policy.update(lag, step, current, policy.init_state(current))
+    assert _mask_count(next_set) <= lag.n - lag.meq == 1
+    if expected is None:
+        expected = (
+            _active(ineq=(False, True))
+            if policy_cls is ThresholdWorkingSetPolicy
+            else _active()
+        )
+    assert bool(eqx.tree_equal(next_set, expected))
+
+
+# ``make_problem``: ``x₀ + x₁ = 1``, ``x₀ ≤ 2``, ``x₁ ≥ 0``, box ``[0, 2] × [-1, 3]``.
+@pytest.mark.parametrize("cap", [True, False])
+@pytest.mark.parametrize(
+    ("meq", "x", "active0", "expected_count"),
+    [
+        # Both inequalities violated: only the most violated row fits.
+        (1, (2.5, -1.0), _active(ineq=(True, True)), 1),
+        # Feasible degenerate vertex (no equality): three active rows for two
+        # degrees of freedom are consistent with ``d = 0`` and kept whole.
+        (0, (2.0, 0.0), _active(ineq=(True, True), ub=(True, False)), 3),
+        # Same vertex but the equality is violated: the set is capped.
+        (1, (2.0, 0.0), _active(ineq=(True, True), ub=(True, False)), 1),
+    ],
+    ids=["violated", "feasible-vertex", "violated-equality"],
+)
+def test_initial_set_is_capped_from_an_infeasible_reference(
+    cap, meq, x, active0, expected_count
+):
+    """The cold start of an infeasible point is cut down to ``n - meq`` rows."""
+    problem = make_problem(meq=meq)
+    active0 = ActiveSet(
+        meq=meq,
+        active_inequalities=active0.active_inequalities,
+        active_lb=active0.active_lb,
+        active_ub=active0.active_ub,
+    )
+    lag = make_evaluated_lagrangian(
+        problem=problem,
+        primal=Primal(jnp.asarray(x)),
+        dual=make_zero_dual(2, meq, 2),
+    )
+    policy = ThresholdWorkingSetPolicy(tol=TOL, cap_working_set=cap)
+    kept = policy.initial_set(lag, active0)
+    if not cap or expected_count == _mask_count(active0):
+        assert bool(eqx.tree_equal(kept, active0))
+        return
+    assert _mask_count(kept) == expected_count == lag.n - lag.meq
+    values = jnp.asarray(lag.ineq_fn_val)
+    if bool(jnp.any(values > TOL)):
+        # The most violated row is the one kept.
+        assert bool(kept.active_inequalities[int(jnp.argmax(values))])
+
+
+def _dependent_rows_lagrangian():
+    """``n = 3``, one equality ``x₂ = 1`` and four violated inequalities.
+
+    Row 0 is a near copy of the more violated row 1 and row 3 is parallel to
+    the equality Jacobian, so only rows 1 and 2 can enter a non-singular
+    working set. The (most violated) lower bound on ``x₂`` is likewise
+    parallel to the equality.
+    """
+    A = jnp.array([[1.0, 0.0, 0.0], [1.0, 1e-6, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    e2 = jnp.array([[0.0, 0.0, 1.0]])
+    problem = build_problem(
+        n=3,
+        meq=1,
+        mineq=4,
+        fn=lambda x: jnp.sum(x**2),
+        grad=lambda x: 2 * x,
+        hvp=lambda x, v: 2 * v,
+        eq_fn=lambda x: e2 @ x - 1.0,
+        eq_fn_jac=lambda x: e2,
+        eq_fn_hvp=lambda x, v: jnp.zeros((1, 3)),
+        ineq_fn=lambda x: A @ x + jnp.array([3.0, 4.0, 2.0, 1.0]),
+        ineq_fn_jac=lambda x: A,
+        ineq_fn_hvp=lambda x, v: jnp.zeros((4, 3)),
+        lb=jnp.array([-jnp.inf, -jnp.inf, 5.0]),
+        ub=jnp.array([jnp.inf, jnp.inf, jnp.inf]),
+    )
+    return Lagrangian(problem)(Primal(jnp.zeros(3)), make_zero_dual(3, 1, 4))
+
+
+@pytest.mark.parametrize("via_policy", [False, True], ids=["function", "policy"])
+def test_independence_screen_skips_dependent_rows(via_policy):
+    """Near-duplicate and equality-parallel rows never enter a full set."""
+    lag = _dependent_rows_lagrangian()
+    cand = jnp.array([True, True, True, True, False, False, True, False, False, False])
+    scores = jnp.concatenate([lag.ineq_fn_val, lag.lb - lag.ref.x, lag.ref.x - lag.ub])
+    if via_policy:
+        policy = ThresholdWorkingSetPolicy(tol=TOL)
+        selected = policy._select_rows(lag, jnp.zeros_like(cand), cand, scores)
+    else:
+        selected = independent_rows(jnp.zeros_like(cand), cand, scores, 2, lag)
+    assert selected.tolist() == [False, True, True, False] + [False] * 6
+    # Without the screen the cap keeps the two most violated (dependent) rows.
+    plain = ThresholdWorkingSetPolicy(tol=TOL, independence_tol=0.0)
+    capped = plain._select_rows(lag, jnp.zeros_like(cand), cand, scores)
+    assert (
+        capped.tolist() == [False, True, False, False, False, False, True] + [False] * 3
+    )
+
+
+@pytest.mark.parametrize("select", [cap_rows, independent_rows], ids=["cap", "screen"])
+def test_rows_staying_in_the_set_are_never_capped_or_screened(select):
+    """``keep`` passes through whole even when it exceeds the cap or is dependent."""
+    lag = _dependent_rows_lagrangian()
+    keep = jnp.array([True, True, False, True, False, False, True, False, False, False])
+    cand = jnp.array(
+        [False, False, True, False, False, False, False, False, False, False]
+    )
+    scores = jnp.concatenate([lag.ineq_fn_val, lag.lb - lag.ref.x, lag.ref.x - lag.ub])
+    args = (keep, cand, scores, 2) + ((lag,) if select is independent_rows else ())
+    selected = select(*args)
+    # Four rows stay for a cap of two: no slot is left for the candidate.
+    assert selected.tolist() == keep.tolist()
 
 
 def test_single_exchange_inherits_ramp_and_cycle_guard():

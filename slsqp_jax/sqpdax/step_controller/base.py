@@ -13,10 +13,56 @@ from ..primal import PrimalType
 from ..subproblem.solver import SubProblemSolverStateType
 
 __all__ = [
+    "ROUNDING_LEVEL_FACTOR",
     "StepResult",
     "StepController",
     "MeritStepController",
+    "at_rounding_level",
 ]
+
+ROUNDING_LEVEL_FACTOR: float = 100.0
+"""Multiple of the machine epsilon below which a predicted decrease is noise."""
+
+
+def at_rounding_level(predicted: Scalar, merit0: Scalar) -> Bool[Array, ""]:
+    """Whether a predicted merit decrease is below the merit's rounding level.
+
+    A step controller compares the merit at the trial point with the merit at
+    the current point; once the predicted decrease is a small multiple of the
+    machine epsilon times ``max(1, |merit0|)``, the difference of the two
+    merit values is dominated by round-off and the acceptance test carries no
+    information about the model. Such rejections must not be counted as model
+    or line-search failures by the outer loop.
+
+    Parameters
+    ----------
+    predicted
+        Predicted decrease of the merit for the full step (first-order slope
+        for a line search, model reduction for a trust region).
+    merit0
+        Merit value at the current iterate.
+
+    Returns
+    -------
+    Bool[Array, ""]
+        ``|predicted| <= ROUNDING_LEVEL_FACTOR * eps * max(1, |merit0|)``;
+        ``False`` for a non-finite ``predicted``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.step_controller import at_rounding_level
+    >>> bool(at_rounding_level(jnp.asarray(1e-20), jnp.asarray(2.0)))
+    True
+    >>> bool(at_rounding_level(jnp.asarray(1e-3), jnp.asarray(2.0)))
+    False
+    """
+    predicted = jnp.asarray(predicted)
+    eps = jnp.asarray(jnp.finfo(predicted.dtype).eps, predicted.dtype)
+    scale = jnp.maximum(1.0, jnp.abs(merit0))
+    return jnp.isfinite(predicted) & (
+        jnp.abs(predicted) <= ROUNDING_LEVEL_FACTOR * eps * scale
+    )
 
 
 class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
@@ -44,6 +90,12 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
         ``True`` only when a line search accepted through its weaker
         fallback after the primary sufficient-decrease condition failed.
         Non-line-search controllers leave this ``False``.
+    rounding_level
+        ``True`` when the controller's predicted decrease for the proposed
+        step was below the rounding level of the merit (see
+        :func:`at_rounding_level`), so ``accepted`` carries no information
+        about the quality of the model. Outer loops must not count such a
+        rejection towards their failure streaks.
     """
 
     x: PrimalType
@@ -55,6 +107,7 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
     accepted_by_fallback: Bool[Array, ""] = field(
         default_factory=lambda: jnp.asarray(False)
     )
+    rounding_level: Bool[Array, ""] = field(default_factory=lambda: jnp.asarray(False))
 
 
 class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):

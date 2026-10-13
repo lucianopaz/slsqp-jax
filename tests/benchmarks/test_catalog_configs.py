@@ -6,7 +6,14 @@ import pandas as pd
 import pytest
 
 from benchmarks import __main__ as cli
-from benchmarks.catalog import COLUMNS, TIERS, load_catalog, select, tier_of
+from benchmarks.catalog import (
+    COLUMNS,
+    TIERS,
+    VALIDATION_COLUMNS,
+    load_catalog,
+    select,
+    tier_of,
+)
 from benchmarks.configs import CONFIGS, get_configs
 from benchmarks.worker import TaskSpec, _solved, adaptive_repeats
 
@@ -17,8 +24,12 @@ def catalog() -> pd.DataFrame:
 
 
 def test_catalog_schema(catalog):
-    assert list(catalog.columns) == list(COLUMNS)
+    assert list(catalog.columns) == [*COLUMNS, *VALIDATION_COLUMNS]
     assert not catalog.duplicated(["name", "y0_iD"]).any()
+    assert catalog["valid"].dtype == bool
+    # the validated reference is consistent with has_fstar
+    assert (catalog["has_fstar"] == catalog["fstar"].notna()).all()
+    assert catalog["fstar_source"].isin(["sif2jax", "scipy-consensus"]).all()
     assert (catalog["n"] > 0).all()
     assert catalog["tier"].map(lambda t: t in {*TIERS, "large"}).all()
     assert (catalog["tier"] == catalog["n"].map(tier_of)).all()

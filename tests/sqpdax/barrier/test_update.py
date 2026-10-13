@@ -118,6 +118,72 @@ def test_optimality_residual_matches_manual_inf_norms():
 
 
 @pytest.mark.parametrize(
+    ("multiplier", "scale_max"),
+    [(1.0, 100.0), (1e4, 100.0), (1e4, 1e6)],
+    ids=["small-multipliers", "large-multipliers", "scaling-off"],
+)
+def test_scaled_optimality_residual_uses_ipopt_multiplier_scaling(
+    multiplier, scale_max
+):
+    """``s_d = max(s_max, (‖y‖₁+‖z‖₁)/(m+p))/s_max`` and ``s_c = max(s_max, ‖z‖₁/p)/s_max``
+    divide the stationarity and complementarity components; with multipliers
+    below ``s_max`` the scaled residual equals the unscaled one."""
+    problem = make_problem(
+        lb=jnp.array([0.0, -jnp.inf]),
+        ub=jnp.array([jnp.inf, 3.0]),
+    )
+    dual = Dual(
+        eq_multipliers=jnp.full((problem.meq,), multiplier),
+        ineq_multipliers=jnp.full((problem.mineq,), multiplier),
+        lb_multipliers=jnp.full((problem.n,), multiplier),
+        ub_multipliers=jnp.full((problem.n,), multiplier),
+    )
+    evaluated, barrier = make_evaluated_ip_lagrangian(
+        problem=problem, dual=dual, weight=0.5
+    )
+    policy = MonotoneBarrierUpdate(scale_max=scale_max)
+    mu = barrier.weight
+    stationarity, feasibility, complementarity = policy.residual_components(
+        evaluated, mu
+    )
+    p = problem.mineq + 1 + 1  # one finite lower and one finite upper bound
+    m = problem.meq
+    z_sum = multiplier * p
+    y_sum = multiplier * m
+    s_d = max(scale_max, (y_sum + z_sum) / (m + p)) / scale_max
+    s_c = max(scale_max, z_sum / p) / scale_max
+    expected = jnp.max(
+        jnp.stack([stationarity / s_d, feasibility, complementarity / s_c])
+    )
+    scaled = policy.scaled_optimality_residual(evaluated, mu)
+    assert jnp.allclose(scaled, expected)
+    unscaled = policy.optimality_residual(evaluated, mu)
+    if multiplier <= scale_max:
+        assert jnp.allclose(scaled, unscaled)
+    else:
+        assert float(scaled) < float(unscaled)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        MonotoneBarrierUpdate(sigma=0.2, kappa_eps=0.0),
+        FunnelBarrierUpdate(gamma_mu=0.2, zeta1=1e-12, zeta2=1e-12, kappa_eps=0.0),
+    ],
+    ids=["monotone", "funnel"],
+)
+@pytest.mark.parametrize("force", [False, True], ids=["unforced", "forced"])
+def test_force_reduces_mu_regardless_of_the_inner_test(policy, force):
+    """``force=True`` reduces ``μ`` when the policy's own test fails."""
+    mu = 0.1
+    evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
+    updated, solved = policy.update(barrier, evaluated, force=jnp.asarray(force))
+    assert bool(solved) is force
+    expected = 0.2 * mu if force else mu
+    assert float(updated.weight) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
     ("kappa_eps", "sigma", "mu", "expect_reduce"),
     [
         (1e6, 0.2, 1.0, True),  # huge tolerance → always "solved"
@@ -226,12 +292,34 @@ def test_update_preserves_barrier_masks():
         {"kappa_fb_power": 0.0},
         {"kappa_y_scale": 0.0},
         {"kappa_D_scale": -1.0},
+        {"kappa_eps": -1.0},
     ],
     ids=lambda kw: "-".join(kw),
 )
 def test_funnel_check_init_rejects_invalid_constants(kwargs):
     with pytest.raises(ValueError):
         FunnelBarrierUpdate(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kappa_eps", "expect_solved"),
+    [(0.0, False), (1e9, True)],
+    ids=["kkt-test-off", "kkt-test-loose"],
+)
+def test_funnel_kkt_test_is_an_alternative_to_315a(kappa_eps, expect_solved):
+    """``E_scaled(·; μ) ≤ κ_ε μ`` declares BSP(μ) solved when (3.15a) fails."""
+    mu = 0.1
+    evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
+    policy = FunnelBarrierUpdate(
+        gamma_mu=0.2, zeta1=1e-12, zeta2=1e-12, kappa_eps=kappa_eps
+    )
+    assert not bool(policy.solved(mu, jnp.asarray(1.0), jnp.asarray(1.0)))
+    updated, solved = policy.update(
+        barrier, evaluated, pi_f=jnp.asarray(1.0), v=jnp.asarray(1.0)
+    )
+    assert bool(solved) is expect_solved
+    expected = 0.2 * mu if expect_solved else mu
+    assert float(updated.weight) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +338,7 @@ def test_funnel_update_reduces_mu_iff_both_tolerances_met(pi_f, v, expect_solved
     mu = 0.1
     evaluated, barrier = make_evaluated_ip_lagrangian(weight=mu)
     policy = FunnelBarrierUpdate(
-        gamma_mu=0.2, zeta1=0.5, alpha=1.0, zeta2=1.0, beta=1.0
+        gamma_mu=0.2, zeta1=0.5, alpha=1.0, zeta2=1.0, beta=1.0, kappa_eps=0.0
     )
     assert float(policy.eps_pi(mu)) == pytest.approx(0.05)
     assert float(policy.eps_v(mu)) == pytest.approx(0.1)
@@ -286,14 +374,18 @@ def test_funnel_update_defaults_pi_f_and_v_from_lagrangian():
     assert pi_f > 0.0 and v > 0.0
 
     # Violation tolerance just above / below the recomputed ``v`` (πᶠ supplied).
-    loose = FunnelBarrierUpdate(zeta1=0.99, alpha=1.0, zeta2=2.0 * v / mu, beta=1.0)
-    tight = FunnelBarrierUpdate(zeta1=0.99, alpha=1.0, zeta2=0.5 * v / mu, beta=1.0)
+    loose = FunnelBarrierUpdate(
+        zeta1=0.99, alpha=1.0, zeta2=2.0 * v / mu, beta=1.0, kappa_eps=0.0
+    )
+    tight = FunnelBarrierUpdate(
+        zeta1=0.99, alpha=1.0, zeta2=0.5 * v / mu, beta=1.0, kappa_eps=0.0
+    )
     assert float(loose.eps_v(mu)) > v > float(tight.eps_v(mu))
     _, solved_loose = loose.update(barrier, evaluated, pi_f=jnp.asarray(0.0))
     _, solved_tight = tight.update(barrier, evaluated, pi_f=jnp.asarray(0.0))
     assert bool(solved_loose) and not bool(solved_tight)
     # Stationarity recomputed (``v`` supplied): solved iff πᶠ ≤ ζ₁ μ.
-    _, solved_pi = FunnelBarrierUpdate(zeta1=0.99, zeta2=1e6).update(
+    _, solved_pi = FunnelBarrierUpdate(zeta1=0.99, zeta2=1e6, kappa_eps=0.0).update(
         barrier, evaluated, v=jnp.asarray(0.0)
     )
     assert bool(solved_pi) == (pi_f <= 0.99 * mu)

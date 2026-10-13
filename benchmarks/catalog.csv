@@ -1,692 +1,692 @@
-name,collection,n,meq,mineq,nbounds,y0_iD,n_y0s,has_fstar,fstar,has_xstar,tier
-AIRCRFTB,bounded,8,0,0,6,0,1,True,0.064099,False,tiny
-BDEXP,bounded,5000,0,0,5000,0,1,True,0.0,False,large
-BIGGS3,bounded,6,0,0,6,0,1,True,0.0,False,tiny
-BIGGS5,bounded,6,0,0,2,0,1,True,0.0,False,tiny
-BOX2,bounded,3,0,0,2,0,1,True,0.0,False,tiny
-BRANIN,bounded,2,0,0,4,0,1,True,0.397887,True,tiny
-CAMEL6,bounded,2,0,0,4,0,1,True,-1.0316,True,tiny
-CHARDIS0,bounded,2000,0,0,4000,0,1,False,,False,large
-CYCLOOCTLS,bounded,30000,0,0,8,0,1,True,0.0,False,large
-DEGDIAG,bounded,100001,0,0,100001,0,1,True,16666.58333416666,True,large
-DEGTRID,bounded,100001,0,0,100001,0,1,False,,False,large
-DEGTRID2,bounded,100001,0,0,100001,0,1,False,,False,large
-DEVGLA1B,bounded,4,0,0,8,0,1,True,0.0,True,tiny
-DEVGLA2B,bounded,5,0,0,10,0,1,True,0.0,True,tiny
-DGOSPEC,bounded,3,0,0,6,0,1,False,,False,tiny
-DIAGIQB,bounded,10,0,0,20,0,1,False,,True,tiny
-DIAGIQE,bounded,1000,0,0,2000,0,1,False,,True,medium
-DIAGIQT,bounded,1000,0,0,2000,0,1,True,-3.7854644926851035,True,medium
-DIAGNQB,bounded,1000,0,0,2000,0,1,True,502.04401053674934,True,medium
-DIAGNQE,bounded,1000,0,0,2000,0,1,True,3.7427354302751725,True,medium
-DIAGNQT,bounded,1000,0,0,2000,0,1,True,821.96728334078,True,medium
-DIAGPQB,bounded,1000,0,0,2000,0,1,True,-821.96728334078,True,medium
-DIAGPQE,bounded,1000,0,0,2000,0,1,True,-3.742735430275173,True,medium
-DIAGPQT,bounded,1000,0,0,2000,0,1,True,-502.04401053674934,True,medium
-EGGCRATEB,bounded,2,0,0,4,0,1,True,0.0,True,tiny
-ELATVIDUB,bounded,2,0,0,4,0,1,True,0.0,False,tiny
-EXP2B,bounded,2,0,0,4,0,1,False,,False,tiny
-EXPLIN,bounded,1200,0,0,2400,0,1,True,0.0,False,large
-EXPLIN2,bounded,1200,0,0,2400,0,1,True,0.0,False,large
-FBRAINLS,bounded,2,0,0,4,0,1,True,0.0,False,tiny
-HADAMALS,bounded,400,0,0,800,0,1,True,0.0,False,medium
-HART6,bounded,6,0,0,12,0,1,True,-3.32288689158,True,tiny
-HATFLDA,bounded,4,0,0,4,0,1,False,,False,tiny
-HATFLDB,bounded,4,0,0,5,0,1,True,0.00557281,False,tiny
-HATFLDC,bounded,25,0,0,48,0,1,True,0.0,False,small
-HS1,bounded,2,0,0,1,0,1,True,0.0,True,tiny
-HS110,bounded,10,0,0,20,0,1,True,-45.77846971,True,tiny
-HS2,bounded,2,0,0,1,0,1,True,0.0504261879,True,tiny
-HS25,bounded,3,0,0,6,0,1,True,0.0,True,tiny
-HS3,bounded,2,0,0,1,0,1,True,0.0,True,tiny
-HS38,bounded,4,0,0,8,0,1,True,0.0,True,tiny
-HS3MOD,bounded,2,0,0,1,0,1,True,0.0,False,tiny
-HS4,bounded,2,0,0,2,0,1,True,2.6666666666666665,True,tiny
-HS45,bounded,5,0,0,10,0,1,True,1.0,True,tiny
-HS5,bounded,2,0,0,4,0,1,True,-5.034897941932651,True,tiny
-JUDGEB,bounded,2,0,0,4,0,1,True,0.0,False,tiny
-KOEBHELB,bounded,3,0,0,2,0,1,True,77.516347286,True,tiny
-LEVYMONT,bounded,100,0,0,200,0,1,True,0.0,False,small
-LEVYMONT10,bounded,10,0,0,20,0,1,True,0.0,False,tiny
-LEVYMONT5,bounded,2,0,0,4,0,1,True,0.0,False,tiny
-LEVYMONT6,bounded,3,0,0,6,0,1,True,0.0,False,tiny
-LEVYMONT7,bounded,4,0,0,8,0,1,True,0.0,False,tiny
-LEVYMONT8,bounded,5,0,0,10,0,1,True,0.0,False,tiny
-LEVYMONT9,bounded,8,0,0,16,0,1,True,0.0,False,tiny
-LOGROS,bounded,2,0,0,2,0,1,True,0.0,True,tiny
-OBSTCLAE,bounded,10000,0,0,20000,0,1,False,,False,large
-OBSTCLAL,bounded,10000,0,0,20000,0,1,False,,False,large
-OBSTCLBL,bounded,10000,0,0,20000,0,1,False,,False,large
-OBSTCLBM,bounded,10000,0,0,20000,0,1,False,,False,large
-OBSTCLBU,bounded,10000,0,0,20000,0,1,False,,False,large
-PALMER1,bounded,4,0,0,3,0,1,True,11754.6025,False,tiny
-PALMER1A,bounded,6,0,0,2,0,1,True,0.011611512,True,tiny
-PALMER2,bounded,4,0,0,3,0,1,True,3651.097532,False,tiny
-PALMER2A,bounded,6,0,0,2,0,1,True,0.017437656,True,tiny
-PALMER2B,bounded,4,0,0,2,0,1,True,0.017552259,True,tiny
-PALMER2E,bounded,8,0,0,1,0,1,True,7.9851969e-05,True,tiny
-PALMER3,bounded,4,0,0,3,0,1,True,2265.95822,True,tiny
-PALMER3A,bounded,6,0,0,2,0,1,True,0.016139887,True,tiny
-PALMER3B,bounded,4,0,0,2,0,1,True,4.227647,False,tiny
-PALMER3E,bounded,8,0,0,1,0,1,True,0.016139887,True,tiny
-PALMER4,bounded,4,0,0,3,0,1,True,2103.9059,True,tiny
-PALMER4B,bounded,4,0,0,2,0,1,True,3.10595086,True,tiny
-PALMER4E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny
-PALMER5B,bounded,9,0,0,2,0,1,True,0.040606141,True,tiny
-PALMER6A,bounded,6,0,0,2,0,1,True,0.040606141,True,tiny
-PALMER6E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny
-PALMER7E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny
-PALMER8A,bounded,6,0,0,2,0,1,True,0.040606141,True,tiny
-PALMER8E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny
-PFIT1LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny
-PFIT2LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny
-PFIT3LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny
-PFIT4LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny
-PRICE4B,bounded,2,0,0,4,0,1,True,0.0,False,tiny
-QINGB,bounded,5,0,0,10,0,1,True,0.0,True,tiny
-QUDLIN,bounded,5000,0,0,10000,0,1,True,0.0,False,large
-RAYBENDL,bounded,2050,0,0,8,0,1,True,96.2424,False,large
-S368,bounded,8,0,0,16,0,1,False,,False,tiny
-TRIGON1B,bounded,10,0,0,20,0,1,True,0.0,True,tiny
-BQP1VAR,bqp,1,0,0,2,0,1,True,0.0,True,tiny
-BQPGABIM,bqp,50,0,0,100,0,1,True,-5.519814e-05,False,small
-BQPGASIM,bqp,50,0,0,100,0,1,True,-5.519814e-05,False,small
-CVXBQP1,bqp,100000,0,0,200000,0,1,False,,False,large
-NCVXBQP1,bqp,10000,0,0,20000,0,1,False,,False,large
-NCVXBQP2,bqp,10000,0,0,20000,0,1,False,,False,large
-NCVXBQP3,bqp,10000,0,0,20000,0,1,False,,False,large
-TORSION1,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSION2,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSION3,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSION4,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSION5,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSION6,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSIONA,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSIONB,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSIONC,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSIOND,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large
-TORSIONE,bqp,5476,0,0,10952,0,1,True,-2.8502,False,large
-TORSIONF,bqp,5476,0,0,10952,0,1,True,-2.8502,False,large
-ALJAZZAF,constrained,1000,1,0,1000,0,1,True,75.004996,False,medium
-ALSOTAME,constrained,2,1,0,4,0,1,False,,False,tiny
-AVGASA,constrained,8,0,10,16,0,1,False,,False,tiny
-AVGASB,constrained,8,0,10,16,0,1,False,,False,tiny
-BATCH,constrained,48,12,61,94,0,1,False,,False,small
-BIGGSC4,constrained,4,0,7,8,0,1,True,-24.5,False,tiny
-BT1,constrained,2,1,0,0,0,1,True,-1.0,True,tiny
-BT10,constrained,2,2,0,0,0,3,True,-1.0,True,tiny
-BT10,constrained,2,2,0,0,1,3,True,-1.0,True,tiny
-BT10,constrained,2,2,0,0,2,3,True,-1.0,True,tiny
-BT11,constrained,5,3,0,0,0,3,False,,True,tiny
-BT11,constrained,5,3,0,0,1,3,False,,True,tiny
-BT11,constrained,5,3,0,0,2,3,False,,True,tiny
-BT12,constrained,5,3,0,0,0,4,False,,True,tiny
-BT12,constrained,5,3,0,0,1,4,False,,True,tiny
-BT12,constrained,5,3,0,0,2,4,False,,True,tiny
-BT12,constrained,5,3,0,0,3,4,False,,True,tiny
-BT13,constrained,5,1,0,1,0,1,True,0.0,True,tiny
-BT2,constrained,3,1,0,0,0,3,False,,True,tiny
-BT2,constrained,3,1,0,0,1,3,False,,True,tiny
-BT2,constrained,3,1,0,0,2,3,False,,True,tiny
-BT3,constrained,5,3,0,0,0,3,False,,True,tiny
-BT3,constrained,5,3,0,0,1,3,False,,True,tiny
-BT3,constrained,5,3,0,0,2,3,False,,True,tiny
-BT4,constrained,3,2,0,0,0,4,False,,True,tiny
-BT4,constrained,3,2,0,0,1,4,False,,True,tiny
-BT4,constrained,3,2,0,0,2,4,False,,True,tiny
-BT4,constrained,3,2,0,0,3,4,False,,True,tiny
-BT5,constrained,3,2,0,0,0,3,False,,True,tiny
-BT5,constrained,3,2,0,0,1,3,False,,True,tiny
-BT5,constrained,3,2,0,0,2,3,False,,True,tiny
-BT6,constrained,5,2,0,0,0,2,False,,True,tiny
-BT6,constrained,5,2,0,0,1,2,False,,True,tiny
-BT7,constrained,5,3,0,0,0,2,False,,True,tiny
-BT7,constrained,5,3,0,0,1,2,False,,True,tiny
-BT8,constrained,5,2,0,0,0,2,True,1.0,True,tiny
-BT8,constrained,5,2,0,0,1,2,True,1.0,True,tiny
-BT9,constrained,4,2,0,0,0,3,True,-1.0,True,tiny
-BT9,constrained,4,2,0,0,1,3,True,-1.0,True,tiny
-BT9,constrained,4,2,0,0,2,3,True,-1.0,True,tiny
-BURKEHAN,constrained,1,0,1,1,0,1,False,,False,tiny
-BYRDSPHR,constrained,3,2,0,0,0,1,True,-4.68330049,False,tiny
-CANTILVR,constrained,5,0,1,5,0,1,True,1.3399595938,False,tiny
-CB2,constrained,3,0,3,0,0,1,True,0.0,False,tiny
-CB3,constrained,3,0,3,0,0,1,True,0.0,False,tiny
-CHACONN1,constrained,3,0,3,0,0,1,True,1.95222,False,tiny
-CHACONN2,constrained,3,0,3,0,0,1,True,2.0,False,tiny
-CLEUVEN2,constrained,1530,1065,1264,1158,0,1,False,,False,large
-CLEUVEN3,constrained,1200,29,2944,2196,0,1,False,,False,large
-CLEUVEN4,constrained,1200,29,2944,2196,0,1,False,,False,large
-CLEUVEN5,constrained,1200,29,2944,2196,0,1,False,,False,large
-CLEUVEN6,constrained,1200,29,3062,2167,0,1,False,,False,large
-CLEUVEN7,constrained,360,0,946,659,0,1,True,706.5690133723616,False,medium
-COSHFUN,constrained,6001,0,2000,0,0,1,False,,False,large
-CSFI1,constrained,5,2,2,6,0,1,True,-49.1,True,tiny
-CSFI2,constrained,5,2,2,5,0,1,True,55.0,True,tiny
-DALLASS,constrained,46,31,0,92,0,1,True,-32393.0,False,small
-DECONVC,constrained,63,1,0,75,0,1,False,,False,small
-DEGENLPA,constrained,20,15,0,40,0,1,True,-3.06435,False,tiny
-DEGENLPB,constrained,20,15,0,40,0,1,True,3.06435,False,tiny
-DEMBO7,constrained,16,0,20,32,0,1,True,174.788807,False,tiny
-DEMYMALO,constrained,3,0,3,0,0,1,True,-3.0,False,tiny
-DIPIGRI,constrained,7,0,4,0,0,1,True,680.63,False,tiny
-DTOC1L,constrained,5998,3996,0,8,0,1,True,3.9430507151,False,large
-DTOC1NA,constrained,5998,3996,0,8,0,1,True,4.13895890755,False,large
-DTOC1NB,constrained,5998,3996,0,8,0,1,True,7.13884991815,False,large
-DTOC1NC,constrained,5998,3996,0,8,0,1,True,35.1993544122,False,large
-DTOC1ND,constrained,5998,3996,0,8,0,1,True,47.6030771433,False,large
-DTOC2,constrained,5998,3996,0,8,0,1,True,0.490200910983,False,large
-DTOC4,constrained,4499,2998,0,4,0,1,False,,False,large
-DTOC5,constrained,9999,4999,0,2,0,1,False,,False,large
-DTOC6,constrained,10001,5000,0,2,0,1,False,,False,large
-EIGENB2,constrained,2550,1275,0,0,0,1,True,0.0,False,large
-EIGENBCO,constrained,2550,1275,0,0,0,1,True,0.0,False,large
-EIGENC2,constrained,2652,1326,0,0,0,1,True,0.0,False,large
-EIGENCCO,constrained,2652,1326,0,0,0,1,True,0.0,False,large
-ELATTAR,constrained,7,0,102,0,0,1,True,0.1427066255,True,tiny
-FLETCHER,constrained,4,1,3,1,0,1,True,5.82842712474619,True,tiny
-FLT,constrained,2,2,0,0,0,1,True,0.0,True,tiny
-GIGOMEZ1,constrained,3,0,3,0,0,1,True,-3.0,False,tiny
-GIGOMEZ2,constrained,3,0,3,0,0,1,True,1.95222,False,tiny
-GIGOMEZ3,constrained,3,0,3,0,0,1,True,2.0,False,tiny
-GOFFIN,constrained,51,0,50,0,0,1,True,0.0,False,small
-HADAMARD,constrained,401,210,800,1,0,1,False,,False,medium
-HAGER1,constrained,5001,2500,0,2,0,1,True,0.88079708841,True,large
-HAGER2,constrained,5001,2500,0,2,0,1,True,0.4320822986,True,large
-HAGER4,constrained,5001,2500,0,2502,0,1,True,2.794244187,True,large
-HAIFAM,constrained,99,0,150,0,0,1,False,,False,small
-HAIFAS,constrained,13,0,9,0,0,1,False,,False,tiny
-HIMMELBC,constrained,2,2,0,0,0,1,True,0.0,False,tiny
-HIMMELBD,constrained,2,2,0,0,0,1,True,0.0,False,tiny
-HIMMELBE,constrained,3,3,0,0,0,1,True,0.0,True,tiny
-HS10,constrained,2,0,1,0,0,1,True,-1.0,True,tiny
-HS100,constrained,7,0,4,0,0,1,True,680.6300573,True,tiny
-HS101,constrained,7,0,5,14,0,1,True,1809.76476,False,tiny
-HS102,constrained,7,0,5,14,0,1,True,911.880571,False,tiny
-HS103,constrained,7,0,5,14,0,1,True,543.667958,False,tiny
-HS104,constrained,8,0,5,16,0,1,True,3.9511634396,True,tiny
-HS105,constrained,8,0,1,16,0,1,True,1138.41624,True,tiny
-HS106,constrained,8,0,6,16,0,1,True,7049.330923,True,tiny
-HS107,constrained,9,6,0,8,0,1,True,5055.011803,True,tiny
-HS108,constrained,9,0,13,1,0,1,True,-0.866025403,True,tiny
-HS11,constrained,2,0,1,0,0,1,True,-8.498464223,True,tiny
-HS111,constrained,10,3,0,20,0,1,True,-47.76109026,True,tiny
-HS111LNP,constrained,10,3,0,0,0,1,True,-47.707579,False,tiny
-HS112,constrained,10,3,0,10,0,1,True,-47.707579,True,tiny
-HS113,constrained,10,0,8,0,0,1,True,24.3062091,True,tiny
-HS114,constrained,10,3,8,20,0,1,True,-1768.80696,True,tiny
-HS116,constrained,13,0,14,26,0,1,True,97.588409,True,tiny
-HS117,constrained,15,0,5,15,0,1,True,32.348679,True,tiny
-HS119,constrained,16,8,0,32,0,1,True,244.899698,True,tiny
-HS12,constrained,2,0,1,0,0,1,True,-30.0,True,tiny
-HS13,constrained,2,0,1,2,0,1,True,1.0,True,tiny
-HS14,constrained,2,1,1,0,0,1,True,1.393464980689302,True,tiny
-HS15,constrained,2,0,2,1,0,1,True,306.5,True,tiny
-HS16,constrained,2,0,2,3,0,1,True,0.25,True,tiny
-HS17,constrained,2,0,2,3,0,1,True,1.0,True,tiny
-HS18,constrained,2,0,2,4,0,1,True,5.0,True,tiny
-HS19,constrained,2,0,2,4,0,1,True,-6961.81381,True,tiny
-HS20,constrained,2,0,3,2,0,1,True,38.19872981077807,True,tiny
-HS21,constrained,2,0,1,4,0,1,True,-99.96,True,tiny
-HS21MOD,constrained,7,0,1,8,0,1,True,-99.96,False,tiny
-HS22,constrained,2,0,2,0,0,1,True,1.0,True,tiny
-HS23,constrained,2,0,5,4,0,1,True,2.0,True,tiny
-HS24,constrained,2,0,3,2,0,1,True,-1.0,True,tiny
-HS26,constrained,3,1,0,0,0,1,True,0.0,True,tiny
-HS268,constrained,5,0,5,0,0,1,False,,False,tiny
-HS27,constrained,3,1,0,0,0,1,True,0.04,True,tiny
-HS28,constrained,3,1,0,0,0,1,True,0.0,True,tiny
-HS29,constrained,3,0,1,0,0,1,True,-22.627416997969522,True,tiny
-HS30,constrained,3,0,1,6,0,1,True,1.0,True,tiny
-HS31,constrained,3,0,1,6,0,1,True,6.0,True,tiny
-HS32,constrained,3,1,1,3,0,1,True,1.0,True,tiny
-HS33,constrained,3,0,2,4,0,1,True,-4.585786437626905,True,tiny
-HS34,constrained,3,0,2,6,0,1,True,-2.302585092994046,True,tiny
-HS35,constrained,3,0,1,3,0,1,True,0.1111111111111111,True,tiny
-HS35I,constrained,3,0,1,6,0,1,True,0.1111111111,False,tiny
-HS35MOD,constrained,3,0,1,4,0,1,True,0.1111111111,False,tiny
-HS36,constrained,3,0,1,6,0,1,True,-3300.0,True,tiny
-HS37,constrained,3,0,2,6,0,1,True,-3456.0,True,tiny
-HS39,constrained,4,2,0,0,0,1,True,-1.0,True,tiny
-HS40,constrained,4,3,0,0,0,1,True,-0.25,True,tiny
-HS41,constrained,4,1,0,8,0,1,True,1.9259259259259258,True,tiny
-HS42,constrained,4,2,0,0,0,1,True,13.857864376269049,True,tiny
-HS43,constrained,4,0,3,0,0,1,True,-44.0,True,tiny
-HS44,constrained,4,0,6,4,0,1,True,-15.0,True,tiny
-HS46,constrained,5,2,0,0,0,1,True,0.0,True,tiny
-HS47,constrained,5,3,0,0,0,1,True,0.0,True,tiny
-HS48,constrained,5,2,0,0,0,1,True,0.0,True,tiny
-HS49,constrained,5,2,0,0,0,1,True,0.0,True,tiny
-HS50,constrained,5,3,0,0,0,1,True,0.0,True,tiny
-HS51,constrained,5,3,0,0,0,1,True,0.0,True,tiny
-HS52,constrained,5,3,0,0,0,1,True,5.326647564469914,True,tiny
-HS53,constrained,5,3,0,10,0,1,True,4.093023255813954,True,tiny
-HS54,constrained,6,1,0,12,0,1,True,-0.9080747577659853,True,tiny
-HS55,constrained,6,6,0,8,0,1,True,6.333333333333333,True,tiny
-HS56,constrained,7,4,0,0,0,1,True,-3.456,True,tiny
-HS57,constrained,2,0,1,2,0,1,True,0.02845966972,True,tiny
-HS6,constrained,2,1,0,0,0,1,True,0.0,True,tiny
-HS60,constrained,3,1,0,6,0,1,True,0.03256820025,True,tiny
-HS61,constrained,3,2,0,0,0,1,True,-143.6461422,True,tiny
-HS62,constrained,3,1,0,6,0,1,True,-26272.51448,True,tiny
-HS63,constrained,3,2,0,3,0,1,True,961.7151721,True,tiny
-HS64,constrained,3,0,1,3,0,1,True,6299.842428,True,tiny
-HS65,constrained,3,0,1,6,0,1,True,0.9535288567,True,tiny
-HS66,constrained,3,0,2,6,0,1,True,0.5181632741,True,tiny
-HS68,constrained,4,2,0,8,0,1,True,-0.920425026,True,tiny
-HS69,constrained,4,2,0,8,0,1,True,-956.71288,True,tiny
-HS7,constrained,2,1,0,0,0,1,True,-1.7320508075688772,True,tiny
-HS71,constrained,4,1,1,8,0,1,True,17.0140173,True,tiny
-HS72,constrained,4,0,2,8,0,1,True,727.67937,True,tiny
-HS73,constrained,4,1,2,4,0,1,True,29.894378,True,tiny
-HS76,constrained,4,0,3,4,0,1,True,-4.681818181,True,tiny
-HS76I,constrained,4,0,3,8,0,1,False,,False,tiny
-HS77,constrained,5,2,0,0,0,1,True,0.24150513,True,tiny
-HS78,constrained,5,3,0,0,0,1,True,-2.91970041,True,tiny
-HS79,constrained,5,3,0,0,0,1,True,0.0787768209,True,tiny
-HS8,constrained,2,2,0,0,0,1,True,-1.0,True,tiny
-HS80,constrained,5,3,0,10,0,1,True,0.0539498478,True,tiny
-HS81,constrained,5,3,0,10,0,1,True,0.0539498478,True,tiny
-HS83,constrained,5,0,3,10,0,1,True,-30665.53867,True,tiny
-HS86,constrained,5,0,10,5,0,1,False,,True,tiny
-HS87,constrained,6,4,0,12,0,1,True,8927.5977,True,tiny
-HS9,constrained,2,1,0,0,0,1,True,-0.5,True,tiny
-HS93,constrained,6,0,2,6,0,1,True,135.075961,True,tiny
-HS95,constrained,6,0,4,12,0,1,True,0.015619514,False,tiny
-HS96,constrained,6,0,4,12,0,1,True,0.015619515,False,tiny
-HS97,constrained,6,0,4,12,0,1,True,3.1358091,False,tiny
-HS98,constrained,6,0,4,12,0,1,True,3.135809,False,tiny
-HYDROELL,constrained,1009,0,1008,2018,0,1,True,-3585550.0,False,large
-LIPPERT2,constrained,20201,10000,40000,1,0,1,False,,False,large
-LISWET1,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET10,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET11,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET12,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET2,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET3,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET4,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET5,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET6,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET7,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET8,constrained,2002,0,2000,0,0,1,False,,False,large
-LISWET9,constrained,2002,0,2000,0,0,1,False,,False,large
-LOOTSMA,constrained,3,0,2,4,0,1,False,,False,tiny
-LSNNODOC,constrained,5,4,0,6,0,1,False,,False,tiny
-LSQFIT,constrained,2,0,1,1,0,1,False,,False,tiny
-LUKVLE1,constrained,10000,9998,0,0,0,1,True,0.0,True,large
-LUKVLE10,constrained,10000,9998,0,0,0,1,False,,False,large
-LUKVLE11,constrained,9998,6664,0,0,0,1,False,,False,large
-LUKVLE13,constrained,9998,6664,0,0,0,1,False,,False,large
-LUKVLE15,constrained,9997,7497,0,0,0,1,False,,False,large
-LUKVLE16,constrained,9997,7497,0,0,0,1,False,,False,large
-LUKVLE17,constrained,9997,7497,0,0,0,1,False,,False,large
-LUKVLE18,constrained,9997,7497,0,0,0,1,False,,False,large
-LUKVLE3,constrained,10000,2,0,0,0,1,False,,False,large
-LUKVLE5,constrained,10002,9996,0,4,0,1,False,,False,large
-LUKVLE6,constrained,9999,4999,0,0,0,1,False,,False,large
-LUKVLE7,constrained,10000,4,0,0,0,1,False,,False,large
-LUKVLE8,constrained,10000,9998,0,0,0,1,False,,False,large
-LUKVLI1,constrained,10000,0,9998,0,0,1,True,0.0,True,large
-LUKVLI10,constrained,10000,0,9998,0,0,1,False,,False,large
-LUKVLI11,constrained,9998,0,6664,0,0,1,False,,False,large
-LUKVLI13,constrained,9998,0,6664,0,0,1,False,,False,large
-LUKVLI15,constrained,9997,0,7497,0,0,1,False,,False,large
-LUKVLI16,constrained,9997,0,7497,0,0,1,False,,False,large
-LUKVLI17,constrained,9997,0,7497,0,0,1,False,,False,large
-LUKVLI18,constrained,9997,0,7497,0,0,1,False,,False,large
-LUKVLI3,constrained,10000,0,2,0,0,1,False,,False,large
-LUKVLI5,constrained,10002,0,9996,4,0,1,False,,False,large
-LUKVLI6,constrained,9999,0,4999,0,0,1,False,,False,large
-LUKVLI7,constrained,10000,0,4,0,0,1,False,,False,large
-LUKVLI8,constrained,10000,0,9998,0,0,1,False,,False,large
-MADSEN,constrained,3,0,6,0,0,1,False,,False,tiny
-MAKELA1,constrained,3,0,2,0,0,1,True,-1.4142121558,False,tiny
-MAKELA2,constrained,3,0,3,0,0,1,True,7.2,False,tiny
-MAKELA3,constrained,21,0,20,0,0,1,True,0.0,False,small
-MAKELA4,constrained,21,0,40,0,0,1,True,0.0,False,small
-MARATOS,constrained,2,1,0,0,0,1,False,,False,tiny
-MATRIX2,constrained,6,0,2,4,0,1,True,0.0,True,tiny
-MINMAXBD,constrained,5,0,20,0,0,1,False,,False,tiny
-MINMAXRB,constrained,3,0,4,0,0,1,True,0.0,False,tiny
-MSS1,constrained,90,73,0,0,0,1,False,,False,small
-MSS2,constrained,756,703,0,0,0,1,False,,False,medium
-ODFITS,constrained,10,6,0,10,0,1,True,-2380.026775,False,tiny
-OET1,constrained,3,0,1002,0,0,1,False,,False,tiny
-OET2,constrained,3,0,1002,0,0,1,False,,False,tiny
-OET3,constrained,4,0,1002,0,0,1,False,,False,tiny
-OET4,constrained,4,0,1002,0,0,1,False,,False,tiny
-OET5,constrained,5,0,1002,0,0,1,False,,False,tiny
-OET6,constrained,5,0,1002,0,0,1,False,,False,tiny
-OET7,constrained,7,0,1002,0,0,1,False,,False,tiny
-OPTCDEG2,constrained,4502,3000,0,4505,0,1,False,,False,large
-OPTCDEG3,constrained,4502,3000,0,4505,0,1,False,,False,large
-OPTCNTRL,constrained,32,20,0,36,0,1,True,549.9999869,False,small
-OPTCTRL3,constrained,4502,3000,0,6,0,1,False,,False,large
-OPTCTRL6,constrained,4502,3000,0,6,0,1,False,,False,large
-OPTMASS,constrained,30010,20004,5001,8,0,1,False,,False,large
-OPTPRLOC,constrained,30,0,30,60,0,1,False,,False,small
-ORTHRDS2C,constrained,5003,2500,0,0,0,1,True,0.0,True,large
-ORTHREGB,constrained,27,6,0,0,0,1,True,0.0,True,small
-ORTHREGC,constrained,5005,2500,0,0,0,1,True,0.0,True,large
-ORTHREGD,constrained,5003,2500,0,0,0,1,False,,False,large
-ORTHREGE,constrained,7506,5000,0,1,0,1,True,0.0,True,large
-ORTHRGDM,constrained,10003,5000,0,0,0,1,False,,False,large
-ORTHRGDS,constrained,5003,2500,0,0,0,1,True,0.0,True,large
-PENTAGON,constrained,6,0,15,0,0,1,True,0.000136521631,False,tiny
-POLAK1,constrained,3,0,2,0,0,1,True,2.7182818,False,tiny
-POLAK2,constrained,11,0,2,0,0,1,True,54.598146,False,tiny
-POLAK3,constrained,12,0,10,0,0,1,True,5.93300252,False,tiny
-POLAK4,constrained,3,0,3,0,0,1,True,0.0,False,tiny
-POLAK5,constrained,3,0,2,0,0,1,True,50.0,False,tiny
-POLAK6,constrained,5,0,4,0,0,1,True,-44.0,True,tiny
-PORTFL1,constrained,12,1,0,24,0,1,True,0.0204863313869,False,tiny
-PORTFL2,constrained,12,1,0,24,0,1,True,0.029689208,False,tiny
-PORTFL3,constrained,12,1,0,24,0,1,True,0.0327497293,False,tiny
-PORTFL4,constrained,12,1,0,24,0,1,True,0.0263069364,False,tiny
-PORTFL6,constrained,12,1,0,24,0,1,True,0.0257917996,False,tiny
-READING1,constrained,4002,2000,0,8004,0,1,False,,True,large
-READING2,constrained,6003,4000,0,8006,0,1,False,,True,large
-READING3,constrained,4002,2001,0,8004,0,1,False,,True,large
-READING9,constrained,10002,5000,0,10004,0,1,True,-0.0441677,True,large
-ROSEPETAL,constrained,1000,0,2000,0,0,1,False,,False,medium
-ROSEPETAL2,constrained,10001,1,20000,0,0,1,False,,False,large
-S316-322,constrained,2,1,0,0,0,1,True,334.315,False,tiny
-S365,constrained,7,0,5,4,0,1,True,0.0,False,tiny
-S365MOD,constrained,7,0,5,4,0,1,False,,False,tiny
-SIMPLLPA,constrained,2,0,2,2,0,1,True,1.0,False,tiny
-SIMPLLPB,constrained,2,0,3,2,0,1,True,1.1,False,tiny
-SIPOW1,constrained,2,0,2000,0,0,1,True,-1.0,False,tiny
-SIPOW2,constrained,2,0,2000,0,0,1,True,-1.0,False,tiny
-TENBARS1,constrained,18,8,1,14,0,1,True,2295.37,False,tiny
-TENBARS2,constrained,18,8,0,14,0,1,True,2277.9458,False,tiny
-TENBARS3,constrained,18,8,0,12,0,1,True,2247.129,False,tiny
-TENBARS4,constrained,18,8,1,10,0,1,True,2247.129,False,tiny
-TRAINF,constrained,4008,2002,0,4016,0,1,True,3.09751881012,False,large
-TRO11X3,constrained,150,60,1,90,0,1,True,1.0,False,medium
-TRO21X5,constrained,540,200,1,340,0,1,True,1.0,False,medium
-TRO3X3,constrained,30,12,1,18,0,1,True,1.0,False,small
-TRO41X9,constrained,2040,720,1,1320,0,1,True,1.0,False,large
-TRO4X4,constrained,63,24,1,39,0,1,True,1.0,False,small
-TRO5X5,constrained,108,40,1,68,0,1,True,1.0,False,medium
-TRO6X2,constrained,45,20,1,25,0,1,True,1.0,False,small
-ZECEVIC2,constrained,2,0,2,4,0,1,True,-4.125,False,tiny
-ZECEVIC3,constrained,2,0,2,4,0,1,True,-97.30952,False,tiny
-ZECEVIC4,constrained,2,0,2,4,0,1,True,7.563,False,tiny
-A0ENDNDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0ENINDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0ENSNDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0ESDNDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0ESINDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0ESSNDL,cqp,45006,15002,0,60008,0,1,False,,False,large
-A0NNDNDL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NNDNIL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NNDNSL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NNSNSL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NSDSDL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NSDSDS,cqp,6012,2004,0,8016,0,1,False,,False,large
-A0NSDSIL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NSDSSL,cqp,60012,20004,0,80016,0,1,False,,False,large
-A0NSSSSL,cqp,60012,20004,0,80016,0,1,False,,False,large
-CMPC1,cqp,2550,1785,2048,2020,0,1,False,,False,large
-CMPC10,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC12,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC15,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC2,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC3,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC4,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC5,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC6,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CMPC8,cqp,1530,1065,1286,1220,0,1,False,,False,large
-CVXQP1,cqp,10000,5000,0,20000,0,1,False,,False,large
-CVXQP2,cqp,10000,2500,0,20000,0,1,False,,False,large
-CVXQP3,cqp,10000,7500,0,20000,0,1,False,,False,large
-DEGENQP,cqp,10,5,120,20,0,1,False,,False,tiny
-DEGENQPC,cqp,50,25,19600,100,0,1,False,,False,small
-DUAL1,cqp,85,1,0,170,0,1,False,,False,small
-DUAL2,cqp,96,1,0,192,0,1,False,,False,small
-DUAL3,cqp,111,1,0,222,0,1,False,,False,medium
-DUAL4,cqp,75,1,0,150,0,1,False,,False,small
-DUALC1,cqp,9,1,214,18,0,1,False,,False,tiny
-DUALC2,cqp,7,1,228,14,0,1,False,,False,tiny
-DUALC5,cqp,8,1,277,16,0,1,False,,False,tiny
-DUALC8,cqp,8,1,502,16,0,1,False,,False,tiny
-GOULDQP1,cqp,32,17,0,64,0,1,True,-3485.333,True,small
-GOULDQP2,cqp,19999,9999,0,39998,0,1,True,0.0,False,large
-GOULDQP3,cqp,19999,9999,0,39998,0,1,True,0.0,False,large
-HATFLDH,cqp,4,0,7,8,0,1,True,-24.4999998,False,tiny
-HS44NEW,cqp,4,0,6,4,0,1,True,-15.0,False,tiny
-HS88,cqp,2,0,1,0,0,1,True,1.3601,True,tiny
-HS89,cqp,3,0,1,0,0,1,True,1.36009,True,tiny
-HS90,cqp,4,0,1,0,0,1,False,,True,tiny
-HS91,cqp,5,0,1,0,0,1,False,,False,tiny
-HS92,cqp,6,0,1,0,0,1,False,,False,tiny
-JUNKTURN,cqp,10010,7000,0,28,0,1,True,1.224842784e-05,False,large
-NASH,cqp,72,24,0,114,0,1,False,,False,small
-NCVXQP1,cqp,10000,5000,0,20000,0,1,False,,False,large
-NCVXQP2,cqp,10000,5000,0,20000,0,1,False,,False,large
-NCVXQP3,cqp,10000,5000,0,20000,0,1,False,,False,large
-NCVXQP4,cqp,10000,2500,0,20000,0,1,False,,False,large
-NCVXQP5,cqp,10000,2500,0,20000,0,1,False,,False,large
-NCVXQP6,cqp,10000,2500,0,20000,0,1,False,,False,large
-NCVXQP7,cqp,10000,7500,0,20000,0,1,False,,False,large
-NCVXQP8,cqp,10000,7500,0,20000,0,1,False,,False,large
-NCVXQP9,cqp,10000,7500,0,20000,0,1,False,,False,large
-QPBAND,cqp,50000,0,25000,100000,0,1,False,,False,large
-QPNBAND,cqp,50000,0,25000,100000,0,1,False,,False,large
-TABLE1,cqp,1584,510,0,2546,0,1,True,0.0,True,large
-TABLE3,cqp,4992,2464,0,7389,0,1,True,0.0,True,large
-TABLE6,cqp,1584,510,0,2546,0,1,True,0.0,True,large
-TABLE7,cqp,624,230,0,1108,0,1,True,0.0,True,medium
-TABLE8,cqp,1271,72,0,2542,0,1,True,0.0,True,large
-TAME,cqp,2,1,0,2,0,1,True,0.0,True,tiny
-YAO,cqp,2002,0,2000,5,0,1,True,197.705,False,large
-10FOLDTR,nle,1000,1000,0,0,0,1,True,0.0,True,medium
-AIRCRFTA,nle,8,5,0,6,0,1,True,0.0,False,tiny
-ARGAUSS,nle,3,15,0,0,0,1,True,0.0,True,tiny
-ARGLALE,nle,200,400,0,0,0,1,True,0.0,False,medium
-ARGLBLE,nle,200,400,0,0,0,1,True,0.0,False,medium
-ARGLCLE,nle,200,399,0,0,0,1,True,-1.0,False,medium
-ARGTRIG,nle,200,200,0,0,0,1,True,0.0,False,medium
-ARTIF,nle,5002,5000,0,4,0,1,True,0.0,False,large
-BARDNE,nle,3,15,0,0,0,1,True,0.0,False,tiny
-BDVALUES,nle,10002,10000,0,4,0,1,True,0.0,False,large
-BEALENE,nle,2,3,0,0,0,1,True,0.0,True,tiny
-BENNETT5,nle,3,154,0,0,0,2,True,0.0,False,tiny
-BENNETT5,nle,3,154,0,0,1,2,True,0.0,False,tiny
-BIGGS6NE,nle,6,13,0,0,0,2,True,0.0,False,tiny
-BIGGS6NE,nle,6,13,0,0,1,2,True,0.0,False,tiny
-BOOTH,nle,2,2,0,0,0,1,True,0.0,True,tiny
-BOX3NE,nle,3,10,0,0,0,1,True,0.0,False,tiny
-BOXBOD,nle,2,6,0,0,0,1,True,0.0,True,tiny
-BRATU2DT,nle,5184,4900,0,568,0,1,True,1.30497e-06,False,large
-BROWNBSNE,nle,2,3,0,0,0,1,True,0.0,True,tiny
-BROWNDENE,nle,4,20,0,0,0,1,True,0.0,False,tiny
-CERI651C,nle,7,56,0,0,0,1,True,0.0,False,tiny
-CHANDHEQ,nle,100,100,0,100,0,1,True,0.0,False,small
-CHEBYQADNE,nle,100,100,0,200,0,1,True,0.0,False,small
-CLUSTER,nle,2,2,0,0,0,1,True,0.0,False,tiny
-COOLHANS,nle,9,9,0,0,0,1,True,0.0,False,tiny
-CYCLIC3,nle,100002,100002,0,0,0,1,True,0.0,True,large
-CYCLOOCF,nle,29996,20000,0,0,0,1,True,0.0,False,large
-CYCLOOCT,nle,30000,20000,0,8,0,1,True,0.0,False,large
-DANIWOOD,nle,2,6,0,0,0,1,True,0.0,True,tiny
-DECONVBNE,nle,63,40,0,86,0,1,True,0.0,True,small
-DECONVNE,nle,63,40,0,24,0,1,True,0.0,True,small
-DENSCHNBNE,nle,2,3,0,0,0,1,True,0.0,True,tiny
-DENSCHNCNE,nle,2,2,0,0,0,1,True,0.0,True,tiny
-DENSCHNDNE,nle,3,3,0,0,0,1,True,0.0,True,tiny
-DENSCHNENE,nle,3,3,0,0,0,1,True,0.0,True,tiny
-DENSCHNFNE,nle,2,2,0,0,0,1,True,0.0,True,tiny
-DEVGLA1NE,nle,4,24,0,0,0,1,True,0.0,True,tiny
-DEVGLA2NE,nle,5,16,0,0,0,1,True,0.0,True,tiny
-DMN15102,nle,66,4643,0,0,0,2,False,,False,small
-DMN15102,nle,66,4643,0,0,1,2,False,,False,small
-DMN15103,nle,99,4643,0,0,0,2,False,,False,small
-DMN15103,nle,99,4643,0,0,1,2,False,,False,small
-DRCAVTY1,nle,4489,3969,0,1040,0,1,True,0.0,True,large
-DRCAVTY2,nle,4489,3969,0,1040,0,1,True,0.0,True,large
-DRCAVTY3,nle,4489,3969,0,1040,0,1,True,0.0,True,large
-ECKERLE4,nle,3,35,0,0,0,2,True,0.0,False,tiny
-ECKERLE4,nle,3,35,0,0,1,2,True,0.0,False,tiny
-EGGCRATENE,nle,2,4,0,0,0,1,True,0.0,True,tiny
-EIGENB,nle,2550,2550,0,0,0,1,True,0.0,False,large
-EIGENC,nle,2652,2652,0,0,0,1,True,0.0,False,large
-ELATVIDUNE,nle,2,3,0,0,0,1,True,0.0,True,tiny
-ENGVAL2NE,nle,3,5,0,0,0,1,True,0.0,False,tiny
-ENSO,nle,9,168,0,0,0,1,True,0.0,True,tiny
-ERRINROSNE,nle,50,98,0,0,0,1,True,0.0,False,small
-ERRINRSMNE,nle,50,98,0,0,0,1,True,0.0,True,small
-EXP2NE,nle,2,10,0,0,0,1,True,0.0,True,tiny
-EXPFITNE,nle,2,10,0,0,0,1,True,0.0,True,tiny
-EXTROSNBNE,nle,1000,1000,0,0,0,1,True,0.0,True,medium
-FBRAIN,nle,2,2211,0,0,0,1,True,0.0,False,tiny
-FBRAIN2,nle,4,2211,0,0,0,2,True,0.0,False,tiny
-FBRAIN2,nle,4,2211,0,0,1,2,True,0.0,False,tiny
-FBRAIN2NE,nle,4,2211,0,8,0,2,True,0.0,False,tiny
-FBRAIN2NE,nle,4,2211,0,8,1,2,True,0.0,False,tiny
-FBRAIN3,nle,6,2211,0,0,0,1,True,0.0,False,tiny
-FBRAINNE,nle,2,2211,0,4,0,1,True,0.0,False,tiny
-FREURONE,nle,2,2,0,0,0,1,True,0.0,True,tiny
-GAUSS1,nle,8,250,0,0,0,1,False,,False,tiny
-GAUSS2,nle,8,250,0,0,0,1,False,,False,tiny
-GAUSS3,nle,8,250,0,0,0,1,False,,False,tiny
-GENROSEBNE,nle,500,998,0,1000,0,1,True,0.0,True,medium
-GENROSENE,nle,1000,1999,0,0,0,1,True,0.0,True,medium
-GOTTFR,nle,2,2,0,0,0,1,True,0.0,False,tiny
-GROWTH,nle,3,12,0,0,0,1,True,0.0,False,tiny
-GULFNE,nle,3,99,0,0,0,1,True,0.0,True,tiny
-HATFLDANE,nle,4,4,0,4,0,1,True,0.0,True,tiny
-HATFLDBNE,nle,4,4,0,5,0,1,True,0.0,False,tiny
-HATFLDCNE,nle,25,25,0,48,0,1,True,0.0,True,small
-HATFLDDNE,nle,3,10,0,0,0,1,True,0.0,False,tiny
-HATFLDENE,nle,3,21,0,0,0,1,True,0.0,False,tiny
-HATFLDF,nle,3,3,0,0,0,1,True,0.0,False,tiny
-HATFLDFLNE,nle,3,3,0,0,0,1,True,0.0,False,tiny
-HATFLDG,nle,25,25,0,0,0,1,True,0.0,False,small
-HEART6,nle,6,6,0,0,0,1,True,0.0,False,tiny
-HEART8,nle,8,8,0,0,0,1,True,0.0,False,tiny
-HELIXNE,nle,3,3,0,0,0,1,True,0.0,True,tiny
-HIMMELBA,nle,2,2,0,0,0,1,True,0.0,True,tiny
-HIMMELBFNE,nle,4,7,0,0,0,1,True,0.0,True,tiny
-HS1NE,nle,2,2,0,1,0,1,True,0.0,True,tiny
-HS25NE,nle,3,99,0,6,0,1,True,0.0,True,tiny
-HS2NE,nle,2,2,0,1,0,1,True,0.0,True,tiny
-HYPCIR,nle,2,2,0,0,0,1,True,0.0,False,tiny
-INTEGREQ,nle,502,500,0,4,0,1,True,0.0,True,medium
-INTEQNE,nle,12,12,0,0,0,1,True,0.0,True,tiny
-JENSMPNE,nle,2,10,0,0,0,1,True,0.0,True,tiny
-JUDGENE,nle,2,20,0,0,0,1,True,0.0,True,tiny
-KIRBY2,nle,5,151,0,0,0,2,True,0.0,False,tiny
-KIRBY2,nle,5,151,0,0,1,2,True,0.0,False,tiny
-KOEBHELBNE,nle,3,156,0,2,0,1,True,0.0,True,tiny
-KOWOSBNE,nle,4,11,0,0,0,1,True,0.0,True,tiny
-KSS,nle,1000,1000,0,0,0,1,True,0.0,True,medium
-LANCZOS1,nle,6,24,0,0,0,2,True,0.0,True,tiny
-LANCZOS1,nle,6,24,0,0,1,2,True,0.0,True,tiny
-LANCZOS2,nle,6,24,0,0,0,2,True,0.0,False,tiny
-LANCZOS2,nle,6,24,0,0,1,2,True,0.0,False,tiny
-LANCZOS3,nle,6,24,0,0,0,2,True,0.0,False,tiny
-LANCZOS3,nle,6,24,0,0,1,2,True,0.0,False,tiny
-LEVYMONE,nle,100,200,0,200,0,1,True,0.0,False,small
-LEVYMONE10,nle,10,20,0,20,0,1,True,0.0,True,tiny
-LEVYMONE5,nle,2,4,0,4,0,1,True,0.0,True,tiny
-LEVYMONE6,nle,3,6,0,6,0,1,True,0.0,False,tiny
-LEVYMONE7,nle,4,8,0,8,0,1,True,0.0,False,tiny
-LEVYMONE8,nle,5,10,0,10,0,1,True,0.0,True,tiny
-LEVYMONE9,nle,8,16,0,16,0,1,True,0.0,True,tiny
-LIARWHDNE,nle,5000,10000,0,0,0,1,True,0.0,True,large
-LSC1,nle,3,6,0,0,0,2,False,,False,tiny
-LSC1,nle,3,6,0,0,1,2,False,,False,tiny
-LSC2,nle,3,6,0,0,0,2,False,,False,tiny
-LSC2,nle,3,6,0,0,1,2,False,,False,tiny
-LUKSAN11,nle,100,198,0,0,0,1,True,0.0,True,small
-LUKSAN12,nle,98,192,0,0,0,1,True,0.0,True,small
-LUKSAN13,nle,98,224,0,0,0,1,True,0.0,False,small
-LUKSAN14,nle,98,224,0,0,0,1,True,0.0,False,small
-LUKSAN15,nle,100,196,0,0,0,1,True,0.0,False,small
-LUKSAN16,nle,100,196,0,0,0,1,True,0.0,False,small
-LUKSAN17,nle,100,196,0,0,0,1,True,0.0,False,small
-LUKSAN21,nle,100,100,0,0,0,1,True,0.0,False,small
-LUKSAN22,nle,100,198,0,0,0,1,True,0.0,True,small
-MANCINONE,nle,100,100,0,0,0,1,True,0.0,True,small
-MEYER3NE,nle,3,16,0,0,0,1,True,0.0,True,tiny
-MGH09,nle,4,11,0,0,0,2,True,0.0,False,tiny
-MGH09,nle,4,11,0,0,1,2,True,0.0,False,tiny
-MGH10,nle,3,16,0,0,0,2,True,0.0,False,tiny
-MGH10,nle,3,16,0,0,1,2,True,0.0,False,tiny
-MGH10S,nle,3,16,0,0,0,2,True,0.0,False,tiny
-MGH10S,nle,3,16,0,0,1,2,True,0.0,False,tiny
-MGH17,nle,5,33,0,0,0,2,True,0.0,False,tiny
-MGH17,nle,5,33,0,0,1,2,True,0.0,False,tiny
-MGH17S,nle,5,33,0,0,0,2,True,0.0,False,tiny
-MGH17S,nle,5,33,0,0,1,2,True,0.0,False,tiny
-MISRA1A,nle,2,14,0,0,0,2,True,0.0,False,tiny
-MISRA1A,nle,2,14,0,0,1,2,True,0.0,False,tiny
-MISRA1B,nle,2,14,0,0,0,2,True,0.0,False,tiny
-MISRA1B,nle,2,14,0,0,1,2,True,0.0,False,tiny
-MISRA1C,nle,2,14,0,0,0,2,True,0.0,False,tiny
-MISRA1C,nle,2,14,0,0,1,2,True,0.0,False,tiny
-MISRA1D,nle,2,14,0,0,0,2,True,0.0,False,tiny
-MISRA1D,nle,2,14,0,0,1,2,True,0.0,False,tiny
-MSQRTA,nle,1024,1024,0,0,0,1,True,0.0,True,large
-MSQRTB,nle,1024,1024,0,0,0,1,True,0.0,True,large
-NELSON,nle,3,128,0,0,0,2,True,0.0,False,tiny
-NELSON,nle,3,128,0,0,1,2,True,0.0,False,tiny
-NONDIANE,nle,5000,5000,0,0,0,1,True,0.0,True,large
-NONSCOMPNE,nle,5000,5000,0,10000,0,1,True,0.0,True,large
-OSBORNE1,nle,5,33,0,0,0,1,True,0.0,False,tiny
-OSBORNE2,nle,11,65,0,0,0,1,True,0.0,False,tiny
-OSCIGRNE,nle,100000,100000,0,0,0,1,True,0.0,True,large
-OSCIPANE,nle,10,10,0,0,0,1,True,0.0,True,tiny
-PALMER1ANE,nle,6,35,0,2,0,1,True,0.0,True,tiny
-PALMER1BNE,nle,4,35,0,2,0,1,True,0.0,False,tiny
-PALMER1ENE,nle,8,35,0,1,0,1,True,0.0,True,tiny
-PALMER1NE,nle,4,31,0,3,0,1,True,0.0,True,tiny
-PALMER2ANE,nle,6,23,0,2,0,1,True,0.0,False,tiny
-PALMER2BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny
-PALMER2ENE,nle,8,23,0,1,0,1,True,0.0,True,tiny
-PALMER2NE,nle,4,23,0,3,0,1,True,0.0,True,tiny
-PALMER3ANE,nle,6,23,0,2,0,1,True,0.0,True,tiny
-PALMER3BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny
-PALMER3ENE,nle,8,23,0,1,0,1,True,5.0741053e-05,False,tiny
-PALMER3NE,nle,4,23,0,3,0,1,True,0.0,True,tiny
-PALMER4ANE,nle,6,23,0,2,0,1,True,0.0,True,tiny
-PALMER4BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny
-PALMER4ENE,nle,8,23,0,1,0,1,True,0.0,False,tiny
-PALMER4NE,nle,4,23,0,3,0,1,True,0.0,True,tiny
-PALMER5BNE,nle,9,12,0,2,0,1,True,0.040606141,False,tiny
-PALMER6ANE,nle,6,13,0,2,0,1,True,0.0,True,tiny
-PALMER6ENE,nle,8,13,0,1,0,1,True,0.0,True,tiny
-PALMER7ANE,nle,6,13,0,2,0,1,True,0.0,False,tiny
-PALMER7ENE,nle,8,13,0,1,0,1,True,0.0,True,tiny
-PALMER8ANE,nle,6,12,0,2,0,1,True,0.0,True,tiny
-PALMER8ENE,nle,8,12,0,1,0,1,True,0.0,True,tiny
-PFIT1,nle,3,3,0,1,0,1,True,0.0,True,tiny
-PFIT2,nle,3,3,0,1,0,1,True,0.0,True,tiny
-PFIT3,nle,3,3,0,1,0,1,True,0.0,True,tiny
-PFIT4,nle,3,3,0,1,0,1,True,0.0,True,tiny
-POROUS2,nle,5184,4900,0,568,0,1,True,0.0,False,large
-POWELLBS,nle,2,2,0,0,0,1,True,0.0,False,tiny
-POWELLSE,nle,4,4,0,0,0,1,True,0.0,False,tiny
-POWELLSQ,nle,2,2,0,0,0,1,True,0.0,False,tiny
-POWERSUMNE,nle,4,4,0,0,0,1,True,0.0,True,tiny
-QINGNE,nle,100,100,0,0,0,1,True,0.0,True,small
-RAT42,nle,3,9,0,0,0,2,True,0.0,False,tiny
-RAT42,nle,3,9,0,0,1,2,True,0.0,False,tiny
-RAT43,nle,4,15,0,0,0,2,True,0.0,False,tiny
-RAT43,nle,4,15,0,0,1,2,True,0.0,False,tiny
-RECIPE,nle,3,3,0,0,0,1,True,0.0,True,tiny
-REPEAT,nle,100000,200001,0,100003,0,1,True,0.0,False,large
-S308NE,nle,2,3,0,0,0,1,True,0.773199,False,tiny
-SANTA,nle,21,23,0,42,0,1,True,0.0,False,small
-SINVALNE,nle,2,2,0,0,0,1,True,0.0,True,tiny
-SPIN,nle,1327,1325,0,0,0,1,False,,False,large
-TRIGON1NE,nle,10,10,0,0,0,1,True,0.0,True,tiny
-VANDANIUMS,nle,22,10,0,0,0,1,False,,False,small
-VARDIMNE,nle,10,12,0,0,0,1,True,0.0,True,tiny
-VESUVIA,nle,8,1025,0,0,0,1,False,,False,tiny
-VESUVIO,nle,8,1025,0,0,0,1,False,,False,tiny
-VESUVIOU,nle,8,1025,0,0,0,1,False,,False,tiny
-VIBRBEAMNE,nle,8,30,0,0,0,1,True,0.15644607137,False,tiny
-YATP1CNE,nle,123200,123200,0,0,0,1,True,0.0,True,large
-YATP1NE,nle,123200,123200,0,0,0,1,True,0.0,True,large
+name,collection,n,meq,mineq,nbounds,y0_iD,n_y0s,has_fstar,fstar,has_xstar,tier,ineq_flip,fstar_sif,fstar_source,valid,validation,validation_note,ref_slsqp_f,ref_slsqp_feas,ref_tc_f,ref_tc_feas
+AIRCRFTB,bounded,8,0,0,6,0,1,True,2.789213551412376e-25,False,tiny,,0.064099,scipy-consensus,True,fstar_mismatch,documented: SLSQP 1.5457944e-12 and trust-constr 2.7892136e-25 agree; sif2jax f*=0.064099 not reached,1.5457944443188946e-12,0.0,2.789213551412376e-25,6.732775652123034e-13
+BDEXP,bounded,5000,0,0,5000,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+BIGGS3,bounded,6,0,0,6,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,4.114831769744388e-11,0.0,1.1600605900119526e-19,1.368372082310998e-11
+BIGGS5,bounded,6,0,0,2,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.005655649945153093,0.0,1.1639700178234979e-14,0.0
+BOX2,bounded,3,0,0,2,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,2.4421438699559626e-12,0.0,2.319501188936189e-17,5.981465323046109e-09
+BRANIN,bounded,2,0,0,4,0,1,True,0.397887,True,tiny,,0.397887,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.3978873577429931,0.0,0.3978873609987762,0.0
+CAMEL6,bounded,2,0,0,4,0,1,True,-1.0316,True,tiny,,-1.0316,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0316284534896838,0.0,-1.0316284534898774,0.0
+CHARDIS0,bounded,2000,0,0,4000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CYCLOOCTLS,bounded,30000,0,0,8,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+DEGDIAG,bounded,100001,0,0,100001,0,1,True,16666.58333416666,True,large,,16666.58333416666,sif2jax,True,unvalidated,,,,,
+DEGTRID,bounded,100001,0,0,100001,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+DEGTRID2,bounded,100001,0,0,100001,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+DEVGLA1B,bounded,4,0,0,8,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",3.165215757115661e-12,0.0,1.47574474139155e-12,0.0
+DEVGLA2B,bounded,5,0,0,10,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 10645.989, f*=0 not reached, no trust-constr consensus",10645.989034098555,0.0,10640.458915536117,0.0
+DGOSPEC,bounded,3,0,0,6,0,1,True,-996.9592109922235,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",-996.9592109922235,0.0,-993.3506117300968,0.0
+DIAGIQB,bounded,10,0,0,20,0,1,False,,True,tiny,,,sif2jax,False,unbounded,objective diverges under every sign convention,-10100993300000.0,0.0,-7872996300000.59,1.1641532182693481e-10
+DIAGIQE,bounded,1000,0,0,2000,0,1,False,,True,medium,,,sif2jax,False,unbounded,objective diverges under every sign convention,-6612638667778.624,0.0,,
+DIAGIQT,bounded,1000,0,0,2000,0,1,True,-3.7854644926851035,True,medium,,-3.7854644926851035,sif2jax,False,unbounded,objective diverges under every sign convention,-2.6520543375289376e+16,0.0,,
+DIAGNQB,bounded,1000,0,0,2000,0,1,True,502.04401053674934,True,medium,,502.04401053674934,sif2jax,False,unbounded,objective diverges under every sign convention,-228321561654.96115,0.0,,
+DIAGNQE,bounded,1000,0,0,2000,0,1,True,3.7427354302751725,True,medium,,3.7427354302751725,sif2jax,False,unbounded,objective diverges under every sign convention,-2.0370316947268294e+17,0.0,,
+DIAGNQT,bounded,1000,0,0,2000,0,1,True,821.96728334078,True,medium,,821.96728334078,sif2jax,False,unbounded,objective diverges under every sign convention,-2.7198345992552292e+16,0.0,,
+DIAGPQB,bounded,1000,0,0,2000,0,1,True,-821.96728334078,True,medium,,-821.96728334078,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",-556.3638250435973,0.0,,
+DIAGPQE,bounded,1000,0,0,2000,0,1,True,-3.742735430275173,True,medium,,-3.742735430275173,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-3.742735430057033,0.0,,
+DIAGPQT,bounded,1000,0,0,2000,0,1,True,-502.04401053674934,True,medium,,-502.04401053674934,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-502.04401053662883,0.0,,
+EGGCRATEB,bounded,2,0,0,4,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",9.488197339106364,0.0,9.488197339106259,0.0
+ELATVIDUB,bounded,2,0,0,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 26.975431, f*=0 not reached, no trust-constr consensus",26.975430973216042,0.0,54.75111864223102,0.0
+EXP2B,bounded,2,0,0,4,0,1,True,1.9829532052587026e-13,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",1.9829532052587026e-13,0.0,3.5502531321053203e-10,0.0
+EXPLIN,bounded,1200,0,0,2400,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+EXPLIN2,bounded,1200,0,0,2400,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+FBRAINLS,bounded,2,0,0,4,0,1,True,0.4166029255825647,False,tiny,,0.0,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.41660293 and trust-constr 0.41660293 agree; sif2jax f*=0 not reached,0.41660292560808626,0.0,0.4166029255825647,0.0
+HADAMALS,bounded,400,0,0,800,0,1,True,0.0,False,medium,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 61.390841, f*=0 not reached, no trust-constr consensus",61.390841267116016,0.0,,
+HART6,bounded,6,0,0,12,0,1,True,-3.32288689158,True,tiny,,-3.32288689158,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-3.322886891589278,0.0,-3.3228868915893104,0.0
+HATFLDA,bounded,4,0,0,4,0,1,True,3.1076700019266586e-12,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",3.1076700019266586e-12,0.0,7.548905079140518e-12,0.0
+HATFLDB,bounded,4,0,0,5,0,1,True,0.00557281,False,tiny,,0.00557281,sif2jax,True,ok,documented: scipy reaches f*,0.005572809001651079,0.0,0.0055740950433536395,0.0
+HATFLDC,bounded,25,0,0,48,0,1,True,0.0,False,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,8.359614894994397e-12,0.0,5.691096060212918e-16,0.0
+HS1,bounded,2,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",3.2177855199553344e-11,0.0,2.627934876322288e-13,0.0
+HS110,bounded,10,0,0,20,0,1,True,-45.77846971,True,tiny,,-45.77846971,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-45.77846970744629,0.0,-45.77846970590122,0.0
+HS2,bounded,2,0,0,1,0,1,True,0.0504261879,True,tiny,,0.0504261879,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",4.941229318005285,0.0,4.941230597987055,0.0
+HS25,bounded,3,0,0,6,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",32.834999999663594,0.0,3.495101719254002e-13,0.0
+HS3,bounded,2,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.7351061495392366e-14,0.0,0.00016001181644796956,0.0
+HS38,bounded,4,0,0,8,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",8.611127995458454e-12,0.0,2.4296613964017213e-21,0.0
+HS3MOD,bounded,2,0,0,1,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,1.4598734954074768e-24,0.0,0.0007999569666523997,0.0
+HS4,bounded,2,0,0,2,0,1,True,2.6666666666666665,True,tiny,,2.6666666666666665,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.6666666666666665,0.0,2.6669088564979644,0.0
+HS45,bounded,5,0,0,10,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.0,0.0,1.0001711622878857,0.0
+HS5,bounded,2,0,0,4,0,1,True,-1.9132229549807498,True,tiny,,-5.034897941932651,scipy-consensus,True,fstar_mismatch,documented: SLSQP -1.913223 and trust-constr -1.913223 agree; sif2jax f*=-5.0348979 not reached,-1.9132229549807498,0.0,-1.9132229549707405,0.0
+JUDGEB,bounded,2,0,0,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 20.482337, f*=0 not reached, no trust-constr consensus",20.48233700051466,0.0,16.08173013296039,0.0
+KOEBHELB,bounded,3,0,0,2,0,1,True,77.516347286,True,tiny,,77.516347286,sif2jax,True,ok,documented: scipy reaches f*,77.5163473415253,0.0,77.51634734152053,0.0
+LEVYMONT,bounded,100,0,0,200,0,1,True,0.0,False,small,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 153.89081, f*=0 not reached, no trust-constr consensus",153.89080968002094,0.0,154.8856742086383,0.0
+LEVYMONT10,bounded,10,0,0,20,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 158.41621, f*=0 not reached, no trust-constr consensus",158.41620551035686,0.0,163.70092200172053,0.0
+LEVYMONT5,bounded,2,0,0,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,3.0803890016980407e-14,0.0,12.487063715607496,0.0
+LEVYMONT6,bounded,3,0,0,6,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,1.4020324120531175e-12,0.0,12.502860200817539,0.0
+LEVYMONT7,bounded,4,0,0,8,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 10.154008, f*=0 not reached, no trust-constr consensus",10.154007750222288,0.0,12.510759059446594,0.0
+LEVYMONT8,bounded,5,0,0,10,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,unverified,"documented: SLSQP feasible at 12.515498, f*=0 not reached, no trust-constr consensus",12.515498377142972,0.0,173.49564177186807,0.0
+LEVYMONT9,bounded,8,0,0,16,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,6.7958800643152765e-12,0.0,166.14960194425745,0.0
+LOGROS,bounded,2,0,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",7.283063041540762e-14,0.0,2.3029755853570003e-09,0.0
+OBSTCLAE,bounded,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OBSTCLAL,bounded,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OBSTCLBL,bounded,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OBSTCLBM,bounded,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OBSTCLBU,bounded,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+PALMER1,bounded,4,0,0,3,0,1,True,11754.6025,False,tiny,,11754.6025,sif2jax,True,ok,documented: scipy reaches f*,11754.602545349455,0.0,11754.602545349451,0.0
+PALMER1A,bounded,6,0,0,2,0,1,True,0.0898836290429613,True,tiny,,0.011611512,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.089883629 and trust-constr 0.089883629 agree; sif2jax f*=0.011611512 not reached,0.08988362908123168,0.0,0.0898836290429613,0.0
+PALMER2,bounded,4,0,0,3,0,1,True,3651.097532,False,tiny,,3651.097532,sif2jax,True,ok,documented: scipy reaches f*,3651.0975354001935,0.0,3651.0975354001876,0.0
+PALMER2A,bounded,6,0,0,2,0,1,True,0.017109717059212246,True,tiny,,0.017437656,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.017109717 and trust-constr 0.017109717 agree; sif2jax f*=0.017437656 not reached,0.017109717059212246,0.0,0.017109717065022713,0.0
+PALMER2B,bounded,4,0,0,2,0,1,True,0.6232669705847959,True,tiny,,0.017552259,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.62326697 and trust-constr 0.62326697 agree; sif2jax f*=0.017552259 not reached,0.6232669705964584,0.0,0.6232669705847959,0.0
+PALMER2E,bounded,8,0,0,1,0,1,True,7.9851969e-05,True,tiny,,7.9851969e-05,sif2jax,True,unverified,"documented: SLSQP feasible at 0.0002065001, f*=7.9851969e-05 not reached, no trust-constr consensus",0.00020650009509161403,0.0,0.014635206371792287,0.0
+PALMER3,bounded,4,0,0,3,0,1,True,2265.95822,True,tiny,,2265.95822,sif2jax,True,ok,documented: scipy reaches f*,2265.958218282433,0.0,2416.980323255126,0.0
+PALMER3A,bounded,6,0,0,2,0,1,True,0.02043142299913244,True,tiny,,0.016139887,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.020431423 and trust-constr 0.020431423 agree; sif2jax f*=0.016139887 not reached,0.02043142299913244,0.0,0.020431423311858883,0.0
+PALMER3B,bounded,4,0,0,2,0,1,True,4.227647,False,tiny,,4.227647,sif2jax,True,ok,documented: scipy reaches f*,4.227647250908014,0.0,4.227647250925769,0.0
+PALMER3E,bounded,8,0,0,1,0,1,True,5.074084212968973e-05,True,tiny,,0.016139887,scipy-consensus,True,fstar_mismatch,documented: SLSQP 5.0740851e-05 and trust-constr 5.0740842e-05 agree; sif2jax f*=0.016139887 not reached,5.0740851175111654e-05,0.0,5.074084212968973e-05,0.0
+PALMER4,bounded,4,0,0,3,0,1,True,2424.016417947358,True,tiny,,2103.9059,scipy-consensus,True,fstar_mismatch,documented: SLSQP 2424.0164 and trust-constr 2424.0164 agree; sif2jax f*=2103.9059 not reached,2424.016417947358,0.0,2424.0164378248764,0.0
+PALMER4B,bounded,4,0,0,2,0,1,True,6.835138599869967,True,tiny,,3.10595086,scipy-consensus,True,fstar_mismatch,documented: SLSQP 6.8351386 and trust-constr 6.8351386 agree; sif2jax f*=3.1059509 not reached,6.835138599869967,0.0,6.835138599921274,0.0
+PALMER4E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny,,0.000148003482,sif2jax,True,ok,documented: scipy reaches f*,0.00014800421990225393,0.0,0.00014800429871380353,0.0
+PALMER5B,bounded,9,0,0,2,0,1,True,0.040606141,True,tiny,,0.040606141,sif2jax,True,unverified,"documented: SLSQP feasible at 0.01489111, f*=0.040606141 not reached, no trust-constr consensus",0.014891109956022656,0.0,0.02185843392014739,0.0
+PALMER6A,bounded,6,0,0,2,0,1,True,0.05594883902365021,True,tiny,,0.040606141,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.055948839 and trust-constr 0.055949672 agree; sif2jax f*=0.040606141 not reached,0.05594883902365021,0.0,0.05594967204477455,0.0
+PALMER6E,bounded,8,0,0,1,0,1,True,0.000148003482,True,tiny,,0.000148003482,sif2jax,True,ok,documented: scipy reaches f*,0.00022395503468229373,0.0,0.0002239550343328457,0.0
+PALMER7E,bounded,8,0,0,1,0,1,True,10.153899080265482,True,tiny,,0.000148003482,scipy-consensus,True,fstar_mismatch,documented: SLSQP 10.153899 and trust-constr 10.154475 agree; sif2jax f*=0.00014800348 not reached,10.153899080265482,0.0,10.154474503835887,0.0
+PALMER8A,bounded,6,0,0,2,0,1,True,0.07400969795520264,True,tiny,,0.040606141,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.074009698 and trust-constr 0.074009698 agree; sif2jax f*=0.040606141 not reached,0.0740096979581494,0.0,0.07400969795520264,0.0
+PALMER8E,bounded,8,0,0,1,0,1,True,0.006339307431270095,True,tiny,,0.000148003482,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.0063393074 and trust-constr 0.0063393074 agree; sif2jax f*=0.00014800348 not reached,0.006339307433732989,0.0,0.006339307431270095,0.0
+PFIT1LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",4.507966370009723e-06,0.0,3.893423200044644e-05,0.0
+PFIT2LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,2.0536335022946745e-11,0.0,1.1315275917194155e-15,0.0
+PFIT3LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.019498121474915676,0.0,1.0080135241272767e-07,0.0
+PFIT4LS,bounded,3,0,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.05201420587657893,0.0,2.1182016021310375e-05,0.0
+PRICE4B,bounded,2,0,0,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,5.243248855724091e-12,0.0,5.8131896001668435e-18,0.0
+QINGB,bounded,5,0,0,10,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.7783941098023425e-12,0.0,4.6177545844212456e-18,0.0
+QUDLIN,bounded,5000,0,0,10000,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+RAYBENDL,bounded,2050,0,0,8,0,1,True,96.2424,False,large,,96.2424,sif2jax,True,unvalidated,,,,,
+S368,bounded,8,0,0,16,0,1,True,-0.7499999999560437,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-0.7499999999560437,0.0,-0.7499963021091433,0.0
+TRIGON1B,bounded,10,0,0,20,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.302766797228785e-12,0.0,3.2903420020741136e-13,0.0
+BQP1VAR,bqp,1,0,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.2204460492503136e-16,0.0,0.00016079726196356405,0.0
+BQPGABIM,bqp,50,0,0,100,0,1,True,-5.519814e-05,False,small,,-5.519814e-05,sif2jax,True,ok,documented: scipy reaches f*,-3.790341582299769e-05,0.0,-2.471517184017038e-05,2.1386962857464178e-10
+BQPGASIM,bqp,50,0,0,100,0,1,True,-5.519814e-05,False,small,,-5.519814e-05,sif2jax,True,ok,documented: scipy reaches f*,-5.5198140165669126e-05,0.0,1.5792171918006565e-05,0.0
+CVXBQP1,bqp,100000,0,0,200000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXBQP1,bqp,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXBQP2,bqp,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXBQP3,bqp,10000,0,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+TORSION1,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSION2,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSION3,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSION4,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSION5,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSION6,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSIONA,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSIONB,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSIONC,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSIOND,bqp,5476,0,0,10952,0,1,True,-1.2042,False,large,,-1.2042,sif2jax,True,unvalidated,,,,,
+TORSIONE,bqp,5476,0,0,10952,0,1,True,-2.8502,False,large,,-2.8502,sif2jax,True,unvalidated,,,,,
+TORSIONF,bqp,5476,0,0,10952,0,1,True,-2.8502,False,large,,-2.8502,sif2jax,True,unvalidated,,,,,
+ALJAZZAF,constrained,1000,1,0,1000,0,1,True,75.004996,False,medium,,75.004996,sif2jax,False,infeasible,best violation 3.46e+03 under every sign convention,37413.7923195299,3455.97557294185,,
+ALSOTAME,constrained,2,1,0,4,0,1,True,0.08208499862392282,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.08208499862392282,2.9254376698872875e-13,0.08211721228048448,1.1102230246251565e-16
+AVGASA,constrained,8,0,10,16,0,1,True,-4.631925545270727,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",-4.631925545270727,0.0,-4.6311705351096455,0.0
+AVGASB,constrained,8,0,10,16,0,1,True,-4.483219364853183,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-4.483219364853183,1.6265987263843602e-13,-4.483187325971432,0.0
+BATCH,constrained,48,12,61,94,0,1,False,,False,small,,,sif2jax,False,infeasible,best violation 0.000257 under every sign convention,58726.95480833412,0.0002573907148195609,5355.983518179843,3.0412497721423177
+BIGGSC4,constrained,4,0,7,8,0,1,True,-50.0,False,tiny,,-24.5,scipy-consensus,True,fstar_mismatch,documented: SLSQP -50 and trust-constr -49.999262 agree; sif2jax f*=-24.5 not reached,-50.0,0.0,-49.99926169056074,0.0
+BT1,constrained,2,1,0,0,0,1,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0000382742894658,3.846662260942324e-07,-0.9999999998574935,1.432187701766452e-12
+BT10,constrained,2,2,0,0,0,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0,0.0,-1.000000002785312,4.1779160131483195e-09
+BT10,constrained,2,2,0,0,1,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0,0.0,-1.000000002785312,4.1779160131483195e-09
+BT10,constrained,2,2,0,0,2,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0,0.0,-1.000000002785312,4.1779160131483195e-09
+BT11,constrained,5,3,0,0,0,3,True,0.8248917782780038,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.8248917782780038,1.786482073384832e-11,0.824891778287666,8.881784197001252e-16
+BT11,constrained,5,3,0,0,1,3,True,0.8248917782780038,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.8248917782780038,1.786482073384832e-11,0.824891778287666,8.881784197001252e-16
+BT11,constrained,5,3,0,0,2,3,True,0.8248917782780038,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.8248917782780038,1.786482073384832e-11,0.824891778287666,8.881784197001252e-16
+BT12,constrained,5,3,0,0,0,4,True,6.1881188118811865,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",6.188118811881188,1.1368683772161603e-13,6.1881188118811865,4.547473508864641e-13
+BT12,constrained,5,3,0,0,1,4,True,6.1881188118811865,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",6.188118811881188,1.1368683772161603e-13,6.1881188118811865,4.547473508864641e-13
+BT12,constrained,5,3,0,0,2,4,True,6.1881188118811865,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",6.188118811881188,1.1368683772161603e-13,6.1881188118811865,4.547473508864641e-13
+BT12,constrained,5,3,0,0,3,4,True,6.1881188118811865,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",6.188118811881188,1.1368683772161603e-13,6.1881188118811865,4.547473508864641e-13
+BT13,constrained,5,1,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,5.683740120531729e-11,1.0239999999998631e-08,8.65143732046137e-09
+BT2,constrained,3,1,0,0,0,3,True,0.03256820039323374,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.03256820039323374,5.062616992290714e-13,0.03256820039323778,1.7763568394002505e-15
+BT2,constrained,3,1,0,0,1,3,True,0.03256820039323374,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.03256820039323374,5.062616992290714e-13,0.03256820039323778,1.7763568394002505e-15
+BT2,constrained,3,1,0,0,2,3,True,0.03256820039323374,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.03256820039323374,5.062616992290714e-13,0.03256820039323778,1.7763568394002505e-15
+BT3,constrained,5,3,0,0,0,3,True,4.093023255813954,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",4.093023255823792,0.0,4.093023255813954,0.0
+BT3,constrained,5,3,0,0,1,3,True,4.093023255813954,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",4.093023255823792,0.0,4.093023255813954,0.0
+BT3,constrained,5,3,0,0,2,3,True,4.093023255813954,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",4.093023255823792,0.0,4.093023255813954,0.0
+BT4,constrained,3,2,0,0,0,4,True,-45.51055073989063,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-45.51055073989063,0.0,-45.510550739890625,3.552713678800501e-15
+BT4,constrained,3,2,0,0,1,4,True,-45.51055073989063,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-45.51055073989063,0.0,-45.510550739890625,3.552713678800501e-15
+BT4,constrained,3,2,0,0,2,4,True,-45.51055073989063,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-45.51055073989063,0.0,-45.510550739890625,3.552713678800501e-15
+BT4,constrained,3,2,0,0,3,4,True,-45.51055073989063,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-45.51055073989063,0.0,-45.510550739890625,3.552713678800501e-15
+BT5,constrained,3,2,0,0,0,3,True,961.7151721299613,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",961.7151721300517,4.227729277772596e-13,961.7151721299613,7.431921744682768e-11
+BT5,constrained,3,2,0,0,1,3,True,961.7151721299613,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",961.7151721300517,4.227729277772596e-13,961.7151721299613,7.431921744682768e-11
+BT5,constrained,3,2,0,0,2,3,True,961.7151721299613,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",961.7151721300517,4.227729277772596e-13,961.7151721299613,7.431921744682768e-11
+BT6,constrained,5,2,0,0,0,2,True,0.27704478876787797,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.27704478876787797,4.4586556668946287e-13,0.2770447887679021,2.886579864025407e-15
+BT6,constrained,5,2,0,0,1,2,True,0.27704478876787797,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.27704478876787797,4.4586556668946287e-13,0.2770447887679021,2.886579864025407e-15
+BT7,constrained,5,3,0,0,0,2,True,360.3797671742834,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",360.3797671742834,4.440892098500626e-16,306.4999999999999,7.771561172376096e-16
+BT7,constrained,5,3,0,0,1,2,True,360.3797671742834,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",360.3797671742834,4.440892098500626e-16,306.4999999999999,7.771561172376096e-16
+BT8,constrained,5,2,0,0,0,2,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.000000000014552,1.4551915228366852e-11,1.0000000037252903,3.725290298461914e-09
+BT8,constrained,5,2,0,0,1,2,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.000000000014552,1.4551915228366852e-11,1.0000000037252903,3.725290298461914e-09
+BT9,constrained,4,2,0,0,0,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0000000000135003,1.1817621549815595e-11,-1.000000000005094,3.985478613802697e-12
+BT9,constrained,4,2,0,0,1,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.000000000000534,4.0303173592622976e-13,-1.0000000004477076,5.410210057803373e-10
+BT9,constrained,4,2,0,0,2,3,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0000000000005205,5.122569240069876e-13,-1.0000000005366338,8.043463672900763e-10
+BURKEHAN,constrained,1,0,1,1,0,1,False,,False,tiny,,,sif2jax,False,unbounded,objective diverges under every sign convention,-7.105427357600909e+30,0.0,-4.850773426852761e+47,0.0
+BYRDSPHR,constrained,3,2,0,0,0,1,True,-4.68330049,False,tiny,,-4.68330049,sif2jax,True,ok,documented: scipy reaches f*,-4.683300132670377,0.0,-4.683300132670377,0.0
+CANTILVR,constrained,5,0,1,5,0,1,True,1.3399595938,False,tiny,all,1.3399595938,sif2jax,True,sign_flipped,all: scipy reaches f*,1.3399563605577869,9.396461386756982e-11,1.3399627617485397,0.0
+CB2,constrained,3,0,3,0,0,1,True,1.9522244938706381,False,tiny,,0.0,scipy-consensus,True,fstar_mismatch,documented: SLSQP 1.9522245 and trust-constr 1.952239 agree; sif2jax f*=0 not reached,1.9522244938706381,2.1538326677728037e-14,1.9522389995084006,0.0
+CB3,constrained,3,0,3,0,0,1,True,1.999999999999533,False,tiny,,0.0,scipy-consensus,True,fstar_mismatch,documented: SLSQP 2 and trust-constr 2.0001274 agree; sif2jax f*=0 not reached,1.999999999999533,1.0629275237761249e-12,2.0001273987717973,0.0
+CHACONN1,constrained,3,0,3,0,0,1,True,1.95222,False,tiny,all,1.95222,sif2jax,True,sign_flipped,all: scipy reaches f*,1.952224493870584,8.570921750106208e-14,1.9522389068675186,0.0
+CHACONN2,constrained,3,0,3,0,0,1,True,2.0,False,tiny,all,2.0,sif2jax,True,sign_flipped,all: scipy reaches f*,1.9999999999989768,2.33946195749013e-12,2.0004809684693856,0.0
+CLEUVEN2,constrained,1530,1065,1264,1158,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CLEUVEN3,constrained,1200,29,2944,2196,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CLEUVEN4,constrained,1200,29,2944,2196,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CLEUVEN5,constrained,1200,29,2944,2196,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CLEUVEN6,constrained,1200,29,3062,2167,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CLEUVEN7,constrained,360,0,946,659,0,1,True,706.5690133723616,False,medium,,706.5690133723616,sif2jax,True,unverified,all: bounded feasible end point at 683.45789 without convergence,1.776357e-15,175.9982,,
+COSHFUN,constrained,6001,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CSFI1,constrained,5,2,2,6,0,1,True,-49.0752,True,tiny,all,-49.1,scipy-consensus,True,fstar_mismatch,all: SLSQP -49.0752 and trust-constr -49.075199 agree; sif2jax f*=-49.1 not reached (sign flipped),-49.0752,1.4210854715202004e-14,-49.075199389509265,4.3357317736081313e-11
+CSFI2,constrained,5,2,2,5,0,1,True,55.01760563380284,True,tiny,all,55.0,scipy-consensus,True,fstar_mismatch,all: SLSQP 55.017606 and trust-constr 55.017606 agree; sif2jax f*=55 not reached (sign flipped),55.01760563380284,7.105427357601002e-15,55.01760621462568,7.778254484946956e-09
+DALLASS,constrained,46,31,0,92,0,1,True,-32393.0,False,small,,-32393.0,sif2jax,True,unverified,documented: bounded feasible end point at 87649.596 without convergence,87649.59592478724,2.3129332586769774e-13,,
+DECONVC,constrained,63,1,0,75,0,1,True,0.0033526858347808276,False,small,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.0033526858347808276,3.1445068771063234e-11,0.004946868099359812,1.0721379339884152e-10
+DEGENLPA,constrained,20,15,0,40,0,1,True,-3.06435,False,tiny,,-3.06435,sif2jax,True,unverified,"documented: SLSQP feasible at 3.0603926, f*=-3.06435 not reached, no trust-constr consensus",3.0603925988530434,3.801642654027453e-11,3.0593629686989305,9.996079630703036e-09
+DEGENLPB,constrained,20,15,0,40,0,1,True,3.06435,False,tiny,,3.06435,sif2jax,True,unverified,"documented: SLSQP feasible at -30.731246, f*=3.06435 not reached, no trust-constr consensus",-30.731246016259746,4.309691622669809e-11,-30.734901080714256,6.12844985869998e-09
+DEMBO7,constrained,16,0,20,32,0,1,True,174.788807,False,tiny,,174.788807,sif2jax,False,infeasible,best violation 0.73 under every sign convention,237.682351544609,0.730040571067617,50.36429577811373,0.9345085186957985
+DEMYMALO,constrained,3,0,3,0,0,1,True,-3.0,False,tiny,all,-3.0,sif2jax,True,sign_flipped,all: scipy reaches f*,-6.661338147750939e-16,5.773159728050814e-15,-2.999888236780993,0.0
+DIPIGRI,constrained,7,0,4,0,0,1,True,680.63,False,tiny,all,680.63,sif2jax,True,sign_flipped,all: scipy reaches f*,680.6300573608949,1.1660674203994859e-08,680.6300758355636,0.0
+DTOC1L,constrained,5998,3996,0,8,0,1,True,3.9430507151,False,large,,3.9430507151,sif2jax,True,unvalidated,,,,,
+DTOC1NA,constrained,5998,3996,0,8,0,1,True,4.13895890755,False,large,,4.13895890755,sif2jax,True,unvalidated,,,,,
+DTOC1NB,constrained,5998,3996,0,8,0,1,True,7.13884991815,False,large,,7.13884991815,sif2jax,True,unvalidated,,,,,
+DTOC1NC,constrained,5998,3996,0,8,0,1,True,35.1993544122,False,large,,35.1993544122,sif2jax,True,unvalidated,,,,,
+DTOC1ND,constrained,5998,3996,0,8,0,1,True,47.6030771433,False,large,,47.6030771433,sif2jax,True,unvalidated,,,,,
+DTOC2,constrained,5998,3996,0,8,0,1,True,0.490200910983,False,large,,0.490200910983,sif2jax,True,unvalidated,,,,,
+DTOC4,constrained,4499,2998,0,4,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+DTOC5,constrained,9999,4999,0,2,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+DTOC6,constrained,10001,5000,0,2,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+EIGENB2,constrained,2550,1275,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+EIGENBCO,constrained,2550,1275,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+EIGENC2,constrained,2652,1326,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+EIGENCCO,constrained,2652,1326,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+ELATTAR,constrained,7,0,102,0,0,1,True,0.1427066255,True,tiny,all,0.1427066255,sif2jax,True,sign_flipped,all: scipy reaches f*,74.20617857936527,0.0,0.14272541496890523,0.0
+FLETCHER,constrained,4,1,3,1,0,1,True,5.82842712474619,True,tiny,,5.82842712474619,sif2jax,True,unverified,"documented: SLSQP feasible at 11.656854, f*=5.8284271 not reached, no trust-constr consensus",11.65685424949102,3.375077994860476e-14,19.52568643210082,4.966027589148325e-11
+FLT,constrained,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",1.0,1.0,1.0,3.451592656950774e-17
+GIGOMEZ1,constrained,3,0,3,0,0,1,True,-3.0,False,tiny,,-3.0,sif2jax,True,ok,documented: scipy reaches f*,-3.0000000000004494,1.3464784842653899e-12,-2.999519986000579,0.0
+GIGOMEZ2,constrained,3,0,3,0,0,1,True,1.95222,False,tiny,,1.95222,sif2jax,True,ok,documented: scipy reaches f*,1.9522244938694626,2.0545787293713147e-12,1.9525447648271337,0.0
+GIGOMEZ3,constrained,3,0,3,0,0,1,True,2.0,False,tiny,,2.0,sif2jax,True,ok,documented: scipy reaches f*,1.999999999999676,7.336353746723034e-13,2.0004802035989413,0.0
+GOFFIN,constrained,51,0,50,0,0,1,True,0.0,False,small,all,0.0,sif2jax,True,sign_flipped,all: scipy reaches f*,1.1805556532351602e-12,8.378887861315576e-14,0.008000812942441843,0.0
+HADAMARD,constrained,401,210,800,1,0,1,False,,False,medium,,,sif2jax,False,infeasible,best violation 20 under every sign convention,0.0,20.0,,
+HAGER1,constrained,5001,2500,0,2,0,1,True,0.88079708841,True,large,,0.88079708841,sif2jax,True,unvalidated,,,,,
+HAGER2,constrained,5001,2500,0,2,0,1,True,0.4320822986,True,large,,0.4320822986,sif2jax,True,unvalidated,,,,,
+HAGER4,constrained,5001,2500,0,2502,0,1,True,2.794244187,True,large,,2.794244187,sif2jax,True,unvalidated,,,,,
+HAIFAM,constrained,99,0,150,0,0,1,True,-45.00031019290678,False,small,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",-45.00029357895669,1.3614808835882286e-08,-45.00031019290678,0.0
+HAIFAS,constrained,13,0,9,0,0,1,True,-0.4500000000000062,False,tiny,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",-0.4500000000000062,8.326672684688674e-15,-0.449980799516004,0.0
+HIMMELBC,constrained,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,0.0,0.0,3.552713678800501e-15
+HIMMELBD,constrained,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 2.43 under every sign convention,0.0,159.52039645287857,0.0,2.4335999083660207
+HIMMELBE,constrained,3,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,2.220446049250313e-16,0.0,0.0
+HS10,constrained,2,0,1,0,0,1,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.000000000007069,1.4137802040181668e-11,-0.9998398005568263,0.0
+HS100,constrained,7,0,4,0,0,1,True,680.6300573,True,tiny,,680.6300573,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",680.6300573550512,2.988209857335278e-08,680.6300758355635,0.0
+HS101,constrained,7,0,5,14,0,1,True,1809.76476,False,tiny,all,1809.76476,sif2jax,True,sign_flipped,all: scipy reaches f*,1809.7628687556125,4.105875236748435e-07,1593.3471908613078,302.75202466560035
+HS102,constrained,7,0,5,14,0,1,True,911.880571,False,tiny,all,911.880571,sif2jax,True,sign_flipped,all: scipy reaches f*,911.8804715587663,3.2194878443747577e-07,1594.669012484571,302.75327710988483
+HS103,constrained,7,0,5,14,0,1,True,543.667958,False,tiny,,543.667958,sif2jax,True,unverified,documented: bounded feasible end point at 3000 without convergence,2662.8933956309215,337.10660436907847,3000.00000050902,0.0
+HS104,constrained,8,0,5,16,0,1,True,3.9511634396,True,tiny,,3.9511634396,sif2jax,True,unverified,"documented: SLSQP feasible at 1, f*=3.9511634 not reached, no trust-constr consensus",0.9999999999989573,1.042721464727947e-12,-2.3182210969263473,3.3182210969263473
+HS105,constrained,8,0,1,16,0,1,True,1138.41624,True,tiny,,1138.41624,sif2jax,True,unverified,"documented: SLSQP feasible at 1136.3073, f*=1138.4162 not reached, no trust-constr consensus",1136.3073035740745,0.0,1291.2600920334198,5.0
+HS106,constrained,8,0,6,16,0,1,True,7049.330923,True,tiny,,7049.330923,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",7049.248020528663,1.3096723705530167e-10,7049.248059703226,0.0
+HS107,constrained,9,6,0,8,0,1,True,5055.011803,True,tiny,,5055.011803,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",5055.011454801169,1.29798913173218e-07,5055.012214656136,1.5969670030813177e-11
+HS108,constrained,9,0,13,1,0,1,True,-0.866025403,True,tiny,"2,4,7",-0.866025403,sif2jax,True,sign_flipped,"xstar_rows: x* feasible, scipy does not reach f* from x0",-4233556586369929.5,323556318868.12256,-4.238572950909812e+28,721.636962890625
+HS11,constrained,2,0,1,0,0,1,True,-8.498464223,True,tiny,,-8.498464223,sif2jax,True,ok,documented: scipy reaches f*,-8.498464223156027,4.4297898682543746e-13,-8.498304196914301,0.0
+HS111,constrained,10,3,0,20,0,1,True,-47.76109026,True,tiny,,-47.76109026,sif2jax,True,ok,documented: scipy reaches f*,-47.761090859370086,1.6786572132332367e-13,-47.76109085937418,5.848654893725325e-13
+HS111LNP,constrained,10,3,0,0,0,1,True,-47.76109085937157,False,tiny,,-47.707579,scipy-consensus,True,fstar_mismatch,documented: SLSQP -47.761091 and trust-constr -47.761091 agree; sif2jax f*=-47.707579 not reached,-47.761090859370086,1.6830981053317373e-13,-47.76109085937157,2.6423307986078726e-13
+HS112,constrained,10,3,0,10,0,1,True,-47.707579,True,tiny,,-47.707579,sif2jax,True,unverified,"documented: SLSQP feasible at -47.761091, f*=-47.707579 not reached, no trust-constr consensus",-47.76109085931843,1.1102230246251565e-16,-61.00671119786114,0.5218664189430213
+HS113,constrained,10,0,8,0,0,1,True,12.779602847497443,True,tiny,"2,3",24.3062091,scipy-consensus,True,fstar_mismatch,xstar_rows: SLSQP 12.779603 and trust-constr 12.779608 agree; sif2jax f*=24.306209 not reached and x* is not a minimiser under this conversion (sign flipped),12.779602847497443,9.947598300641403e-13,12.779608249400376,0.0
+HS114,constrained,10,3,8,20,0,1,True,-1768.80696,True,tiny,,-1768.80696,sif2jax,True,ok,documented: scipy reaches f*,-1768.8069656523658,3.296181603218429e-07,-1768.8069556859336,1.5086243365658447e-10
+HS116,constrained,13,0,14,26,0,1,True,49.99999999999999,True,tiny,"4,7,9,12,13",97.588409,scipy-consensus,True,fstar_mismatch,xstar_rows: SLSQP 50 and trust-constr 50 agree; sif2jax f*=97.588409 not reached and x* is not a minimiser under this conversion (sign flipped),49.99999999999999,7.105427357601002e-15,50.00000025699274,0.0
+HS117,constrained,15,0,5,15,0,1,True,32.348679,True,tiny,,32.348679,sif2jax,False,unbounded,objective diverges under every sign convention,,,,
+HS119,constrained,16,8,0,32,0,1,True,244.899698,True,tiny,,244.899698,sif2jax,True,ok,documented: scipy reaches f*,244.8996975165478,3.2163161023390785e-12,244.89984769530656,1.2434497875801753e-14
+HS12,constrained,2,0,1,0,0,1,True,-30.0,True,tiny,,-30.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-30.000000000043194,8.638956217055238e-11,-29.99983998918162,0.0
+HS13,constrained,2,0,1,2,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.9999967723266096,4.2031976231719634e-18,1.0822148068674453,0.0
+HS14,constrained,2,1,1,0,0,1,True,1.393464980689302,True,tiny,,1.393464980689302,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.3934649806878863,7.667200208061331e-13,1.3942709207208308,2.220446049250313e-16
+HS15,constrained,2,0,2,1,0,1,True,306.5,True,tiny,,306.5,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",306.50000000010317,2.6423307986078726e-13,360.3799271711591,0.0
+HS16,constrained,2,0,2,3,0,1,True,0.25,True,tiny,,0.25,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",23.144660936147346,9.511147425200761e-11,23.145090191371853,0.0
+HS17,constrained,2,0,2,3,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.0000000000000386,0.0,1.0000500580626999,0.0
+HS18,constrained,2,0,2,4,0,1,True,5.0,True,tiny,,5.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",4.999999999998874,5.631051180898794e-12,5.0001599391672364,0.0
+HS19,constrained,2,0,2,4,0,1,True,-6961.81381,True,tiny,,-6961.81381,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-6961.813875575247,1.8692958292376716e-10,-6961.775261250312,0.0
+HS20,constrained,2,0,3,2,0,1,True,38.19872981077807,True,tiny,,38.19872981077807,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",40.19872982226975,0.0,40.200376291972695,0.0
+HS21,constrained,2,0,1,4,0,1,True,-99.96,True,tiny,,-99.96,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-99.96,0.0,-99.95996775843402,0.0
+HS21MOD,constrained,7,0,1,8,0,1,True,-95.95999999999998,False,tiny,,-99.96,scipy-consensus,True,fstar_mismatch,documented: SLSQP -95.96 and trust-constr -95.959996 agree; sif2jax f*=-99.96 not reached,-95.95999999999998,0.0,-95.95999641593373,0.0
+HS22,constrained,2,0,2,0,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.9999999999999982,2.1094237467877974e-15,1.0003200141002884,0.0
+HS23,constrained,2,0,5,4,0,1,True,2.0,True,tiny,,2.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.000000000000058,0.0,2.0002701393143765,0.0
+HS24,constrained,2,0,3,2,0,1,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0000000000098352,1.9321433342156524e-11,-0.999907544785688,0.0
+HS26,constrained,3,1,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",8.068819575256852e-20,6.708633648599971e-11,3.017900320129698e-16,9.772486819770165e-09
+HS268,constrained,5,0,5,0,0,1,True,-1.0913936421275139e-11,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-1.0913936421275139e-11,0.0,5.432557372841984e-07,0.0
+HS27,constrained,3,1,0,0,0,1,True,0.04,True,tiny,,0.04,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.03999999999885146,2.8722246803170037e-11,0.04,0.0
+HS28,constrained,3,1,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.465190328815662e-31,2.220446049250313e-16,7.518830502887769e-31,1.3322676295501878e-15
+HS29,constrained,3,0,1,0,0,1,True,-22.627416997969522,True,tiny,,-22.627416997969522,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-22.627416997977157,2.3177904040494468e-11,-22.627384998250182,0.0
+HS30,constrained,3,0,1,6,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.0000000000145517,0.0,1.0000025600380027,0.0
+HS31,constrained,3,0,1,6,0,1,True,6.0,True,tiny,,6.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",6.000000000000217,0.0,6.0000319974592715,0.0
+HS32,constrained,3,1,1,3,0,1,True,1.0,True,tiny,,1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.0000000000000018,0.0,1.0000105945937026,0.0
+HS33,constrained,3,0,2,4,0,1,True,-4.585786437626905,True,tiny,,-4.585786437626905,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",-3.999999999973753,0.0,-4.585306492501257,0.0
+HS34,constrained,3,0,2,6,0,1,True,-2.302585092994046,True,tiny,1,-2.302585092994046,sif2jax,True,unverified,"xstar_rows: SLSQP feasible at -4.6051702, f*=-2.3025851 not reached, no trust-constr consensus",-4.605170185988092,4.263256414560601e-14,-2.1276995888075367,0.0
+HS35,constrained,3,0,1,3,0,1,True,0.1111111111111111,True,tiny,,0.1111111111111111,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.11111111111111094,0.0,0.11114319958027563,0.0
+HS35I,constrained,3,0,1,6,0,1,True,0.1111111111,False,tiny,,0.1111111111,sif2jax,True,ok,documented: scipy reaches f*,0.11111111111111072,0.0,0.11114320896318297,0.0
+HS35MOD,constrained,3,0,1,4,0,1,True,0.24999999902267334,False,tiny,,0.1111111111,scipy-consensus,True,fstar_mismatch,documented: SLSQP 0.25 and trust-constr 0.25 agree; sif2jax f*=0.11111111 not reached,0.2500000000000018,0.0,0.24999999902267334,8.661378170238265e-09
+HS36,constrained,3,0,1,6,0,1,True,-3300.0,True,tiny,,-3300.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-3299.9999999415945,0.0,-3299.9996410615927,0.0
+HS37,constrained,3,0,2,6,0,1,True,-3456.0,True,tiny,,-3456.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-3456.0000131539123,9.13466173813049e-08,-3455.980001625381,0.0
+HS39,constrained,4,2,0,0,0,1,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0000000000135003,1.1817621549815595e-11,-1.000000000005094,3.985478613802697e-12
+HS40,constrained,4,3,0,0,0,1,True,-0.25,True,tiny,,-0.25,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-0.2500000000140833,2.3426593998010503e-11,-0.25000000050234766,5.444094064444016e-10
+HS41,constrained,4,1,0,8,0,1,True,1.9259259259259258,True,tiny,,1.9259259259259258,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.9259259259260435,0.0,1.9259323175598853,4.440892098500626e-16
+HS42,constrained,4,2,0,0,0,1,True,13.857864376269049,True,tiny,,13.857864376269049,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",13.85786437626857,1.900701818158268e-13,13.857864373077813,1.2586056641339383e-09
+HS43,constrained,4,0,3,0,0,1,True,-44.0,True,tiny,,-44.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-44.00000000000369,1.258437798412615e-12,-43.999987200937,0.0
+HS44,constrained,4,0,6,4,0,1,True,-15.0,True,tiny,,-15.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-15.000000004222535,1.7461641022009644e-09,-14.98399126393385,0.0
+HS46,constrained,5,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",4.553646575096579e-19,7.274358893027966e-11,3.380555390135468e-11,7.72715225139109e-14
+HS47,constrained,5,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",7.687105086002261e-16,3.267341952550851e-11,1.9046064894332392e-13,3.3078637606820394e-09
+HS48,constrained,5,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",3.0814879110195774e-31,8.881784197001252e-16,6.162975822039155e-32,0.0
+HS49,constrained,5,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",3.3387407123922276e-11,0.0,7.003092180476203e-12,0.0
+HS50,constrained,5,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",2.469726638689256e-14,0.0,4.979684464207637e-30,0.0
+HS51,constrained,5,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",9.860761315262648e-32,4.440892098500626e-16,6.409494854920721e-31,4.440892098500626e-16
+HS52,constrained,5,3,0,0,0,1,True,5.326647564469914,True,tiny,,5.326647564469914,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",5.326647564517787,2.7755575615628914e-17,5.32664756446992,1.2434497875801753e-14
+HS53,constrained,5,3,0,10,0,1,True,4.093023255813954,True,tiny,,4.093023255813954,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",4.0930232558365285,1.1102230246251565e-16,4.093023255813954,1.1102230246251565e-16
+HS54,constrained,6,1,0,12,0,1,True,-0.9080747577659853,True,tiny,,-0.9080747577659853,sif2jax,True,unverified,"documented: SLSQP feasible at -7.2239493e-34, f*=-0.90807476 not reached, no trust-constr consensus",-7.223949304449539e-34,0.0,-0.9032560984017826,0.0
+HS55,constrained,6,6,0,8,0,1,True,6.333333333333333,True,tiny,,6.333333333333333,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",6.72913393979753,4.440892098500626e-16,6.793346503081354,8.881784197001252e-16
+HS56,constrained,7,4,0,0,0,1,True,-3.456,True,tiny,,-3.456,sif2jax,True,ok,documented: scipy reaches f*,-3.456000000000331,6.87894186057747e-13,-3.456000000000087,1.1226575225009583e-12
+HS57,constrained,2,0,1,2,0,1,True,0.02845966972,True,tiny,,0.02845966972,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.030646306028252225,0.0,0.030647618943394055,0.0
+HS6,constrained,2,1,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",5.592266019002934e-22,1.9118040484045196e-12,2.7733391199176196e-30,1.9984014443252818e-14
+HS60,constrained,3,1,0,6,0,1,True,0.03256820025,True,tiny,,0.03256820025,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.03256820025506982,1.7763568394002505e-15,0.03256820025506986,0.0
+HS61,constrained,3,2,0,0,0,1,True,-143.6461422,True,tiny,,-143.6461422,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,11.0,-143.64614220058405,2.633852247413415e-09
+HS62,constrained,3,1,0,6,0,1,True,-26272.51448,True,tiny,,-26272.51448,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-26272.514487318254,0.0,-25698.300930296282,1.1102230246251565e-16
+HS63,constrained,3,2,0,3,0,1,True,961.7151721,True,tiny,,961.7151721,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",961.7151721300413,8.832046205498045e-12,961.7151721300195,2.667732701411296e-11
+HS64,constrained,3,0,1,3,0,1,True,6299.842428,True,tiny,all,6299.842428,sif2jax,True,sign_flipped,"all: x* feasible, scipy reaches f*",6299.842427920387,4.971578704271451e-13,6299.842587752646,0.0
+HS65,constrained,3,0,1,6,0,1,True,0.9535288567,True,tiny,,0.9535288567,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.9535288568044549,4.014566457044566e-12,0.953560869399056,0.0
+HS66,constrained,3,0,2,6,0,1,True,0.5181632741,True,tiny,,0.5181632741,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.5181632741798619,4.583888824072346e-12,0.5181778256086871,0.0
+HS68,constrained,4,2,0,8,0,1,True,-0.920425026,True,tiny,,-0.920425026,sif2jax,True,ok,documented: scipy reaches f*,-0.9204250036417005,6.423084286666381e-12,-0.9204250037734039,4.683679000194729e-10
+HS69,constrained,4,2,0,8,0,1,True,-956.71288,True,tiny,,-956.71288,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-956.7128866500276,1.6653345369377348e-16,-956.712886674995,4.892928284760956e-10
+HS7,constrained,2,1,0,0,0,1,True,-1.7320508075688772,True,tiny,,-1.7320508075688772,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.732050807649228,2.7834268223614345e-10,-1.732050807568885,2.6645352591003757e-14
+HS71,constrained,4,1,1,8,0,1,True,17.0140173,True,tiny,,17.0140173,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",17.014017289137243,3.527134140313137e-11,17.014033599489824,5.3852176051805145e-09
+HS72,constrained,4,0,2,8,0,1,True,727.67937,True,tiny,,727.67937,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",727.6793577896144,1.0842021724855044e-18,727.6794217881575,0.0
+HS73,constrained,4,1,2,4,0,1,True,29.894378,True,tiny,,29.894378,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",29.894378159136465,1.5789147767009126e-11,29.894858294621027,2.220446049250313e-16
+HS76,constrained,4,0,3,4,0,1,True,-5.230769230769232,True,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-5.230769230769232,1.3322676295501878e-15,-5.230756426768983,0.0
+HS76I,constrained,4,0,3,8,0,1,True,-5.230769230769228,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-5.230769230769228,0.0,-5.230751745816363,0.0
+HS77,constrained,5,2,0,0,0,1,True,0.24150513,True,tiny,,0.24150513,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.24150512879017863,1.1102230246251565e-15,0.24150512879017885,2.4424906541753444e-15
+HS78,constrained,5,3,0,0,0,1,True,-2.91970041,True,tiny,,-2.91970041,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-2.9197004089825587,1.84439130634928e-11,-2.9197004090440286,6.141220865174546e-11
+HS79,constrained,5,3,0,0,0,1,True,0.0787768209,True,tiny,,0.0787768209,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.07877682087145242,1.0157208407690632e-11,0.07877682087150946,1.2566836460337072e-11
+HS8,constrained,2,2,0,0,0,1,True,-1.0,True,tiny,,-1.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-1.0,0.0,-1.0,5.684341886080802e-14
+HS80,constrained,5,3,0,10,0,1,True,0.0539498478,True,tiny,,0.0539498478,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0539498477702715,8.881784197001252e-15,0.05394984772693957,7.795364354024059e-10
+HS81,constrained,5,3,0,10,0,1,True,0.0539498478,True,tiny,,0.0539498478,sif2jax,True,ok,documented: scipy reaches f*,0.05394984776899597,2.2891910589351028e-11,0.053949847726939594,7.795364354024059e-10
+HS83,constrained,5,0,3,10,0,1,True,-31026.427718471088,True,tiny,,-30665.53867,scipy-consensus,True,fstar_mismatch,documented: SLSQP -31026.428 and trust-constr -31026.428 agree; sif2jax f*=-30665.539 not reached and x* is not a minimiser under this conversion,-31026.427718471088,2.1716370923741124e-09,-31026.427588843188,0.0
+HS86,constrained,5,0,10,5,0,1,True,-32.34867904842842,True,tiny,,,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",-32.34867896566686,9.71223101942087e-12,-32.34856296454917,0.0
+HS87,constrained,6,4,0,12,0,1,True,8996.881024389691,True,tiny,,8927.5977,scipy-consensus,True,fstar_mismatch,documented: SLSQP 8996.881 and trust-constr 8996.8905 agree; sif2jax f*=8927.5977 not reached,8996.881024389691,1.1368683772161603e-13,8996.890471959836,1.8474111129762605e-13
+HS9,constrained,2,1,0,0,0,1,True,-0.5,True,tiny,,-0.5,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",-0.4999999999999999,1.7763568394002505e-15,-0.4999999999999999,1.7763568394002505e-15
+HS93,constrained,6,0,2,6,0,1,True,0.0,True,tiny,all,135.075961,scipy-consensus,True,fstar_mismatch,all: SLSQP 0 and trust-constr 8.2663453e-09 agree; sif2jax f*=135.07596 not reached (sign flipped),0.0,0.0,8.266345320374834e-09,0.0
+HS95,constrained,6,0,4,12,0,1,True,0.015619514,False,tiny,,0.015619514,sif2jax,True,ok,documented: scipy reaches f*,0.015619533623182403,0.0,0.01661429360500398,0.0
+HS96,constrained,6,0,4,12,0,1,True,0.015619515,False,tiny,,0.015619515,sif2jax,True,unverified,documented: bounded feasible end point at 0.020486155 without convergence,0.015619505400146106,1.0488284524434732e-05,0.020486154554158805,0.0
+HS97,constrained,6,0,4,12,0,1,True,3.1358091,False,tiny,,3.1358091,sif2jax,True,unverified,documented: bounded feasible end point at 3.4400713 without convergence,3.135791724202474,6.92058145119745e-05,3.4400713383271095,0.0
+HS98,constrained,6,0,4,12,0,1,True,3.135809,False,tiny,,3.135809,sif2jax,True,ok,documented: scipy reaches f*,3.1358091220180566,4.119087293474877e-09,2.663700221187206,0.002763676200418336
+HYDROELL,constrained,1009,0,1008,2018,0,1,True,-3585550.0,False,large,,-3585550.0,sif2jax,True,unvalidated,,,,,
+LIPPERT2,constrained,20201,10000,40000,1,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET1,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET10,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET11,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET12,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET2,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET3,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET4,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET5,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET6,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET7,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET8,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LISWET9,constrained,2002,0,2000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LOOTSMA,constrained,3,0,2,4,0,1,True,0.0,False,tiny,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",0.0,0.0,6.399823131149863e-05,0.0
+LSNNODOC,constrained,5,4,0,6,0,1,False,,False,tiny,,,sif2jax,True,unverified,documented: bounded feasible end point at 123.11322 without convergence,2568.5727609564105,0.0,123.1132239938492,8.881784197001252e-16
+LSQFIT,constrained,2,0,1,1,0,1,True,0.009435350000045667,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.009435350000045667,0.0,0.009435350750618937,0.0
+LUKVLE1,constrained,10000,9998,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+LUKVLE10,constrained,10000,9998,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE11,constrained,9998,6664,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE13,constrained,9998,6664,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE15,constrained,9997,7497,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE16,constrained,9997,7497,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE17,constrained,9997,7497,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE18,constrained,9997,7497,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE3,constrained,10000,2,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE5,constrained,10002,9996,0,4,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE6,constrained,9999,4999,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE7,constrained,10000,4,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLE8,constrained,10000,9998,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI1,constrained,10000,0,9998,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+LUKVLI10,constrained,10000,0,9998,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI11,constrained,9998,0,6664,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI13,constrained,9998,0,6664,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI15,constrained,9997,0,7497,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI16,constrained,9997,0,7497,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI17,constrained,9997,0,7497,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI18,constrained,9997,0,7497,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI3,constrained,10000,0,2,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI5,constrained,10002,0,9996,4,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI6,constrained,9999,0,4999,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI7,constrained,10000,0,4,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+LUKVLI8,constrained,10000,0,9998,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+MADSEN,constrained,3,0,6,0,0,1,True,0.6164324355607956,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.6164324355607956,0.0,0.6164455012188105,0.0
+MAKELA1,constrained,3,0,2,0,0,1,True,-1.4142121558,False,tiny,all,-1.4142121558,sif2jax,True,sign_flipped,all: scipy reaches f*,-1.4142135623884762,2.1752821766085617e-11,-1.4141495595395763,0.0
+MAKELA2,constrained,3,0,3,0,0,1,True,7.2,False,tiny,all,7.2,sif2jax,True,sign_flipped,all: scipy reaches f*,7.199999999994778,5.242029033070139e-12,7.20008843469024,0.0
+MAKELA3,constrained,21,0,20,0,0,1,True,0.0,False,small,all,0.0,sif2jax,True,sign_flipped,all: scipy reaches f*,3.0263856226651954e-12,5.749868905335592e-11,0.0004962528947982165,0.0
+MAKELA4,constrained,21,0,40,0,0,1,True,0.0,False,small,all,0.0,sif2jax,True,sign_flipped,all: scipy reaches f*,1.4344636589669335e-12,0.0,0.0003175640766469466,0.0
+MARATOS,constrained,2,1,0,0,0,1,True,-0.9999990000000133,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",-0.9999990000000133,2.6645352591003757e-14,-0.999999,0.0
+MATRIX2,constrained,6,0,2,4,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.8169217579653532e-19,3.848271136724702e-11,0.0015740615247748593,0.0
+MINMAXBD,constrained,5,0,20,0,0,1,True,115.70643952099361,False,tiny,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",115.70643952099361,2.2851054382044822e-11,115.70646446256754,0.0
+MINMAXRB,constrained,3,0,4,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,-4.3701946652168504e-14,9.823253321883385e-13,0.0006405212979157969,0.0
+MSS1,constrained,90,73,0,0,0,1,False,,False,small,,,sif2jax,True,unverified,documented: bounded feasible end point at -16 without convergence,-4050.0,89.0,-15.999999999999995,2.5450516044531075e-17
+MSS2,constrained,756,703,0,0,0,1,False,,False,medium,,,sif2jax,False,infeasible,best violation 755 under every sign convention,-285768.0,755.0,,
+ODFITS,constrained,10,6,0,10,0,1,True,-2380.026775,False,tiny,,-2380.026775,sif2jax,True,ok,documented: scipy reaches f*,-2380.0267743688664,2.2737367544323206e-13,-2380.0267743688664,1.1368683772161603e-13
+OET1,constrained,3,0,1002,0,0,1,True,0.5382431192002963,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.5382431192002963,4.1744385725905886e-14,0.5382570928642584,0.0
+OET2,constrained,3,0,1002,0,0,1,True,0.0871596338780024,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.0871596338780024,4.440892098500626e-16,0.09127980122483738,0.0
+OET3,constrained,4,0,1002,0,0,1,True,0.004505052892362078,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.004505052892362078,6.661338147750939e-16,0.007339786630022488,0.0
+OET4,constrained,4,0,1002,0,0,1,True,0.004295430692980787,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.004295430692980787,5.540456982089381e-12,0.1603468963370078,0.0
+OET5,constrained,5,0,1002,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -11 during phase 'slsqp:documented',,,,
+OET6,constrained,5,0,1002,0,0,1,True,0.08715963387800241,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.08715963387800241,2.220446049250313e-16,0.032111544777573914,0.0
+OET7,constrained,7,0,1002,0,0,1,True,0.08715963387800228,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",0.08715963387800228,1.1102230246251565e-15,0.00026146836332345265,0.0
+OPTCDEG2,constrained,4502,3000,0,4505,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OPTCDEG3,constrained,4502,3000,0,4505,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OPTCNTRL,constrained,32,20,0,36,0,1,True,549.9999869,False,small,,549.9999869,sif2jax,True,ok,documented: scipy reaches f*,550.0000000000158,1.687538997430238e-13,549.9999975165279,6.361966953249976e-09
+OPTCTRL3,constrained,4502,3000,0,6,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OPTCTRL6,constrained,4502,3000,0,6,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OPTMASS,constrained,30010,20004,5001,8,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+OPTPRLOC,constrained,30,0,30,60,0,1,True,-16.394219629736106,False,small,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",-16.394219629736106,1.5898393712632242e-13,-16.394033464584666,0.0
+ORTHRDS2C,constrained,5003,2500,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+ORTHREGB,constrained,27,6,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,8.821668037447705e-14,4.729550084903167e-14,7.338001745707474e-22,5.428990590417015e-13
+ORTHREGC,constrained,5005,2500,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+ORTHREGD,constrained,5003,2500,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+ORTHREGE,constrained,7506,5000,0,1,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+ORTHRGDM,constrained,10003,5000,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+ORTHRGDS,constrained,5003,2500,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+PENTAGON,constrained,6,0,15,0,0,1,True,0.000136521631,False,tiny,all,0.000136521631,sif2jax,True,sign_flipped,all: scipy reaches f*,0.0001365216755135447,0.0,0.00013677279834769956,0.0
+POLAK1,constrained,3,0,2,0,0,1,True,2.7182818,False,tiny,all,2.7182818,sif2jax,True,sign_flipped,all: scipy reaches f*,2.7182818284593324,0.0,2.7182946284830667,0.0
+POLAK2,constrained,11,0,2,0,0,1,True,54.598146,False,tiny,all,54.598146,sif2jax,True,sign_flipped,all: scipy reaches f*,54.59815003313755,9.983125437429408e-12,54.598150545003044,0.0
+POLAK3,constrained,12,0,10,0,0,1,True,5.93300252,False,tiny,all,5.93300252,sif2jax,True,sign_flipped,all: scipy reaches f*,5.933003348692221,1.6600026908619725e-11,5.93302243932058,0.0
+POLAK4,constrained,3,0,3,0,0,1,True,0.0,False,tiny,all,0.0,sif2jax,True,sign_flipped,all: scipy reaches f*,3.3968035700561255e-16,4.440892098500626e-15,0.0011802471216156127,0.0
+POLAK5,constrained,3,0,2,0,0,1,True,50.0,False,tiny,all,50.0,sif2jax,True,sign_flipped,all: scipy reaches f*,49.99999999999668,4.355626970209414e-12,50.00000051269394,0.0
+POLAK6,constrained,5,0,4,0,0,1,True,-44.0,True,tiny,all,-44.0,sif2jax,True,sign_flipped,"all: x* feasible, scipy reaches f*",-44.00000000000009,1.0516032489249483e-12,-43.99998077742099,0.0
+PORTFL1,constrained,12,1,0,24,0,1,True,0.0204863313869,False,tiny,,0.0204863313869,sif2jax,True,ok,documented: scipy reaches f*,0.02048627468216621,0.0,0.020494018827052075,5.551115123125783e-15
+PORTFL2,constrained,12,1,0,24,0,1,True,0.029689208,False,tiny,,0.029689208,sif2jax,True,ok,documented: scipy reaches f*,0.02968923985712609,4.440892098500626e-16,0.02969048111378688,2.9976021664879227e-15
+PORTFL3,constrained,12,1,0,24,0,1,True,0.0327497293,False,tiny,,0.0327497293,sif2jax,True,ok,documented: scipy reaches f*,0.03274970934359148,0.0,0.032751358539999414,3.9968028886505635e-15
+PORTFL4,constrained,12,1,0,24,0,1,True,0.0263069364,False,tiny,,0.0263069364,sif2jax,True,ok,documented: scipy reaches f*,0.026306950940056344,2.220446049250313e-16,0.026308010300088665,5.551115123125783e-15
+PORTFL6,constrained,12,1,0,24,0,1,True,0.0257917996,False,tiny,,0.0257917996,sif2jax,True,ok,documented: scipy reaches f*,0.02579179821843624,2.220446049250313e-16,0.025797487201182658,1.709743457922741e-14
+READING1,constrained,4002,2000,0,8004,0,1,False,,True,large,,,sif2jax,True,unvalidated,,,,,
+READING2,constrained,6003,4000,0,8006,0,1,False,,True,large,,,sif2jax,True,unvalidated,,,,,
+READING3,constrained,4002,2001,0,8004,0,1,False,,True,large,,,sif2jax,True,unvalidated,,,,,
+READING9,constrained,10002,5000,0,10004,0,1,True,-0.0441677,True,large,,-0.0441677,sif2jax,True,unvalidated,,,,,
+ROSEPETAL,constrained,1000,0,2000,0,0,1,False,,False,medium,,,sif2jax,False,unbounded,objective diverges under every sign convention,-6.255222795942577e+40,0.0,,
+ROSEPETAL2,constrained,10001,1,20000,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+S316-322,constrained,2,1,0,0,0,1,True,334.315,False,tiny,,334.315,sif2jax,True,ok,documented: scipy reaches f*,800.0,1.0,334.3145750437463,3.837019590946511e-11
+S365,constrained,7,0,5,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 18 under every sign convention,6.0,18.0,,
+S365MOD,constrained,7,0,5,4,0,1,False,,False,tiny,,,sif2jax,False,infeasible,best violation 18 under every sign convention,6.0,18.0,,
+SIMPLLPA,constrained,2,0,2,2,0,1,True,1.0,False,tiny,,1.0,sif2jax,True,ok,documented: scipy reaches f*,1.0000000000000078,0.0,1.0000924816227723,0.0
+SIMPLLPB,constrained,2,0,3,2,0,1,True,1.1,False,tiny,,1.1,sif2jax,True,ok,documented: scipy reaches f*,1.1000000000000143,0.0,1.1000924214501469,0.0
+SIPOW1,constrained,2,0,2000,0,0,1,True,-1.0,False,tiny,,-1.0,sif2jax,True,ok,documented: scipy reaches f*,-1.000000000000009,9.547918011776346e-15,-0.9998492166009708,0.0
+SIPOW2,constrained,2,0,2000,0,0,1,True,-1.0,False,tiny,,-1.0,sif2jax,True,ok,documented: scipy reaches f*,-1.0000000000000138,1.3766765505351941e-14,-0.9952721281466459,0.0
+TENBARS1,constrained,18,8,1,14,0,1,True,2295.37,False,tiny,all,2295.37,sif2jax,True,unverified,"all: SLSQP feasible at 2302.5485, f*=2295.37 not reached, no trust-constr consensus",2302.5485125146624,1.1027623258996755e-11,-10.14358262768228,5.469398168974127
+TENBARS2,constrained,18,8,0,14,0,1,True,2277.9458,False,tiny,,2277.9458,sif2jax,True,unverified,"documented: SLSQP feasible at 2302.5485, f*=2277.9458 not reached, no trust-constr consensus",2302.5485125146743,5.002220859751105e-12,-8.154419377130578,4.4314068853729705
+TENBARS3,constrained,18,8,0,12,0,1,True,2247.129,False,tiny,,2247.129,sif2jax,True,ok,documented: scipy reaches f*,2247.129067652992,4.547473508864641e-13,28.601182637603802,2.988655832345194
+TENBARS4,constrained,18,8,1,10,0,1,True,2247.129,False,tiny,,2247.129,sif2jax,True,unverified,"documented: SLSQP feasible at 2374.9881, f*=2247.129 not reached, no trust-constr consensus",2374.988142779448,3.410605131648481e-13,-8.001151928056863,10.428934830772782
+TRAINF,constrained,4008,2002,0,4016,0,1,True,3.09751881012,False,large,,3.09751881012,sif2jax,True,unvalidated,,,,,
+TRO11X3,constrained,150,60,1,90,0,1,True,1.0,False,medium,,1.0,sif2jax,False,infeasible,best violation 0.00161 under every sign convention,2988.452894870588,2.0055040839979483,-16864.767399622237,0.001613595516367652
+TRO21X5,constrained,540,200,1,340,0,1,True,1.0,False,medium,,1.0,sif2jax,True,unverified,"documented: SLSQP feasible at 5076.4884, f*=1 not reached, no trust-constr consensus",5076.488432332767,1.1119993814645568e-12,,
+TRO3X3,constrained,30,12,1,18,0,1,True,1.0,False,small,,1.0,sif2jax,True,unverified,"documented: SLSQP feasible at 0.83152263, f*=1 not reached, no trust-constr consensus",0.8315226263366572,4.447286983135707e-11,1.2207935045946756e-08,4.440892098500626e-16
+TRO41X9,constrained,2040,720,1,1320,0,1,True,1.0,False,large,,1.0,sif2jax,True,unvalidated,,,,,
+TRO4X4,constrained,63,24,1,39,0,1,True,5.430543071937764e-09,False,small,,1.0,scipy-consensus,True,fstar_mismatch,documented: SLSQP 4.2935819e-05 and trust-constr 5.4305431e-09 agree; sif2jax f*=1 not reached,4.2935818791620884e-05,4.618527782440651e-14,5.430543071937764e-09,6.661338147750939e-16
+TRO5X5,constrained,108,40,1,68,0,1,True,1.0,False,medium,all,1.0,sif2jax,True,unverified,"all: SLSQP feasible at 10.5625, f*=1 not reached, no trust-constr consensus",10.562500000000007,1.4432899320127035e-13,-14352.659925276485,85.90705611942631
+TRO6X2,constrained,45,20,1,25,0,1,True,1.0,False,small,,1.0,sif2jax,False,infeasible,best violation 0.00233 under every sign convention,1581.203405178004,2.9316170843234493,-1718887.9815191696,0.04551014859463942
+ZECEVIC2,constrained,2,0,2,4,0,1,True,-4.125,False,tiny,all,-4.125,sif2jax,True,sign_flipped,all: scipy reaches f*,-4.124999999999893,0.0,-4.124967999475452,0.0
+ZECEVIC3,constrained,2,0,2,4,0,1,True,-97.30952,False,tiny,,-97.30952,sif2jax,True,unverified,"documented: SLSQP feasible at 227.72487, f*=-97.30952 not reached, no trust-constr consensus",227.72487187713534,3.151678917845402e-11,44.06933348386889,0.0
+ZECEVIC4,constrained,2,0,2,4,0,1,True,165.99999918312437,False,tiny,,7.563,scipy-consensus,True,fstar_mismatch,documented: SLSQP 166 and trust-constr 166 agree; sif2jax f*=7.563 not reached,166.0,0.0,165.99999918312437,7.462092303726596e-09
+A0ENDNDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0ENINDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0ENSNDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0ESDNDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0ESINDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0ESSNDL,cqp,45006,15002,0,60008,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NNDNDL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NNDNIL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NNDNSL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NNSNSL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NSDSDL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NSDSDS,cqp,6012,2004,0,8016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NSDSIL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NSDSSL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+A0NSSSSL,cqp,60012,20004,0,80016,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC1,cqp,2550,1785,2048,2020,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC10,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC12,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC15,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC2,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC3,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC4,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC5,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC6,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CMPC8,cqp,1530,1065,1286,1220,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CVXQP1,cqp,10000,5000,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CVXQP2,cqp,10000,2500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+CVXQP3,cqp,10000,7500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+DEGENQP,cqp,10,5,120,20,0,1,True,8.104628079763644e-15,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP alone, no sif2jax f*",8.104628079763644e-15,8.881784197001252e-16,0.004026327540528236,8.673617379884035e-19
+DEGENQPC,cqp,50,25,19600,100,0,1,False,,False,small,,,sif2jax,True,timeout,killed after 900s during phase 'trust-constr',,,,
+DUAL1,cqp,85,1,0,170,0,1,True,0.03501296783426692,False,small,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.03501296783426692,0.0,0.03501964234820263,1.3322676295501878e-15
+DUAL2,cqp,96,1,0,192,0,1,True,0.03373367148298101,False,small,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.03373367148298101,0.0,0.033735445854685055,6.661338147750939e-16
+DUAL3,cqp,111,1,0,222,0,1,True,0.13575583291888227,False,medium,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.13575583291888227,2.220446049250313e-16,0.13576070769486737,3.3306690738754696e-16
+DUAL4,cqp,75,1,0,150,0,1,True,0.7460906493990198,False,small,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",0.7460906493990198,1.1102230246251565e-15,0.7460941292762224,6.8833827526759706e-15
+DUALC1,cqp,9,1,214,18,0,1,False,,False,tiny,,,sif2jax,True,unverified,documented: bounded feasible end point at 6259.8223 without convergence,0.0,1.0,6259.822260191604,6.661338147750939e-16
+DUALC2,cqp,7,1,228,14,0,1,False,,False,tiny,,,sif2jax,True,unverified,documented: bounded feasible end point at 3577.1074 without convergence,0.0,1.0,3577.1073641749867,2.886579864025407e-15
+DUALC5,cqp,8,1,277,16,0,1,True,427.2326605581467,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",427.23336927671335,8.881784197001252e-16,427.2326605581467,1.2212453270876722e-15
+DUALC8,cqp,8,1,502,16,0,1,False,,False,tiny,,,sif2jax,True,unverified,documented: bounded feasible end point at 22508.322 without convergence,0.0,1.0,22508.322279753716,9.992007221626409e-16
+GOULDQP1,cqp,32,17,0,64,0,1,True,-3485.333,True,small,,-3485.333,sif2jax,True,ok,documented: scipy reaches f*,-3485.3332500855954,5.806910507999419e-10,-3485.33086002687,2.531308496145357e-13
+GOULDQP2,cqp,19999,9999,0,39998,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+GOULDQP3,cqp,19999,9999,0,39998,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+HATFLDH,cqp,4,0,7,8,0,1,True,-24.4999998,False,tiny,,-24.4999998,sif2jax,True,unverified,"documented: SLSQP feasible at -50, f*=-24.5 not reached, no trust-constr consensus",-50.0,0.0,-49.984009130001745,0.0
+HS44NEW,cqp,4,0,6,4,0,1,True,-15.0,False,tiny,,-15.0,sif2jax,True,ok,documented: scipy reaches f*,-15.000000000000009,7.105427357601002e-15,-14.999360037112915,0.0
+HS88,cqp,2,0,1,0,0,1,True,1.3601,True,tiny,,1.3601,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,0.13323333333333334,1.3626580949891194,0.0
+HS89,cqp,3,0,1,0,0,1,True,1.36009,True,tiny,,1.36009,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",1.3626568148894276,4.330710052721787e-16,1.3626580949890985,0.0
+HS90,cqp,4,0,1,0,0,1,True,1.3601022723740002,True,tiny,,,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,0.13323333333333334,1.4999998898139784,0.0
+HS91,cqp,5,0,1,0,0,1,True,1.3626568148634934,False,tiny,,,scipy-consensus,True,fstar_from_consensus,"documented: SLSQP and trust-constr agree, no sif2jax f*",1.3626568148634934,2.4996755425103767e-14,1.362657070893784,0.0
+HS92,cqp,6,0,1,0,0,1,True,2.6221084620359968e-17,False,tiny,all,,scipy-consensus,True,fstar_from_consensus,"all: SLSQP and trust-constr agree, no sif2jax f* (sign flipped)",9.801604548613227e-12,0.0,2.6221084620359968e-17,0.0
+JUNKTURN,cqp,10010,7000,0,28,0,1,True,1.224842784e-05,False,large,,1.224842784e-05,sif2jax,True,unvalidated,,,,,
+NASH,cqp,72,24,0,114,0,1,False,,False,small,,,sif2jax,False,infeasible,best violation 35.3 under every sign convention,0.0,61.241589,930.0777615823654,35.31998389324423
+NCVXQP1,cqp,10000,5000,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP2,cqp,10000,5000,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP3,cqp,10000,5000,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP4,cqp,10000,2500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP5,cqp,10000,2500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP6,cqp,10000,2500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP7,cqp,10000,7500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP8,cqp,10000,7500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+NCVXQP9,cqp,10000,7500,0,20000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+QPBAND,cqp,50000,0,25000,100000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+QPNBAND,cqp,50000,0,25000,100000,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+TABLE1,cqp,1584,510,0,2546,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+TABLE3,cqp,4992,2464,0,7389,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+TABLE6,cqp,1584,510,0,2546,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+TABLE7,cqp,624,230,0,1108,0,1,True,0.0,True,medium,,0.0,sif2jax,True,unverified,documented: bounded feasible end point at 69349.895 without convergence,69349.89458707892,2.4442670110147446e-12,,
+TABLE8,cqp,1271,72,0,2542,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+TAME,cqp,2,1,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",1.232595164407831e-32,3.3306690738754696e-16,0.0,0.0
+YAO,cqp,2002,0,2000,5,0,1,True,197.705,False,large,,197.705,sif2jax,True,unvalidated,,,,,
+10FOLDTR,nle,1000,1000,0,0,0,1,True,0.0,True,medium,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,9.076030935543634e-11,,
+AIRCRFTA,nle,8,5,0,6,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,3.705138518043938e-12,0.0,5.990372031750013e-09
+ARGAUSS,nle,3,15,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 0.0011 under every sign convention,0.0,0.0011000000000000454,,
+ARGLALE,nle,200,400,0,0,0,1,True,0.0,False,medium,,0.0,sif2jax,False,infeasible,best violation 2 under every sign convention,0.0,2.0,,
+ARGLBLE,nle,200,400,0,0,0,1,True,0.0,False,medium,,0.0,sif2jax,False,infeasible,best violation 0.996 under every sign convention,0.0,8039999.0,0.0,0.9962546816479332
+ARGLCLE,nle,200,399,0,0,0,1,True,-1.0,False,medium,,-1.0,sif2jax,False,infeasible,best violation 1 under every sign convention,-1.0,7919801.0,-1.0,1.0
+ARGTRIG,nle,200,200,0,0,0,1,True,0.0,False,medium,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,5.684341886080802e-14,0.0,9.811174095375463e-11
+ARTIF,nle,5002,5000,0,4,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+BARDNE,nle,3,15,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 4.11 under every sign convention,0.0,4.11,,
+BDVALUES,nle,10002,10000,0,4,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+BEALENE,nle,2,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,2.625,,
+BENNETT5,nle,3,154,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -11 during phase 'slsqp:documented',,,,
+BENNETT5,nle,3,154,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+BIGGS6NE,nle,6,13,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.523 under every sign convention,0.0,0.5228997691262586,,
+BIGGS6NE,nle,6,13,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.02 under every sign convention,0.0,1.0206664527792295,,
+BOOTH,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,1.7763568394002505e-15,0.0,8.881784197001252e-16
+BOX3NE,nle,3,10,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.632 under every sign convention,0.0,0.6321205588285577,,
+BOXBOD,nle,2,6,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 223 under every sign convention,0.0,223.00004539992977,,
+BRATU2DT,nle,5184,4900,0,568,0,1,True,1.30497e-06,False,large,,1.30497e-06,sif2jax,True,unvalidated,,,,,
+BROWNBSNE,nle,2,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,999999.0,,
+BROWNDENE,nle,4,20,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 822 under every sign convention,0.0,822.2777568510064,,
+CERI651C,nle,7,56,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+CHANDHEQ,nle,100,100,0,100,0,1,True,0.0,False,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,2.688071987222429e-12,0.0,3.3440390456718205e-09
+CHEBYQADNE,nle,100,100,0,200,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 0.0484 under every sign convention,0.0,0.04843092871048691,0.0,0.1621322039300217
+CLUSTER,nle,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.0,0.0,9.740239163992393e-12
+COOLHANS,nle,9,9,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,4.547473508864641e-13,0.0,7.105427357601002e-15
+CYCLIC3,nle,100002,100002,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+CYCLOOCF,nle,29996,20000,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+CYCLOOCT,nle,30000,20000,0,8,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+DANIWOOD,nle,2,6,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 7.72 under every sign convention,0.0,7.7227821567999975,,
+DECONVBNE,nle,63,40,0,86,0,1,True,0.0,True,small,,0.0,sif2jax,False,infeasible,best violation 0.0357 under every sign convention,0.0,9.0,0.0,0.0356819209555137
+DECONVNE,nle,63,40,0,24,0,1,True,0.0,True,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,9.0,0.0,9.445432214150173e-09
+DENSCHNBNE,nle,2,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,2.0,,
+DENSCHNCNE,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.509903313490213e-14,0.0,1.4141221527097514e-10
+DENSCHNDNE,nle,3,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,6.159068868366922e-11,0.0,6.418880586998854e-09
+DENSCHNENE,nle,3,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.2010662907860268e-17,0.0,8.393286066166183e-14
+DENSCHNFNE,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.474376176702208e-13,0.0,0.0
+DEVGLA1NE,nle,4,24,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'trust-constr',,,,
+DEVGLA2NE,nle,5,16,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,46.68049347593898,,
+DMN15102,nle,66,4643,0,0,0,2,False,,False,small,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+DMN15102,nle,66,4643,0,0,1,2,False,,False,small,,,sif2jax,True,error,worker exited with code -11 during phase 'slsqp:documented',,,,
+DMN15103,nle,99,4643,0,0,0,2,False,,False,small,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+DMN15103,nle,99,4643,0,0,1,2,False,,False,small,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+DRCAVTY1,nle,4489,3969,0,1040,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+DRCAVTY2,nle,4489,3969,0,1040,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+DRCAVTY3,nle,4489,3969,0,1040,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+ECKERLE4,nle,3,35,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+ECKERLE4,nle,3,35,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'trust-constr',,,,
+EGGCRATENE,nle,2,4,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,4.546487134128409,,
+EIGENB,nle,2550,2550,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+EIGENC,nle,2652,2652,0,0,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+ELATVIDUNE,nle,2,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 125 under every sign convention,0.0,125.0,,
+ENGVAL2NE,nle,3,5,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 23 under every sign convention,0.0,23.0,,
+ENSO,nle,9,168,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -11 during phase 'trust-constr',,,,
+ERRINROSNE,nle,50,98,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 145 under every sign convention,0.0,145.0,,
+ERRINRSMNE,nle,50,98,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,False,infeasible,best violation 101 under every sign convention,0.0,100.99294893287963,,
+EXP2NE,nle,2,10,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,1.1932560927059557,,
+EXPFITNE,nle,2,10,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 2.5 under every sign convention,0.0,2.5,,
+EXTROSNBNE,nle,1000,1000,0,0,0,1,True,0.0,True,medium,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,6.760803201218289e+31,,
+FBRAIN,nle,2,2211,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+FBRAIN2,nle,4,2211,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+FBRAIN2,nle,4,2211,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+FBRAIN2NE,nle,4,2211,0,8,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -11 during phase 'slsqp:documented',,,,
+FBRAIN2NE,nle,4,2211,0,8,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.283 under every sign convention,0.0,0.2828320314102015,,
+FBRAIN3,nle,6,2211,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+FBRAINNE,nle,2,2211,0,4,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+FREURONE,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 4.95 under every sign convention,0.0,7.26664458842437,0.0,4.94895219080605
+GAUSS1,nle,8,250,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+GAUSS2,nle,8,250,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+GAUSS3,nle,8,250,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+GENROSEBNE,nle,500,998,0,1000,0,1,True,0.0,True,medium,,0.0,sif2jax,False,infeasible,best violation 2.52 under every sign convention,0.0,2.519870438763192,,
+GENROSENE,nle,1000,1999,0,0,0,1,True,0.0,True,medium,,0.0,sif2jax,True,timeout,killed after 900s during phase 'slsqp:documented',,,,
+GOTTFR,nle,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,0.0,0.0,2.436606472144831e-12
+GROWTH,nle,3,12,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 92 under every sign convention,0.0,92.0,,
+GULFNE,nle,3,99,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'trust-constr',,,,
+HATFLDANE,nle,4,4,0,4,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,2.220446049250313e-16,0.0,1.8563257597747906e-09
+HATFLDBNE,nle,4,4,0,5,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.0458 under every sign convention,0.0,0.1441025289462069,0.0,0.04579561292088452
+HATFLDCNE,nle,25,25,0,48,0,1,True,0.0,True,small,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,6.661338147750939e-16,0.0,3.552713678800501e-15
+HATFLDDNE,nle,3,10,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.93 under every sign convention,0.0,1.9322692469220182,,
+HATFLDENE,nle,3,21,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.82 under every sign convention,0.0,1.8201817793182822,,
+HATFLDF,nle,3,3,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,0.0313674374615609,0.0,5.0701248754947414e-12
+HATFLDFLNE,nle,3,3,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.0064 under every sign convention,0.0,0.028251871119522126,0.0,0.006404643391801072
+HATFLDG,nle,25,25,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.9895196601282805e-13,0.0,2.5621060828484588e-11
+HEART6,nle,6,6,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,17.065,0.0,3.552713678800501e-15
+HEART8,nle,8,8,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,9.48,0.0,2.86613399680391e-10
+HELIXNE,nle,3,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,1.145684582856896e-14,0.0,1.7563728249569976e-12
+HIMMELBA,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,0.0,0.0,0.0
+HIMMELBFNE,nle,4,7,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 1.34e+04 under every sign convention,0.0,13413.651780667047,,
+HS1NE,nle,2,2,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,0.0,0.0,0.0
+HS25NE,nle,3,99,0,6,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+HS2NE,nle,2,2,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 1.37 under every sign convention,0.0,5.0,0.0,1.3675562544987683
+HYPCIR,nle,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,2.220446049250313e-16,0.0,2.4868995751603507e-14
+INTEGREQ,nle,502,500,0,4,0,1,True,0.0,True,medium,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,2.7200464103316335e-15,,
+INTEQNE,nle,12,12,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,2.8345381597461028e-15,0.0,2.8345381597461028e-15
+JENSMPNE,nle,2,10,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 52.7 under every sign convention,0.0,52.68368695633191,,
+JUDGENE,nle,2,20,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'trust-constr',,,,
+KIRBY2,nle,5,151,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+KIRBY2,nle,5,151,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+KOEBHELBNE,nle,3,156,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,error,worker exited with code -11 during phase 'slsqp:documented',,,,
+KOWOSBNE,nle,4,11,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 0.0475 under every sign convention,0.0,0.04751329639889193,,
+KSS,nle,1000,1000,0,0,0,1,True,0.0,True,medium,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,2.2737367544323206e-13,,
+LANCZOS1,nle,6,24,0,0,0,2,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,10.7866,,
+LANCZOS1,nle,6,24,0,0,1,2,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,5.5866,,
+LANCZOS2,nle,6,24,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 10.8 under every sign convention,0.0,10.7866,,
+LANCZOS2,nle,6,24,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 5.59 under every sign convention,0.0,5.5866,,
+LANCZOS3,nle,6,24,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 10.8 under every sign convention,0.0,10.7866,,
+LANCZOS3,nle,6,24,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 5.59 under every sign convention,0.0,5.5866,,
+LEVYMONE,nle,100,200,0,200,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 0.283 under every sign convention,0.0,0.2827433388230814,,
+LEVYMONE10,nle,10,20,0,20,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,2.827433388230814,,
+LEVYMONE5,nle,2,4,0,4,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,6.305615118447678,,
+LEVYMONE6,nle,3,6,0,6,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 5.15 under every sign convention,0.0,5.148513184858707,,
+LEVYMONE7,nle,4,8,0,8,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 4.46 under every sign convention,0.0,4.4587432098067685,,
+LEVYMONE8,nle,5,10,0,10,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,5.654866776461628,,
+LEVYMONE9,nle,8,16,0,16,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,3.5342917352885173,,
+LIARWHDNE,nle,5000,10000,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+LSC1,nle,3,6,0,0,0,2,False,,False,tiny,,,sif2jax,False,infeasible,best violation 123 under every sign convention,0.0,122.83190773369155,,
+LSC1,nle,3,6,0,0,1,2,False,,False,tiny,,,sif2jax,False,infeasible,best violation 123 under every sign convention,0.0,122.83190773369155,,
+LSC2,nle,3,6,0,0,0,2,False,,False,tiny,,,sif2jax,False,infeasible,best violation 204 under every sign convention,0.0,204.2124631864059,,
+LSC2,nle,3,6,0,0,1,2,False,,False,tiny,,,sif2jax,False,infeasible,best violation 204 under every sign convention,0.0,204.2124631864059,,
+LUKSAN11,nle,100,198,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,False,infeasible,best violation 1.8 under every sign convention,0.0,1.8,,
+LUKSAN12,nle,98,192,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,False,infeasible,best violation 20 under every sign convention,0.0,20.0,,
+LUKSAN13,nle,98,224,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 31 under every sign convention,0.0,31.0,,
+LUKSAN14,nle,98,224,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 20 under every sign convention,0.0,20.0,,
+LUKSAN15,nle,100,196,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 0.257 under every sign convention,0.0,22.964671668600964,0.0,0.25748503976952364
+LUKSAN16,nle,100,196,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 0.258 under every sign convention,0.0,19.75219137874734,0.0,0.25755445768172436
+LUKSAN17,nle,100,196,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 144 under every sign convention,0.0,144.250066234136,,
+LUKSAN21,nle,100,100,0,0,0,1,True,0.0,False,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.0658141036401503e-14,0.0,2.327027459614328e-12
+LUKSAN22,nle,100,198,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,False,infeasible,best violation 22 under every sign convention,0.0,22.0,,
+MANCINONE,nle,100,100,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.432454155292362e-11,0.0,1.4779288903810084e-11
+MEYER3NE,nle,3,16,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 2.24e+04 under every sign convention,0.0,22431.247461757346,,
+MGH09,nle,4,11,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 19.3 under every sign convention,0.0,19.261313574660633,,
+MGH09,nle,4,11,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.0475 under every sign convention,0.0,0.04751329639889193,,
+MGH10,nle,3,16,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.72e+07 under every sign convention,0.0,17178832.493533082,,
+MGH10,nle,3,16,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 2.24e+04 under every sign convention,0.0,22431.247461757346,,
+MGH10S,nle,3,16,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.72e+07 under every sign convention,0.0,17178832.493533082,,
+MGH10S,nle,3,16,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 2.24e+04 under every sign convention,0.0,22431.247461757346,,
+MGH17,nle,5,33,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 99.2 under every sign convention,0.0,99.156,,
+MGH17,nle,5,33,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'trust-constr',,,,
+MGH17S,nle,5,33,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.312 under every sign convention,0.0,99.156,0.0,0.31186837903820686
+MGH17S,nle,5,33,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.183 under every sign convention,0.0,0.1826520161187758,,
+MISRA1A,nle,2,14,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 45.2 under every sign convention,0.0,45.18810327969112,,
+MISRA1A,nle,2,14,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 9.96 under every sign convention,0.0,9.964083074045803,,
+MISRA1B,nle,2,14,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 45.8 under every sign convention,0.0,45.84124123388315,,
+MISRA1B,nle,2,14,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 5.61 under every sign convention,0.0,5.6080334827830995,,
+MISRA1C,nle,2,14,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 47.6 under every sign convention,0.0,47.627495312456226,,
+MISRA1C,nle,2,14,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 4.71 under every sign convention,0.0,4.7138685741351765,,
+MISRA1D,nle,2,14,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 46.5 under every sign convention,0.0,46.46401486988848,,
+MISRA1D,nle,2,14,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 1.77 under every sign convention,0.0,1.7704885993485249,,
+MSQRTA,nle,1024,1024,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+MSQRTB,nle,1024,1024,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+NELSON,nle,3,128,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+NELSON,nle,3,128,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+NONDIANE,nle,5000,5000,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+NONSCOMPNE,nle,5000,5000,0,10000,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+OSBORNE1,nle,5,33,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+OSBORNE2,nle,11,65,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 0.491 under every sign convention,0.0,0.49122421422888773,,
+OSCIGRNE,nle,100000,100000,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+OSCIPANE,nle,10,10,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 1 under every sign convention,0.0,4981652951130499.0,0.0,0.9999996863312499
+PALMER1ANE,nle,6,35,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 86.4 under every sign convention,0.0,86.3995,,
+PALMER1BNE,nle,4,35,0,2,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+PALMER1ENE,nle,8,35,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 647 under every sign convention,0.0,646.524761257815,,
+PALMER1NE,nle,4,31,0,3,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 87.4 under every sign convention,0.0,87.3995,,
+PALMER2ANE,nle,6,23,0,2,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 30.8 under every sign convention,0.0,30.838308886677652,,
+PALMER2BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 60.1 under every sign convention,0.0,60.104274697415924,,
+PALMER2ENE,nle,8,23,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 317 under every sign convention,0.0,317.3498706265275,,
+PALMER2NE,nle,4,23,0,3,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 69.4 under every sign convention,0.0,69.3834465821793,,
+PALMER3ANE,nle,6,23,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 32.5 under every sign convention,0.0,32.52742380998997,,
+PALMER3BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 54.3 under every sign convention,0.0,54.30553989333641,,
+PALMER3ENE,nle,8,23,0,1,0,1,True,5.0741053e-05,False,tiny,,5.0741053e-05,sif2jax,False,infeasible,best violation 181 under every sign convention,0.0,181.43246312328344,,
+PALMER3NE,nle,4,23,0,3,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 61.9 under every sign convention,0.0,61.86349159324052,,
+PALMER4ANE,nle,6,23,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 34.9 under every sign convention,0.0,34.92428380998997,,
+PALMER4BNE,nle,4,23,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 56.7 under every sign convention,0.0,56.70239989333641,,
+PALMER4ENE,nle,8,23,0,1,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 179 under every sign convention,0.0,179.03560312328344,,
+PALMER4NE,nle,4,23,0,3,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 15.3 under every sign convention,0.0,64.26035159324053,0.0,15.330417079101393
+PALMER5BNE,nle,9,12,0,2,0,1,True,0.040606141,False,tiny,,0.040606141,sif2jax,False,infeasible,best violation 298 under every sign convention,0.0,298.0264831137278,,
+PALMER6ANE,nle,6,13,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 50.5 under every sign convention,0.0,50.54895988000925,,
+PALMER6ENE,nle,8,13,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 77.8 under every sign convention,0.0,77.76493834865826,,
+PALMER7ANE,nle,6,13,0,2,0,1,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 85.3 under every sign convention,0.0,85.27899280998997,,
+PALMER7ENE,nle,8,13,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 129 under every sign convention,0.0,128.68089412328345,,
+PALMER8ANE,nle,6,12,0,2,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 73 under every sign convention,0.0,73.00897688000924,,
+PALMER8ENE,nle,8,12,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,False,infeasible,best violation 55.3 under every sign convention,0.0,55.30492134865827,,
+PFIT1,nle,3,3,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,23.1111111111,0.0,5.778630907116167e-10
+PFIT2,nle,3,3,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,71.1111111111,0.0,3.7829295251867734e-11
+PFIT3,nle,3,3,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,143.407407407,0.0,0.0
+PFIT4,nle,3,3,0,1,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,239.670781893,0.0,8.526512829121202e-14
+POROUS2,nle,5184,4900,0,568,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+POWELLBS,nle,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,1.573374763808033e-11,0.0,2.023525791372549e-11
+POWELLSE,nle,4,4,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,3.637978807091716e-11,0.0,9.801185811268654e-09
+POWELLSQ,nle,2,2,0,0,0,1,True,0.0,False,tiny,,0.0,sif2jax,True,ok,documented: scipy reaches f*,0.0,9.589241707101214,0.0,6.366519656269417e-09
+POWERSUMNE,nle,4,4,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,50.0,0.0,0.08115718425308671
+QINGNE,nle,100,100,0,0,0,1,True,0.0,True,small,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,1.4210854715202004e-14,0.0,3.355928868131741e-10
+RAT42,nle,3,9,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 63.5 under every sign convention,0.0,63.484893509951235,,
+RAT42,nle,3,9,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 6.27 under every sign convention,0.0,6.269427305988586,,
+RAT43,nle,4,15,0,0,0,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 652 under every sign convention,0.0,651.8241421369995,,
+RAT43,nle,4,15,0,0,1,2,True,0.0,False,tiny,,0.0,sif2jax,False,infeasible,best violation 62.6 under every sign convention,0.0,62.591415743623486,,
+RECIPE,nle,3,3,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,9.094947017729282e-11,0.0,4.108094385073016e-09
+REPEAT,nle,100000,200001,0,100003,0,1,True,0.0,False,large,,0.0,sif2jax,True,unvalidated,,,,,
+S308NE,nle,2,3,0,0,0,1,True,0.773199,False,tiny,,0.773199,sif2jax,False,infeasible,best violation 9.31 under every sign convention,0.0,9.31,,
+SANTA,nle,21,23,0,42,0,1,True,0.0,False,small,,0.0,sif2jax,False,infeasible,best violation 1.02 under every sign convention,0.0,1.015424868818863,,
+SINVALNE,nle,2,2,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,0.0,0.0,4.828049906862005e-19
+SPIN,nle,1327,1325,0,0,0,1,False,,False,large,,,sif2jax,True,unvalidated,,,,,
+TRIGON1NE,nle,10,10,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy reaches f*",0.0,1.7763568394002505e-15,0.0,1.7763568394002505e-15
+VANDANIUMS,nle,22,10,0,0,0,1,False,,False,small,,,sif2jax,False,infeasible,best violation 1.42 under every sign convention,0.0,2.0,0.0,1.4204781709294418
+VARDIMNE,nle,10,12,0,0,0,1,True,0.0,True,tiny,,0.0,sif2jax,True,ok,"documented: x* feasible, scipy does not reach f* from x0",0.0,1482.25,,
+VESUVIA,nle,8,1025,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+VESUVIO,nle,8,1025,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+VESUVIOU,nle,8,1025,0,0,0,1,False,,False,tiny,,,sif2jax,True,error,worker exited with code -5 during phase 'slsqp:documented',,,,
+VIBRBEAMNE,nle,8,30,0,0,0,1,True,0.15644607137,False,tiny,,0.15644607137,sif2jax,False,infeasible,best violation 29.5 under every sign convention,0.0,29.458257454703837,,
+YATP1CNE,nle,123200,123200,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,
+YATP1NE,nle,123200,123200,0,0,0,1,True,0.0,True,large,,0.0,sif2jax,True,unvalidated,,,,,

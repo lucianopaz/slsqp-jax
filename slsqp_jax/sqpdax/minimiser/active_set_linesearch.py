@@ -81,8 +81,9 @@ class ActiveSetLineSearchTerminationMetrics(
         ``‖∇_x L‖_∞`` at the current iterate.
     stationarity_scale
         ``max(|L|, 1)`` by default, or ``max(μ_max, 1)`` when the filterSQP
-        scale is enabled. The minimiser converges when
-        ``stationarity <= rtol * stationarity_scale``.
+        scale is enabled; ``max(|f|, 1)`` when the last QP solve did not
+        converge, so that its multipliers cannot inflate the scale. The
+        minimiser converges when ``stationarity <= rtol * stationarity_scale``.
     feasibility
         ``∞``-norm of the equality / inequality / bound violations, compared
         against ``atol``.
@@ -92,6 +93,13 @@ class ActiveSetLineSearchTerminationMetrics(
     has_min_steps
         ``True`` once ``step_count >= min_steps``, gating convergence so a
         cold start cannot report success before doing any work.
+    violation_stationarity
+        Dimensionless stationarity of the squared violation measure
+        ``ψ(x) = ½‖c_E‖² + ½‖max(c_I, 0)‖² + ½‖max(lb - x, 0)‖² + ½‖max(x - ub, 0)‖²``:
+        the box-projected gradient ``∇ψ / ‖c⁺‖₂`` divided by the largest
+        row norm of the violated constraint Jacobian. Small values certify
+        that the iterate is a stationary point of the infeasibility measure,
+        so no first-order method can restore feasibility from it.
     """
 
     stationarity: Scalar
@@ -99,6 +107,7 @@ class ActiveSetLineSearchTerminationMetrics(
     feasibility: Scalar
     kkt_ratio: Scalar
     has_min_steps: Bool[Array, ""]
+    violation_stationarity: Scalar
 
 
 class ActiveSetLineSearchResultAdapter(ResultAdapter[ACTIVE_SET_LINE_SEARCH_RESULTS]):
@@ -200,12 +209,29 @@ class ActiveSetLineSearchMinimiser(
     zero_step_patience
         Consecutive converged zero QP steps required by guarded QP-KKT success.
     stagnation_tol, stagnation_patience
-        Relative merit-improvement threshold and no-improvement window.
+        Relative merit-improvement threshold (relative to
+        ``max(|merit|, atol)``) and no-improvement window.
     divergence_factor, divergence_patience
         Excess-merit threshold and consecutive count before best-point rollback.
     secant_reset
         Shared soft / diagonal / identity / fatal recovery policy. QP and
         line-search failures advance one global recovery episode.
+    restoration
+        Fall back to a feasibility-restoration step when the line search
+        rejects the QP direction at a primally infeasible iterate (see
+        :meth:`_restoration_direction`). The QP can produce a non-descent or
+        non-finite direction there: an inconsistent / capped working set
+        only linearises part of the violated rows, a failed KKT solve
+        returns garbage. The restoration step is a truncated-CGLS
+        Gauss--Newton normal step on ``½‖c⁺‖²``, bounded by
+        ``restoration_radius * max(1, ‖x‖_∞)``, clipped to the box and
+        globalised by an Armijo search on the L2 penalty ``f + ρ ‖c⁺‖₂``
+        (see :meth:`_restoration_fallback`). On by default.
+    restoration_radius
+        Relative ``∞``-norm bound of the restoration step.
+    restoration_cg_iter
+        CGLS iterations of the normal-step solve (``1`` gives the Cauchy
+        step).
     """
 
     # QP inner solve
@@ -232,6 +258,16 @@ class ActiveSetLineSearchMinimiser(
     stagnation_patience: int = eqx.field(static=True, default=10)
     divergence_factor: float = eqx.field(static=True, default=10.0)
     divergence_patience: int = eqx.field(static=True, default=3)
+    # feasibility restoration fallback
+    restoration: bool = eqx.field(static=True, default=True)
+    restoration_radius: float = eqx.field(static=True, default=10.0)
+    restoration_cg_iter: int = eqx.field(static=True, default=20)
+    n_restoration_steps: Array = eqx.field(
+        default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    last_step_restoration: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
     # termination state
     best_merit: Scalar = eqx.field(default_factory=lambda: jnp.asarray(jnp.inf))
     best_iterate: Primal | None = None
@@ -522,7 +558,243 @@ class ActiveSetLineSearchMinimiser(
             Updated minimiser after the controlled step.
         """
         seeded = self._seed_predicted_active_set(problem)
-        return CommonMinimiser.step(seeded, problem)
+        ctx = seeded._init_subproblem(problem)
+        step_primal, step_dual, solver_state = seeded._solve_direction(ctx)
+        result = seeded._assess_direction(ctx, step_primal, step_dual, solver_state)
+        result, restored, penalty = seeded._restoration_fallback(
+            ctx, step_dual, solver_state, result
+        )
+        seeded = cast(
+            Self,
+            eqx.tree_at(
+                lambda m: (
+                    m.last_step_restoration,
+                    m.n_restoration_steps,
+                    m.merit_penalty,
+                ),
+                seeded,
+                (
+                    restored,
+                    seeded.n_restoration_steps + restored.astype(jnp.int32),
+                    penalty,
+                ),
+            ),
+        )
+        return seeded._execute_step(ctx, step_dual, result)
+
+    def _restoration_fallback(
+        self,
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        step_dual: Dual,
+        solver_state: ActiveSetStateType,
+        result: StepResult[Primal, ActiveSetStateType],
+    ) -> tuple[StepResult[Primal, ActiveSetStateType], Bool[Array, ""], Scalar]:
+        """Retry the line search along the restoration direction when needed.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        step_dual
+            Multipliers from the QP solve (sets the merit penalty).
+        solver_state
+            QP carry after the solve.
+        result
+            Outcome of the line search along the QP direction.
+
+        Returns
+        -------
+        result
+            ``result`` itself when it was accepted, the iterate is feasible
+            or :attr:`restoration` is off; otherwise the outcome of the line
+            search along :meth:`_restoration_direction`. The restoration
+            search accepts on the L2 penalty ``f + ρ_R ‖c⁺‖₂``: the L1
+            violation can be flat along a direction that reduces the
+            violation (e.g. when the violated rows sum to a constant), while
+            keeping ``f`` in the test stops the step from trading a small
+            violation decrease for an exploding objective. ``merit_val`` is
+            nevertheless reported in the L1 merit units of this step so the
+            progress bookkeeping stays consistent.
+        restored
+            Whether a restoration step was tried *and* accepted.
+        penalty
+            Merit penalty to carry. ``ρ_R = max(ρ, 2 ∇fᵀd / Δv)`` where
+            ``Δv`` is the decrease of the linearised violation along the
+            restoration direction, so that the direction is a descent
+            direction of the L2 penalty (Nocedal & Wright eq. 18.36 without
+            the curvature term). It replaces the carried penalty only when
+            the restoration step is accepted; otherwise the carried value is
+            returned unchanged.
+        """
+        if not self.restoration:
+            return result, jnp.asarray(False), self.merit_penalty
+        lagrangian = ctx.subproblem.lagrangian
+        infeasible = self._feasibility_from_lagrangian(lagrangian) > self.atol
+        attempt = infeasible & ~result.accepted
+        direction, predicted_decrease = self._restoration_step(lagrangian)
+        slope_f = jnp.dot(lagrangian.grad_val, direction)
+        rho = self._next_merit_penalty(step_dual, solver_state)
+        rho_r = jnp.where(
+            predicted_decrease > 0.0,
+            jnp.maximum(rho, 2.0 * jnp.maximum(slope_f, 0.0) / predicted_decrease),
+            rho,
+        )
+        rho_r = jnp.where(jnp.isfinite(rho_r), rho_r, rho)
+        self.logger.info(
+            "QP direction rejected at an infeasible iterate: trying the "
+            "restoration step (‖d‖_∞={norm:.3e}, predicted decrease={dv:.3e}, "
+            "penalty {rho:.3e} -> {rho_r:.3e})",
+            when=attempt,
+            norm=_inf_norm(direction),
+            dv=predicted_decrease,
+            rho=rho,
+            rho_r=rho_r,
+        )
+        l1_merit = replace(
+            self._l1_merit(ctx.problem, step_dual, solver_state),
+            feasibility_weight=rho_r,
+        )
+        search = cast(
+            StepController[Primal, ActiveSetStateType],
+            ArmijoLineSearch(
+                merit=replace(l1_merit, norm=2),
+                logger=self.logger.child("restoration"),
+                max_steps=self.line_search_max_steps,
+                c1=self.armijo_c1,
+                backtrack=self.armijo_backtrack,
+            ),
+        )
+
+        def restore() -> StepResult[Primal, ActiveSetStateType]:
+            out = search.step(
+                cast(Primal, self.iterate),
+                cast(Primal, Primal(direction)),
+                solver_state,
+            )
+            return replace(out, merit_val=l1_merit(out.x))
+
+        fallback = jax.lax.cond(attempt, restore, lambda: result)
+        restored = attempt & fallback.accepted
+        penalty = jnp.where(restored, rho_r, self.merit_penalty)
+        return fallback, restored, penalty
+
+    def _restoration_direction(self, lagrangian: EvaluatedLagrangian[Primal]) -> Array:
+        """Restoration direction only (see :meth:`_restoration_step`)."""
+        return self._restoration_step(lagrangian)[0]
+
+    def _restoration_step(
+        self, lagrangian: EvaluatedLagrangian[Primal]
+    ) -> tuple[Array, Scalar]:
+        """Bounded, box-constrained Gauss--Newton normal step on ``½‖c⁺‖²``.
+
+        With ``c⁺ = (c_E, max(c_I, 0))`` and ``J⁺`` the matching Jacobian
+        rows, the step approximately minimises ``‖c⁺ + J⁺ d‖₂`` subject to
+        ``lb <= x + d <= ub`` and ``‖d‖_∞ <= restoration_radius *
+        max(1, ‖x‖_∞)``. Each of a few projection rounds runs
+        :attr:`restoration_cg_iter` CGLS iterations from ``d = 0`` on the
+        free variables (the first iterate is the Cauchy step, the residual
+        decreases monotonically, and the truncation bounds the step on
+        rank-deficient Jacobians without regularising anything), clips the
+        result to the box, fixes the variables that hit a bound, and adds the
+        inequality rows the clipped step would violate (``c_i + J_i d > atol``)
+        as targets for the next round. Variables outside the box are moved
+        back onto it in the first round regardless of the radius.
+
+        Parameters
+        ----------
+        lagrangian
+            Lagrangian evaluated at the current iterate.
+
+        Returns
+        -------
+        direction
+            Restoration direction ``d`` (``0`` at a feasible point).
+        predicted_decrease
+            ``‖c⁺‖₂ - ‖(c + J d)⁺‖₂`` (including the bound violations) for
+            the returned direction.
+        """
+        x = lagrangian.x_ref
+        j_eq = lagrangian.eq_fn_jac_val
+        j_in = lagrangian.ineq_fn_jac_val
+        c_eq = lagrangian.eq_fn_val
+        c_raw = lagrangian.ineq_fn_val
+        lb = jnp.where(lagrangian.null_lb, -jnp.inf, lagrangian.lb)
+        ub = jnp.where(lagrangian.null_ub, jnp.inf, lagrangian.ub)
+        tiny = jnp.asarray(jnp.finfo(x.dtype).tiny, x.dtype)
+        radius = self.restoration_radius * jnp.maximum(1.0, _inf_norm(x))
+        box_lo = jnp.maximum(lb - x, -radius)
+        box_hi = jnp.minimum(ub - x, radius)
+        box_lo = jnp.where(jnp.isfinite(box_lo), box_lo, -radius)
+        box_hi = jnp.where(jnp.isfinite(box_hi), box_hi, radius)
+        # Variables outside the box jump back onto it whatever the radius.
+        box_hi = jnp.where(lb - x > 0.0, jnp.maximum(box_hi, lb - x), box_hi)
+        box_lo = jnp.where(x - ub > 0.0, jnp.minimum(box_lo, ub - x), box_lo)
+
+        def apply(v, rows):
+            return (j_eq @ v, jnp.where(rows, j_in @ v, 0.0))
+
+        def apply_t(u, rows):
+            u_eq, u_in = u
+            return j_eq.T @ u_eq + j_in.T @ jnp.where(rows, u_in, 0.0)
+
+        def sq(u):
+            return sum(jnp.sum(leaf**2) for leaf in u)
+
+        def cgls(free, d_fixed, rows):
+            """CGLS on the free variables for ``J (d_fixed + d) = -c`` on ``rows``."""
+            target = (-c_eq, jnp.where(rows, -c_raw, 0.0))
+            residual = jax.tree.map(lambda t, q: t - q, target, apply(d_fixed, rows))
+            s0 = jnp.where(free, apply_t(residual, rows), 0.0)
+            gamma0 = jnp.sum(s0**2)
+
+            def body(_, carry):
+                d, r, p, gamma = carry
+                q = apply(p, rows)
+                q_sq = sq(q)
+                live = (gamma > 0.0) & (q_sq > 0.0)
+                alpha = jnp.where(live, gamma / jnp.maximum(q_sq, tiny), 0.0)
+                d = d + alpha * p
+                r = jax.tree.map(lambda ri, qi: ri - alpha * qi, r, q)
+                s = jnp.where(free, apply_t(r, rows), 0.0)
+                gamma_new = jnp.sum(s**2)
+                beta = jnp.where(live, gamma_new / jnp.maximum(gamma, tiny), 0.0)
+                p = jnp.where(live, s + beta * p, p)
+                return d, r, p, jnp.where(live, gamma_new, 0.0)
+
+            d, _, _, _ = jax.lax.fori_loop(
+                0,
+                max(int(self.restoration_cg_iter), 1),
+                body,
+                (jnp.zeros_like(x), residual, s0, gamma0),
+            )
+            return d_fixed + d
+
+        # Bound-constrained least squares by projection rounds: variables
+        # outside the box (or on a bound they would leave) are fixed at the
+        # bound, inequality rows the clipped step would violate join the
+        # targets, and the remaining variables are re-solved. A few rounds
+        # settle the typical handful of bound-hitting variables / rows.
+        d_fixed = jnp.clip(jnp.zeros_like(x), box_lo, box_hi)
+        free = (box_lo <= 0.0) & (box_hi >= 0.0)
+        rows = c_raw > 0.0
+        direction = d_fixed
+        for _ in range(4):
+            raw = cgls(free, d_fixed, rows)
+            direction = jnp.clip(raw, box_lo, box_hi)
+            hit = free & (raw != direction)
+            free = free & ~hit
+            d_fixed = jnp.where(free, 0.0, direction)
+            rows = rows | (c_raw + j_in @ direction > self.atol)
+        direction = jnp.where(jnp.isfinite(direction), direction, 0.0)
+
+        def violation(dx):
+            x_new = x + dx
+            lb_v = jnp.where(jnp.isfinite(lb), jnp.maximum(0.0, lb - x_new), 0.0)
+            ub_v = jnp.where(jnp.isfinite(ub), jnp.maximum(0.0, x_new - ub), 0.0)
+            c_in = jnp.maximum(0.0, c_raw + j_in @ dx)
+            return jnp.sqrt(sq((c_eq + j_eq @ dx, c_in, lb_v, ub_v)))
+
+        return direction, violation(jnp.zeros_like(x)) - violation(direction)
 
     def _init_subproblem(
         self, problem: ProblemProtocol[Primal]
@@ -577,22 +849,33 @@ class ActiveSetLineSearchMinimiser(
         solver_state: ActiveSetStateType,
     ) -> StepController[Primal, ActiveSetStateType]:
         """Armijo line search on the monotonically updated L1 merit."""
-        rho = self._next_merit_penalty(step_dual, solver_state)
-        merit = NormMerit(
-            ctx.problem,
-            barrier=None,
-            problem_weight=jnp.asarray(1.0),
-            feasibility_weight=rho,
-            norm=1,
-        )
         return cast(
             StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
-                merit=merit,
+                merit=self._l1_merit(ctx.problem, step_dual, solver_state),
                 logger=self.logger.child("step_controller"),
                 max_steps=self.line_search_max_steps,
                 c1=self.armijo_c1,
                 backtrack=self.armijo_backtrack,
+            ),
+        )
+
+    def _l1_merit(
+        self,
+        problem: ProblemProtocol[Primal],
+        step_dual: Dual,
+        solver_state: ActiveSetStateType,
+    ) -> NormMerit:
+        """L1 merit ``f + ρ ‖c⁺‖₁`` at this step's Han--Powell penalty ``ρ``."""
+        rho = self._next_merit_penalty(step_dual, solver_state)
+        return cast(
+            NormMerit,
+            NormMerit(
+                problem,
+                barrier=None,
+                problem_weight=jnp.asarray(1.0),
+                feasibility_weight=rho,
+                norm=1,
             ),
         )
 
@@ -644,6 +927,56 @@ class ActiveSetLineSearchMinimiser(
         )
         return jnp.max(jnp.stack([eq_v, ineq_v, lb_v, ub_v]))
 
+    @staticmethod
+    def _violation_stationarity(
+        lagrangian: EvaluatedLagrangian[Primal],
+    ) -> Scalar:
+        """Dimensionless box-projected gradient of the squared violation measure.
+
+        With ``c⁺ = (c_E, max(c_I, 0), max(lb - x, 0), max(x - ub, 0))`` the
+        measure ``ψ = ½‖c⁺‖²`` has gradient ``∇ψ = J⁺ᵀ c⁺`` where ``J⁺`` stacks
+        the constraint Jacobian with ``-I`` / ``+I`` rows for the violated
+        bounds. The returned quantity is ``‖P(∇ψ / ‖c⁺‖₂)‖_∞ / s`` where ``P``
+        zeroes the components that point out of the box at an active bound
+        and ``s`` is the largest ``∞``-norm of the violated rows of ``J⁺``.
+        It is ``0`` at a feasible point and lies in ``[0, 1]`` otherwise.
+        """
+        x = lagrangian.x_ref
+        c_eq = lagrangian.eq_fn_val
+        c_in = jnp.maximum(0.0, lagrangian.ineq_fn_val)
+        lb_v = jnp.where(lagrangian.null_lb, 0.0, jnp.maximum(0.0, lagrangian.lb - x))
+        ub_v = jnp.where(lagrangian.null_ub, 0.0, jnp.maximum(0.0, x - lagrangian.ub))
+        grad = (
+            lagrangian.eq_fn_jac_val.T @ c_eq
+            + lagrangian.ineq_fn_jac_val.T @ c_in
+            - lb_v
+            + ub_v
+        )
+        norm_c = jnp.sqrt(
+            jnp.sum(c_eq**2) + jnp.sum(c_in**2) + jnp.sum(lb_v**2) + jnp.sum(ub_v**2)
+        )
+        tiny = jnp.asarray(jnp.finfo(x.dtype).tiny, x.dtype)
+        unit_grad = grad / jnp.maximum(norm_c, tiny)
+        # Project onto the box: a descent direction (-∇ψ) must not leave it.
+        at_lb = ~lagrangian.null_lb & (x <= lagrangian.lb) & (unit_grad > 0.0)
+        at_ub = ~lagrangian.null_ub & (x >= lagrangian.ub) & (unit_grad < 0.0)
+        projected = jnp.where(at_lb | at_ub, 0.0, unit_grad)
+        row_norm_eq = jnp.max(jnp.abs(lagrangian.eq_fn_jac_val), axis=1, initial=0.0)
+        row_norm_in = jnp.max(jnp.abs(lagrangian.ineq_fn_jac_val), axis=1, initial=0.0)
+        scale = jnp.max(
+            jnp.concatenate(
+                [
+                    jnp.where(c_eq != 0.0, row_norm_eq, 0.0),
+                    jnp.where(c_in > 0.0, row_norm_in, 0.0),
+                    jnp.where((lb_v > 0.0) | (ub_v > 0.0), 1.0, 0.0),
+                ]
+            ),
+            initial=0.0,
+        )
+        return jnp.where(
+            norm_c > 0.0, _inf_norm(projected) / jnp.maximum(scale, tiny), 0.0
+        )
+
     def _advance_dynamics(
         self,
         ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
@@ -671,8 +1004,13 @@ class ActiveSetLineSearchMinimiser(
         )
         best_merit = merit(cast(Primal, self.best_iterate))
         merit_scale = jnp.maximum(jnp.abs(best_merit), 1.0)
+        # Progress is relative to the merit's own magnitude (floored at
+        # ``atol``): with ``max(|merit|, 1)`` every step on a problem whose
+        # optimum is ``f* = 0`` counts as stagnation as soon as the merit
+        # drops below ``stagnation_tol``, however much it still decreases.
+        improvement_scale = jnp.maximum(jnp.abs(best_merit), self.atol)
         improved = (~jnp.isfinite(best_merit)) | (
-            result.merit_val < best_merit - self.stagnation_tol * merit_scale
+            result.merit_val < best_merit - self.stagnation_tol * improvement_scale
         )
         new_best_merit = jnp.where(improved, result.merit_val, best_merit)
         new_best_iterate = jax.tree.map(
@@ -685,7 +1023,10 @@ class ActiveSetLineSearchMinimiser(
             step_dual,
             cast(Dual, self.best_dual),
         )
-        steps_without = jnp.where(improved, 0, self.steps_without_improvement + 1)
+        # An accepted restoration step reduced the constraint violation even
+        # when the L1 merit did not improve: it is progress, not stagnation.
+        progress = improved | (self.last_step_restoration & result.accepted)
+        steps_without = jnp.where(progress, 0, self.steps_without_improvement + 1)
         merit_stagnation = (self.step_count >= self.stagnation_patience) & (
             steps_without >= self.stagnation_patience
         )
@@ -699,6 +1040,7 @@ class ActiveSetLineSearchMinimiser(
         zero_step = (
             solver_state.success
             & result.accepted
+            & ~self.last_step_restoration
             & (result.step_size * result.proposed_step_norm < self.atol)
         )
         zero_steps = jnp.where(zero_step, self.consecutive_zero_steps + 1, 0)
@@ -722,8 +1064,15 @@ class ActiveSetLineSearchMinimiser(
             & feasible
         ) | qp_nonfinite
         qp_failures = jnp.where(qp_real_failure, self.consecutive_qp_failures + 1, 0)
+        # A rejection whose predicted decrease was below the rounding level
+        # of the merit says nothing about the model: the Armijo test compared
+        # two merit values that differ by round-off. It is not a line-search
+        # failure and clears the streak, exactly as the trust-region
+        # minimisers do for their model-stall streak (the reset policy fires
+        # on any positive streak, so merely holding the count would still
+        # escalate the recovery).
         ls_failures = jnp.where(
-            result.accepted,
+            result.accepted | result.rounding_level,
             0,
             jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
         )
@@ -928,10 +1277,21 @@ class ActiveSetLineSearchMinimiser(
         )
 
         stationarity = _inf_norm(lagrangian.x_grad)
+        # The multipliers of a QP solve that did not converge (working-set
+        # budget exhausted, KKT solver failure) are not a KKT estimate: they
+        # can be arbitrarily large and would inflate the relative scale
+        # through ``|L| = |f + λᵀc|`` (or ``μ_max``) until any gradient
+        # passes the test. The scale then falls back to the objective's.
+        trusted_dual = cast(ActiveSetStateType, ctx.solver_state).success
+        objective_scale = jnp.maximum(jnp.abs(lagrangian.fn_val), 1.0)
         stationarity_scale = jnp.where(
-            self.use_mu_max,
-            jnp.maximum(compute_mu_max(lagrangian), 1.0),
-            jnp.maximum(jnp.abs(lagrangian.value), 1.0),
+            trusted_dual,
+            jnp.where(
+                self.use_mu_max,
+                jnp.maximum(compute_mu_max(lagrangian), 1.0),
+                jnp.maximum(jnp.abs(lagrangian.value), 1.0),
+            ),
+            objective_scale,
         )
         return cast(
             ActiveSetLineSearchTerminationMetrics,
@@ -943,6 +1303,7 @@ class ActiveSetLineSearchMinimiser(
                 nonfinite=nonfinite,
                 fatal_result=ACTIVE_SET_LINE_SEARCH_RESULTS.qp_subproblem_failure,
                 has_min_steps=self.step_count >= self.min_steps,
+                violation_stationarity=self._violation_stationarity(lagrangian),
             ),
         )
 
@@ -966,11 +1327,20 @@ class ActiveSetLineSearchMinimiser(
         Returns
         -------
         Bool[Array, ""]
-            ``True`` when the iterate is stationary, infeasible and the
-            minimum step count has been reached. Subclasses whose QP step
-            does not enforce ``A d = -c`` (proximal variants) override this.
+            ``True`` when the iterate is infeasible, a stationary point of
+            the violation measure (``violation_stationarity <= sqrt(rtol)``),
+            the minimum step count has been reached and either the
+            Lagrangian is stationary or the last step (QP direction and
+            restoration fallback) was rejected. Lagrangian stationarity
+            alone is not a certificate: with an over-determined working set
+            the QP multipliers can zero ``∇L`` at any point, so the gradient
+            of ``½‖c⁺‖²`` must vanish before infeasibility is declared.
+            Subclasses whose QP step does not enforce ``A d = -c`` (proximal
+            variants) override this.
         """
-        return stationary & ~feasible & metrics.has_min_steps
+        violation_stationary = metrics.violation_stationarity <= jnp.sqrt(self.rtol)
+        stuck = stationary | ~self.last_ls_success
+        return stuck & ~feasible & violation_stationary & metrics.has_min_steps
 
     def termination_flags(
         self,
@@ -978,6 +1348,15 @@ class ActiveSetLineSearchMinimiser(
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> TerminationFlags[ACTIVE_SET_LINE_SEARCH_RESULTS]:
         """Converge on ``rtol``-relative stationarity plus ``atol`` feasibility.
+
+        Convergence is decided from the KKT metrics of the current iterate
+        alone and outranks the fatal flags accumulated by the last step
+        (merit stagnation, secant recovery exhaustion, ...): the outer loop
+        evaluates this test before attempting the next step, so a rejected
+        step at a solution still terminates successfully. The QP-optimality
+        shortcut (QP reports optimal, full step accepted at a feasible
+        point) is model-based and is suppressed once the secant recovery is
+        exhausted.
 
         Parameters
         ----------
@@ -1002,7 +1381,16 @@ class ActiveSetLineSearchMinimiser(
             & metrics.has_min_steps
         )
         recovery_fatal = self.secant_recovery_state.fatal
-        converged = (classical | qp_kkt) & ~recovery_fatal
+        # The KKT test is evaluated at the current iterate before the next
+        # step is attempted and takes precedence over the failure flags of
+        # the last step: a point that passes the test is a solution whether
+        # or not the step that led there was rejected or exhausted the secant
+        # recovery (``classify_termination`` ranks ``converged`` above
+        # ``fatal``). The QP-optimality shortcut trusts the *model* rather
+        # than the measured KKT residual, so it keeps the recovery gate: an
+        # exhausted secant is exactly the situation in which the model is
+        # not to be trusted.
+        converged = classical | (qp_kkt & ~recovery_fatal)
 
         infeasible_stationary = self._infeasible_stationary(
             metrics, stationary, feasible
@@ -1062,6 +1450,7 @@ class ActiveSetLineSearchMinimiser(
             "final_lagrangian_grad_norm": jnp.linalg.norm(lagrangian.x_grad),
             "kkt_scale": metrics.stationarity_scale,
             "kkt_ratio": metrics.kkt_ratio,
+            "violation_stationarity": metrics.violation_stationarity,
             "multipliers_eq": dual.eq_multipliers,
             "multipliers_ineq": dual.ineq_multipliers,
             "multipliers_lb": dual.lb_multipliers,
@@ -1087,5 +1476,7 @@ class ActiveSetLineSearchMinimiser(
             "consecutive_ls_failures": self.consecutive_ls_failures,
             "merit_stagnation": self.merit_stagnation,
             "diverging": self.iterate_blowup,
+            "n_restoration_steps": self.n_restoration_steps,
+            "last_step_restoration": self.last_step_restoration,
             "sqpdax_result": result,
         }

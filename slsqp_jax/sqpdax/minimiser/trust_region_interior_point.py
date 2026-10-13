@@ -58,6 +58,10 @@ class TRUST_REGION_INTERIOR_POINT_RESULTS(
         "The trust-region subproblem exceeded its condition-number limit."
     )
     subproblem_nonfinite = "The trust-region subproblem received non-finite input."
+    trust_region_collapse = (
+        "The trust region collapsed on a barrier subproblem whose parameter is "
+        "already below the tolerance."
+    )
 
 
 class TrustRegionInteriorPointTerminationMetrics(
@@ -130,6 +134,10 @@ class TrustRegionInteriorPointResultAdapter(
                 TRUST_REGION_INTERIOR_POINT_RESULTS.subproblem_nonfinite,
                 optx.RESULTS.nonfinite_input,
             ),
+            (
+                TRUST_REGION_INTERIOR_POINT_RESULTS.trust_region_collapse,
+                optx.RESULTS.stagnation,
+            ),
         )
         for native, optimistix in mappings:
             coarse = optx.RESULTS.where(result == native, optimistix, coarse)
@@ -170,29 +178,34 @@ class TrustRegionInteriorPointMinimiser(
     initial multipliers and the barrier Lagrangian are inherited from
     :class:`~slsqp_jax.sqpdax.minimiser.interior_point.InteriorPointMinimiser`.
 
-    Termination follows the two nested tests of N&W Algorithm 19.4. The inner
-    one — solve the current barrier subproblem to ``E(x, s, y, z; μ) ≤ ε_μ``
-    — is owned by :attr:`barrier_update` and surfaced as
-    :attr:`barrier_updated`; the outer one compares the unperturbed KKT error
-    ``E(x, s, y, z; 0)`` against ``atol``. There is no relative tolerance, so
-    passing ``rtol`` raises.
+    Termination follows N&W Algorithm 19.4: the inner test — solve the
+    current barrier subproblem to ``E(x, s, y, z; μ) ≤ ε_μ`` — is owned by
+    :attr:`barrier_update` and surfaced as :attr:`barrier_updated`; the
+    outer test compares the unperturbed KKT error ``E(x, s, y, z; 0)``
+    against ``atol`` and alone decides convergence. There is no relative
+    tolerance, so passing ``rtol`` raises.
 
-    When the subproblem model uses a secant, the minimiser feeds the
-    ``model`` channel of :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals`
-    from two model-quality stalls detected after every step:
+    The inner loop also has an ``xtol``-style exit (trust-constr's
+    ``tr_radius < xtol``): when the trust-region radius has fallen below
+    ``radius_floor * max(1, ||x||)``, or a step was rejected with a
+    predicted reduction at the rounding level of the merit
+    (``StepResult.rounding_level``), the current barrier subproblem is
+    solved to working precision whatever its KKT error says. ``μ`` is then
+    reduced through :attr:`barrier_update` (``force=True``) and the radius
+    returns to :attr:`initial_radius`. The run stops with
+    :attr:`TRUST_REGION_INTERIOR_POINT_RESULTS.trust_region_collapse` when
+    the exit fires again with ``μ`` already at or below ``atol`` and no step
+    was accepted since the previous exit — reducing ``μ`` did not unlock
+    any progress — or when the schedule could not reduce ``μ`` any further.
 
-    * **radius collapse** — the trust-region radius has fallen below
-      ``radius_floor * max(1, ||x||)`` while the unperturbed KKT error is
-      still above ``atol``;
-    * **model failure** — the step was rejected with an actual / predicted
-      reduction ratio below ``model_failure_rho`` (including ``-inf`` when
-      the model predicted no decrease).
-
-    Consecutive stalls build ``consecutive_model_failures``; a healthy
-    rejection or an accepted step with a sound radius resets it, so ordinary
-    shrink-and-retry never triggers a reset. Subproblem failures and plain
-    rejections are *not* reported to the reset policy: the former terminate
-    immediately and the latter only shrink the radius.
+    When the subproblem model uses a secant, a radius collapse on a
+    *rejected* step whose predicted reduction was above rounding level (the
+    model claimed a decrease that never materialised, down to the floor) is
+    reported to the ``model`` channel of
+    :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` as a model
+    stall (switch with :attr:`collapse_resets_secant`). Ordinary rejections
+    only shrink the radius and subproblem failures terminate immediately, so
+    neither is reported.
 
     Attributes
     ----------
@@ -203,17 +216,23 @@ class TrustRegionInteriorPointMinimiser(
     eta, shrink_threshold, grow_threshold, shrink_factor, grow_factor, max_radius
         Forwarded to :class:`TrustRegionManager`.
     radius_floor
-        Relative radius floor for the radius-collapse stall
+        Relative radius floor of the inner-loop exit
         (``radius < radius_floor * max(1, ||x||)``).
-    model_failure_rho
-        A rejected step with ``rho`` below this value counts as a model
-        failure stall.
+    collapse_resets_secant
+        Report a radius collapse on a rejected, non-rounding-level step as a
+        model stall to the secant reset policy.
     secant_reset
         Shared soft / diagonal / identity / fatal recovery policy. Model
         stalls advance its one global recovery episode.
     consecutive_model_failures
-        Dynamic count of consecutive model-quality stalls, reported to the
-        secant reset policy as ``model_streak``.
+        Dynamic count of consecutive model stalls, reported to the secant
+        reset policy as ``model_streak``.
+    exit_without_progress
+        Dynamic flag: the last inner-loop exit has not been followed by an
+        accepted step yet.
+    trust_region_collapsed
+        Dynamic flag set when the inner-loop exit exhausted the barrier
+        schedule (see above); read by :meth:`termination_flags`.
     """
 
     initial_radius: float = eqx.field(static=True, default=1.0)
@@ -225,11 +244,17 @@ class TrustRegionInteriorPointMinimiser(
     shrink_factor: float = eqx.field(static=True, default=0.25)
     grow_factor: float = eqx.field(static=True, default=2.0)
     max_radius: float = eqx.field(static=True, default=1e10)
-    # secant model-stall detection (feeds the ``model`` reset channel)
+    # inner-loop exit and secant model-stall detection
     radius_floor: float = eqx.field(static=True, default=1e-8)
-    model_failure_rho: float = eqx.field(static=True, default=-1.0)
+    collapse_resets_secant: bool = eqx.field(static=True, default=True)
     consecutive_model_failures: Int[Array, ""] = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
+    )
+    exit_without_progress: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
+    )
+    trust_region_collapsed: Bool[Array, ""] = eqx.field(
+        default_factory=lambda: jnp.asarray(False)
     )
 
     @property
@@ -247,12 +272,16 @@ class TrustRegionInteriorPointMinimiser(
     def _init_dynamics(
         self, problem: ProblemProtocol[InteriorPointPrimal], x0: Vector_n
     ) -> Self:
-        """Seed the secant and barrier (via super) and a zero model-stall streak."""
+        """Seed the secant and barrier (via super) and clear the stall carry."""
         base = super()._init_dynamics(problem, x0)
         return eqx.tree_at(
-            lambda m: m.consecutive_model_failures,
+            lambda m: (
+                m.consecutive_model_failures,
+                m.exit_without_progress,
+                m.trust_region_collapsed,
+            ),
             base,
-            jnp.asarray(0, jnp.int32),
+            (jnp.asarray(0, jnp.int32), jnp.asarray(False), jnp.asarray(False)),
         )
 
     def _init_solver_state(
@@ -349,20 +378,25 @@ class TrustRegionInteriorPointMinimiser(
         result: StepResult[InteriorPointPrimal, TrustRegionStateType],
         step_dual: Dual,
     ) -> Self:
-        """Reduce ``μ`` and refresh the model-stall streak at the new iterate.
+        """Reduce ``μ``, apply the inner-loop exit and refresh the stall carry.
 
-        Also records whether the policy judged the barrier subproblem solved,
+        Records whether the policy judged the barrier subproblem solved,
         which :meth:`termination_metrics` reads back as the inner
         ``E(·; μ) ≤ ε_μ`` test of N&W Algorithm 19.4. That test is evaluated
         at the iterate, so it runs on rejected steps too — ``result.x`` is
         then the retained iterate.
 
-        The model-stall streak counts consecutive steps at which either the
-        radius collapsed while the unperturbed KKT error ``E(·; 0)`` was still
-        above ``atol``, or the step was rejected with ``rho`` below
-        :attr:`model_failure_rho`. The unperturbed residual is used (rather
-        than the barrier policy's ``updated`` flag) because adaptive
-        schedules report ``updated`` unconditionally.
+        The inner-loop exit declares the subproblem finished when the radius
+        has collapsed below ``radius_floor * max(1, ||x||)`` or the step was
+        rejected at rounding level, provided the unperturbed KKT error
+        ``E(·; 0)`` is still above ``atol`` (otherwise the outer test ends
+        the run). ``μ`` is then reduced regardless of the barrier test and
+        the radius returns to :attr:`initial_radius`. The
+        :attr:`trust_region_collapsed` flag is raised when the exit fires
+        with ``μ`` already at or below ``atol`` while no step was accepted
+        since the previous exit, or when ``μ`` could not be reduced. The
+        model-stall streak counts consecutive collapses on rejected steps
+        whose predicted reduction was above rounding level.
 
         Parameters
         ----------
@@ -376,8 +410,9 @@ class TrustRegionInteriorPointMinimiser(
         Returns
         -------
         Self
-            Minimiser with ``barrier``, ``barrier_updated`` and
-            ``consecutive_model_failures`` refreshed.
+            Minimiser with ``barrier``, ``barrier_updated``, ``solver_state``,
+            ``consecutive_model_failures``, ``exit_without_progress`` and
+            ``trust_region_collapsed`` refreshed.
         """
         # ``ctx.lagrangian`` is the module; re-evaluate at (x_new, step_dual)
         # exactly as ``_update_secant`` does. Complementarity is secant-independent,
@@ -385,32 +420,62 @@ class TrustRegionInteriorPointMinimiser(
         x_new = result.x
         lag_module = cast(InteriorPointLagrangian, ctx.lagrangian)
         lagrangian = lag_module(x_new, step_dual)
-        new_barrier, updated = self.barrier_update.update(
-            cast(Barrier, self.barrier), lagrangian
-        )
+        barrier = cast(Barrier, self.barrier)
+        mu_old = barrier.weight
 
         # The trust-region controller always writes the solver state back.
-        state = cast(TrustRegionSolverState, result.solver_state)
+        raw_state = cast(TrustRegionSolverState, result.solver_state)
         unconverged = (
             self.barrier_update.optimality_residual(lagrangian, jnp.asarray(0.0))
             > self.atol
         )
         x_scale = jnp.maximum(1.0, jnp.linalg.norm(x_new.x))
-        radius_collapse = (state.radius < self.radius_floor * x_scale) & unconverged
-        model_failure = ~result.accepted & (state.rho < self.model_failure_rho)
-        stall = radius_collapse | model_failure
+        collapsed = raw_state.radius < self.radius_floor * x_scale
+        rejected = ~result.accepted
+        # xtol-style exit: the barrier subproblem is solved to working precision.
+        finished = (collapsed | (rejected & result.rounding_level)) & unconverged
+        new_barrier, updated = self.barrier_update.update(
+            barrier, lagrangian, force=finished
+        )
+        # The previous exit is still "without progress" if this step was not
+        # accepted either; a second exit then shows that reducing ``μ`` did
+        # not unlock anything. A ``μ`` the schedule cannot reduce is final.
+        no_progress = self.exit_without_progress & rejected
+        exhausted = finished & (
+            ((mu_old <= self.atol) & no_progress) | (new_barrier.weight >= mu_old)
+        )
+        state = eqx.tree_at(
+            lambda s: s.radius,
+            raw_state,
+            jnp.where(
+                finished,
+                jnp.asarray(self.initial_radius, raw_state.radius.dtype),
+                raw_state.radius,
+            ),
+        )
+        # A collapse on a rejected step whose model still claimed a decrease is
+        # evidence against the model; one at rounding level is not.
+        stall = collapsed & rejected & ~result.rounding_level & unconverged
+        if not self.collapse_resets_secant:
+            stall = jnp.asarray(False)
         streak = jnp.where(stall, self.consecutive_model_failures + 1, 0).astype(
             jnp.int32
         )
         self.logger.warning(
-            "model stall: radius_collapse={collapse} model_failure={failure} "
+            "model stall: trust region collapsed on a rejected step "
             "rho={rho:.3e} radius={radius:.3e} consecutive={streak}",
             when=stall,
-            collapse=radius_collapse,
-            failure=model_failure,
-            rho=state.rho,
-            radius=state.radius,
+            rho=raw_state.rho,
+            radius=raw_state.radius,
             streak=streak,
+        )
+        self.logger.info(
+            "inner-loop exit: collapsed={collapsed} rounding_level={rounding} "
+            "mu={mu:.3e}",
+            when=finished,
+            collapsed=collapsed,
+            rounding=result.rounding_level,
+            mu=mu_old,
         )
         self.logger.info(
             "barrier reduced: mu={mu:.3e}",
@@ -418,9 +483,23 @@ class TrustRegionInteriorPointMinimiser(
             mu=new_barrier.weight,
         )
         return eqx.tree_at(
-            lambda m: (m.barrier, m.barrier_updated, m.consecutive_model_failures),
+            lambda m: (
+                m.barrier,
+                m.barrier_updated,
+                m.solver_state,
+                m.consecutive_model_failures,
+                m.exit_without_progress,
+                m.trust_region_collapsed,
+            ),
             self,
-            (new_barrier, updated, streak),
+            (
+                new_barrier,
+                updated,
+                state,
+                streak,
+                finished | no_progress,
+                self.trust_region_collapsed | exhausted,
+            ),
         )
 
     def _step_log_fields(
@@ -469,6 +548,7 @@ class TrustRegionInteriorPointMinimiser(
                 "predicted_reduction": state.predicted_reduction,
                 "cg_total": state.n_cg_iter,
                 "consecutive_model_failures": self.consecutive_model_failures,
+                "trust_region_collapsed": self.trust_region_collapsed,
                 "slack": cast(InteriorPointPrimal, self.iterate).slack,
             }
         )
@@ -570,7 +650,16 @@ class TrustRegionInteriorPointMinimiser(
         ctx: OptimisationContext[InteriorPointPrimal, TrustRegionStateType],
         metrics: TrustRegionInteriorPointTerminationMetrics,
     ) -> TerminationFlags[TRUST_REGION_INTERIOR_POINT_RESULTS]:
-        """Require *both* Algorithm 19.4 stopping tests before declaring success.
+        """Converge on the unperturbed KKT error ``E(x, s, y, z; 0) <= atol``.
+
+        This is the outer stopping test of N&W Algorithm 19.4; the inner one
+        (``E(·; μ) <= ε_μ``) only drives the barrier update and is not
+        required to hold on the same step. The test is evaluated at the
+        current iterate before the next step is attempted and outranks the
+        fatal flags of the last step (subproblem status, secant recovery
+        exhaustion, trust-region collapse): a point with an acceptable KKT
+        error is a solution whether or not the step that led there was
+        rejected.
 
         Parameters
         ----------
@@ -584,7 +673,6 @@ class TrustRegionInteriorPointMinimiser(
         TerminationFlags
             Shared termination decision.
         """
-        barrier_updated = metrics.barrier_updated
         acceptable_residual = metrics.optimality_residual <= self.atol
         nonfinite = metrics.nonfinite
         recovery_fatal = self.secant_recovery_state.fatal
@@ -592,25 +680,24 @@ class TrustRegionInteriorPointMinimiser(
             cast(TrustRegionStateType, ctx.solver_state).status
             != SUBPROBLEM_RESULTS.successful
         )
-        converged = (
-            barrier_updated
-            & acceptable_residual
-            & metrics.has_min_steps
-            & ~nonfinite
-            & ~subproblem_fatal
-            & ~recovery_fatal
-        )
+        converged = acceptable_residual & metrics.has_min_steps & ~nonfinite
+        collapsed = self.trust_region_collapsed
         fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.where(
             recovery_fatal,
             TRUST_REGION_INTERIOR_POINT_RESULTS.secant_recovery_failure,
             metrics.fatal_result,
+        )
+        fatal_result = TRUST_REGION_INTERIOR_POINT_RESULTS.where(
+            collapsed,
+            TRUST_REGION_INTERIOR_POINT_RESULTS.trust_region_collapse,
+            fatal_result,
         )
         return cast(
             TerminationFlags,
             TerminationFlags(
                 converged=converged,
                 nonfinite=nonfinite,
-                fatal=subproblem_fatal | recovery_fatal,
+                fatal=subproblem_fatal | recovery_fatal | collapsed,
                 fatal_result=fatal_result,
             ),
         )

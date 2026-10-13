@@ -375,7 +375,8 @@ def _harness_row(
     """Result row for a task the worker could not complete."""
     from .configs import CONFIGS
 
-    row: dict[str, Any] = {**asdict(spec), **CONFIGS[spec.config].tags()}
+    cfg = CONFIGS.get(getattr(spec, "config", ""))
+    row: dict[str, Any] = {**asdict(spec), **(cfg.tags() if cfg is not None else {})}
     row.update(
         {
             "phase": phase,

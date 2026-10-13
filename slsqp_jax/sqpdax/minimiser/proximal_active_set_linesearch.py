@@ -258,9 +258,9 @@ class ProximalActiveSetLineSearchMinimiser(
         stationary: Bool[Array, ""],
         feasible: Bool[Array, ""],
     ) -> Bool[Array, ""]:
-        """Stationary, infeasible *and* stuck: the proximal QP step has vanished."""
+        """Base certificate *and* stuck: the proximal QP step has vanished."""
         stuck = self.consecutive_zero_steps >= self.zero_step_patience
-        return stationary & ~feasible & metrics.has_min_steps & stuck
+        return super()._infeasible_stationary(metrics, stationary, feasible) & stuck
 
     def _postprocess_stats(
         self,

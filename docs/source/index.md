@@ -850,10 +850,10 @@ Even with anti-cycling in the QP, the outer SLSQP loop can fail to make progress
 At each step, the solver computes the L1 merit value $\varphi = f + \rho \cdot (\lVert c_\text{eq} \rVert_1 + \lVert \max(0, -c_\text{ineq}) \rVert_1)$ and checks whether:
 
 $$
-\varphi_\text{new} < \varphi_\text{best} - \eta \cdot \max(|\varphi_\text{best}|, 1)
+\varphi_\text{new} < \varphi_\text{best} - \eta \cdot \max(|\varphi_\text{best}|, \texttt{atol})
 $$
 
-where $\eta$ is the `stagnation_tol` parameter. If yes, $\varphi_\text{best}$ is updated and the patience counter resets. Otherwise, `steps_without_improvement` increments. Stagnation fires when `steps_without_improvement >= W` (where $W = \lfloor N / 10 \rfloor$ with $N$ = `max_steps`) and at least $W$ steps have elapsed, terminating early with a `nonlinear_divergence` result code. This is O(1) state (vs O(Wn) for an x-history ring buffer) and directly measures optimization progress.
+where $\eta$ is the `stagnation_tol` parameter (the scale is floored at `atol` rather than at 1 so that problems with $f^* = 0$ keep registering progress once the merit is tiny). If yes, $\varphi_\text{best}$ is updated and the patience counter resets. Otherwise, `steps_without_improvement` increments. Stagnation fires when `steps_without_improvement >= W` (where $W = \lfloor N / 10 \rfloor$ with $N$ = `max_steps`) and at least $W$ steps have elapsed, terminating early with a `nonlinear_divergence` result code. This is O(1) state (vs O(Wn) for an x-history ring buffer) and directly measures optimization progress.
 
 ```python
 solver = SLSQP(

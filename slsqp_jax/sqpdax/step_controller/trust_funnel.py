@@ -10,7 +10,7 @@ from jaxtyping import Scalar
 from ..merit import ConstraintViolation, Merit
 from ..primal import InteriorPointPrimal
 from ..subproblem.solver.trust_funnel import IterationType, TrustFunnelSolverState
-from .base import StepController, StepResult
+from .base import StepController, StepResult, at_rounding_level
 
 __all__ = ["TrustFunnelManager"]
 
@@ -156,6 +156,10 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
             (``|f(x⁺) − m_f(d)|``, ``|v(x⁺) − m_v(d)|``; zero on
             y-iterations), ``demoted`` ((2.10) held but (2.11) failed) and
             ``funnel_violated`` (accepted with ``v⁺ > v_max``).
+            ``rounding_level`` flags a predicted decrease (``Δm_f`` on
+            f-iterations, ``Δm_v`` on v-iterations) below the rounding level
+            of the quantity it is compared with (see
+            :func:`~slsqp_jax.sqpdax.step_controller.base.at_rounding_level`).
 
         Raises
         ------
@@ -332,6 +336,14 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
                 ),
             ),
         )
+        # The predicted decrease that decided the step: ``Δm_f`` against the
+        # barrier value on f-iterations, ``Δm_v`` against the violation on
+        # v-iterations. y-iterations take no step and are never "rounding".
+        rounding_level = jnp.where(
+            is_f,
+            at_rounding_level(dm_f_d, f0),
+            jnp.where(is_v, at_rounding_level(st.dm_v_d, v0), False),
+        )
         return cast(
             StepResult[InteriorPointPrimal, TrustFunnelSolverState],
             StepResult(
@@ -341,5 +353,6 @@ class TrustFunnelManager(StepController[InteriorPointPrimal, TrustFunnelSolverSt
                 solver_state=new_state,
                 step_size=jnp.where(accepted, 1.0, 0.0).astype(dtype),
                 proposed_step_norm=jnp.linalg.norm(direction.flatten()),
+                rounding_level=rounding_level,
             ),
         )
