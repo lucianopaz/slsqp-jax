@@ -122,6 +122,10 @@ class TrustRegionInteriorPointSolver(
         ``ρ`` in the merit-penalty update (eq. 19.42).
     penalty_margin
         Additive margin when raising ``ν``.
+    penalty_decay
+        Smallest ratio ``ν / ν_old`` per step (``1`` recovers the monotone rule).
+    penalty_floor
+        Smallest penalty after a step with a feasibility decrease.
     multiplier_recovery
         :class:`~slsqp_jax.sqpdax.subproblem.solver.multiplier_recovery.MultiplierRecovery`
         producing the dual block (default
@@ -152,6 +156,8 @@ class TrustRegionInteriorPointSolver(
     tau: float = 0.995  # fraction-to-boundary parameter (eq. 19.31e)
     penalty_rho: float = 0.3  # rho in eq. 19.42
     penalty_margin: float = 1e-4
+    penalty_decay: float = 0.2
+    penalty_floor: float = 1.0
     # Multiplier recovery (eq. 19.37 + 19.38 by default); matrix-free on Ahat^T.
     multiplier_recovery: MultiplierRecovery = field(
         default_factory=lambda: LeastSquaresMultiplierRecovery(
@@ -345,9 +351,18 @@ class TrustRegionInteriorPointSolver(
             obj_model / ((1.0 - self.penalty_rho) * jnp.maximum(v_pred, 1e-30)),
             0.0,
         )
+        # Penalty update (eq. 19.42) with a relaxation: instead of the monotone
+        # ``nu = max(nu_old, need)`` the penalty may fall by the factor
+        # ``penalty_decay`` per step (never below ``penalty_floor``). A monotone
+        # penalty explodes when one step needs a huge ``nu`` (``v_pred`` tiny) and
+        # then makes the merit dominated by the constraints (steps of size 1e-3
+        # for hundreds of iterations).
+        need_pos = jnp.where(obj_model > 0, need + self.penalty_margin, 0.0)
         nu_new = jnp.where(
-            (v_pred > 1e-30) & (obj_model > 0),
-            jnp.maximum(nu_old, need + self.penalty_margin),
+            v_pred > 1e-30,
+            jnp.maximum(
+                jnp.maximum(self.penalty_decay * nu_old, need_pos), self.penalty_floor
+            ),
             nu_old,
         )
         pred = -obj_model + nu_new * v_pred
