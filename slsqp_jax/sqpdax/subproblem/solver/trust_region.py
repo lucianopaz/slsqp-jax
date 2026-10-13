@@ -157,7 +157,7 @@ class TrustRegionInteriorPointSolver(
     penalty_rho: float = 0.3  # rho in eq. 19.42
     penalty_margin: float = 1e-4
     penalty_decay: float = 0.2
-    penalty_floor: float = 1.0
+    penalty_floor: float = 50.0
     # Multiplier recovery (eq. 19.37 + 19.38 by default); matrix-free on Ahat^T.
     multiplier_recovery: MultiplierRecovery = field(
         default_factory=lambda: LeastSquaresMultiplierRecovery(
