@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -18,6 +19,37 @@ from ...primal import InteriorPointPrimal
 from ..scaled_barrier import ScaledBarrierSubProblem
 from .base import RESULTS, SubProblemSolver, SubProblemSolverState
 from .gradient_projection import GradientProjection
+
+
+def refined_projector(
+    proj: Callable[[Float[Array, " n"]], Float[Array, " n"]],
+) -> Callable[[Float[Array, " n"]], Float[Array, " n"]]:
+    """Apply a null-space projector twice (one step of iterative refinement).
+
+    A single projection has an absolute error of order ``eps * kappa * ||v||``.
+    When ``||P v|| << ||v||`` this is a large relative error in the projected
+    direction, so ``Â (P v)`` is not small compared with ``P v``. Projecting
+    the result again reduces the leak to ``O(eps) * ||P v||`` (Gould, Hribar
+    and Nocedal, 2001; Nocedal and Wright, section 16.3).
+
+    Parameters
+    ----------
+    proj
+        Projector ``v ↦ P v``.
+
+    Returns
+    -------
+    Callable
+        The refined projector ``v ↦ P(P v)``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> proj = refined_projector(lambda v: v * jnp.array([1.0, 0.0]))
+    >>> proj(jnp.array([1.0, 2.0])).tolist()
+    [1.0, 0.0]
+    """
+    return lambda v: proj(proj(v))
 
 
 class SteihaugTointCGTangentialStepSolverState(SubProblemSolverState):
@@ -62,7 +94,11 @@ class SteihaugTointCGTangentialStepSolver(
       constraint operator ``Â`` and its transpose (matrix-free; the dense
       ``Â`` is never assembled).
 
-    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` solves the normal
+    The null-space projector ``P = I - Âᵀ(Â Âᵀ)⁺Â`` is applied with one step
+    of iterative refinement, ``v ↦ P(P v)`` (see :func:`refined_projector`):
+    near a KKT point the gradient lies almost entirely in range(Âᵀ), so
+    ``P ĝ`` is tiny and the absolute error of a single projection is a large
+    *relative* error that leaks the tangential step out of null(Â).  It solves the normal
     equations with the strategy selected by :attr:`normal_equations`: the
     bound / slack rows of ``Â`` are eliminated exactly (explicit
     pseudo-inverse Schur complement or matrix-free nested PCG, see
@@ -254,7 +290,7 @@ class SteihaugTointCGTangentialStepSolver(
                 max_iter=self.proj_cg_max_iter,
             )
         )
-        proj = null_space_projector(
+        proj1 = null_space_projector(
             A,
             At,
             free_mask=free_w,
@@ -263,6 +299,7 @@ class SteihaugTointCGTangentialStepSolver(
             max_iter=self.proj_cg_max_iter,
             solve=solve,
         )
+        proj = refined_projector(proj1)
 
         tol_sq = jnp.asarray(self.tol, dtype) ** 2
 
