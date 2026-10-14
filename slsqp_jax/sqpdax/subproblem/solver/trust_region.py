@@ -86,6 +86,10 @@ TrustRegionStateType = TypeVar(
 )
 
 
+_PENALTY_DECAY = 0.2
+_PENALTY_CAP = 50.0
+
+
 class TrustRegionInteriorPointSolver(
     SubProblemSolver[
         InteriorPointPrimal, ScaledBarrierSubProblem, TrustRegionStateType
@@ -345,9 +349,20 @@ class TrustRegionInteriorPointSolver(
             obj_model / ((1.0 - self.penalty_rho) * jnp.maximum(v_pred, 1e-30)),
             0.0,
         )
+        # Penalty update (eq. 19.42), monotone up to ``_PENALTY_CAP`` and
+        # relaxed above it: an excursion of ``nu`` beyond the cap (one step with a
+        # tiny ``v_pred`` demands ``nu`` of 3e3..6e5) may fall by the factor
+        # ``_PENALTY_DECAY`` per step, but never below the cap or below the
+        # penalty the step itself requires.  A monotone penalty that exploded makes
+        # the merit follow the constraints and freezes the iteration at steps of
+        # 1e-3 for hundreds of iterations; below the cap nothing changes.
+        need_pos = jnp.where(obj_model > 0, need + self.penalty_margin, 0.0)
         nu_new = jnp.where(
-            (v_pred > 1e-30) & (obj_model > 0),
-            jnp.maximum(nu_old, need + self.penalty_margin),
+            v_pred > 1e-30,
+            jnp.maximum(
+                jnp.maximum(_PENALTY_DECAY * nu_old, need_pos),
+                jnp.minimum(nu_old, _PENALTY_CAP),
+            ),
             nu_old,
         )
         pred = -obj_model + nu_new * v_pred
