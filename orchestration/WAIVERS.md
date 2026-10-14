@@ -2,6 +2,10 @@
 
 Merged so far (no real regressions): G1 H1 null-step restoration, G6 H3 pasls mu back-off (stream A); G8 H1 v3 double projection (float64), funnel end game / noise accept, analytic Cauchy decrease, trip penalty cap (stream B). Tip of `local_bench_cleanup`: see `git log`.
 
+## Recommended first (Oct 14, supersedes the two `termination_missed-lbfgs-*` branches)
+
+`hyp/secant-powell-damping-model` (c42697f): Powell damping of L-BFGS pairs toward the model's own B s instead of toward the stiff per-variable diagonal B0, hvp magnitude guard removed, secant docstrings audited. Same-tip comparison (unsolved v5 tasks + tiny tier, net gains minus losses): asls-craig +20 (0 lost), asls-pcg +18 (1 lost), pasls +16 (4), asls-minresqlp +13 (6), trip +7 (4), tfip +3 (4). Approximate medium counts: craig 232, pcg 230, minresqlp 222, pasls 215, trip 176, tfip 177 (scipy-slsqp 236). Suite 1803 passed. Ledger `g6-secant-powell-damping-impl`.
+
 | Branch (all from the merged tip or earlier) | Group gain | Tiny-tier (vs `new_run` rows) | Real losses | Notes |
 |---|---|---|---|---|
 | `hyp/termination_missed-lbfgs-signgate` (L-BFGS: no absolute floor + sign gate) | 25/112 | +28 / -6 (HS116 pasls is noise) | HS17 asls-craig, HS102 asls-minresqlp, HS1/HS37/HS86 tfip | all end at the solution; supersedes `hyp/termination_missed-lbfgs-relfloor` |
