@@ -20,7 +20,7 @@ from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
     ACTIVE_SET_LINE_SEARCH_RESULTS,
 )
 from slsqp_jax.sqpdax.primal import Primal
-from slsqp_jax.sqpdax.problem import build_problem
+from slsqp_jax.sqpdax.problem import Problem, build_problem
 from slsqp_jax.sqpdax.secant import FailureRecoverySchedule
 from slsqp_jax.sqpdax.step_controller import StepResult
 from slsqp_jax.sqpdax.subproblem.solver import (
@@ -34,6 +34,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     SingleExchangeWorkingSetPolicy,
     ThresholdWorkingSetPolicy,
 )
+from tests.sqpdax.subproblem.solver.conftest import unbounded_box
 
 from ..conftest import make_shifted_box_quadratic
 from .conftest import (
@@ -1248,3 +1249,74 @@ def test_restoration_raises_the_penalty_when_the_objective_opposes_the_step():
     assert float(penalty) == pytest.approx(max(han_powell, 6.0))
     assert float(penalty) >= 6.0
     assert float(result.x.x[0]) == pytest.approx(0.25)
+
+
+def _indefinite_quadratic():
+    """``f(x) = 1/2 (x0^2 - 4 x1^2)`` with exact curvature, unconstrained."""
+    w = jnp.array([1.0, -4.0])
+    lb, ub = unbounded_box(2)
+    return Problem(
+        fn=lambda x: (0.5 * jnp.sum(w * x**2), None),
+        grad=lambda x: w * x,
+        hvp=lambda x, v: w * v,
+        eq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        ineq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        eq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        eq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        lb=lb,
+        ub=ub,
+        null_lb=jnp.ones(2, dtype=bool),
+        null_ub=jnp.ones(2, dtype=bool),
+        n=2,
+        meq=0,
+        mineq=0,
+    )
+
+
+def _retry_context(curvature, failures):
+    """QP context of ``x = (1, 1)`` after ``failures`` consecutive rejections."""
+    problem = _indefinite_quadratic()
+    solver = ActiveSetLineSearchMinimiser(curvature=curvature).init(
+        problem, jnp.array([1.0, 1.0])
+    )
+    solver = eqx.tree_at(
+        lambda s: s.consecutive_ls_failures, solver, jnp.asarray(failures, jnp.int32)
+    )
+    return solver, solver._init_subproblem(problem)
+
+
+def _curvature_along_negative_direction(subproblem):
+    """``e1' (H + delta I) e1`` along the negative-curvature axis ``e1``."""
+    e1 = Primal(x=jnp.array([0.0, 1.0]))
+    zero_dual = subproblem.d_k.__class__(
+        *(jnp.zeros_like(a) for a in jax.tree.leaves(subproblem.d_k))
+    )
+    return float(e1.x @ subproblem.kkt_mvp_primal((e1, zero_dual)).x)
+
+
+@pytest.mark.parametrize(
+    ("curvature", "failures", "shifted"),
+    [("exact", 0, False), ("exact", 4, True), ("secant", 4, False)],
+)
+def test_hessian_shift_after_a_rejection_is_exact_curvature_only(
+    curvature, failures, shifted
+):
+    """The QP Hessian is made positive definite after repeated rejections.
+
+    On ``f = 1/2 (x0^2 - 4 x1^2)`` the unshifted curvature along ``e1`` is
+    ``-4`` (an ascent-prone QP). Four rejections shift it by
+    ``delta_4 = 10 > 4`` for the exact model, so the retry step is a descent
+    direction of the now convex QP; the secant model is never shifted.
+    """
+    solver, ctx = _retry_context(curvature, failures)
+    curv = _curvature_along_negative_direction(ctx.subproblem)
+    base = _curvature_along_negative_direction(
+        _retry_context(curvature, 0)[1].subproblem
+    )
+    assert (curv - base > 0.0) == shifted
+    if shifted:
+        assert base < 0.0 < curv
+        direction, _, _ = solver._solve_direction(ctx)
+        assert float(ctx.subproblem.lagrangian.grad_val @ direction.x) < 0.0
