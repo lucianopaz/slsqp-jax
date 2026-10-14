@@ -653,7 +653,15 @@ class TrustFunnelInteriorPointMinimiser(
         )
         x_norm = jnp.linalg.norm(iterate.x)
         x_scale = jnp.maximum(1.0, x_norm)
-        radius = jnp.maximum(controlled.radius_v, controlled.radius_f)
+        # Once the violation is within its tolerance no normal step is needed and
+        # the tangential radius ``min(kappa_vf radius_v, radius_f)`` is the one
+        # that bounds the iteration: a collapsed ``radius_f`` is a collapse even
+        # though ``radius_v`` was never shrunk.
+        radius = jnp.where(
+            v <= self.barrier_update.eps_v(old_mu),
+            controlled.radius_f,
+            jnp.maximum(controlled.radius_v, controlled.radius_f),
+        )
         collapsed = radius < self.radius_floor * x_scale
         rejected = ~result.accepted
         # xtol-style exit: the barrier subproblem is solved to working precision.
@@ -661,7 +669,10 @@ class TrustFunnelInteriorPointMinimiser(
         rounding_f = result.rounding_level & (
             controlled.iteration_type == IterationType.f_iteration
         )
-        finished = (collapsed | (rejected & rounding_f)) & unconverged
+        # A rounding-level f-iteration is a solved barrier subproblem whether the
+        # step was rejected or noise-accepted (a noise-accepted step makes no
+        # progress, so waiting for a rejection would never end).
+        finished = (collapsed | rounding_f) & unconverged
         new_barrier, solved = self.barrier_update.update(
             cast(Barrier, self.barrier), lagrangian, pi_f=pi_f, v=v, force=finished
         )
