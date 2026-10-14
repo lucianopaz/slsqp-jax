@@ -258,12 +258,8 @@ class FunnelTangentialStepSolver(
         def At(z: Float[Array, " m"]) -> Float[Array, " w"]:
             return subproblem.jac_t_mvp(to_dual(z)).flatten()
 
-        def model_f(w: Float[Array, " w"]) -> Scalar:
-            return subproblem.model_f(to_primal(w))
-
         g_hat = subproblem.primal_grad().flatten()
         g_n = g_hat + H(w_n)  # ĝ + Ĥ w_n = P ∇m_f(n)
-        m_f_n = model_f(w_n)
         lo, _hi = subproblem.tangential_box(w_n_tree)
         # ``w_n`` must lie inside the ball for any tangential step to exist;
         # the (3.12) gate guarantees it, but guard against roundoff anyway.
@@ -314,7 +310,29 @@ class FunnelTangentialStepSolver(
         alpha_c = jnp.minimum(alpha_star, jnp.minimum(alpha_ball, alpha_box))
         alpha_c = jnp.where((slope > 0.0) & (pi_f > tiny) & room, alpha_c, 0.0)
         t_c = -alpha_c * d_c
-        cauchy_decrease = m_f_n - model_f(w_n + t_c)
+
+        # Model decreases of a tangential step ``t`` are evaluated analytically,
+        # ``m_f(w_n) - m_f(w_n + t) = -(g_nᵀ t + ½ tᵀ Ĥ t)`` with ``g_nᵀ t`` replaced
+        # by ``-r0ᵀ t`` (``t`` lies in ``null(Â)``, so only the projected gradient
+        # ``proj(g_n) = -r0`` contributes).  The difference of two model values
+        # cancels to ``eps |g_n| |t|``, which near a KKT point (``|g_n| = 3e2``,
+        # decrease 1e-9) is larger than the decrease and turned it negative.
+        # (float64 only: in float32 the second-order stall detection of infeasible
+        # runs relies on the difference form, and the analytic form keeps such
+        # runs iterating up to ``max_steps``).
+        analytic = bool(jnp.finfo(dtype).eps < 1e-10)
+
+        def model_f(w: Float[Array, " w"]) -> Scalar:
+            return subproblem.model_f(to_primal(w))
+
+        m_f_n = model_f(w_n)
+
+        def tangential_decrease(t_step: Float[Array, " w"]) -> Scalar:
+            if analytic:
+                return jnp.dot(r0, t_step) - 0.5 * jnp.dot(t_step, H(t_step))
+            return m_f_n - model_f(w_n + t_step)
+
+        cauchy_decrease = tangential_decrease(t_c)
 
         # --- projected CG with Steihaug–Toint termination from w_n --------------
         # Convergence threshold: relative to the initial projected residual, with
@@ -342,7 +360,7 @@ class FunnelTangentialStepSolver(
         # --- fraction-to-boundary backtrack along the ray, Cauchy fallback ------
         beta_ftb = box_fraction(t_cg, lo)
         t_bt = beta_ftb * t_cg
-        dm_cg = m_f_n - model_f(w_n + t_bt)
+        dm_cg = tangential_decrease(t_bt)
         use_cauchy = dm_cg < cauchy_decrease
         t = jnp.where(use_cauchy, t_c, t_bt)
         dm_f_t = jnp.where(use_cauchy, cauchy_decrease, dm_cg)
