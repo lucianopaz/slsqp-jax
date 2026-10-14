@@ -32,7 +32,8 @@ class CurvatureDiagnostics(Module):
         Whether the pair would be rejected by the secant's skip logic.
     damping_theta
         Interpolation weight ``θ ∈ [0, 1]`` the secant would apply to ``y``
-        (``y_damped = θ y + (1 - θ) B₀ s``); ``1`` means undamped.
+        (``y_damped = θ y + (1 - θ) B s``, with ``B s`` the product of the
+        current model with ``s``, i.e. Powell damping); ``1`` means undamped.
     """
 
     raw_curvature: Scalar  # s dot product y

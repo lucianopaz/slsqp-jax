@@ -1,4 +1,19 @@
-"""Diagonal-initial-Hessian L-BFGS secant with VARCHEN damping."""
+"""Diagonal-initial-Hessian L-BFGS secant with Powell damping.
+
+The approximation is limited-memory BFGS in the compact representation of
+Byrd, Nocedal & Schnabel (1994) with a per-variable diagonal initial matrix
+``B₀ = diag(d)``. Every incoming pair is damped with Powell's (1978) rule
+toward the model's own product ``B s`` (threshold ``damping_threshold``,
+``τ = 0.2`` by default), which keeps the stored pairs on the positive-curvature
+side and therefore keeps ``B`` positive definite.
+
+The soft reset follows Algorithm 1, step 7 of VARCHEN (Lotfi et al., 2020,
+arXiv:2012.05783), which also motivates clipping the curvature scale. The
+damping itself is *not* VARCHEN's: VARCHEN damps toward a scalar ``B₀``. The
+per-variable diagonal rebuild in :meth:`LBFGS.append` is a heuristic with no
+published source (for a published diagonal BFGS-type update see Li, Wang &
+Huang, 2022, *Computational Optimization and Applications* 81).
+"""
 
 from typing import ClassVar, Self, cast
 
@@ -16,7 +31,7 @@ __all__ = [
 
 
 class LBFGS(Secant):
-    """Limited-memory BFGS with diagonal ``B₀`` and VARCHEN-style damping.
+    """Limited-memory BFGS with a diagonal ``B₀`` and Powell damping.
 
     Stores the last ``memory`` curvature pairs ``(s, y)`` in a circular
     buffer and applies the compact representation
@@ -26,9 +41,31 @@ class LBFGS(Secant):
     B = B₀ - [B₀ S, Y] M⁻¹ [Sᵀ B₀; Yᵀ]
     ```
 
-    with ``B₀ = diag(diagonal)``. Damping is computed against ``B₀``
-    (Lotfi et al., 2020), not the full ``B``, so it stays ``O(n)`` and
-    well-conditioned.
+    with ``B₀ = diag(diagonal)``.
+
+    Each incoming pair is damped with Powell's (1978) rule toward the
+    model's own product ``B s`` (``B`` *before* the pair is added), with
+    threshold ``τ = damping_threshold`` (default ``0.2``):
+
+    ```text
+    y_damped = θ y + (1 - θ) B s,   sᵀ y_damped ≥ τ sᵀ B s
+    ```
+
+    so every stored pair has positive curvature and ``B`` stays symmetric
+    positive definite. The cost is one extra :meth:`hvp` (``O(k² n)``) per
+    appended pair.
+
+    Relation to the literature. The soft reset (:meth:`reset` with
+    ``severity ≤ 0``) is Algorithm 1, step 7 of VARCHEN (Lotfi et al., 2020,
+    arXiv:2012.05783), and the idea of clipping the curvature scale also
+    comes from there; VARCHEN itself damps toward a *scalar* ``B₀``, which is
+    not what this class does. The per-variable diagonal rebuild in
+    :meth:`append` (component-wise secant estimate ``|yᵢ sᵢ| / sᵢ²`` clipped
+    to ``[0.01, 100] · yᵀy / yᵀs`` and to ``[diag_floor, diag_ceil]``, with
+    the whole diagonal replaced at every accepted pair) is a heuristic with
+    no published source. For a published diagonal BFGS-type update see
+    Li, Wang & Huang (2022), *Computational Optimization and Applications*
+    81.
 
     ``inv_eig_lower`` / ``inv_eig_upper`` bound the eigenvalues of the
     *inverse* Hessian ``H₀ = diag(1 / diagonal)``:
@@ -55,7 +92,9 @@ class LBFGS(Secant):
         Optional ridge on the compact-form ``M``. Defaults to ``0``
         (exact solve); nonzero only when explicitly requested.
     damping_threshold
-        Powell / VARCHEN damping threshold (default ``0.2``).
+        Powell damping threshold ``τ`` (default ``0.2``): the stored pair
+        satisfies ``sᵀ y_damped ≥ τ sᵀ B s`` for the model ``B`` before the
+        pair is added.
     diag_floor, diag_ceil
         Absolute clip bracket for the per-variable diagonal.
     s_history, y_history
@@ -115,7 +154,7 @@ class LBFGS(Secant):
             Ridge added to the ``2k × 2k`` compact matrix ``M`` inside
             :meth:`hvp`. Default ``0`` keeps the solve exact.
         damping_threshold
-            VARCHEN / Powell damping threshold.
+            Powell damping threshold ``τ`` toward the model's own ``B s``.
         diag_floor, diag_ceil
             Absolute clip limits for the per-variable diagonal.
         """
@@ -148,15 +187,16 @@ class LBFGS(Secant):
         -------
         CurvatureDiagnostics
             Raw inner product, normalised curvature, skip flag from
-            :meth:`should_skip`, and the VARCHEN damping weight
-            :meth:`append` would apply (``1`` for a skipped pair).
+            :meth:`should_skip`, and the Powell damping weight
+            :meth:`append` would apply (``1`` for a skipped pair), computed
+            against ``B s = self.hvp(s)``.
         """
         s_norm = jnp.linalg.norm(s)
         y_norm = jnp.linalg.norm(y)
         sty = jnp.dot(s, y)
         relative_curvature = jnp.abs(sty) / jnp.maximum(s_norm * y_norm, 1e-30)
         skipped = self.should_skip(s, y)
-        theta = jnp.where(skipped, 1.0, self._damping_theta(s, y))
+        theta = jnp.where(skipped, 1.0, self._damping_theta(s, y, self.hvp(s)))
         return cast(
             CurvatureDiagnostics,
             CurvatureDiagnostics(sty, relative_curvature, skipped, theta),
@@ -180,8 +220,13 @@ class LBFGS(Secant):
         """
         return jnp.min(self.diagonal), jnp.max(self.diagonal)
 
-    def _damping_theta(self, s: Vector_n, y: Vector_n) -> Scalar:
-        """VARCHEN damping weight ``θ`` toward ``B₀`` (Lotfi et al., 2020).
+    def _damping_theta(self, s: Vector_n, y: Vector_n, Bs: Vector_n) -> Scalar:
+        """Powell (1978) damping weight ``θ`` toward the model's own ``B s``.
+
+        With ``τ = damping_threshold`` and ``sᵀB s`` floored at ``1e-12``,
+        ``θ = 1`` if ``sᵀy ≥ τ sᵀB s`` and
+        ``θ = (1 - τ) sᵀB s / (sᵀB s - sᵀy)`` otherwise, clipped to
+        ``[0, 1]``.
 
         Parameters
         ----------
@@ -189,23 +234,23 @@ class LBFGS(Secant):
             Step vector.
         y
             Gradient difference.
+        Bs
+            Product ``B s`` of the current model (before the pair is added),
+            e.g. ``self.hvp(s)``.
 
         Returns
         -------
         Scalar
-            ``θ ∈ [0, 1]`` such that ``sᵀ y_damped ≥ damping_threshold · sᵀ B₀ s``
-            for ``y_damped = θ y + (1 - θ) B₀ s``.
+            ``θ ∈ [0, 1]`` such that ``sᵀ y_damped ≥ τ sᵀ B s`` for
+            ``y_damped = θ y + (1 - θ) B s``.
         """
-        B0s = self.diagonal * s
-        sTB0s_safe = jnp.maximum(jnp.dot(s, B0s), 1e-12)
+        tau = self.damping_threshold
+        sBs_safe = jnp.maximum(jnp.dot(s, Bs), 1e-12)
         sTy = jnp.dot(s, y)
-        use_damping = sTy < self.damping_threshold * sTB0s_safe
-        theta = jax.lax.cond(
-            use_damping,
-            lambda: (1.0 - self.damping_threshold)
-            * sTB0s_safe
-            / (sTB0s_safe - sTy + 1e-12),
-            lambda: jnp.array(1.0),
+        theta = jnp.where(
+            sTy < tau * sBs_safe,
+            (1.0 - tau) * sBs_safe / (sBs_safe - sTy + 1e-12),
+            1.0,
         )
         return jnp.clip(theta, 0.0, 1.0)
 
@@ -291,8 +336,10 @@ class LBFGS(Secant):
         Returns
         -------
         Vector_n
-            ``B v``. Falls back to ``d ⊙ v`` if the compact solve is
-            non-finite or unreasonably large.
+            ``B v``. Falls back to ``d ⊙ v`` only if the compact solve is
+            non-finite. A large finite result is returned as is: the solve
+            is a min-norm least-squares solve and ``B`` may legitimately
+            exceed ``max(diagonal)``.
         """
         k = self.s_history.shape[0]
         d = self.diagonal
@@ -360,23 +407,15 @@ class LBFGS(Secant):
         # B v = B_0 v - [B_0 S, Y]^T @ q = d*v - DS^T @ q[:k] - Y^T @ q[k:]
         result = dv - DS.T @ q[:k] - Y.T @ q[k:]
 
-        # Guard against NaN/inf from numerical blowup in the compact form solve.
-        # The magnitude threshold scales with the diagonal so that it is never
-        # triggered by legitimate Hessian eigenvalues.  B₀ = diag(d), so the
-        # expected scale of ||Bv|| is O(max|d| · ||v||); using a 1000× margin
-        # on top of that catches only genuine numerical failures.
-        v_norm = jnp.linalg.norm(v)
-        result_norm = jnp.linalg.norm(result)
-        max_diag = jnp.max(jnp.abs(d))
-        threshold = 1000.0 * jnp.maximum(max_diag, 1.0)
-
-        is_bad = jnp.any(~jnp.isfinite(result)) | (
-            result_norm > threshold * jnp.maximum(v_norm, 1e-10)
-        )
-
-        result = jnp.where(is_bad, dv, result)
-
-        return result
+        # Only a non-finite result falls back to ``d ⊙ v``. There is deliberately
+        # no magnitude guard (the former test ``‖B v‖ > 1000 · max|d| · ‖v‖``):
+        # the compact solve above is a min-norm least-squares solve, so a large
+        # but finite result is the exact action of the stored pairs, and ``B``
+        # legitimately exceeds ``max|d|`` whenever the learned curvature is
+        # stiffer than the diagonal. The old bound fired falsely in that case
+        # and replaced ``B s`` by ``d ⊙ s``, which is the wrong target for the
+        # Powell damping in :meth:`append`.
+        return jnp.where(jnp.any(~jnp.isfinite(result)), dv, result)
 
     def inverse_hvp(self, v: Vector_n) -> Vector_n:
         """Compute ``H v = B⁻¹ v`` via the L-BFGS two-loop recursion.
@@ -464,23 +503,27 @@ class LBFGS(Secant):
         return r
 
     def append(self, s: Vector_n, y: Vector_n) -> Self:
-        """Append a curvature pair with VARCHEN damping toward ``B₀``.
+        """Append a curvature pair with Powell damping toward ``B s``.
 
-        Damping is computed against ``B₀ = diag(diagonal)``
-        (Lotfi et al., 2020, eqs. 7–8):
+        The pair is damped (Powell, 1978) toward the product of the current
+        model ``B = self`` (before the pair is added) with ``s``:
 
         ```text
-        y_damped = θ y + (1 - θ) B₀ s
+        y_damped = θ y + (1 - θ) B s,   B s = self.hvp(s)
         ```
 
-        with ``θ ∈ [0, 1]`` chosen so
-        ``sᵀ y_damped ≥ damping_threshold · sᵀ B₀ s``.
+        with ``θ ∈ [0, 1]`` from :meth:`_damping_theta`, chosen so
+        ``sᵀ y_damped ≥ damping_threshold · sᵀ B s``. The damped vector
+        ``y_damped``, not ``y``, is stored.
 
-        The per-variable diagonal is then updated with a component-wise
-        secant estimate clipped relative to the scalar curvature scale
-        ``yᵀy / (yᵀs)`` and the absolute ``[diag_floor, diag_ceil]``
-        bracket. Pairs rejected by :meth:`should_skip` leave ``self``
-        unchanged.
+        The per-variable diagonal ``B₀`` is then rebuilt from ``y_damped``
+        (a heuristic with no published source, see the class docstring):
+        every component is replaced by the component-wise secant estimate
+        ``|y_damped,ᵢ sᵢ| / sᵢ²``, clipped to ``[0.01, 100] · yᵀy / yᵀs``
+        (scalar curvature scale of ``y_damped``) and to the absolute
+        ``[diag_floor, diag_ceil]`` bracket. Components with a negligible
+        ``sᵢ`` keep their previous value. Pairs rejected by
+        :meth:`should_skip` leave ``self`` unchanged.
 
         Parameters
         ----------
@@ -497,11 +540,11 @@ class LBFGS(Secant):
         should_skip = self.should_skip(s, y)
 
         def do_append() -> Self:
-            # VARCHEN-style damping toward B0 = diag(diagonal).
-            # O(n) and always well-conditioned, unlike the full lbfgs_hvp.
-            B0s = self.diagonal * s
-            theta = self._damping_theta(s, y)
-            y_damped = theta * y + (1.0 - theta) * B0s
+            # Powell damping toward the model's own B s (current model, before
+            # this pair is added); one extra O(k² n) hvp.
+            Bs = self.hvp(s)
+            theta = self._damping_theta(s, y, Bs)
+            y_damped = theta * y + (1.0 - theta) * Bs
 
             yTy = jnp.dot(y_damped, y_damped)
             yTs = jnp.dot(y_damped, s)
@@ -582,11 +625,13 @@ class LBFGS(Secant):
         return inv_eig_min, inv_eig_max
 
     def _soft_reset(self) -> Self:
-        """VARCHEN soft reset: keep only the most recent ``(s, y)`` pair.
+        """Soft reset: drop all stored pairs except the newest ``(s, y)``.
 
         Less aggressive than :meth:`_reset` (diagonal extraction) or
-        :meth:`_identity_reset`. Based on VARCHEN Algorithm 1, Step 7
-        (Lotfi et al., 2020).
+        :meth:`_identity_reset`. Follows VARCHEN Algorithm 1, step 7
+        (Lotfi et al., 2020, arXiv:2012.05783), which drops the stored pairs
+        and keeps the newest one; here that is the only part taken from
+        VARCHEN. The diagonal ``B₀`` is left unchanged.
 
         Returns
         -------
