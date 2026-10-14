@@ -317,8 +317,20 @@ class FunnelTangentialStepSolver(
         # ``proj(g_n) = -r0`` contributes).  The difference of two model values
         # cancels to ``eps |g_n| |t|``, which near a KKT point (``|g_n| = 3e2``,
         # decrease 1e-9) is larger than the decrease and turned it negative.
+        # (float64 only: in float32 the second-order stall detection of infeasible
+        # runs relies on the difference form, and the analytic form keeps such
+        # runs iterating up to ``max_steps``).
+        analytic = bool(jnp.finfo(dtype).eps < 1e-10)
+
+        def model_f(w: Float[Array, " w"]) -> Scalar:
+            return subproblem.model_f(to_primal(w))
+
+        m_f_n = model_f(w_n)
+
         def tangential_decrease(t_step: Float[Array, " w"]) -> Scalar:
-            return jnp.dot(r0, t_step) - 0.5 * jnp.dot(t_step, H(t_step))
+            if analytic:
+                return jnp.dot(r0, t_step) - 0.5 * jnp.dot(t_step, H(t_step))
+            return m_f_n - model_f(w_n + t_step)
 
         cauchy_decrease = tangential_decrease(t_c)
 
