@@ -2333,6 +2333,20 @@ report pulls the before/after numbers from it."""
 
 
 WORK_LOG: list[str] = [
+    "<strong>Round e (Oct 13-14, two parallel streams)</strong> "
+    + _md_code(
+        "Merged: null-step restoration trigger (asls), pasls `mu` back-off, "
+        "double projection in the Steihaug-Toint step (float64), funnel end "
+        "game (Cauchy slope, noise-accepted f-iterations, analytic decrease) "
+        "and a trip merit-penalty cap. Medium union after the merges "
+        "(`diagnostics/v5`): asls-pcg-exact 229, craig 212, pcg 212, "
+        "minresqlp 209, pasls 199, trip 169, tfip 174 (scipy-slsqp 236). "
+        "Waiting for a waiver: L-BFGS sign gate, Levenberg shift for exact "
+        "curvature, decaying merit penalty, rejected-pair secant update, "
+        "working-set exchange (see `orchestration/WAIVERS.md`). Rejected: trip "
+        "joint-norm merit, NaN rho, always_normal, rounding-level acceptance, "
+        "slack reset, DUALC row scaling."
+    ),
     "<strong>Benchmark artefacts</strong> "
     + _md_code(
         "(`unbounded`, `reference_mismatch`, "

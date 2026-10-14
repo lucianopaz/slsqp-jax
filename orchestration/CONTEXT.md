@@ -59,64 +59,37 @@ Until Oct 13 these changes were uncommitted (33 modified files, +3.6k/−1k line
 
 Tiny-tier solved per config, before → after a–c: asls-craig 137→199, asls-minresqlp 147→198, asls-pcg 147→203, asls-pcg-exact 127→211, pasls 144→185, tfip 103→130, trip 123→149.
 
-## 5. Round d: mu-barrier stall (`ip_barrier_stall`, trip/tfip) — **left halfway**
+## 5. Round d settled, round e (Oct 13-14, two streams)
 
-User's request (Oct 10 06:11): (1) decide the mu update on the scaled barrier KKT error against `kappa_eps * mu` (Fiacco–McCormick; trust-constr uses `BARRIER_DECAY_RATIO * mu`) instead of the final atol; (2) terminate only once mu is below the barrier tolerance and the radius is still collapsed, with a dedicated result code (xtol-style exit); (3) test whether radius collapse must reset the secant memory.
+Round d is kept (user, Oct 13). Its six tiny-tier losses (HS119/HS30/HS55 tfip, HS30/LSNNODOC/PRICE4B trip) were attributed: at `mu` ~ 1e-7 the end game fails. HS55 is a path-dependent second KKT point, not a false success. Round e = the work of two parallel streams (`STREAMS.md`; stream A on `local_bench_cleanup`, stream B on `stream/b`, merged back and forth). Every attempt is in `ledger.jsonl` (32 entries since Oct 13: 6 accepted, 9 rejected, 17 inconclusive, most of them probes or superseded versions).
 
-Implemented in the working tree (all in the diff, none committed):
-- `barrier/update.py`: `scale_max` (default 100), `scaled_optimality_residual`, `residual_components`, `force` argument on all `update`s; `FunnelBarrierUpdate.kappa_eps` (static, default 10.0); `MonotoneBarrierUpdate` test `E(x,s;mu) <= kappa_eps*mu`.
-- `trust_region_interior_point.py` and `trust_funnel_interior_point.py`: `collapse_resets_secant` (static, default `True`), carries `exit_without_progress`, `trust_region_collapsed`, `stalled_since_exit`; new result code `trust_region_collapse`; xtol-style exit forces the mu reduction (`force=True`); funnel restricts rounding-level exits to f-iterations.
-- Tests added/rewritten for the stall streaks and xtol exit in `tests/sqpdax/barrier/test_update.py`, `tests/sqpdax/minimiser/test_trust_{region,funnel}_interior_point.py`, `.../diagnostics/test_trust_funnel.py`.
+Accepted and merged (zero real losses, suite clean): G1 null-step restoration trigger (asls); G6 pasls mu back-off; G8 double projection in Steihaug-Toint (float64, leak > 1e-6); funnel end game (Cauchy slope, noise accept, radius_f collapse); analytic Cauchy decrease (float64); trip penalty cap (monotone to nu = 50, then decay 0.2).
 
-Measurements (66 `ip_barrier_stall` tasks: tfip 56, trip 10):
+Waiting for a user waiver (real losses but gains >= 3x; all listed with numbers in `WAIVERS.md`): L-BFGS sign gate (`hyp/termination_missed-lbfgs-signgate`), Levenberg shift for exact curvature (asls-pcg-exact 229 -> 237), decaying merit penalty, rejected-pair secant update (trip/tfip), funnel projection refinement (+1, clean), working-set exchange (new false success on HS97: investigate first). Combination of the first three on the merged tip (`diagnostics/v5_combo`): asls-pcg-exact 243 (+7 vs scipy-slsqp), union 257 vs scipy 254 (counts previously unsolved tasks only).
 
-| Run | Code | Solved | Still `ip_barrier_stall` |
-|---|---|---|---|
-| `fix_d_barrier_before` | HEAD behaviour | 3/66 (tfip 3/56, trip 0/10) | 50 |
-| `fix_d_barrier_v2` | working tree, `collapse_resets_secant=True` | 8/66 (tfip 7/56, trip 1/10) | 23 |
-| `fix_d_barrier_v1` | worktree `/tmp/wt_v1`, `collapse_resets_secant=False` | 8/66 (same) | 23 |
-
-- v1 and v2 gave identical results on both the 66-task run and on the trip/tfip tiny regression (+46 / −6 against `regress_tiny2`; trip 149→157, tfip 130→162). So the secant-reset hypothesis is **untested in effect**: the flag changed nothing here. Either it never triggers on these tasks or the v1 build did not differ as intended (?). Check before concluding that the user's worry was unwarranted.
-- New diagnoses of the 43 that left `ip_barrier_stall`: `termination_missed` 6, `unclassified` 5, `unbounded` 5, `cycling` 4, `step_collapse` 3, `multiplier_failure` 3, plus smaller groups. CANTILVR, CSFI2, ELATVIDUB, PRICE4B, HS1 now solve on tfip.
-- Tiny-tier losses of the round, **not yet attributed**: HS119 tfip, HS30 tfip, HS30 trip, HS55 tfip, LSNNODOC trip, PRICE4B trip. Attribution protocol is in the skill (rerun at base commit from a worktree, check catalogue `f*`, platform noise).
-- No `FIX_ATTEMPTS` entry, no `WORK_LOG` bullet, no report regeneration for round d (`grep fix_d scripts/diagnose_benchmark.py` is empty).
-
-Tests (last known, Oct 10 07:18, full non-slow suite, 22 min): **1 failed, 1892 passed**.
-Failing: `tests/sqpdax/minimiser/diagnostics/test_trust_funnel.py::test_infeasible_run_reports_multiplier_bound_hits`
-(the infeasible float32 run now ends with `infeasible_stationary_point` and `n_multiplier_bound = 0`; the test asserts bound hits). An earlier failure of `test_run_emits_documented_diagnostic_records[box]` seems to have been fixed (?). The rerun started at 07:20 never reported back.
-
-Open investigation when the session stopped: HS100 on trip (and tfip) stalls with mu ≈ 1e-6 and predicted reduction ≈ 1e-6..1e-4 at radius 2; the agent was probing `probe_pred.py` and a throw-away patch of `slsqp_jax/sqpdax/linalg/projection.py` (free_mask handling) in `/tmp/wt_exp`. **That patch is not in the repo.** The scratch scripts (`/tmp/trace_tfip.py`, `/tmp/probe_pred.py`, `/tmp/diff_runs.py`, `/tmp/trace_infeas.py`) are in `/tmp` on the user's Mac and may be gone.
+Rejected (do not repeat): trip joint-norm merit, NaN rho / CG budget for rho = -inf, `always_normal` default, rounding-level acceptance, trip shrink/grow thresholds, DUALC row scaling (premise falsified), trip slack reset after every step, penalty floor 50.
 
 ## 6. Where the code stands today
 
-`results/new_run` (Oct 12, 303 instances, medium tier) was produced from the dirty working tree that is now committed on `local_bench_cleanup` (user-confirmed), so it includes rounds a–d. Unsolved sqpdax tasks: 1281 (v2) → 744.
+Merged tip of `local_bench_cleanup`: see `git log` (first commit after `9473abc`). Diagnosis of that tip: `diagnostics/v5/{classified,diag}.jsonl` (740 unsolved sqpdax tasks of `results/new_run` re-run; no new full benchmark run exists).
 
-| Config | Solved /303 | Unsolved before (v2) |
-|---|---|---|
-| asls-pcg-exact | 227 | 180 |
-| asls-pcg | 211 | 167 |
-| asls-craig | 209 | 179 |
-| asls-minresqlp | 208 | 167 |
-| pasls | 193 | 174 |
-| tfip | 166 | 218 |
-| trip | 163 | 196 |
-| scipy-slsqp | 236 | |
-| scipy-trust-constr | 174 | |
+| Config | `new_run` | merged tip (v5) | with waiver candidates (combo) | vs scipy-slsqp (236) now |
+|---|---|---|---|---|
+| asls-pcg-exact | 227 | 229 | 243 | -7 |
+| asls-craig | 209 | 212 | 223 | -24 |
+| asls-pcg | 211 | 212 | 225 | -24 |
+| asls-minresqlp | 208 | 209 | 224 | -27 |
+| pasls | 193 | 199 | 212 | -37 |
+| tfip | 166 | 174 | 175 | -62 |
+| trip | 163 | 169 | 172 | -67 |
 
-Gap to scipy (`orchestration/gap.py`): no config beats scipy-slsqp yet (asls-pcg-exact −9, asls-craig −27, asls-pcg −25, asls-minresqlp −28, pasls −43, trip −73, tfip −70; all but trip/tfip beat trust-constr). Deficit set (scipy solves, no sqpdax config does): 16 instances; sqpdax-only wins: 10.
+(combo counts only tasks unsolved in `new_run`; losses on tasks `new_run` solved are not included, tiny tier combo: +68 / -14). `python orchestration/gap.py results/new_run/results.jsonl --overlay diagnostics/v5/compare.json` reproduces the merged-tip numbers. Deficit set (scipy solves, no sqpdax config): 14 (BT7, DECONVC, HAIFAM, HS106, HS25, HS268, HS98, LEVYMONT9, OPTPRLOC, PALMER6E/7E/8A, TRO4X4).
 
-Instance level: sqpdax union 248, scipy-slsqp 236, trust-constr 174, scipy union 254.
-Unsolved sqpdax rows by status: `max_steps_reached` 306, `successful` 182 (solver says success, reference disagrees: false convergence or mismatched f*), `merit_stagnation` 74, `trust_region_collapse` 56, `secant_recovery_failure` 46, `infeasible` 38, `infeasible_stationary` 17, `multiplier_solve_failure` 13.
-Catalogue validation labels in that run: ok 1395, fstar_from_consensus 513, unverified 333, fstar_mismatch 261, sign_flipped 207, error 9.
+## 7. Next steps
 
-## 7. Next steps, in order (cheap first)
-
-1. Baseline is settled: `results/new_run` = committed state of `local_bench_cleanup`.
-2. Settle the branch: fix or mark `test_infeasible_run_reports_multiplier_bound_hits`; rerun `uv run pytest -m "not slow"`; `uv run prek run`.
-3. Attribute the six round-d tiny-tier losses; decide keep/revert for round d; resolve the v1 = v2 puzzle.
-4. Run the diagnostics for `results/new_run/results.jsonl` into `diagnostics/v4` (skill steps 1–3, `--previous diagnostics/v2/classified.jsonl`; ~744 tasks, roughly 20 min on 4–7 jobs).
-5. Update the narrative constants (`FIX_ATTEMPTS` for round d, `WORK_LOG`, `PRIORITIES`, counts quoted in `CAUSES`/`RECOMMENDATIONS`), regenerate `report.html`.
-6. Next causes: order by the per-config deficit to scipy-slsqp after step 4 (see `orchestration/queue.md`). Benchmark-artefact causes are out of scope (benchmark side is frozen). The IP configs (trip, tfip) are furthest behind (−73, −70).
+1. User decides the waivers in `WAIVERS.md` (cheapest, largest effect: Levenberg shift, one loss, asls-pcg-exact above scipy-slsqp). Then re-run the diagnosis and a full medium benchmark (human decision) to confirm.
+2. Open leads, by size: trip/tfip class-B end-game collapses (~30 scipy-solved: L-BFGS curvature under-estimate; the rejected-pair update is the candidate); DUALC infeasible start on trip (normal step moves x by 1e-3 per step: grow the normal radius independently of rho); OET crawl (rho = 0.25 constant: second-order correction); scaled relative stationarity test for the interior-point end game (tolerance decision for the user); QP exchange investigation (HS97 false success); cycling/slow_progress (PALMER*A/E, LOGROS, HS268: secant scaling); G5 (`qp_kkt` guard, 12 tasks) not started.
+3. Report text: `FIX_ATTEMPTS` entries per ledger entry are not written yet; one summary bullet is in `WORK_LOG`.
 
 ## 8. Orchestration
 
