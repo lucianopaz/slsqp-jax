@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from slsqp_jax.sqpdax.secant import LBFGS, CurvatureDiagnostics, Secant
-from tests.sqpdax.secant.conftest import build_lbfgs_with_pairs, explicit_diagonal
+from tests.sqpdax.secant.conftest import (
+    append_jit,
+    build_lbfgs_with_pairs,
+    dense_hessian,
+    explicit_diagonal,
+    pair_with_curvature_ratio,
+    random_pairs,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -154,44 +162,115 @@ def test_append_clips_diagonal_to_absolute_bracket(
         assert float(jnp.max(out.diagonal)) <= diag_ceil + 1e-12
 
 
-def test_append_damps_negative_curvature_pairs():
-    """Pairs with ``sᵀy`` below the damping threshold are Powell-damped."""
-    hist = LBFGS(n=3, memory=4, damping_threshold=0.2)
-    s = jnp.array([1.0, 0.0, 0.0])
-    # sᵀy = -1, sᵀ B₀ s = 1 → damping must fire
-    y = jnp.array([-1.0, 0.0, 0.0])
+# Curvature ratios ``sᵀy / sᵀB s`` of the candidate pair, relative to the Powell
+# threshold ``τ``: a pair is damped iff ``ratio < τ`` (no ratio equals a ``τ``).
+CURVATURE_RATIOS = [2.0, 0.3, 0.1, 0.02, -1.0, -20.0]
+CURVATURE_RATIO_IDS = ["strong", "above", "weak", "tiny", "negative", "very-negative"]
+# Number of random pairs in the model before the candidate pair is appended:
+# empty (``B = B₀``), partly filled, and wrapped around the circular buffer.
+WARM_PAIRS = [0, 3, 9]
+
+
+@pytest.mark.parametrize("n_warm", WARM_PAIRS, ids=["empty", "partial", "wrapped"])
+@pytest.mark.parametrize("ratio", CURVATURE_RATIOS, ids=CURVATURE_RATIO_IDS)
+@pytest.mark.parametrize("tau", [0.05, 0.2, 0.5])
+def test_append_enforces_powell_condition_against_model_Bs(
+    n: int, memory: int, tau: float, ratio: float, n_warm: int
+):
+    """The stored ``y`` satisfies ``sᵀy_damped ≥ τ sᵀB s`` for the model before the append."""
+    hist = build_lbfgs_with_pairs(
+        n, random_pairs(0, n, n_warm), memory=memory, damping_threshold=tau
+    )
+    s, y = pair_with_curvature_ratio(hist, ratio, seed=1)
+    Bs = hist.hvp(s)
+    sBs = float(jnp.dot(s, Bs))
+    assert sBs > 0.0
+    assert not bool(hist.should_skip(s, y))
+
     out = hist.append(s, y)
-    assert int(out.count) == 1
-    stored_y = out.y_history[0]
-    # Damped y should satisfy sᵀ y_damped ≥ threshold · sᵀ B₀ s
-    sTy = float(jnp.dot(s, stored_y))
-    sTB0s = float(jnp.dot(s, hist.diagonal * s))
-    assert sTy >= 0.2 * sTB0s - 1e-10
-    # And must differ from the raw (negative-curvature) y
-    assert not jnp.allclose(stored_y, y)
+    stored = out.y_history[int(hist.next_idx)]
+    np.testing.assert_allclose(out.s_history[int(hist.next_idx)], s)
+    assert float(jnp.dot(s, stored)) >= tau * sBs * (1.0 - 1e-9)
+    if ratio >= tau:
+        # Already above the threshold: stored undamped
+        np.testing.assert_allclose(stored, y)
+    else:
+        # Powell's θ makes the condition active; the pair moves toward B s
+        np.testing.assert_allclose(float(jnp.dot(s, stored)), tau * sBs, rtol=1e-8)
+        assert not jnp.allclose(stored, y)
 
 
-@pytest.mark.parametrize(
-    ("y", "expect_damped"),
-    [
-        (jnp.array([2.0, 1.0, 0.0]), False),
-        (jnp.array([-1.0, 0.5, 0.0]), True),
-        (jnp.array([0.05, 0.0, 0.0]), True),
-    ],
-    ids=["positive-curvature", "negative-curvature", "weak-curvature"],
-)
-def test_diagnostics_damping_theta_matches_append(y: jnp.ndarray, expect_damped: bool):
-    """``diagnostics(...).damping_theta`` is the θ ``append`` interpolates with."""
-    hist = LBFGS(n=3, memory=4, damping_threshold=0.2)
-    s = jnp.array([1.0, 0.0, 0.0])
-    diag = hist.diagnostics(s, y)
-    theta = float(diag.damping_theta)
-    assert (theta < 1.0) is expect_damped
+@pytest.mark.parametrize("n_warm", WARM_PAIRS, ids=["empty", "partial", "wrapped"])
+@pytest.mark.parametrize("ratio", CURVATURE_RATIOS, ids=CURVATURE_RATIO_IDS)
+def test_diagnostics_damping_theta_matches_append(
+    n: int, memory: int, ratio: float, n_warm: int
+):
+    """``diagnostics(...).damping_theta`` is the θ ``append`` uses against ``B s``."""
+    tau = 0.2
+    hist = build_lbfgs_with_pairs(
+        n, random_pairs(0, n, n_warm), memory=memory, damping_threshold=tau
+    )
+    s, y = pair_with_curvature_ratio(hist, ratio, seed=1)
+    theta = float(hist.diagnostics(s, y).damping_theta)
+    assert (theta < 1.0) is (ratio < tau)
     assert 0.0 <= theta <= 1.0
 
     out = hist.append(s, y)
-    expected = theta * y + (1.0 - theta) * hist.diagonal * s
-    np.testing.assert_allclose(out.y_history[0], expected, rtol=1e-10)
+    expected = theta * y + (1.0 - theta) * hist.hvp(s)
+    np.testing.assert_allclose(out.y_history[int(hist.next_idx)], expected, rtol=1e-9)
+
+
+def test_diagnostics_damping_theta_is_one_for_skipped_pair(empty_lbfgs: LBFGS):
+    """A pair rejected by :meth:`should_skip` reports ``θ = 1``."""
+    s = jnp.zeros(empty_lbfgs.n)
+    diag = empty_lbfgs.diagnostics(s, jnp.ones(empty_lbfgs.n))
+    assert bool(diag.skipped)
+    assert float(diag.damping_theta) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("seed", "memory", "tau"),
+    [(0, 3, 0.2), (1, 6, 0.2), (2, 4, 0.05), (3, 5, 0.5)],
+    ids=["small-memory", "large-memory", "weak-damping", "strong-damping"],
+)
+def test_append_keeps_model_symmetric_positive_definite(
+    n: int, seed: int, memory: int, tau: float
+):
+    """Powell damping keeps ``B`` SPD after every append, negative curvature included."""
+    pairs = random_pairs(seed, n, 14, negative_every=3)
+    assert any(float(jnp.dot(s, y)) < 0.0 for s, y in pairs)
+    hist = LBFGS(n=n, memory=memory, damping_threshold=tau)
+    for s, y in pairs:
+        hist = append_jit(hist, s, y)
+        B = dense_hessian(hist)
+        scale = float(jnp.max(jnp.abs(B)))
+        np.testing.assert_allclose(B, B.T, atol=1e-8 * scale)
+        assert float(jnp.linalg.eigvalsh(0.5 * (B + B.T))[0]) > 0.0
+    assert int(hist.count) == memory
+
+
+def test_narrow_valley_soft_curvature_is_not_stiffened_by_the_diagonal(narrow_valley):
+    """Damping toward ``B s`` keeps the soft-direction curvature ``tᵀB t`` small.
+
+    The Hessian is ``λ_t t tᵀ + λ_n n nᵀ`` with ``λ_t = 0.1`` and
+    ``λ_n = 1.5e5``, the initial diagonal is stiff, and 30 pairs crawl along
+    ``t`` with a 5 % normal component. Damping toward the rebuilt per-variable
+    diagonal (the former behaviour) kept ``tᵀB t`` at ``10²–10³`` (final value
+    ``≥ 183``, maximum over the last ten pairs ``≥ 476``, over 12 seeds and
+    three angles); damping toward the model's own ``B s`` brings it to ``O(10)``
+    (``≤ 23.4`` and ``≤ 26.5``).
+    """
+    tangent, pairs = narrow_valley
+    hist = LBFGS(n=2, memory=10)
+    hist = eqx.tree_at(lambda h: h.diagonal, hist, jnp.full(2, 1e4))
+    soft_curvature = []
+    for s, y in pairs:
+        hist = append_jit(hist, s, y)
+        soft_curvature.append(float(tangent @ hist.hvp(tangent)))
+
+    assert min(soft_curvature) > 0.0
+    assert soft_curvature[-1] < 100.0
+    assert max(soft_curvature[-10:]) < 100.0
 
 
 @pytest.mark.parametrize("n_pairs", [0, 2, 5], ids=["empty", "two", "full"])
@@ -264,6 +343,28 @@ def test_compute_diagonal_matches_unit_probe(n_pairs: int):
         explicit_diagonal(hist),
         rtol=1e-5,
     )
+
+
+@pytest.mark.parametrize("scale", [1e1, 1e5], ids=["moderate", "stiff"])
+def test_hvp_returns_learned_curvature_exceeding_the_diagonal(scale: float):
+    """``B s = y`` even when ``‖y‖ ≫ 1000 · max|d| ‖s‖`` (no magnitude guard)."""
+    s = jnp.array([1.0, -0.5, 0.25, 0.1])
+    hist = LBFGS(n=4, memory=3).append(s, scale * s)
+    # The append rebuilt the diagonal from the pair; put B₀ = I back so that the
+    # learned curvature (``scale``) is far above the diagonal.
+    hist = eqx.tree_at(lambda h: h.diagonal, hist, jnp.ones(4))
+    np.testing.assert_allclose(hist.hvp(s), scale * s, rtol=1e-8)
+
+
+def test_hvp_falls_back_to_diagonal_when_compact_solve_is_not_finite():
+    """A non-finite compact-form result falls back to ``d ⊙ v``."""
+    s = jnp.array([1.0, -0.5, 0.25, 0.1])
+    hist = LBFGS(n=4, memory=3).append(s, 2.0 * s)
+    hist = eqx.tree_at(
+        lambda h: h.y_history, hist, hist.y_history.at[0, 0].set(jnp.nan)
+    )
+    v = jnp.array([1.0, 2.0, -1.0, 0.5])
+    np.testing.assert_allclose(hist.hvp(v), hist.diagonal * v)
 
 
 def test_estimate_condition_from_diagonal():
@@ -364,7 +465,10 @@ def test_append_after_diagonal_reset_updates_componentwise_secant(filled_lbfgs: 
     y = jnp.array([0.5, 0.3, 0.8, 0.4, 0.2])
     out = reset.append(s, y)
     assert int(out.count) == 1
-    # No damping expected: sᵀy is comfortably above threshold · sᵀ B₀ s
+    # No damping expected: after the diagonal reset there are no pairs, so
+    # B s = B₀ s, and sᵀy is comfortably above threshold · sᵀ B s.
+    assert float(reset.diagnostics(s, y).damping_theta) == 1.0
+    np.testing.assert_allclose(out.y_history[0], y)
     curvature_scale = jnp.dot(y, y) / jnp.maximum(jnp.dot(y, s), 1e-12)
     curvature_scale = jnp.clip(curvature_scale, out.diag_floor, out.diag_ceil)
     clip_lo = jnp.maximum(curvature_scale * 1e-2, out.diag_floor)
