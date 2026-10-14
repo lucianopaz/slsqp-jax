@@ -82,7 +82,7 @@ def test_predicted_reduction_matches_formula():
         sub, warm, make_trust_region_state(5.0, merit_penalty=nu0)
     )
 
-    assert state.merit_penalty >= solver.penalty_decay * nu0 - 1e-12
+    assert state.merit_penalty >= 0.2 * nu0 - 1e-12
     ghat = sub.primal_grad().flatten()
     chat = sub.dual_grad().flatten()
     w_primal = _scaled_from_native(sub, step_p)
@@ -136,15 +136,18 @@ def test_exports_roundtrip():
     assert solver.TrustRegionSolverState is sqpdax.TrustRegionSolverState
 
 
-@pytest.mark.parametrize("decay", [1.0, 0.2])
-def test_merit_penalty_decay_bounds_the_relaxation(decay: float):
-    """``nu`` never falls below ``penalty_decay * nu_old`` (monotone for ``decay=1``)."""
+@pytest.mark.parametrize(
+    ("nu0", "lower"),
+    [(5.0, 5.0), (50.0, 50.0), (1e4, 50.0)],
+    ids=["below-cap-monotone", "at-cap", "above-cap-decays"],
+)
+def test_merit_penalty_is_monotone_below_the_cap_and_relaxed_above(
+    nu0: float, lower: float
+):
+    """``nu`` never drops below ``min(nu_old, cap)`` nor below ``0.2 nu_old``."""
     sub = make_scaled_barrier_subproblem()
-    solver = TrustRegionInteriorPointSolver(penalty_decay=decay, penalty_floor=0.0)
+    solver = TrustRegionInteriorPointSolver()
     warm = _zero_warm(sub)
-    nu0 = 50.0
     _, state = solver.solve(sub, warm, make_trust_region_state(5.0, merit_penalty=nu0))
 
-    assert float(state.merit_penalty) >= decay * nu0 * (1.0 - 1e-6)
-    if decay == 1.0:
-        assert float(state.merit_penalty) >= nu0 * (1.0 - 1e-6)
+    assert float(state.merit_penalty) >= max(lower, 0.2 * nu0) * (1.0 - 1e-6)
