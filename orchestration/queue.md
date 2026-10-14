@@ -27,3 +27,5 @@ Streams (see `STREAMS.md`): A = G3, G5, G6, G1 asls leftovers; B = G8, G2, G4, G
 Order of `G*` follows the report's `PRIORITIES`; re-sort after Q1 by the per-config deficit to scipy-slsqp (`gap.py`, `digest.py` scipy columns), largest first.
 
 Decisions waiting for the user: `WAIVERS.md`. State of play: `CONTEXT.md` sections 5-7. Stream B stopped after batch 8 by user decision; both streams idle.
+
+Secant audit (after the damping probes settle): `secant/lbfgs.py` and `secant/reset.py` docstrings still say "VARCHEN damping" / "Powell damping"; the damping is toward the rebuilt diagonal B0, not toward the full B (Powell) and not scalar-B0 (L-BFGS); the per-pair diagonal rebuild is replaced, not blended; stored pairs hold the damped y. Decide what remains (cautious skip vs damping, diagonal rebuild rule, reset ladder: soft / SNOPT diagonal / identity), then rename `damping_threshold`, rewrite the module/class/`append`/`_damping_theta`/`_soft_reset` docstrings and the test names accordingly.
