@@ -134,6 +134,36 @@ class ActiveSetLineSearchResultAdapter(ResultAdapter[ACTIVE_SET_LINE_SEARCH_RESU
         )
 
 
+class _ShiftedActiveSetSubProblem(ActiveSetSubProblem):
+    """Active-set QP whose Hessian is shifted by ``delta I`` (Levenberg).
+
+    Attributes
+    ----------
+    delta
+        Non-negative scalar added to the Hessian block of the KKT system.
+    """
+
+    delta: Array
+
+    def __init__(
+        self,
+        lagrangian: EvaluatedLagrangian[Primal],
+        active_set: ActiveSet,
+        delta: Array,
+    ):
+        super().__init__(lagrangian, active_set)
+        self.delta = delta
+
+    def with_active_set(self, active_set: ActiveSet) -> Self:
+        """Rebuild on a new working set, keeping the shift."""
+        return type(self)(self.lagrangian, active_set, self.delta)
+
+    def kkt_mvp_primal(self, step: tuple[Primal, Dual]) -> Primal:
+        """Shifted Hessian product ``(H + delta I) d``."""
+        hd = super().kkt_mvp_primal(step)
+        return cast(Primal, Primal(x=hd.x + self.delta * step[0].x))
+
+
 class ActiveSetLineSearchMinimiser(
     CommonMinimiser[
         Primal,
@@ -806,6 +836,45 @@ class ActiveSetLineSearchMinimiser(
 
         return direction, violation(jnp.zeros_like(x)) - violation(direction)
 
+    def _retry_subproblem(
+        self,
+        problem: ProblemProtocol[Primal],
+        qp_lag: EvaluatedLagrangian[Primal],
+        active_set: ActiveSet,
+    ) -> ActiveSetSubProblem:
+        """Build the QP subproblem, Levenberg-shifted after a rejection.
+
+        With exact curvature a rejected direction is recomputed identically
+        at the same iterate, so after ``j = consecutive_ls_failures >= 1``
+        rejections the QP Hessian is shifted by
+        ``delta_j = 1e-2 max(1, ||grad f||_inf) 10^(j-1)``. Secant models
+        and ``j = 0`` build the plain subproblem.
+
+        Parameters
+        ----------
+        problem
+            NLP being minimised.
+        qp_lag
+            Lagrangian evaluated at the current ``(iterate, dual)``.
+        active_set
+            Initial working set.
+
+        Returns
+        -------
+        ActiveSetSubProblem
+            Plain or shifted subproblem.
+        """
+        if self._model_secant(problem) is not None:
+            return cast(ActiveSetSubProblem, ActiveSetSubProblem(qp_lag, active_set))
+        j = self.consecutive_ls_failures
+        scale = jnp.maximum(1.0, _inf_norm(qp_lag.grad_val))
+        exponent = jnp.maximum(j - 1, 0).astype(scale.dtype)
+        delta = jnp.where(j >= 1, 1e-2 * scale * 10.0**exponent, 0.0)
+        return cast(
+            ActiveSetSubProblem,
+            _ShiftedActiveSetSubProblem(qp_lag, active_set, delta),
+        )
+
     def _init_subproblem(
         self, problem: ProblemProtocol[Primal]
     ) -> SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType]:
@@ -845,7 +914,9 @@ class ActiveSetLineSearchMinimiser(
             SubproblemContext(
                 problem=problem,
                 lagrangian=lag_module,
-                subproblem=ActiveSetSubProblem(qp_lag, self._empty_active_set(problem)),
+                subproblem=self._retry_subproblem(
+                    problem, qp_lag, self._empty_active_set(problem)
+                ),
                 solver=solver,
                 warm=(Primal(jnp.zeros((n,), dtype)), dual),
                 state=cast(ActiveSetStateType, self.solver_state),
