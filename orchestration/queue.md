@@ -22,10 +22,12 @@ below come from `diagnostics/v2` and are stale.
 | G7 | Artefacts and performance | closed (out of scope) | `unbounded`, `reference_mismatch`, `local_minimum_consensus`, `problem_infeasible`, `evaluation_error`, `stationarity_scale_f`; `compile_timeout`, `run_timeout`. Benchmark side is frozen; reopen a label only if the digest shows a sqpdax defect behind it. `compile_timeout`/`run_timeout` are sqpdax performance and stay open. |
 | G8 | `trust_region_collapse` (was `unclassified`) | partial | Accepted (stream B): double projection in Steihaug-Toint for float64 when the leak is above 1e-6 (+3 tiny, 0 lost). Rejected: rounding-level acceptance. Remaining: B-class collapses (L-BFGS curvature far below the true curvature) are G6/G3 stream A. |
 
-Streams (see `STREAMS.md`): A = G3, G5, G6, G1 asls leftovers; B = G8, G2, G4, G1 trip items, HS55 false success. Pending waivers (stream A): `hyp/termination_missed-lbfgs-relfloor` (G3 H1), `hyp/merit_stagnation-decaying-penalty` (G6 H1).
+Streams (see `STREAMS.md`): A = G3, G5, G6, G1 asls leftovers; B = G8, G2, G4, G1 trip items, HS55 false success. Pending waivers (stream A): `hyp/merit_stagnation-decaying-penalty` (G6 H1); the two L-BFGS branches were superseded by the Powell damping merge.
 
 Order of `G*` follows the report's `PRIORITIES`; re-sort after Q1 by the per-config deficit to scipy-slsqp (`gap.py`, `digest.py` scipy columns), largest first.
 
 Decisions waiting for the user: `WAIVERS.md`. State of play: `CONTEXT.md` sections 5-7. Stream B stopped after batch 8 by user decision; both streams idle.
 
 Secant audit (after the damping probes settle): `secant/lbfgs.py` and `secant/reset.py` docstrings still say "VARCHEN damping" / "Powell damping"; the damping is toward the rebuilt diagonal B0, not toward the full B (Powell) and not scalar-B0 (L-BFGS); the per-pair diagonal rebuild is replaced, not blended; stored pairs hold the damped y. Decide what remains (cautious skip vs damping, diagonal rebuild rule, reset ladder: soft / SNOPT diagonal / identity), then rename `damping_threshold`, rewrite the module/class/`append`/`_damping_theta`/`_soft_reset` docstrings and the test names accordingly.
+
+Oct 15: `hyp/secant-powell-damping-model` merged (7fec079), user waiver; L-BFGS branches relfloor/signgate dropped. Secant audit done for `secant/lbfgs.py` and `secant/base.py`; remaining: `docs/source/index.md` and legacy files still say VARCHEN damping (out of scope here). Next: fresh diagnosis of the merged tip (`diagnostics/v6`), then open leads (HS116/CSFI1/MINMAXBD regressions, tfip losses, interior-point end game, DUALC).
