@@ -8,7 +8,7 @@ Merged so far (no real regressions): G1 H1 null-step restoration, G6 H3 pasls mu
 
 | Branch (all from the merged tip or earlier) | Group gain | Tiny-tier (vs `new_run` rows) | Real losses | Notes |
 |---|---|---|---|---|
-| `hyp/merit_stagnation-exact-hessian-shift` (Levenberg shift, exact curvature) | 10/44 | +11 / -1 | HS111LNP asls-pcg-exact (chaotic path change in a slow region) | asls-pcg-exact 229 -> 237 (+1 vs scipy-slsqp) |
+| `hyp/merit_stagnation-exact-hessian-shift` (Levenberg shift, exact curvature) | re-measured on the Oct 15 tip: 229 -> 238 (+10 / -1) | full run, 303 instances | HS111LNP asls-pcg-exact (chaotic path change in a slow region) | asls-pcg-exact 238 = +2 vs scipy-slsqp; deficit 10 -> 8 (KOEBHELB, PALMER7E solved). Merges cleanly into the tip |
 | `hyp/merit_stagnation-decaying-penalty` (scipy decaying merit penalty) | 10/283 | +20 / -6 | HS23 on four asls configs, HS81 asls-pcg-exact, MINMAXBD pasls | |
 | `hyp/ip_barrier_stall-funnel-projection-refinement` | 3/111 | +4 / -0 | none | only fails the G1 count (+1 vs threshold 2); suite clean |
 | `hyp/unclassified-rejected-secant-pair` (stream B: rejected trial pair fed to L-BFGS in trip/tfip, asls bit-identical) | 9 (unclassified 8/46, ip_barrier_stall 1/44) | trip/tfip +14 / -7 vs the tip rows | AIRCRFTB, BT13, HS116, KOEBHELB, MINMAXBD trip; HS86, HS91 tfip | trip 163 -> 167, tfip 169 -> 172; suite 1724 passed |
