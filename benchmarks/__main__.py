@@ -14,6 +14,10 @@ run
     appending rows to ``<out>/results.jsonl`` as they complete.
 merge
     Concatenate shard run directories into one run directory.
+rescore
+    Re-evaluate the ``solved`` flag of every row of a ``results.jsonl`` from
+    its stored metrics with other tolerances (see
+    :func:`benchmarks.criteria.solved_reason`) and write the result.
 report
     Export the static per-run report (``marimo export html``).
 publish
@@ -185,6 +189,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 timeout_s=args.timeout,
                 feas_tol=args.feas_tol,
                 f_tol=args.f_tol,
+                stat_tol=args.stat_tol,
                 repeat_unsolved=args.repeat_unsolved,
             )
             specs.append(spec)
@@ -285,6 +290,89 @@ def cmd_merge(args: argparse.Namespace) -> int:
         json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n"
     )
     print(f"merged {count} rows from {len(shards)} shards into {out}")
+    return 0
+
+
+def cmd_rescore(args: argparse.Namespace) -> int:
+    """Re-evaluate ``solved`` for every row of a results file.
+
+    Every row with a ``problem`` is re-scored with
+    :func:`benchmarks.criteria.solved_reason` from its stored ``successful``,
+    ``finite``, ``feas``, ``has_fstar``, ``f_gap`` and ``stat_scaled`` fields.
+    The new ``solved``, the tolerances (``feas_tol``, ``f_tol``, ``stat_tol``)
+    and ``solved_reason`` (``None`` when solved) are written; every other field
+    is left untouched (in particular ``repeats_skipped``, which records what
+    the worker did at run time). Rows without ``problem`` are copied verbatim.
+
+    Parameters
+    ----------
+    args
+        Namespace with ``input``, ``output``, ``feas_tol``, ``f_tol`` and
+        ``stat_tol``.
+
+    Returns
+    -------
+    int
+        Exit code; prints the number of solved tasks per configuration
+        before and after.
+    """
+    from .criteria import solved_reason
+
+    src, dst = Path(args.input), Path(args.output)
+    if dst.resolve() == src.resolve():
+        print("rescore: OUT.jsonl must differ from IN.jsonl", file=sys.stderr)
+        return 2
+    tolerances = {
+        "feas_tol": args.feas_tol,
+        "f_tol": args.f_tol,
+        "stat_tol": args.stat_tol,
+    }
+    tasks: dict[str, int] = {}
+    before: dict[str, int] = {}
+    after: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    n_other = 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with src.open() as fin, dst.open("w") as fout:
+        for line in fin:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict) or not row.get("problem"):
+                n_other += 1
+                fout.write(line if line.endswith("\n") else line + "\n")
+                continue
+            reason = solved_reason(row, **tolerances)
+            config = str(row.get("config"))
+            tasks[config] = tasks.get(config, 0) + 1
+            before[config] = before.get(config, 0) + bool(row.get("solved"))
+            after[config] = after.get(config, 0) + (reason is None)
+            if reason is not None:
+                reasons[reason] = reasons.get(reason, 0) + 1
+            row.update(tolerances)
+            row["solved"] = reason is None
+            row["solved_reason"] = reason
+            fout.write(json.dumps(row) + "\n")
+
+    width = max([len("config"), *map(len, tasks)])
+    print(
+        f"rescored {sum(tasks.values())} rows ({n_other} without 'problem' copied "
+        f"unchanged) with feas_tol={args.feas_tol:g}, f_tol={args.f_tol:g}, "
+        f"stat_tol={args.stat_tol:g} -> {dst}"
+    )
+    print(
+        f"{'config':{width}s} {'tasks':>6s} {'before':>7s} {'after':>6s} {'delta':>6s}"
+    )
+    for config in sorted(tasks):
+        print(
+            f"{config:{width}s} {tasks[config]:6d} {before[config]:7d} "
+            f"{after[config]:6d} {after[config] - before[config]:+6d}"
+        )
+    print(
+        f"{'total':{width}s} {sum(tasks.values()):6d} {sum(before.values()):7d} "
+        f"{sum(after.values()):6d} {sum(after.values()) - sum(before.values()):+6d}"
+    )
+    print(f"unsolved by reason: {dict(sorted(reasons.items()))}")
     return 0
 
 
@@ -584,6 +672,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="relative objective-gap tolerance for 'solved'",
     )
     p.add_argument(
+        "--stat-tol",
+        type=float,
+        default=1e-4,
+        help="stationarity tolerance for 'solved': IPOPT-scaled inf-norm of the "
+        "Lagrangian gradient with the solver-reported multipliers "
+        "(tasks without multipliers pass)",
+    )
+    p.add_argument(
         "--repeat-unsolved",
         action="store_true",
         help="time repeats even when the pilot did not solve the problem",
@@ -609,6 +705,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="merged run directory")
     p.add_argument("--run-id", help="run id to record in run.json")
     p.set_defaults(func=cmd_merge)
+
+    p = sub.add_parser(
+        "rescore",
+        help="re-evaluate 'solved' of a results.jsonl with other tolerances",
+    )
+    p.add_argument("input", metavar="IN.jsonl", help="results.jsonl to re-score")
+    p.add_argument("output", metavar="OUT.jsonl", help="file to write (not IN.jsonl)")
+    p.add_argument(
+        "--feas-tol",
+        type=float,
+        default=1e-6,
+        help="feasibility tolerance for 'solved'",
+    )
+    p.add_argument(
+        "--f-tol",
+        type=float,
+        default=1e-4,
+        help="relative objective-gap tolerance for 'solved'",
+    )
+    p.add_argument(
+        "--stat-tol",
+        type=float,
+        default=1e-4,
+        help="stationarity tolerance for 'solved' (stat_scaled; NaN passes)",
+    )
+    p.set_defaults(func=cmd_rescore)
 
     p = sub.add_parser("report", help="export the static per-run report")
     p.add_argument("run_dir")

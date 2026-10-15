@@ -34,6 +34,66 @@ def test_add_solved_tolerances(toy_results, feas_tol, f_tol, expected_solved):
     assert int(df["solved"].sum()) == expected_solved
 
 
+# toy_results rows: 0 solved, 1 infeasible, 2 max_steps, 3 wrong objective,
+# 4 timeout, 5 solved. Give every row a large stationarity residual except the
+# harness failure (no multipliers).
+_STAT_ALL_BAD = [0.5, 0.5, 0.5, 0.5, np.nan, 0.5]
+
+
+@pytest.mark.parametrize(
+    ("stat_scaled", "stat_tol", "expected"),
+    [
+        # no column / NaN column: no multipliers, benefit of the doubt
+        (None, 1e-4, ["solved", "solved"]),
+        ([np.nan] * 6, 1e-4, ["solved", "solved"]),
+        # non-stationary reported successes; every other label is unchanged
+        (
+            _STAT_ALL_BAD,
+            1e-4,
+            ["claimed_but_non_stationary", "claimed_but_non_stationary"],
+        ),
+        (_STAT_ALL_BAD, 0.5, ["solved", "solved"]),  # boundary is inclusive
+        (_STAT_ALL_BAD, 1.0, ["solved", "solved"]),
+        (
+            [1e-9, 0.5, 0.5, 0.5, np.nan, 0.5],
+            1e-4,
+            ["solved", "claimed_but_non_stationary"],
+        ),
+    ],
+)
+def test_add_solved_stationarity(toy_results, stat_scaled, stat_tol, expected):
+    frame = (
+        toy_results
+        if stat_scaled is None
+        else toy_results.assign(stat_scaled=stat_scaled)
+    )
+    df = analysis.add_solved(frame, stat_tol=stat_tol)
+    assert (
+        df["outcome"].cat.categories.tolist().count("claimed_but_non_stationary") == 1
+    )
+    # rows 0 and 5 are the reported successes with a feasible, right-objective point
+    assert df["outcome"].iloc[[0, 5]].tolist() == expected
+    assert df["solved"].iloc[[0, 5]].tolist() == [o == "solved" for o in expected]
+    # infeasible / wrong objective / budget hit / harness failure keep their label
+    assert df["outcome"].iloc[[1, 2, 3, 4]].tolist() == [
+        "claimed_but_infeasible",
+        "max_steps",
+        "claimed_but_wrong",
+        "timeout",
+    ]
+    assert not df["solved"].iloc[[1, 2, 3, 4]].any()
+
+
+def test_classify_outcome_default_is_stationary(toy_results):
+    status = toy_results["status"]
+    ok = toy_results["successful"]
+    all_true = pd.Series(True, index=status.index)
+    without = analysis.classify_outcome(status, ok, all_true, all_true)
+    with_all = analysis.classify_outcome(status, ok, all_true, all_true, all_true)
+    pd.testing.assert_series_equal(without, with_all)
+    assert "claimed_but_non_stationary" not in set(without)
+
+
 def test_add_solved_empty():
     df = analysis.add_solved(pd.DataFrame())
     assert list(df.columns) == ["solved", "outcome"]

@@ -38,6 +38,8 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .criteria import solved_reason
+
 __all__ = [
     "TaskSpec",
     "WorkerPool",
@@ -79,9 +81,13 @@ class TaskSpec:
         Pilot duration above which only one timed run is required.
     timeout_s
         Wall-clock budget for the whole task (all phases).
-    feas_tol, f_tol
-        Feasibility and relative objective-gap tolerances used to decide
-        whether the pilot solve counts as *solved*.
+    feas_tol, f_tol, stat_tol
+        Feasibility, relative objective-gap and stationarity tolerances used
+        to decide whether the pilot solve counts as *solved* (see
+        :func:`benchmarks.criteria.solved_reason`). ``stat_tol`` bounds the
+        IPOPT-scaled inf-norm of the Lagrangian gradient evaluated with the
+        solver-reported multipliers; a task without multipliers passes. They
+        are stored in the result row.
     repeat_unsolved
         Time repeats even when the pilot did not solve the problem. Off by
         default: a failed solve is reported from the pilot alone.
@@ -99,6 +105,7 @@ class TaskSpec:
     timeout_s: float = 300.0
     feas_tol: float = 1e-6
     f_tol: float = 1e-4
+    stat_tol: float = 1e-4
     repeat_unsolved: bool = False
 
 
@@ -215,25 +222,21 @@ def make_runner(cfg: Any, problem: Any, x0: Any) -> Any:
 def _solved(row: dict[str, Any], spec: TaskSpec) -> tuple[bool, str | None]:
     """Decide whether the pilot solve counts as solved.
 
+    Applies :func:`benchmarks.criteria.solved_reason` with the tolerances of
+    ``spec``.
+
     Returns
     -------
     tuple[bool, str | None]
         ``(solved, reason)`` where ``reason`` is ``None`` when solved and
-        otherwise one of ``"unsuccessful"``, ``"infeasible"``,
-        ``"wrong_objective"``, ``"non_finite"`` - the same classes the
-        analysis layer uses, evaluated here with the task's tolerances so the
-        worker can skip timing repeats on failures.
+        otherwise one of ``"non_finite"``, ``"unsuccessful"``,
+        ``"infeasible"``, ``"wrong_objective"`` or ``"non_stationary"``
+        (checked in that order) - the same classes the analysis layer uses,
+        evaluated here with the task's tolerances so the worker can skip
+        timing repeats on failures.
     """
-    if not row.get("finite", True):
-        return False, "non_finite"
-    if not row["successful"]:
-        return False, "unsuccessful"
-    if not (row["feas"] <= spec.feas_tol):
-        return False, "infeasible"
-    f_gap = row.get("f_gap", float("nan"))
-    if row.get("has_fstar") and not (math.isnan(f_gap) or f_gap <= spec.f_tol):
-        return False, "wrong_objective"
-    return True, None
+    reason = solved_reason(row, spec.feas_tol, spec.f_tol, spec.stat_tol)
+    return reason is None, reason
 
 
 def run_task_inprocess(
