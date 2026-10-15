@@ -71,19 +71,22 @@ Rejected (do not repeat): trip joint-norm merit, NaN rho / CG budget for rho = -
 
 ## 6. Where the code stands today
 
-Merged tip of `local_bench_cleanup`: see `git log` (first commit after `9473abc`). Diagnosis of that tip: `diagnostics/v5/{classified,diag}.jsonl` (740 unsolved sqpdax tasks of `results/new_run` re-run; no new full benchmark run exists).
+Merged tip of `local_bench_cleanup` after the Powell-damping merge (`7fec079`). Measured diagnosis: `diagnostics/v6/{classified,diag}.jsonl`, `report.html`, `compare.json` (740 originally unsolved sqpdax tasks re-run; 116 now solved, 624 still unsolved, 258 of them solved by scipy-slsqp). Regressions on tasks `new_run` solved are covered only by the tiny-tier comparisons (tiny is a subset of the medium instance set); no new full medium benchmark exists.
 
-| Config | `new_run` | merged tip (v5) | with waiver candidates (combo) | vs scipy-slsqp (236) now |
+| Config | `new_run` | v5 (before Powell damping) | **v6 (now)** | vs scipy-slsqp (236) |
 |---|---|---|---|---|
-| asls-pcg-exact | 227 | 229 | 243 | -7 |
-| asls-craig | 209 | 212 | 223 | -24 |
-| asls-pcg | 211 | 212 | 225 | -24 |
-| asls-minresqlp | 208 | 209 | 224 | -27 |
-| pasls | 193 | 199 | 212 | -37 |
-| tfip | 166 | 174 | 175 | -62 |
-| trip | 163 | 169 | 172 | -67 |
+| asls-craig | 209 | 212 | **232** | -4 |
+| asls-pcg | 211 | 212 | **231** | -5 |
+| asls-pcg-exact | 227 | 229 | **229** | -7 |
+| asls-minresqlp | 208 | 209 | **228** | -8 |
+| pasls | 193 | 199 | **218** | -18 |
+| trip | 163 | 169 | **178** | -58 (+4 vs trust-constr) |
+| tfip | 166 | 174 | **177** | -59 (+3 vs trust-constr) |
 
-(combo counts only tasks unsolved in `new_run`; losses on tasks `new_run` solved are not included, tiny tier combo: +68 / -14). `python orchestration/gap.py results/new_run/results.jsonl --overlay diagnostics/v5/compare.json` reproduces the merged-tip numbers. Deficit set (scipy solves, no sqpdax config): 14 (BT7, DECONVC, HAIFAM, HS106, HS25, HS268, HS98, LEVYMONT9, OPTPRLOC, PALMER6E/7E/8A, TRO4X4).
+Union: sqpdax 256 vs scipy union 254 (+2); deficit (scipy solves, no sqpdax config) 9: DECONVC, HAIFAM, HS106, HS25, HS98, LEVYMONT9, OPTPRLOC, PALMER7E, TRO4X4; sqpdax-only wins 11. `python orchestration/gap.py results/new_run/results.jsonl --overlay diagnostics/v6/compare.json` reproduces it. Note: the report's `loose_tolerance` count (86) is inflated by tasks that now end `successful` but were flagged unsolved in `new_run`; use `compare.json` (`solved`, `cause_after`) for the remaining groups.
+
+Remaining unsolved by cause (n, solved by scipy-slsqp): local_minimum 68 (16), reference_mismatch 63 (15), cycling 60 (27), unclassified/trust_region_collapse 53 (34), merit_stagnation 43 (28), termination_missed 36 (29), local_minimum_consensus 32 (0), ip_bound_slack_residual 31 (13), slow_progress 22 (7), merit_stagnation_near_opt 20 (18), ip_bound_violation 20 (5), step_collapse 19 (10), ip_barrier_stall 19 (14).
+By config: trip 125, tfip 125, pasls 84, asls-minresqlp 75, asls-pcg-exact 73, asls-pcg 72, asls-craig 70.
 
 ## 7. Next steps
 
