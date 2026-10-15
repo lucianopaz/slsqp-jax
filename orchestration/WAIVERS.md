@@ -10,7 +10,7 @@ Merged so far (no real regressions): G1 H1 null-step restoration, G6 H3 pasls mu
 
 | Branch (all from the merged tip or earlier) | Group gain | Tiny-tier (vs `new_run` rows) | Real losses | Notes |
 |---|---|---|---|---|
-| `hyp/merit_stagnation-decaying-penalty` (scipy decaying merit penalty) | 10/283 | +20 / -6 | HS23 on four asls configs, HS81 asls-pcg-exact, MINMAXBD pasls | |
+| `hyp/merit_stagnation-decaying-penalty` (scipy decaying merit penalty) | re-measured Oct 15 on the tip, 5 active-set configs, full run | +23 / -5 | MSS1 craig; HS23 HS81 pcg-exact; HS62 LSNNODOC pasls | craig 235, pcg 232, pcg-exact 241, minresqlp 224, pasls 218; merges cleanly; ledger `g6-decaying-penalty-on-tip` |
 | `hyp/ip_barrier_stall-funnel-projection-refinement` | 3/111 | +4 / -0 | none | only fails the G1 count (+1 vs threshold 2); suite clean |
 | `hyp/unclassified-rejected-secant-pair` (stream B: rejected trial pair fed to L-BFGS in trip/tfip, asls bit-identical) | 9 (unclassified 8/46, ip_barrier_stall 1/44) | trip/tfip +14 / -7 vs the tip rows | AIRCRFTB, BT13, HS116, KOEBHELB, MINMAXBD trip; HS86, HS91 tfip | trip 163 -> 167, tfip 169 -> 172; suite 1724 passed |
 | `hyp/merit_stagnation-working-set-exchange` (Goldfarb-Idnani exchange when the refresh is blocked) | ~26 over all unsolved asls rows of v5 (medium: +2..+3 per asls config) | +23 / -6 | HS97 craig/minresqlp/pcg (successful but unsolved: false success), HS102 pcg, MADSEN pcg-exact (HS116 pasls: noise) | HS97 needs investigation first: a false success is a stop-and-ask case |
