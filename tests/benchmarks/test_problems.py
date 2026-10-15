@@ -80,6 +80,20 @@ def test_run_task_inprocess_skips_repeats_when_unsolved(sif2jax):
     assert forced["repeats"] == 5
 
 
+def test_run_task_inprocess_skips_repeats_when_non_stationary(sif2jax):
+    """A negative stationarity tolerance cannot be met -> 'non_stationary', pilot only."""
+    jax.config.update("jax_enable_x64", True)
+    spec = TaskSpec(
+        problem="HS71", config="pasls", repeats=5, timeout_s=120.0, stat_tol=-1.0
+    )
+    row = run_task_inprocess(spec)
+    assert row["status"] == "successful" and row["successful"]
+    assert row["feas"] < 1e-5 and row["f_gap"] < 1e-5  # only stationarity fails
+    assert row["stat_scaled"] > spec.stat_tol and row["stat_tol"] == -1.0
+    assert not row["solved"] and row["repeats_skipped"] == "non_stationary"
+    assert row["repeats"] == 1 and row["repeats_requested"] == 1
+
+
 def test_worker_pool_runs_and_reports_errors():
     specs = [
         TaskSpec(problem="HS35", config="pasls", repeats=1, timeout_s=120.0),

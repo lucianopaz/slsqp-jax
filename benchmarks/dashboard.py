@@ -105,8 +105,10 @@ the sqpdax minimiser configurations on the sif2jax (CUTEst) catalogue; see the
 [list of runs](runs.html) for links to the detailed per-run reports.
 
 A task counts as **solved** when the minimiser reports success *and* the returned point
-is feasible and, when a reference optimum is known, matches it (tolerances 1e-6 and
-1e-4 respectively; the per-run reports let you vary them)."""
+is feasible, when a reference optimum is known matches it, and is stationary (tolerances
+1e-6, 1e-4 and 1e-4 respectively; stationarity is the scaled Lagrangian gradient at the
+solver's own multipliers, tasks that return none pass; the per-run reports let you vary
+them)."""
     )
     return
 
@@ -272,7 +274,8 @@ def _(alt, analysis, index, mo, run_picker, run_rows):
             mo.hstack([mo.ui.altair_chart(_bar), mo.ui.altair_chart(_profile)]),
             mo.md(
                 """**Figure 3.** Left: tasks per configuration stacked by outcome (`solved`,
-reported successes that are infeasible or off the reference optimum, step-budget hits,
+reported successes that are infeasible, off the reference optimum or not stationary,
+step-budget hits,
 other solver failures, harness timeouts/errors). Right: Dolan-Moré profile of median wall
 time - the fraction of instances (y) each configuration solved within τ times the fastest
 configuration's time (x, log); the height at τ = 1 is how often it was the fastest and the
