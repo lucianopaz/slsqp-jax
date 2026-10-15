@@ -71,23 +71,25 @@ Rejected (do not repeat): trip joint-norm merit, NaN rho / CG budget for rho = -
 
 ## 6. Where the code stands today
 
-**Measured** state of the merged tip (`local_bench_cleanup`, after the Powell-damping merge): full run of the seven sqpdax configs on all 303 instances, `results/tip_run/results.jsonl` (2121 tasks, 4 jobs, 3913 s, timeout 300 s); scipy rows concatenated from `new_run` in `results/tip_run/results_with_scipy.jsonl` (2727 rows, same layout as `new_run`). Diagnosis of the 637 unsolved sqpdax tasks: `diagnostics/v7/{classified,diag}.jsonl`, `report.html` (the report is now built against tip results, so its overview is correct; its `loose_tolerance` label still lacks an f_tol gate).
+**Flag changed (Oct 15, user decision):** `solved` now requires stationarity: successful, finite, feas <= 1e-6, f_gap <= 1e-4 and `stat_scaled` <= 1e-4 (NaN passes). Implemented in `benchmarks/criteria.py`, `worker.py`, `analysis.py`, `__main__.py` (`--stat-tol`, `rescore`) and `scripts/diagnose_benchmark.py` (`compare`, header); merged as `4df81ab`. Old results files are re-scored with `python -m benchmarks rescore IN OUT` (no reruns). `orchestration/strict.py` gives the same numbers plus sensitivity to tau and a complementarity-aware variant.
 
-| Config | `new_run` | **tip** | gained / lost vs `new_run` | vs scipy-slsqp (236) |
+**Measured state of the merged tip** (all 303 instances, `results/final/results_rescored.jsonl` = the five active-set configs run at the final code, trip/tfip from `tip_run`, scipy rows from `new_run`; diagnosis `diagnostics/v9`, `report.html` built against it, so its overview matches):
+
+| Config | solved (strict flag) | flagged-solved before | vs scipy-slsqp (167) | vs trust-constr (173) |
 |---|---|---|---|---|
-| asls-craig | 209 | **235** (decaying penalty merged, feebd24; was 232 in `tip_run`) | see ledger | -1 |
-| asls-pcg | 211 | **232** (was 230) | | -4 |
-| asls-pcg-exact | 227 | **241** (shift 8ba5df8 + decaying penalty feebd24; was 229 in `tip_run`) | | +5 |
-| asls-minresqlp | 208 | **224** (was 220) | | -12 |
-| pasls | 193 | **218** (was 212) | | -18 |
-| trip | 163 | **176** | +15 / -2 | -60 (+2 vs trust-constr) |
-| tfip | 166 | **177** | +11 / -0 | -59 (+3 vs trust-constr) |
+| asls-pcg-exact | **239** | 241 | +72 | +66 |
+| asls-craig | **228** | 235 | +61 | +55 |
+| asls-pcg | **226** | 232 | +59 | +53 |
+| asls-minresqlp | **218** | 224 | +51 | +45 |
+| pasls | **209** | 218 | +42 | +36 |
+| tfip | **177** | 177 | +10 | +4 |
+| trip | **176** | 176 | +9 | +3 |
+| scipy-slsqp | 167 | 236 | | |
+| scipy-trust-constr | 173 | 174 | | |
 
-Union: sqpdax 258 vs scipy union 254 (+4) with the shift and the decaying penalty (255 in `tip_run`). Deficit (scipy solves, no sqpdax config) 9: DECONVC, HAIFAM, HS106, HS25, HS98, LEVYMONT9, MSS1 (lost by asls-craig to the decaying penalty), OPTPRLOC, TRO4X4; sqpdax-only wins 11. asls-pcg-exact is the first config above scipy-slsqp (241 vs 236); asls-craig is 1 below. Measured with `results/decay_on_tip/results_with_scipy_decay.jsonl` (the five active-set configs re-run on the merged code; trip/tfip from `tip_run`). `python orchestration/gap.py results/tip_run/results_with_scipy.jsonl` reproduces it.
+Union: sqpdax 255 vs scipy union 236 (+19). Deficit (scipy solves, no sqpdax config) 9: DIAGPQB, DIAGPQT, HAIFAM, HS106, HS25, HS98, MSS1, OPTPRLOC, TRO4X4; sqpdax-only wins 28. (`python orchestration/gap.py results/final/results_rescored.jsonl`.) scipy-slsqp loses 69 flagged solves because it stops on the change in f at non-stationary points (e.g. PALMER7E, stat 0.53); sqpdax loses 30 rows (asls-craig 7, pasls 9, pcg 6, minresqlp 6, pcg-exact 2; BT5 DIAGPQB DIAGPQT HS13 HS40 HS81 HS87 ODFITS PALMER1/2/3): false successes where the solver stops at stat_scaled 2e-4..8e-3 (classified `stationarity_scale_f` 27, `false_convergence` 2).
 
-Tasks lost vs `new_run` (all from the Powell damping and the earlier merges): minresqlp BYRDSPHR DUAL3 DUAL4 DUALC1 HS102 HS116 HS13 OET4; pasls CSFI1 DALLASS DUAL3 HS116 MINMAXBD TRIGON1B; pcg MINMAXBD; trip KOEBHELB POLAK6. On two configs: DUAL3, HS116, MINMAXBD. Timeouts at the tip (300 s, 4 jobs): DEGENQPC on 5 configs, HS105 pcg-exact, CLEUVEN7 and TRO21X5 craig.
-
-Still unsolved at the tip by cause (n, solved by scipy-slsqp): local_minimum 68 (16), reference_mismatch 63 (15), cycling 62 (29), unclassified/trust_region_collapse 54 (34), merit_stagnation 47 (31), termination_missed 36 (29), local_minimum_consensus 32 (0), ip_bound_slack_residual 31 (13), merit_stagnation_near_opt 23 (21), slow_progress 22 (7), step_collapse 20 (11), ip_bound_violation 20 (5), secant_recovery_premature 19 (8), ip_barrier_stall 19 (14). By config: trip 127, tfip 126, pasls 91, minresqlp 83, pcg-exact 74, pcg 73, craig 71 (274 of 645 rows solved by scipy-slsqp).
+Still unsolved under the strict flag by cause (n, solved by scipy-slsqp): local_minimum 70 (6), cycling 62 (14), reference_mismatch 62 (10), unclassified/trust_region_collapse 54 (13), stationarity_scale_f 45 (10), termination_missed 35 (15), local_minimum_consensus 33 (0), ip_bound_slack_residual 31 (10), merit_stagnation 27 (12), slow_progress 22 (1), ip_bound_violation 20 (4), merit_stagnation_near_opt 20 (2), step_collapse 19 (8), ip_barrier_stall 19 (9). By config: trip 127, tfip 126, pasls 94, minresqlp 85, craig 75, pcg 77, pcg-exact 64.
 
 ## 7. Next steps
 
