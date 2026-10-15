@@ -2,13 +2,14 @@
 
 Merged so far (no real regressions): G1 H1 null-step restoration, G6 H3 pasls mu back-off (stream A); G8 H1 v3 double projection (float64), funnel end game / noise accept, analytic Cauchy decrease, trip penalty cap (stream B). Tip of `local_bench_cleanup`: see `git log`.
 
+## Merged Oct 15: `hyp/merit_stagnation-exact-hessian-shift` (8ba5df8; asls-pcg-exact 229 -> 238; suite 1806 passed)
+
 ## MERGED Oct 15 (7fec079; supersedes and drops the two `termination_missed-lbfgs-*` branches)
 
 `hyp/secant-powell-damping-model` (c42697f): Powell damping of L-BFGS pairs toward the model's own B s instead of toward the stiff per-variable diagonal B0, hvp magnitude guard removed, secant docstrings audited. Same-tip comparison (unsolved v5 tasks + tiny tier, net gains minus losses): asls-craig +20 (0 lost), asls-pcg +18 (1 lost), pasls +16 (4), asls-minresqlp +13 (6), trip +7 (4), tfip +3 (4). Approximate medium counts: craig 232, pcg 230, minresqlp 222, pasls 215, trip 176, tfip 177 (scipy-slsqp 236). Suite 1803 passed. Ledger `g6-secant-powell-damping-impl`.
 
 | Branch (all from the merged tip or earlier) | Group gain | Tiny-tier (vs `new_run` rows) | Real losses | Notes |
 |---|---|---|---|---|
-| `hyp/merit_stagnation-exact-hessian-shift` (Levenberg shift, exact curvature) | re-measured on the Oct 15 tip: 229 -> 238 (+10 / -1) | full run, 303 instances | HS111LNP asls-pcg-exact (chaotic path change in a slow region) | asls-pcg-exact 238 = +2 vs scipy-slsqp; deficit 10 -> 8 (KOEBHELB, PALMER7E solved). Merges cleanly into the tip |
 | `hyp/merit_stagnation-decaying-penalty` (scipy decaying merit penalty) | 10/283 | +20 / -6 | HS23 on four asls configs, HS81 asls-pcg-exact, MINMAXBD pasls | |
 | `hyp/ip_barrier_stall-funnel-projection-refinement` | 3/111 | +4 / -0 | none | only fails the G1 count (+1 vs threshold 2); suite clean |
 | `hyp/unclassified-rejected-secant-pair` (stream B: rejected trial pair fed to L-BFGS in trip/tfip, asls bit-identical) | 9 (unclassified 8/46, ip_barrier_stall 1/44) | trip/tfip +14 / -7 vs the tip rows | AIRCRFTB, BT13, HS116, KOEBHELB, MINMAXBD trip; HS86, HS91 tfip | trip 163 -> 167, tfip 169 -> 172; suite 1724 passed |

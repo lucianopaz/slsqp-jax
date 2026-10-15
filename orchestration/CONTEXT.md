@@ -77,13 +77,13 @@ Rejected (do not repeat): trip joint-norm merit, NaN rho / CG budget for rho = -
 |---|---|---|---|---|
 | asls-craig | 209 | **232** | +23 / -0 | -4 |
 | asls-pcg | 211 | **230** | +20 / -1 | -6 |
-| asls-pcg-exact | 227 | **229** | +2 / -0 | -7 |
+| asls-pcg-exact | 227 | **238** (Levenberg shift merged, 8ba5df8; was 229 in `tip_run`) | +10 / -0 net of tip_run; see ledger | +2 |
 | asls-minresqlp | 208 | **220** | +20 / -8 | -16 |
 | pasls | 193 | **212** | +25 / -6 | -24 |
 | trip | 163 | **176** | +15 / -2 | -60 (+2 vs trust-constr) |
 | tfip | 166 | **177** | +11 / -0 | -59 (+3 vs trust-constr) |
 
-Union: sqpdax 255 vs scipy union 254 (+1). Deficit (scipy solves, no sqpdax config) 10: DECONVC, HAIFAM, HS106, HS25, HS98, KOEBHELB (new: trip lost it), LEVYMONT9, OPTPRLOC, PALMER7E, TRO4X4; sqpdax-only wins 11. `python orchestration/gap.py results/tip_run/results_with_scipy.jsonl` reproduces it.
+Union: sqpdax 257 vs scipy union 254 (+3) with the shift (255 in `tip_run`). Deficit (scipy solves, no sqpdax config) 8: DECONVC, HAIFAM, HS106, HS25, HS98, LEVYMONT9, OPTPRLOC, TRO4X4; sqpdax-only wins 11. asls-pcg-exact is the first config above scipy-slsqp (238 vs 236). `python orchestration/gap.py results/tip_run/results_with_scipy.jsonl` reproduces it.
 
 Tasks lost vs `new_run` (all from the Powell damping and the earlier merges): minresqlp BYRDSPHR DUAL3 DUAL4 DUALC1 HS102 HS116 HS13 OET4; pasls CSFI1 DALLASS DUAL3 HS116 MINMAXBD TRIGON1B; pcg MINMAXBD; trip KOEBHELB POLAK6. On two configs: DUAL3, HS116, MINMAXBD. Timeouts at the tip (300 s, 4 jobs): DEGENQPC on 5 configs, HS105 pcg-exact, CLEUVEN7 and TRO21X5 craig.
 
