@@ -17,6 +17,7 @@ python -m benchmarks run --tier tiny --configs scipy-slsqp,scipy-trust-constr  #
 python -m benchmarks report results/<run_id>               # static HTML report
 python -m benchmarks publish results/<run_id> --results-dir site/results --dashboard
 python -m benchmarks render --results-dir site/results     # re-export everything
+python -m benchmarks rescore in.jsonl out.jsonl --stat-tol 1e-3   # re-evaluate `solved` of stored rows
 python -m benchmarks catalog                               # regenerate catalog.csv
 python -m benchmarks validate --jobs 4                     # check signs / f* against scipy
 ```
@@ -32,10 +33,31 @@ python -m benchmarks validate --jobs 4                     # check signs / f* ag
 | `runners.py` | backend-neutral `SolveOutcome` plus `SqpdaxRunner` (one jitted `minimise` executable with a traced step budget) |
 | `baselines.py` | `ScipyRunner`: feeds jitted JAX callbacks (objective, gradient, constraints, Jacobians, HVPs) to `scipy.optimize.minimize`; maps SciPy statuses onto the harness vocabulary and translates SciPy multipliers into the sqpdax convention so the KKT metrics are comparable |
 | `worker.py`, `_bootstrap.py` | persistent worker processes; per task: compile (untimed) → one-step warm-up (untimed) → pilot (timed) → adaptive repeats, with a 5-minute deadline |
+| `criteria.py` | `solved_reason(row, feas_tol, f_tol, stat_tol)`: the pure *solved* rule shared by the worker, `python -m benchmarks rescore` and `scripts/diagnose_benchmark.py` (see below) |
 | `metrics.py` | solver-independent KKT metrics at the returned point (feasibility, `‖∇ₓL‖`, complementarity, gap to the reference optimum) |
 | `results.py` | append-only `results.jsonl` + `run.json`; `analysis.py`: pure-pandas helpers (solved mask, Dolan–Moré profiles, summaries) |
 | `report.py` | marimo notebook: per-run report, exported to `report.html` |
 | `dashboard.py` | marimo notebook: longitudinal dashboard, exported to WebAssembly as the site's `index.html` |
+
+## What counts as solved
+
+A task is **solved** when, checked in this order, the point is finite
+(`non_finite`), the minimiser reported success (`unsuccessful`), the maximum
+constraint violation is at most `--feas-tol`, default 1e-6 (`infeasible`), the
+objective matches the reference optimum, when one exists, to a relative gap of
+at most `--f-tol`, default 1e-4 (`wrong_objective`), *and* the point is
+stationary (`non_stationary`): `stat_scaled <= --stat-tol`, default 1e-4.
+`stat_scaled` is the IPOPT-scaled inf-norm of the Lagrangian gradient,
+`‖∇ₓL‖∞ / max(1, ‖∇f‖∞, ‖multipliers‖∞)`, evaluated with the multipliers the
+solver returned (`metrics.quality_metrics`). A solver that returned no
+multipliers has `stat_scaled = NaN`; the check then passes (benefit of the
+doubt). The tolerances are stored in every result row. In the analysis layer
+the first three failures and `non_stationary` become the outcomes
+`claimed_but_infeasible`, `claimed_but_wrong` and `claimed_but_non_stationary`
+for reported successes. `python -m benchmarks rescore IN.jsonl OUT.jsonl`
+re-evaluates the flag of an existing results file (it adds `solved_reason` and
+the tolerances and prints the solved counts per configuration before and
+after).
 
 ## SciPy baselines
 
@@ -60,8 +82,9 @@ under a minute and `1` otherwise; `--repeats N` overrides. Timing excludes
 compilation and the warm-up call; the pilot solve counts as the first repeat
 and provides the status, solver statistics (`stats_*` columns) and quality
 metrics. Repeats are skipped when the pilot did not solve the problem
-(`repeats_skipped` records `unsuccessful`, `infeasible`, `wrong_objective` or
-`non_finite`; `--repeat-unsolved` forces timing anyway).
+(`repeats_skipped` records `non_finite`, `unsuccessful`, `infeasible`,
+`wrong_objective` or `non_stationary`; `--repeat-unsolved` forces timing
+anyway).
 
 ## Published results
 

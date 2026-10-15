@@ -17,8 +17,9 @@ uv run python scripts/diagnose_benchmark.py report diagnostics --results results
 ```
 
 A failure is any result row whose ``solved`` flag is false: the minimiser
-stopped unsuccessfully, or claimed success at a point that is infeasible or
-whose objective disagrees with the CUTEst reference. Only sqpdax rows are
+stopped unsuccessfully, or claimed success at a point that is infeasible,
+whose objective disagrees with the CUTEst reference, or that is not stationary
+(``stat_scaled > stat_tol`` at the solver's own multipliers). Only sqpdax rows are
 diagnosed; the scipy rows of the same run (``scipy-slsqp``,
 ``scipy-trust-constr``) are the external baseline: they feed the classifier
 (``ref_*`` / ``tc_*`` fields, replacing the former in-run SLSQP reference
@@ -2719,6 +2720,10 @@ def build_report(
 ) -> Path:
     feas_tol = float(results[0].get("feas_tol", 1e-6))
     f_tol = float(results[0].get("f_tol", 1e-4))
+    stat_tol = float(results[0].get("stat_tol", 1e-4))
+    stat_note = (
+        "" if "stat_tol" in results[0] else " (not recorded: solved flags predate it)"
+    )
     by_key = {task_key(d): d for d in diags}
     sqpdax_results = [r for r in results if not is_baseline(r)]
     baseline_results = [r for r in results if is_baseline(r)]
@@ -2786,7 +2791,8 @@ def build_report(
         f"{n_fail} unsolved ({n_fail / n_total:.0%}) · "
         f"{n_rerun} re-run with diagnostics, {n_repro} reproduced the recorded status · "
         f"baselines: {', '.join(base_configs) or 'none'} · "
-        f"tolerances feas ≤ {feas_tol:g}, |f−f*|/max(1,|f*|) ≤ {f_tol:g} · "
+        f"tolerances feas ≤ {feas_tol:g}, |f−f*|/max(1,|f*|) ≤ {f_tol:g}, "
+        f"stat_scaled ≤ {stat_tol:g}{stat_note} · "
         f"generated {time.strftime('%Y-%m-%d %H:%M')}</p>"
     )
 
@@ -3477,15 +3483,32 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _solved(row: dict[str, Any], feas_tol: float, f_tol: float) -> bool:
-    """Benchmark success criterion applied to a diagnostic row."""
-    if row.get("status") != "successful":
-        return False
-    if not (_g(row, "feas", math.inf) <= feas_tol):
-        return False
-    if row.get("has_fstar"):
-        return _g(row, "f_gap", math.inf) <= f_tol
-    return True
+def _solved(
+    row: dict[str, Any], feas_tol: float, f_tol: float, stat_tol: float = 1e-4
+) -> bool:
+    """Benchmark success criterion applied to a diagnostic row.
+
+    The rule is :func:`benchmarks.criteria.solved_reason` (finite, successful,
+    feasible, matching the reference objective, stationary). A diagnostic
+    re-run builds its row with :func:`benchmarks.metrics.quality_metrics` and
+    the multipliers returned by the re-run itself (``sol.state.dual``), exactly
+    like the benchmark worker, so ``stat_scaled`` of the row is the IPOPT-scaled
+    stationarity residual with the solver-reported multipliers; it is used
+    as is. It is ``None`` (``NaN``) when the solver returned no multipliers,
+    which passes. The least-squares measure ``stat_ls`` is a diagnostic only
+    and does not enter the criterion. "Successful" is the re-run's ``status``.
+
+    Parameters
+    ----------
+    row
+        Row of ``diag.jsonl``.
+    feas_tol, f_tol, stat_tol
+        Tolerances of the original run (``stat_tol`` defaults to 1e-4).
+    """
+    from benchmarks.criteria import solved_reason
+
+    checked = {**row, "successful": row.get("status") == "successful"}
+    return solved_reason(checked, feas_tol, f_tol, stat_tol) is None
 
 
 def compare_runs(
@@ -3502,6 +3525,7 @@ def compare_runs(
     """
     feas_tol = float(results[0].get("feas_tol", 1e-6))
     f_tol = float(results[0].get("f_tol", 1e-4))
+    stat_tol = float(results[0].get("stat_tol", 1e-4))
     base = {task_key(c): c for c in base_classified}
     by_problem: dict[tuple[str, int], list[dict[str, Any]]] = collections.defaultdict(
         list
@@ -3521,7 +3545,7 @@ def compare_runs(
         if b is None or (causes and b.get("cause") not in causes):
             continue
         peers = [p for p in by_problem[instance_key(d)] if p["config"] != d["config"]]
-        solved = _solved(d, feas_tol, f_tol)
+        solved = _solved(d, feas_tol, f_tol, stat_tol)
         d_full = {**d, **_baseline_fields(baselines.get(instance_key(d), {}))}
         new_cause = (
             "solved"

@@ -93,18 +93,27 @@ def _(mo):
         step=1e-5,
         label="relative objective-gap tolerance",
     )
-    mo.hstack([feas_tol, f_tol])
-    return f_tol, feas_tol
+    stat_tol = mo.ui.number(
+        value=1e-4,
+        start=1e-12,
+        stop=1e3,
+        step=1e-5,
+        label="stationarity tolerance",
+    )
+    mo.hstack([feas_tol, f_tol, stat_tol])
+    return f_tol, feas_tol, stat_tol
 
 
 @app.cell
-def _(analysis, f_tol, feas_tol, raw):
-    df = analysis.add_solved(raw, feas_tol=feas_tol.value, f_tol=f_tol.value)
+def _(analysis, f_tol, feas_tol, raw, stat_tol):
+    df = analysis.add_solved(
+        raw, feas_tol=feas_tol.value, f_tol=f_tol.value, stat_tol=stat_tol.value
+    )
     return (df,)
 
 
 @app.cell
-def _(alt, analysis, df, f_tol, feas_tol, mo):
+def _(alt, analysis, df, f_tol, feas_tol, mo, stat_tol):
     _outcomes = analysis.outcome_table(df)
     _chart = (
         alt.Chart(_outcomes)
@@ -132,9 +141,12 @@ def _(alt, analysis, df, f_tol, feas_tol, mo):
                 f"""**Figure 1.** Stacked count of tasks per solver configuration (x axis), split by
     outcome. `solved` requires the minimiser to report success *and* the returned point to
     be feasible (max violation ≤ {feas_tol.value:g}) *and*, when a reference optimum is
-    known, to match it (relative gap ≤ {f_tol.value:g}). `claimed_but_infeasible` /
-    `claimed_but_wrong` are reported successes that fail those checks; `max_steps` hit the
-    iteration budget; `solver_failure` groups every other solver-reported termination;
+    known, to match it (relative gap ≤ {f_tol.value:g}) *and* to be stationary (IPOPT-scaled
+    inf-norm of the Lagrangian gradient with the solver's own multipliers ≤
+    {stat_tol.value:g}; tasks that returned no multipliers pass). `claimed_but_infeasible` /
+    `claimed_but_wrong` / `claimed_but_non_stationary` are reported successes that fail
+    those checks (in that priority); `max_steps` hit the iteration budget; `solver_failure`
+    groups every other solver-reported termination;
     `timeout`, `compile_error`, `runtime_error` are harness-level failures."""
             ),
         ]
@@ -380,6 +392,7 @@ def _(analysis, df, mo):
         "feas",
         "f_gap",
         "stat_inf",
+        "stat_scaled",
         "compl",
         "time_median_s",
         "stats_final_lagrangian_grad_norm",

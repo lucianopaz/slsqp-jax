@@ -12,9 +12,11 @@ task
     One instance solved with one solver ``config``.
 solved
     A task whose minimiser reported success *and* whose returned point is
-    feasible (``feas <= feas_tol``) and - when a reference value is known -
-    matches the reference objective (``f_gap <= f_tol``). See
-    :func:`add_solved`.
+    feasible (``feas <= feas_tol``), matches the reference objective when a
+    reference value is known (``f_gap <= f_tol``) *and* is stationary
+    (``stat_scaled <= stat_tol``: the IPOPT-scaled Lagrangian gradient with the
+    solver-reported multipliers; a task without multipliers passes). See
+    :func:`add_solved` and :func:`benchmarks.criteria.solved_reason`.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import pandas as pd
 __all__ = [
     "DEFAULT_FEAS_TOL",
     "DEFAULT_F_TOL",
+    "DEFAULT_STAT_TOL",
     "HARNESS_STATUSES",
     "add_solved",
     "classify_outcome",
@@ -39,12 +42,14 @@ __all__ = [
 
 DEFAULT_FEAS_TOL = 1e-6
 DEFAULT_F_TOL = 1e-4
+DEFAULT_STAT_TOL = 1e-4
 HARNESS_STATUSES: tuple[str, ...] = ("timeout", "compile_error", "runtime_error")
 
 _OUTCOME_ORDER = (
     "solved",
     "claimed_but_wrong",
     "claimed_but_infeasible",
+    "claimed_but_non_stationary",
     "max_steps",
     "solver_failure",
     "timeout",
@@ -58,6 +63,7 @@ def add_solved(
     *,
     feas_tol: float = DEFAULT_FEAS_TOL,
     f_tol: float = DEFAULT_F_TOL,
+    stat_tol: float = DEFAULT_STAT_TOL,
 ) -> pd.DataFrame:
     """Return a copy with ``solved`` and ``outcome`` columns.
 
@@ -70,6 +76,11 @@ def add_solved(
     f_tol
         Maximum relative objective gap ``|f - f*| / max(1, |f*|)`` when a
         reference ``fstar`` is available.
+    stat_tol
+        Maximum IPOPT-scaled stationarity residual ``stat_scaled`` (inf-norm
+        of the Lagrangian gradient with the solver-reported multipliers). A
+        missing or ``NaN`` value, i.e. a solver that returned no multipliers,
+        passes.
 
     Returns
     -------
@@ -77,7 +88,10 @@ def add_solved(
         Copy of ``frame`` with boolean ``solved`` and categorical
         ``outcome``. The worker also writes a ``solved`` column (with its
         own tolerances, used to skip timing repeats); it is recomputed here
-        so reports can vary the tolerances.
+        so reports can vary the tolerances. The rule is the vectorised twin
+        of :func:`benchmarks.criteria.solved_reason`; ``outcome`` is
+        ``claimed_but_non_stationary`` for a reported success that is
+        feasible and matches the reference but has ``stat_scaled > stat_tol``.
 
     Examples
     --------
@@ -89,9 +103,24 @@ def add_solved(
     ...     "feas": [0.0, 1e-3, 0.0, None],
     ...     "f_gap": [1e-9, 1e-9, 1e-9, None],
     ...     "has_fstar": [True, True, True, True],
+    ...     "stat_scaled": [1e-8, 1e-8, 1e-8, None],
     ... })
     >>> add_solved(rows)["outcome"].tolist()
     ['solved', 'claimed_but_infeasible', 'max_steps', 'timeout']
+
+    A successful, feasible point with the right objective value that is not
+    stationary is reported as such, and a missing ``stat_scaled`` passes:
+
+    >>> rows = pd.DataFrame({
+    ...     "status": ["successful"] * 3,
+    ...     "successful": True,
+    ...     "feas": 0.0,
+    ...     "f_gap": [7.6e-6, 7.6e-6, 7.6e-6],
+    ...     "has_fstar": True,
+    ...     "stat_scaled": [0.53, 1e-4, None],
+    ... })
+    >>> add_solved(rows)["outcome"].tolist()
+    ['claimed_but_non_stationary', 'solved', 'solved']
     """
     out = frame.copy()
     if out.empty:
@@ -117,13 +146,18 @@ def add_solved(
     finite = (
         out.get("finite", pd.Series(True, index=out.index)).fillna(True).astype(bool)
     )
+    stat = pd.to_numeric(
+        out.get("stat_scaled", pd.Series(np.nan, index=out.index)), errors="coerce"
+    )
 
     feasible = feas.le(feas_tol).fillna(False) & finite
     objective_ok = (~has_fstar) | f_gap.le(f_tol).fillna(False)
-    solved = successful & feasible & objective_ok
+    # No multipliers (NaN) -> nothing to evaluate -> benefit of the doubt.
+    stationary = stat.isna() | stat.le(stat_tol)
+    solved = successful & feasible & objective_ok & stationary
     out["solved"] = solved
     out["outcome"] = classify_outcome(
-        out["status"].astype(str), successful, feasible, objective_ok
+        out["status"].astype(str), successful, feasible, objective_ok, stationary
     )
     out["outcome"] = pd.Categorical(out["outcome"], categories=list(_OUTCOME_ORDER))
     return out
@@ -134,6 +168,7 @@ def classify_outcome(
     successful: pd.Series,
     feasible: pd.Series,
     objective_ok: pd.Series,
+    stationary: pd.Series | None = None,
 ) -> pd.Series:
     """Map each task to one of the labels in ``_OUTCOME_ORDER``.
 
@@ -143,13 +178,39 @@ def classify_outcome(
         Result-enumeration name reported by the minimiser or the harness.
     successful, feasible, objective_ok
         Boolean series aligned with ``status``.
+    stationary
+        Boolean series aligned with ``status``; ``None`` means every point is
+        stationary (no ``claimed_but_non_stationary`` label).
+
+    Returns
+    -------
+    pandas.Series
+        One label per task. Reported successes are labelled, in priority
+        order, ``claimed_but_infeasible``, ``claimed_but_wrong``,
+        ``claimed_but_non_stationary`` and ``solved``.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from benchmarks.analysis import classify_outcome
+    >>> status = pd.Series(["successful"] * 3 + ["max_steps_reached"])
+    >>> ok = pd.Series([True, True, True, False])
+    >>> classify_outcome(
+    ...     status, ok, ok, ok, pd.Series([True, False, True, True])
+    ... ).tolist()
+    ['solved', 'claimed_but_non_stationary', 'solved', 'max_steps']
     """
+    if stationary is None:
+        stationary = pd.Series(True, index=status.index)
     outcome = pd.Series("solver_failure", index=status.index, dtype=object)
     outcome[status.isin(HARNESS_STATUSES)] = status[status.isin(HARNESS_STATUSES)]
     outcome[status.str.contains("max_steps", case=False, regex=False)] = "max_steps"
     outcome[successful & ~feasible] = "claimed_but_infeasible"
     outcome[successful & feasible & ~objective_ok] = "claimed_but_wrong"
-    outcome[successful & feasible & objective_ok] = "solved"
+    outcome[successful & feasible & objective_ok & ~stationary] = (
+        "claimed_but_non_stationary"
+    )
+    outcome[successful & feasible & objective_ok & stationary] = "solved"
     return outcome
 
 
