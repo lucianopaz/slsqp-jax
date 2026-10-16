@@ -1,0 +1,447 @@
+{
+ "by_config": [
+  {
+   "config": "asls-craig",
+   "n_tasks": 303,
+   "n_solved": 220,
+   "solve_rate": 0.7260726073,
+   "median_time_s": 0.0118968037,
+   "median_steps": 9.0,
+   "median_compile_s": 6.619006472
+  },
+  {
+   "config": "asls-minresqlp",
+   "n_tasks": 303,
+   "n_solved": 220,
+   "solve_rate": 0.7260726073,
+   "median_time_s": 0.0150200288,
+   "median_steps": 10.0,
+   "median_compile_s": 5.930637069
+  },
+  {
+   "config": "asls-pcg",
+   "n_tasks": 303,
+   "n_solved": 222,
+   "solve_rate": 0.7326732673,
+   "median_time_s": 0.0060935868,
+   "median_steps": 10.0,
+   "median_compile_s": 5.578981077
+  },
+  {
+   "config": "asls-pcg-exact",
+   "n_tasks": 303,
+   "n_solved": 239,
+   "solve_rate": 0.7887788779,
+   "median_time_s": 0.001678435,
+   "median_steps": 6.0,
+   "median_compile_s": 4.216517451
+  },
+  {
+   "config": "pasls",
+   "n_tasks": 303,
+   "n_solved": 207,
+   "solve_rate": 0.6831683168,
+   "median_time_s": 0.00770062,
+   "median_steps": 11.0,
+   "median_compile_s": 7.2105279025
+  },
+  {
+   "config": "scipy-slsqp",
+   "n_tasks": 303,
+   "n_solved": 170,
+   "solve_rate": 0.5610561056,
+   "median_time_s": 0.001979017,
+   "median_steps": 8.0,
+   "median_compile_s": 0.1751893
+  },
+  {
+   "config": "scipy-trust-constr",
+   "n_tasks": 303,
+   "n_solved": 175,
+   "solve_rate": 0.5775577558,
+   "median_time_s": 0.034050927,
+   "median_steps": 17.0,
+   "median_compile_s": 0.290168123
+  },
+  {
+   "config": "tfip",
+   "n_tasks": 303,
+   "n_solved": 178,
+   "solve_rate": 0.5874587459,
+   "median_time_s": 0.0198904403,
+   "median_steps": 24.0,
+   "median_compile_s": 7.121162666
+  },
+  {
+   "config": "trip",
+   "n_tasks": 303,
+   "n_solved": 173,
+   "solve_rate": 0.5709570957,
+   "median_time_s": 0.011792352,
+   "median_steps": 18.0,
+   "median_compile_s": 5.192309406
+  }
+ ],
+ "by_collection_config": [
+  {
+   "collection": "bounded",
+   "config": "asls-craig",
+   "n_tasks": 68,
+   "n_solved": 38,
+   "solve_rate": 0.5588235294,
+   "median_time_s": 0.0221795315,
+   "median_steps": 20.0,
+   "median_compile_s": 5.8187670955
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-minresqlp",
+   "n_tasks": 68,
+   "n_solved": 39,
+   "solve_rate": 0.5735294118,
+   "median_time_s": 0.025553714,
+   "median_steps": 20.0,
+   "median_compile_s": 5.2947524995
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg",
+   "n_tasks": 68,
+   "n_solved": 37,
+   "solve_rate": 0.5441176471,
+   "median_time_s": 0.012755013,
+   "median_steps": 20.0,
+   "median_compile_s": 4.9003745815
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg-exact",
+   "n_tasks": 68,
+   "n_solved": 48,
+   "solve_rate": 0.7058823529,
+   "median_time_s": 0.002126706,
+   "median_steps": 10.0,
+   "median_compile_s": 3.529304636
+  },
+  {
+   "collection": "bounded",
+   "config": "pasls",
+   "n_tasks": 68,
+   "n_solved": 37,
+   "solve_rate": 0.5441176471,
+   "median_time_s": 0.0123142465,
+   "median_steps": 20.0,
+   "median_compile_s": 6.144629011
+  },
+  {
+   "collection": "bounded",
+   "config": "scipy-slsqp",
+   "n_tasks": 68,
+   "n_solved": 8,
+   "solve_rate": 0.1176470588,
+   "median_time_s": 0.001342037,
+   "median_steps": 7.0,
+   "median_compile_s": 0.140054801
+  },
+  {
+   "collection": "bounded",
+   "config": "scipy-trust-constr",
+   "n_tasks": 68,
+   "n_solved": 42,
+   "solve_rate": 0.6176470588,
+   "median_time_s": 0.0883480655,
+   "median_steps": 33.5,
+   "median_compile_s": 0.2693556905
+  },
+  {
+   "collection": "bounded",
+   "config": "tfip",
+   "n_tasks": 68,
+   "n_solved": 26,
+   "solve_rate": 0.3823529412,
+   "median_time_s": 0.0262659705,
+   "median_steps": 28.0,
+   "median_compile_s": 6.6317234875
+  },
+  {
+   "collection": "bounded",
+   "config": "trip",
+   "n_tasks": 68,
+   "n_solved": 25,
+   "solve_rate": 0.3676470588,
+   "median_time_s": 0.02351545,
+   "median_steps": 26.0,
+   "median_compile_s": 4.933948233
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-craig",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.0018983785,
+   "median_steps": 2.0,
+   "median_compile_s": 6.444738682
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 3,
+   "n_solved": 2,
+   "solve_rate": 0.6666666667,
+   "median_time_s": 0.3169127727,
+   "median_steps": 106.5,
+   "median_compile_s": 5.505489211
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.002524816,
+   "median_steps": 2.0,
+   "median_compile_s": 5.358773105
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 3,
+   "n_solved": 3,
+   "solve_rate": 1.0,
+   "median_time_s": 0.0024326155,
+   "median_steps": 1.0,
+   "median_compile_s": 4.049457098
+  },
+  {
+   "collection": "bqp",
+   "config": "pasls",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.0025425295,
+   "median_steps": 2.0,
+   "median_compile_s": 6.542083518
+  },
+  {
+   "collection": "bqp",
+   "config": "scipy-slsqp",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.000660921,
+   "median_steps": 2.0,
+   "median_compile_s": 0.193852242
+  },
+  {
+   "collection": "bqp",
+   "config": "scipy-trust-constr",
+   "n_tasks": 3,
+   "n_solved": 0,
+   "solve_rate": 0.0,
+   "median_time_s": null,
+   "median_steps": null,
+   "median_compile_s": 0.384224585
+  },
+  {
+   "collection": "bqp",
+   "config": "tfip",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.0056456915,
+   "median_steps": 12.0,
+   "median_compile_s": 6.416329804
+  },
+  {
+   "collection": "bqp",
+   "config": "trip",
+   "n_tasks": 3,
+   "n_solved": 1,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.0053422855,
+   "median_steps": 12.0,
+   "median_compile_s": 6.833042693
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-craig",
+   "n_tasks": 211,
+   "n_solved": 170,
+   "solve_rate": 0.8056872038,
+   "median_time_s": 0.0109245765,
+   "median_steps": 9.0,
+   "median_compile_s": 6.7967601385
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-minresqlp",
+   "n_tasks": 211,
+   "n_solved": 168,
+   "solve_rate": 0.7962085308,
+   "median_time_s": 0.0131618337,
+   "median_steps": 9.0,
+   "median_compile_s": 6.143527983
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg",
+   "n_tasks": 211,
+   "n_solved": 173,
+   "solve_rate": 0.8199052133,
+   "median_time_s": 0.0051959785,
+   "median_steps": 9.0,
+   "median_compile_s": 5.726116017
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg-exact",
+   "n_tasks": 211,
+   "n_solved": 173,
+   "solve_rate": 0.8199052133,
+   "median_time_s": 0.0015590525,
+   "median_steps": 6.0,
+   "median_compile_s": 4.3122747375
+  },
+  {
+   "collection": "constrained",
+   "config": "pasls",
+   "n_tasks": 211,
+   "n_solved": 160,
+   "solve_rate": 0.7582938389,
+   "median_time_s": 0.0072198757,
+   "median_steps": 10.0,
+   "median_compile_s": 7.382380965
+  },
+  {
+   "collection": "constrained",
+   "config": "scipy-slsqp",
+   "n_tasks": 211,
+   "n_solved": 154,
+   "solve_rate": 0.7298578199,
+   "median_time_s": 0.001997214,
+   "median_steps": 8.0,
+   "median_compile_s": 0.175714029
+  },
+  {
+   "collection": "constrained",
+   "config": "scipy-trust-constr",
+   "n_tasks": 211,
+   "n_solved": 124,
+   "solve_rate": 0.5876777251,
+   "median_time_s": 0.0222888515,
+   "median_steps": 15.0,
+   "median_compile_s": 0.290727041
+  },
+  {
+   "collection": "constrained",
+   "config": "tfip",
+   "n_tasks": 211,
+   "n_solved": 144,
+   "solve_rate": 0.682464455,
+   "median_time_s": 0.0187161218,
+   "median_steps": 24.0,
+   "median_compile_s": 7.2451452575
+  },
+  {
+   "collection": "constrained",
+   "config": "trip",
+   "n_tasks": 211,
+   "n_solved": 139,
+   "solve_rate": 0.6587677725,
+   "median_time_s": 0.010262431,
+   "median_steps": 18.0,
+   "median_compile_s": 5.1544848275
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-craig",
+   "n_tasks": 21,
+   "n_solved": 11,
+   "solve_rate": 0.5238095238,
+   "median_time_s": 0.053096026,
+   "median_steps": 11.0,
+   "median_compile_s": 7.780760539
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 21,
+   "n_solved": 11,
+   "solve_rate": 0.5238095238,
+   "median_time_s": 0.02756922,
+   "median_steps": 13.0,
+   "median_compile_s": 6.659200587
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg",
+   "n_tasks": 21,
+   "n_solved": 11,
+   "solve_rate": 0.5238095238,
+   "median_time_s": 0.014704688,
+   "median_steps": 11.0,
+   "median_compile_s": 6.614522923
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 21,
+   "n_solved": 15,
+   "solve_rate": 0.7142857143,
+   "median_time_s": 0.0209130735,
+   "median_steps": 1.0,
+   "median_compile_s": 5.193126094
+  },
+  {
+   "collection": "cqp",
+   "config": "pasls",
+   "n_tasks": 21,
+   "n_solved": 9,
+   "solve_rate": 0.4285714286,
+   "median_time_s": 0.012612394,
+   "median_steps": 22.0,
+   "median_compile_s": 8.138812997
+  },
+  {
+   "collection": "cqp",
+   "config": "scipy-slsqp",
+   "n_tasks": 21,
+   "n_solved": 7,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.0051092925,
+   "median_steps": 5.0,
+   "median_compile_s": 0.26951087
+  },
+  {
+   "collection": "cqp",
+   "config": "scipy-trust-constr",
+   "n_tasks": 21,
+   "n_solved": 9,
+   "solve_rate": 0.4285714286,
+   "median_time_s": 0.2121691615,
+   "median_steps": 55.0,
+   "median_compile_s": 0.509766771
+  },
+  {
+   "collection": "cqp",
+   "config": "tfip",
+   "n_tasks": 21,
+   "n_solved": 7,
+   "solve_rate": 0.3333333333,
+   "median_time_s": 0.024900762,
+   "median_steps": 26.0,
+   "median_compile_s": 8.6837440405
+  },
+  {
+   "collection": "cqp",
+   "config": "trip",
+   "n_tasks": 21,
+   "n_solved": 8,
+   "solve_rate": 0.380952381,
+   "median_time_s": 0.0347012633,
+   "median_steps": 23.5,
+   "median_compile_s": 6.474797382
+  }
+ ]
+}
