@@ -18,7 +18,14 @@ from slsqp_jax.sqpdax.step_controller import (
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS, SubProblemSolverState
 from tests.sqpdax.lagrangian.conftest import obj
 
-from .conftest import make_armijo, make_unconstrained_quadratic
+from .conftest import (
+    NeverValidCorrection,
+    bind_active_set_correction,
+    make_armijo,
+    make_circle_problem,
+    make_unconstrained_quadratic,
+    maratos_step,
+)
 
 
 def test_line_search_state_x_scales_step():
@@ -236,3 +243,65 @@ def test_armijo_small_alpha_decrease_fallback():
     assert bool(ls.accepted_by_fallback(state))
     # Searches without a fallback inherit the base behaviour: never by fallback.
     assert not bool(LineSearch.accepted_by_fallback(ls, state))
+
+
+# --- second-order correction stage -------------------------------------------
+
+MARATOS_X0 = jnp.array([jnp.cos(0.3), jnp.sin(0.3)])
+
+
+def _maratos_search(correction: str, rho: float = 10.0):
+    """Armijo search on ``f + ρ|c|`` at the Maratos point, with a correction."""
+    problem = make_circle_problem()
+    x0, least_norm = bind_active_set_correction(problem, MARATOS_X0)
+    corrections = {
+        "none": None,
+        "never-valid": NeverValidCorrection(),
+        "least-norm": least_norm,
+    }
+    merit = NormMerit(
+        problem,
+        barrier=None,
+        problem_weight=jnp.asarray(1.0),
+        feasibility_weight=jnp.asarray(rho),
+        norm=1,
+    )
+    search = ArmijoLineSearch(merit=merit, correction=corrections[correction])
+    return search, x0, maratos_step(x0)
+
+
+@pytest.mark.parametrize(
+    ("correction", "corrected"),
+    [("none", False), ("never-valid", False), ("least-norm", True)],
+)
+def test_maratos_full_step_is_taken_only_with_a_correction(correction, corrected):
+    search, x0, d = _maratos_search(correction)
+    result = search.step(x0, d)
+    assert bool(result.accepted)
+    assert bool(result.corrected) is corrected
+    assert (float(result.step_size) == 1.0) is corrected
+    assert float(result.merit_val) < float(search.merit(x0))
+
+
+def test_invalid_correction_leaves_the_search_unchanged():
+    plain = _maratos_search("none")
+    stub = _maratos_search("never-valid")
+    a, b = (search.step(x0, d) for search, x0, d in (plain, stub))
+    assert jnp.array_equal(a.x.x, b.x.x)
+    for field in ("accepted", "step_size", "merit_val", "corrected"):
+        assert jnp.array_equal(getattr(a, field), getattr(b, field)), field
+
+
+def test_corrected_point_is_the_least_norm_correction():
+    search, x0, d = _maratos_search("least-norm")
+    result = search.step(x0, d)
+    expected = x0.x + d.x + search.correction(x0, d).step.x
+    assert jnp.allclose(result.x.x, expected, atol=1e-6)
+
+
+def test_non_finite_direction_is_rejected_with_a_correction():
+    search, x0, d = _maratos_search("least-norm")
+    result = search.step(x0, Primal(jnp.full_like(d.x, jnp.nan)))
+    assert not bool(result.accepted)
+    assert not bool(result.corrected)
+    assert jnp.array_equal(result.x.x, x0.x)

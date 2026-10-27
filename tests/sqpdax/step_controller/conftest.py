@@ -17,6 +17,7 @@ from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal, Slack
 from slsqp_jax.sqpdax.problem import Problem, build_problem
 from slsqp_jax.sqpdax.step_controller import (
     ArmijoLineSearch,
+    CorrectionResult,
     LeastNormCorrection,
     StepCorrection,
     TrustFunnelManager,
@@ -230,3 +231,32 @@ def tangent_step(x0: Primal, t: float) -> Primal:
     d = t * jnp.array([-x[1], x[0]]) / jnp.linalg.norm(x)
     step = jax.tree.map(jnp.zeros_like, x0)
     return eqx.tree_at(lambda p: p.x, step, d)
+
+
+def maratos_step(x0: Primal) -> Primal:
+    """SQP step of :func:`make_circle_problem` from a point ``x0`` on the circle.
+
+    With ``∇²L = I`` (``λ* = −3/2``) the step is the projected steepest
+    descent ``d = −(tᵀ∇f) t`` along the unit tangent ``t``; at
+    ``x0 = (cos θ, sin θ)`` it is ``sin θ (sin θ, −cos θ)``. It raises both
+    ``f`` and ``|c|`` by ``sin² θ``, so every ℓ1 merit rejects it.
+    """
+    x = x0.x
+    t = jnp.array([-x[1], x[0]]) / jnp.linalg.norm(x)
+    grad = 4.0 * x - jnp.array([1.0, 0.0])
+    return Primal(-(t @ grad) * t)
+
+
+class NeverValidCorrection(StepCorrection):
+    """Correction that is never valid (a controller must then ignore it)."""
+
+    def bind(self, **kwargs):
+        return self
+
+    def __call__(self, x0, direction):
+        return CorrectionResult(
+            step=jax.tree.map(jnp.zeros_like, direction),
+            valid=jnp.asarray(False),
+            residual_norm=jnp.asarray(0.0),
+            fraction=jnp.asarray(0.0),
+        )
