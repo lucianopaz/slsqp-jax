@@ -145,6 +145,24 @@ class ActiveSetSubProblem(SubProblem[Primal]):
         """Dual residual of the masked Lagrangian ``L_k``."""
         return self.L_k.dual_grad
 
+    def constraint_residual(self, trial: EvaluatedLagrangian[Primal]) -> Dual:
+        """Working-set residual at a trial point, masked like :meth:`dual_grad`.
+
+        Parameters
+        ----------
+        trial
+            Lagrangian evaluated at the trial point.
+
+        Returns
+        -------
+        Dual
+            ``trial.dual_grad`` restricted to the equalities and the
+            inequality / bound rows of :attr:`active_set`. Inherited unchanged
+            by the proximal subproblem, so the residual is the plain constraint
+            value without the proximal shift of its equality rows.
+        """
+        return self.active_set.mask_lagrangian(trial).dual_grad
+
     def kkt_mvp_primal(self, step: tuple[Primal, Dual]) -> Primal:
         """Lagrangian Hessian product ``∇²ₓₓL(x_k, λ_k) d`` (unmasked multipliers).
 
