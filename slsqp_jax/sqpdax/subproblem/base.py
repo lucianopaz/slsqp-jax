@@ -333,6 +333,38 @@ class SubProblem(Module, Generic[PrimalType]):
         )
         return self.kkt_mvp_upper_offdiag((zero_primal, y))
 
+    def to_native_primal(self, w: PrimalType) -> PrimalType:
+        """Map a primal step from model to native coordinates.
+
+        Parameters
+        ----------
+        w
+            Primal step in the coordinates of :meth:`kkt_mvp_lower_offdiag`,
+            :meth:`primal_box` and :meth:`least_norm_step`.
+
+        Returns
+        -------
+        PrimalType
+            The same step in the coordinates of the iterate (identity by
+            default; scaled subproblems unscale here).
+        """
+        return w
+
+    def to_model_primal(self, p: PrimalType) -> PrimalType:
+        """Map a primal step from native to model coordinates.
+
+        Parameters
+        ----------
+        p
+            Primal step in the coordinates of the iterate.
+
+        Returns
+        -------
+        PrimalType
+            Inverse of :meth:`to_native_primal` (identity by default).
+        """
+        return p
+
     def kkt_operator(self, step: tuple[PrimalType, Dual]) -> tuple[PrimalType, Dual]:
         """Assemble the saddle-point operator ``K z``.
 

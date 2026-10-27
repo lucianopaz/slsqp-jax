@@ -302,6 +302,42 @@ class ScaledBarrierSubProblem(SubProblem[InteriorPointPrimal]):
             return super().range_space_solve(rhs, tol=tol, max_iter=max_iter)
         return Dual.from_flat(self.schur_cache.solve(rhs.flatten()), *rhs.sizes)
 
+    def to_native_primal(self, w: InteriorPointPrimal) -> InteriorPointPrimal:
+        """Unscale the slack block of a model step, ``p_s = S p̃_s``.
+
+        Parameters
+        ----------
+        w
+            Primal step with the slack block in ball scale.
+
+        Returns
+        -------
+        InteriorPointPrimal
+            The step with original-scale slacks; null bound entries are ``0``.
+        """
+        return cast(
+            InteriorPointPrimal,
+            InteriorPointPrimal(x=w.x, slack=self._slack_to_orig_scale(w.slack)),
+        )
+
+    def to_model_primal(self, p: InteriorPointPrimal) -> InteriorPointPrimal:
+        """Scale the slack block of a native step, ``p̃_s = S⁻¹ p_s``.
+
+        Parameters
+        ----------
+        p
+            Primal step with original-scale slacks.
+
+        Returns
+        -------
+        InteriorPointPrimal
+            The step with the slack block in ball scale.
+        """
+        return cast(
+            InteriorPointPrimal,
+            InteriorPointPrimal(x=p.x, slack=self._slack_to_ball_scale(p.slack)),
+        )
+
     def primal_box(self) -> tuple[Float[Array, " n_p"], Float[Array, " n_p"]]:
         """Box for the scaled primal step ``[x | s̃ | s̃_lb | s̃_ub]``.
 

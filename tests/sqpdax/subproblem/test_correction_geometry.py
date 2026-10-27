@@ -125,3 +125,28 @@ def test_schur_factor_matches_the_matrix_free_solve():
         sub.least_norm_step(rhs).flatten(),
         atol=1e-5,
     )
+
+
+def test_model_native_maps_round_trip(subproblem: SubProblem):
+    flat = subproblem.lagrangian.ref.flatten()
+    p = subproblem.unflatten_primal(
+        jnp.asarray(np.random.default_rng(2).normal(size=flat.shape), flat.dtype)
+    )
+    np.testing.assert_allclose(
+        subproblem.to_native_primal(subproblem.to_model_primal(p)).flatten(),
+        p.flatten(),
+        rtol=1e-6,
+    )
+
+
+def test_native_trial_point_matches_the_linearisation(family: str):
+    sub = SUBPROBLEMS[family]()
+    a = materialise(sub)
+    flat = sub.lagrangian.ref.flatten()
+    w = 1e-3 * np.random.default_rng(3).normal(size=flat.shape)
+    step = sub.to_native_primal(sub.unflatten_primal(jnp.asarray(w, flat.dtype)))
+    trial = jax.tree.map(jnp.add, sub.lagrangian.ref, step)
+    residual = sub.constraint_residual(TRIAL_LAGRANGIANS[family](trial)).flatten()
+    predicted = np.asarray(sub.dual_grad().flatten()) + a @ w
+    # First-order agreement: the error is O(|w|^2), far below |A w|.
+    np.testing.assert_allclose(residual, predicted, atol=1e-5)
