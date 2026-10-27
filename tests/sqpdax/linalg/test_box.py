@@ -5,7 +5,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 import pytest
 
-from slsqp_jax.sqpdax.linalg import box_fraction, box_ray_length
+from slsqp_jax.sqpdax.linalg import box_fraction, box_ray_length, box_segment_fraction
 
 from .conftest import random_direction
 
@@ -55,3 +55,28 @@ def test_box_fraction_is_scale_consistent(dim: int, seed: int):
     beta = box_fraction(w, lo)
     assert beta < 1.0
     assert jnp.isclose(box_fraction(2.0 * w, lo), beta / 2.0)
+
+
+SEGMENT_CASES = {
+    # (start, w, lo, hi, expected t)
+    "inside": ([0.5, 0.0], [0.25, 1.0], [0.0, -INF], [1.0, 2.0], 1.0),
+    "lower-face": ([0.5, 0.0], [-1.0, 0.0], [0.0, -INF], [1.0, 2.0], 0.5),
+    "upper-face": ([0.5, 0.0], [0.0, 4.0], [0.0, -INF], [1.0, 2.0], 0.5),
+    "tightest-wins": ([0.5, 0.0], [1.0, 8.0], [0.0, -INF], [1.0, 2.0], 0.25),
+    "start-on-face": ([1.0, 0.0], [1.0, 0.0], [0.0, -INF], [1.0, 2.0], 0.0),
+    "start-outside": ([1.5, 0.0], [-1.0, 0.0], [0.0, -INF], [1.0, 2.0], 0.0),
+    "free": ([3.0, -3.0], [5.0, -5.0], [-INF, -INF], [INF, INF], 1.0),
+}
+
+
+@pytest.mark.parametrize(
+    "start, w, lo, hi, expected", SEGMENT_CASES.values(), ids=SEGMENT_CASES.keys()
+)
+def test_box_segment_fraction(start, w, lo, hi, expected):
+    """Largest ``t ∈ [0, 1]`` keeping ``start + t w`` in the box (0 from outside)."""
+    start, w, lo, hi = (jnp.asarray(v, jnp.float32) for v in (start, w, lo, hi))
+    t = box_segment_fraction(start, w, lo, hi)
+    assert t == pytest.approx(expected)
+    point = start + t * w
+    if expected > 0.0:
+        assert jnp.all((point >= lo - 1e-7) & (point <= hi + 1e-7))
