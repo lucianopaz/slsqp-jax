@@ -147,9 +147,12 @@ class LeastNormCorrection(StepCorrection[PrimalType]):
     the subproblem's :meth:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.primal_box`
     (variable bounds for working-set subproblems, fraction-to-the-boundary
     faces for interior-point ones). As in scipy's ``trust-constr`` it is only
-    tried near feasibility: the range-space part ``d_n = −Aᵀ(A Aᵀ)⁺ c(x)``
+    tried near feasibility: the range-space part ``d_n = −Aᵀ(A Aᵀ)⁺ c⁺(x)``
     of the step must be small next to its tangential part,
-    ``‖d_n‖ ≤ soc_threshold ‖d − d_n‖``.
+    ``‖d_n‖ ≤ soc_threshold ‖d − d_n‖``, where ``c⁺`` is the violated part
+    of the residual
+    (:meth:`~slsqp_jax.sqpdax.subproblem.base.SubProblem.violated_part`): the
+    distance of a satisfied working-set row to its face is not infeasibility.
     Components of ``w`` below the accuracy of the range-space solve are
     zeroed before the box test, and a step that sits on a face up to rounding
     is moved onto it, so round-off on the coordinates a working set fixes
@@ -265,10 +268,13 @@ class LeastNormCorrection(StepCorrection[PrimalType]):
         residual = sub.constraint_residual(self.lagrangian(trial, self.dual))
         residual_norm = _inf_norm(residual.flatten())
 
-        # Near-feasibility gate in model coordinates: range-space part of d.
+        # Near-feasibility gate in model coordinates: the part of d that
+        # restores the violated rows.
         d_model = sub.to_model_primal(direction).flatten()
         d_normal = sub.least_norm_step(
-            negate(sub.dual_grad()), tol=self.cg_tol, max_iter=self.cg_max_iter
+            negate(sub.violated_part(sub.dual_grad())),
+            tol=self.cg_tol,
+            max_iter=self.cg_max_iter,
         ).flatten()
         tangential = jnp.linalg.norm(d_model - d_normal)
         near_feasible = jnp.linalg.norm(d_normal) <= self.soc_threshold * tangential

@@ -128,6 +128,22 @@ def _landing_on_a_bound(**kwargs):
     return primal, correction, d
 
 
+def test_reaching_a_working_set_bound_is_not_infeasibility():
+    # The distance of x₁ to its face is a third of the step: as residual it
+    # would fail the near-feasibility gate, as a satisfied bound it must not.
+    x0, correction, d = _landing_on_a_bound()
+    out = correction(x0, d)
+    assert bool(out.valid)
+    assert float(out.fraction) == pytest.approx(1.0)
+    assert float(out.step.x[0]) == 0.0
+    # With x₁ held on its face only x₂ corrects: still third order in |d|.
+    t = float(jnp.linalg.norm(d.x))
+    before = _violation(correction, _add(x0, d))
+    after = _violation(correction, _add(x0, d, out.step))
+    assert after < before
+    assert after <= 4.0 * t**3
+
+
 class _NoisyActiveSetSubProblem(ActiveSetSubProblem):
     """Least-norm steps carry round-off on x₁, which the working set fixes."""
 
