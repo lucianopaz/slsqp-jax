@@ -393,6 +393,11 @@ class TrustFunnelInteriorPointMinimiser(
                 f"initial_radius_v={self.initial_radius_v}, "
                 f"initial_radius_f={self.initial_radius_f}"
             )
+        if self.step_correction is not None:
+            raise ValueError(
+                "TrustFunnelInteriorPointMinimiser has no second-order correction "
+                "stage yet (TrustFunnelManager); step_correction must be None"
+            )
         if self.infeasibility_tol <= 0.0:
             raise ValueError(
                 f"infeasibility_tol must be positive; got {self.infeasibility_tol}"
@@ -543,6 +548,7 @@ class TrustFunnelInteriorPointMinimiser(
                 max_radius=self.max_radius,
                 kappa_t1=self.kappa_t1,
                 kappa_t2=self.kappa_t2,
+                correction=self._bind_step_correction(ctx, solver_state),
             ),
         )
 

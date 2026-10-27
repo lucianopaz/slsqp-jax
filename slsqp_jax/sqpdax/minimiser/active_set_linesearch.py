@@ -930,7 +930,12 @@ class ActiveSetLineSearchMinimiser(
         step_dual: Dual,
         solver_state: ActiveSetStateType,
     ) -> StepController[Primal, ActiveSetStateType]:
-        """Armijo line search on the adaptively updated L1 merit."""
+        """Armijo line search on the adaptively updated L1 merit.
+
+        Carries the bound :attr:`step_correction` (see
+        :meth:`_bind_step_correction`), tried when the full QP step fails the
+        Armijo test.
+        """
         return cast(
             StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
@@ -939,8 +944,33 @@ class ActiveSetLineSearchMinimiser(
                 max_steps=self.line_search_max_steps,
                 c1=self.armijo_c1,
                 backtrack=self.armijo_backtrack,
+                correction=self._bind_step_correction(ctx, solver_state),
             ),
         )
+
+    def _correction_subproblem(
+        self,
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        solver_state: ActiveSetStateType,
+    ) -> ActiveSetSubProblem:
+        """The QP subproblem on its final working set.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context; its subproblem carries the empty
+            initial working set.
+        solver_state
+            QP carry after the solve.
+
+        Returns
+        -------
+        ActiveSetSubProblem
+            ``ctx.subproblem`` rebuilt with ``solver_state.active_set``, the
+            rows the QP step satisfies (shifted and proximal variants keep
+            their extra parameters through ``with_active_set``).
+        """
+        return ctx.subproblem.with_active_set(solver_state.active_set)
 
     def _l1_merit(
         self,
