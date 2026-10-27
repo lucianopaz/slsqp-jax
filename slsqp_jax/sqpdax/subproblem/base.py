@@ -250,6 +250,26 @@ class SubProblem(Module, Generic[PrimalType]):
         """
         return trial.dual_grad
 
+    def violated_part(self, residual: Dual) -> Dual:
+        """Part of a :meth:`dual_grad`-layout residual that is a violation.
+
+        Parameters
+        ----------
+        residual
+            Constraint residual in the layout of :meth:`dual_grad`.
+
+        Returns
+        -------
+        Dual
+            ``residual`` itself by default: every row of the model is an
+            equality (``c(x) = 0``, or ``c(x) + s = 0`` with slacks), so any
+            nonzero entry is infeasibility. Models with inequality rows
+            override this to keep only the positive (violated) part, so that
+            the distance of a satisfied working-set row to its face is not
+            mistaken for infeasibility.
+        """
+        return residual
+
     def range_space_solve(
         self,
         rhs: Dual,

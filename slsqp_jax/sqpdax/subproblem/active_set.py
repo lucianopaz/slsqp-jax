@@ -161,6 +161,32 @@ class ActiveSetSubProblem(SubProblem[Primal]):
         """
         return self.active_set.mask_lagrangian(trial).dual_grad
 
+    def violated_part(self, residual: Dual) -> Dual:
+        """Equality rows unchanged, inequality and bound rows clipped at zero.
+
+        Parameters
+        ----------
+        residual
+            Residual in the :meth:`dual_grad` layout: ``c_eq``, ``h``,
+            ``lb - x`` and ``x - ub``.
+
+        Returns
+        -------
+        Dual
+            ``c_eq`` and the positive parts of the other blocks: a working-set
+            inequality or bound that is satisfied (negative residual) is not
+            infeasible, even though the QP step moves onto it.
+        """
+        return cast(
+            Dual,
+            Dual(
+                eq_multipliers=residual.eq_multipliers,
+                ineq_multipliers=jnp.maximum(residual.ineq_multipliers, 0.0),
+                lb_multipliers=jnp.maximum(residual.lb_multipliers, 0.0),
+                ub_multipliers=jnp.maximum(residual.ub_multipliers, 0.0),
+            ),
+        )
+
     def kkt_mvp_primal(self, step: tuple[Primal, Dual]) -> Primal:
         """Lagrangian Hessian product ``∇²ₓₓL(x_k, λ_k) d`` (unmasked multipliers).
 

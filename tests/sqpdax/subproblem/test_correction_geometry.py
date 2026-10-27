@@ -150,3 +150,26 @@ def test_native_trial_point_matches_the_linearisation(family: str):
     predicted = np.asarray(sub.dual_grad().flatten()) + a @ w
     # First-order agreement: the error is O(|w|^2), far below |A w|.
     np.testing.assert_allclose(residual, predicted, atol=1e-5)
+
+
+# Blocks of ``dual_grad`` that are inequality rows (``≤ 0``) in each family.
+INEQUALITY_BLOCKS = {
+    "active-set": ("ineq_multipliers", "lb_multipliers", "ub_multipliers"),
+    "proximal": ("ineq_multipliers", "lb_multipliers", "ub_multipliers"),
+    "scaled-barrier": (),
+    "funnel-barrier": (),
+}
+
+
+def test_violated_part_keeps_only_infeasibility(family: str):
+    sub = SUBPROBLEMS[family]()
+    sizes = sub.dual_grad().sizes
+    flat = np.random.default_rng(4).normal(size=sum(sizes) + sizes[0])
+    residual = as_dual(sub, flat)
+    violated = sub.violated_part(residual)
+    for block in ("eq_multipliers", *INEQUALITY_BLOCKS["active-set"]):
+        value = np.asarray(getattr(residual, block))
+        expected = (
+            np.maximum(value, 0.0) if block in INEQUALITY_BLOCKS[family] else value
+        )
+        np.testing.assert_array_equal(getattr(violated, block), expected)
