@@ -150,6 +150,10 @@ class LeastNormCorrection(StepCorrection[PrimalType]):
     tried near feasibility: the range-space part ``d_n = −Aᵀ(A Aᵀ)⁺ c(x)``
     of the step must be small next to its tangential part,
     ``‖d_n‖ ≤ soc_threshold ‖d − d_n‖``.
+    Components of ``w`` below the accuracy of the range-space solve are
+    zeroed before the box test, and a step that sits on a face up to rounding
+    is moved onto it, so round-off on the coordinates a working set fixes
+    cannot block the correction.
 
     Attributes
     ----------
@@ -271,15 +275,25 @@ class LeastNormCorrection(StepCorrection[PrimalType]):
 
         w = sub.least_norm_step(
             negate(residual), tol=self.cg_tol, max_iter=self.cg_max_iter
+        ).flatten()
+        # Round-off of the range-space solve (e.g. on coordinates fixed by a
+        # working-set bound, whose rows have a zero target) is not a step.
+        eps = jnp.finfo(w.dtype).eps
+        noise = max(self.cg_tol, 100.0 * float(eps)) * jnp.maximum(
+            1.0, jnp.linalg.norm(residual.flatten())
         )
+        w = jnp.where(jnp.abs(w) <= noise, 0.0, w)
         lo, hi = sub.primal_box()
         # Round-off on the faces must not block the correction: a start that
-        # violates the box by at most ``tol`` is moved onto it first.
+        # violates the box by no more than the feasibility tolerance or the
+        # rounding of ``bound - x`` is moved onto it first.
+        scale = 1.0 + jnp.max(jnp.abs(sub.lagrangian.ref.flatten()))
+        box_tol = jnp.maximum(tol, 100.0 * eps * scale)
         outside = jnp.maximum(jnp.max(lo - d_model, initial=0.0), 0.0)
         outside = jnp.maximum(outside, jnp.max(d_model - hi, initial=0.0))
-        start = jnp.where(outside <= tol, jnp.clip(d_model, lo, hi), d_model)
-        fraction = box_segment_fraction(start, w.flatten(), lo, hi)
-        step = sub.to_native_primal(jax.tree.map(lambda v: fraction * v, w))
+        start = jnp.where(outside <= box_tol, jnp.clip(d_model, lo, hi), d_model)
+        fraction = box_segment_fraction(start, w, lo, hi)
+        step = sub.to_native_primal(sub.unflatten_primal(fraction * w))
 
         valid = (
             enabled

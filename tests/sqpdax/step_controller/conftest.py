@@ -169,18 +169,25 @@ def bind_active_set_correction(
     *,
     enabled: bool = True,
     correction: StepCorrection | None = None,
+    active_lb: tuple[bool, ...] | None = None,
+    subproblem_type: type[ActiveSetSubProblem] = ActiveSetSubProblem,
 ) -> tuple[Primal, StepCorrection]:
-    """``(x0, correction)`` bound to a working-set QP with every inequality active."""
+    """``(x0, correction)`` bound to a working-set QP with every inequality active.
+
+    ``active_lb`` adds lower bounds to the working set (none by default);
+    ``subproblem_type`` swaps in an :class:`ActiveSetSubProblem` subclass.
+    """
     lagrangian = Lagrangian(problem)
     primal = Primal(jnp.asarray(x))
     dual = zero_dual(problem)
+    lower = jnp.zeros(problem.n, bool) if active_lb is None else jnp.array(active_lb)
     working_set = ActiveSet(
         meq=problem.meq,
         active_inequalities=jnp.ones(problem.mineq, bool),
-        active_lb=jnp.zeros(problem.n, bool),
+        active_lb=lower,
         active_ub=jnp.zeros(problem.n, bool),
     )
-    subproblem = ActiveSetSubProblem(lagrangian(primal, dual), working_set)
+    subproblem = subproblem_type(lagrangian(primal, dual), working_set)
     bound = (correction or LeastNormCorrection()).bind(
         subproblem=subproblem,
         lagrangian=lagrangian,

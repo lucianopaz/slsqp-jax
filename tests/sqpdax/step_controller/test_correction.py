@@ -9,7 +9,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.step_controller import LeastNormCorrection
+from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 
 from .conftest import (
     bind_active_set_correction,
@@ -112,3 +114,36 @@ def test_unbound_correction_raises():
 def test_soc_threshold_must_be_positive(soc_threshold: float):
     with pytest.raises(ValueError, match="soc_threshold"):
         LeastNormCorrection(soc_threshold=soc_threshold)
+
+
+def _landing_on_a_bound(**kwargs):
+    """Tangent step that lands x₁ on its lower bound, which is in the working set."""
+    x0 = _on_circle(1.0)
+    d = tangent_step(bind_active_set_correction(make_circle_problem(), x0)[0], 0.05)
+    lb = jnp.array([x0[0] + d.x[0], -jnp.inf])
+    problem = make_circle_problem(lb=lb, ub=jnp.full(2, jnp.inf))
+    primal, correction = bind_active_set_correction(
+        problem, x0, active_lb=(True, False), **kwargs
+    )
+    return primal, correction, d
+
+
+class _NoisyActiveSetSubProblem(ActiveSetSubProblem):
+    """Least-norm steps carry round-off on x₁, which the working set fixes."""
+
+    def least_norm_step(self, rhs, *, tol=1e-10, max_iter=None):
+        w = super().least_norm_step(rhs, tol=tol, max_iter=max_iter)
+        return Primal(w.x.at[0].add(-1e-14))
+
+
+def test_round_off_on_a_fixed_coordinate_does_not_block_the_correction():
+    # An outward speck of 1e-14 on the face x₁ sits on would leave no room in
+    # the box; it is below the accuracy of the solve and must be ignored.
+    x0, correction, d = _landing_on_a_bound(
+        correction=LeastNormCorrection(soc_threshold=1e6),
+        subproblem_type=_NoisyActiveSetSubProblem,
+    )
+    out = correction(x0, d)
+    assert bool(out.valid)
+    assert float(out.fraction) == pytest.approx(1.0)
+    assert float(out.step.x[0]) == 0.0
