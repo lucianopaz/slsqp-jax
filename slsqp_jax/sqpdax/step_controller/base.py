@@ -1,8 +1,9 @@
 """Abstract step-controller interface and per-step result carrier."""
 
 from abc import abstractmethod
-from typing import Generic
+from typing import ClassVar, Generic, cast
 
+import jax
 from equinox import Module, field
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Scalar
@@ -11,6 +12,7 @@ from ..logging import Logger
 from ..merit import Merit
 from ..primal import PrimalType
 from ..subproblem.solver import SubProblemSolverStateType
+from .correction import CorrectionResult, StepCorrection
 
 __all__ = [
     "ROUNDING_LEVEL_FACTOR",
@@ -96,6 +98,10 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
         :func:`at_rounding_level`), so ``accepted`` carries no information
         about the quality of the model. Outer loops must not count such a
         rejection towards their failure streaks.
+    corrected
+        ``True`` when the accepted point is the second-order corrected trial
+        ``x0 + d + d̂`` rather than a point on the ray ``x0 + α d`` (see
+        :attr:`StepController.correction`).
     """
 
     x: PrimalType
@@ -108,6 +114,7 @@ class StepResult(Module, Generic[PrimalType, SubProblemSolverStateType]):
         default_factory=lambda: jnp.asarray(False)
     )
     rounding_level: Bool[Array, ""] = field(default_factory=lambda: jnp.asarray(False))
+    corrected: Bool[Array, ""] = field(default_factory=lambda: jnp.asarray(False))
 
 
 class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
@@ -133,9 +140,60 @@ class StepController(Module, Generic[PrimalType, SubProblemSolverStateType]):
         controller's own records (trial steps, acceptance / rejection).
         Minimisers pass their ``minimiser.step_controller`` child; the
         default never emits.
+    correction
+        Optional bound
+        :class:`~slsqp_jax.sqpdax.step_controller.correction.StepCorrection`
+        tried on a rejected full step before the controller shortens it.
+        Each controller decides when to try it and how to accept the
+        corrected point; controllers that have no such stage declare
+        :attr:`supports_correction` ``False`` and refuse a correction.
+    supports_correction
+        Class-level flag: whether :meth:`step` implements a correction stage.
     """
 
+    supports_correction: ClassVar[bool] = False
+
     logger: Logger = field(static=True, default_factory=Logger.disabled, kw_only=True)
+    correction: StepCorrection | None = field(default=None, kw_only=True)
+
+    def __check_init__(self) -> None:
+        """Refuse a correction on a controller without a correction stage."""
+        if self.correction is not None and not self.supports_correction:
+            raise ValueError(
+                f"{type(self).__name__} has no second-order correction stage; "
+                "pass correction=None"
+            )
+
+    def _corrected_point(
+        self, x0: PrimalType, direction: PrimalType
+    ) -> tuple[PrimalType, CorrectionResult[PrimalType]]:
+        """Second-order corrected trial point ``x0 + direction + d̂``.
+
+        Parameters
+        ----------
+        x0
+            Current iterate.
+        direction
+            Full proposed step.
+
+        Returns
+        -------
+        x
+            Corrected trial point; ``x0 + direction`` when the correction is
+            invalid (its step is then zero).
+        result
+            The :class:`~slsqp_jax.sqpdax.step_controller.correction.CorrectionResult`.
+
+        Raises
+        ------
+        ValueError
+            If the controller carries no :attr:`correction`.
+        """
+        if self.correction is None:
+            raise ValueError(f"{type(self).__name__} carries no correction")
+        result = self.correction(x0, direction)
+        x = jax.tree.map(lambda a, b, c: a + b + c, x0, direction, result.step)
+        return cast(PrimalType, x), result
 
     @abstractmethod
     def step(
