@@ -25,13 +25,7 @@ from ..results import (
     ResultAdapter,
 )
 from ..secant import SecantResetSignals
-from ..step_controller import (
-    ArmijoLineSearch,
-    LeastNormCorrection,
-    StepController,
-    StepCorrection,
-    StepResult,
-)
+from ..step_controller import ArmijoLineSearch, StepController, StepResult
 from ..subproblem import ActiveSetSubProblem
 from ..subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
@@ -271,11 +265,12 @@ class ActiveSetLineSearchMinimiser(
         step).
     step_correction
         Second-order correction tried when the full QP step fails the
-        Armijo test (Nocedal & Wright Alg. 18.3): a
+        Armijo test (Nocedal & Wright Alg. 18.3), e.g. a
         :class:`~slsqp_jax.sqpdax.step_controller.correction.LeastNormCorrection`
-        on the QP's final working set by default, which counters the
-        Maratos effect of curved constraints on the L1 merit. ``None``
-        (``options['minimiser']['step_correction'] = None``) turns it off.
+        on the QP's final working set
+        (``options['minimiser']['step_correction'] = {}``). Off by default:
+        on the benchmark it changed no solved task (see
+        ``orchestration/hypotheses/soc_least_norm.md``).
     """
 
     # QP inner solve
@@ -306,10 +301,6 @@ class ActiveSetLineSearchMinimiser(
     restoration: bool = eqx.field(static=True, default=True)
     restoration_radius: float = eqx.field(static=True, default=10.0)
     restoration_cg_iter: int = eqx.field(static=True, default=20)
-    # second-order correction of a rejected full step
-    step_correction: StepCorrection | None = eqx.field(
-        static=True, default_factory=LeastNormCorrection
-    )
     n_restoration_steps: Array = eqx.field(
         default_factory=lambda: jnp.asarray(0, jnp.int32)
     )
