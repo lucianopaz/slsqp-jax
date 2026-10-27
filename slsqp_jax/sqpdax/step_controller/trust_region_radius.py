@@ -1,10 +1,12 @@
 """Trust-region radius update and step acceptance."""
 
+from collections.abc import Callable
 from typing import cast
 
 import equinox as eqx
 import jax
 from jax import numpy as jnp
+from jaxtyping import Array, Bool, Scalar
 
 from ..primal import Primal
 from ..subproblem.solver.trust_region import TrustRegionSolverState
@@ -43,6 +45,12 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
     outer loop can detect model failures (``ρ = -inf`` when the predicted
     reduction is non-positive) without recomputing the merit.
 
+    With a :attr:`~slsqp_jax.sqpdax.step_controller.base.StepController.correction`
+    a step with ``ρ < η`` is retried at the corrected point ``x0 + d + d̂``
+    against the *same* predicted reduction (Byrd, Hribar & Nocedal 1999,
+    p. 892; scipy ``trust-constr``); the corrected point is taken when its
+    ratio reaches ``η``, and the radius update then uses that ratio.
+
     Attributes
     ----------
     merit
@@ -67,6 +75,8 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
     shrink_factor: float = eqx.field(default=0.25)
     grow_factor: float = eqx.field(default=2.0)
     max_radius: float = eqx.field(default=1e10)
+
+    supports_correction = True
 
     def step(
         self,
@@ -149,18 +159,27 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
         merit0 = self.merit(x0)
         x_trial = jax.tree.map(jnp.add, x0, direction)
         merit_trial = self.merit(x_trial)
-        actual_reduction = merit0 - merit_trial
 
         # rho = actual / predicted reduction.  A non-positive predicted reduction
         # means the model failed; treat rho as -inf so the step is rejected and the
         # radius shrinks.
         tiny = jnp.asarray(jnp.finfo(pred.dtype).tiny, pred.dtype)
         good_pred = pred > tiny
-        rho = jnp.where(
-            good_pred,
-            actual_reduction / jnp.where(good_pred, pred, 1.0),
-            -jnp.inf,
-        )
+
+        def ratio(merit: Scalar) -> Scalar:
+            return jnp.where(
+                good_pred,
+                (merit0 - merit) / jnp.where(good_pred, pred, 1.0),
+                -jnp.inf,
+            )
+
+        rho = ratio(merit_trial)
+        corrected = jnp.asarray(False)
+        if self.correction is not None:
+            x_trial, merit_trial, rho, corrected = self._try_correction(
+                x0, direction, x_trial, merit_trial, rho, ratio
+            )
+        actual_reduction = merit0 - merit_trial
 
         accepted = rho >= self.eta
         x_new = jax.tree.map(lambda a, b: jnp.where(accepted, b, a), x0, x_trial)
@@ -207,5 +226,60 @@ class TrustRegionManager(MeritStepController[Primal, TrustRegionSolverState]):
                 step_size=jnp.where(accepted, jnp.asarray(1.0), jnp.asarray(0.0)),
                 proposed_step_norm=proposed_step_norm,
                 rounding_level=at_rounding_level(pred, merit0),
+                corrected=accepted & corrected,
             ),
         )
+
+    def _try_correction(
+        self,
+        x0: Primal,
+        direction: Primal,
+        x_trial: Primal,
+        merit_trial: Scalar,
+        rho: Scalar,
+        ratio: Callable[[Scalar], Scalar],
+    ) -> tuple[Primal, Scalar, Scalar, Bool[Array, ""]]:
+        """Retry a step with ``ρ < η`` at its second-order corrected point.
+
+        Parameters
+        ----------
+        x0, direction
+            Current iterate and proposed step.
+        x_trial, merit_trial, rho
+            Uncorrected trial point, its merit and its ratio.
+        ratio
+            ``merit ↦ ρ`` against this step's predicted reduction.
+
+        Returns
+        -------
+        tuple
+            ``(x, merit, ρ, corrected)`` of the corrected point when its ratio
+            reaches :attr:`eta`, otherwise of the uncorrected trial.
+        """
+
+        def attempt() -> tuple[Primal, Scalar, Scalar, Bool[Array, ""]]:
+            x_soc, result = self._corrected_point(x0, direction)
+            merit_soc = self.merit(x_soc)
+            rho_soc = ratio(merit_soc)
+            ok = result.valid & (rho_soc >= self.eta)
+            self.logger.info(
+                "second-order correction accepted: |c(x+d)|={res:.3e} "
+                "fraction={t:.3e} rho {rho:.3e} -> {rho_soc:.3e}",
+                when=ok,
+                res=result.residual_norm,
+                t=result.fraction,
+                rho=rho,
+                rho_soc=rho_soc,
+            )
+            x = jax.tree.map(lambda a, b: jnp.where(ok, a, b), x_soc, x_trial)
+            return (
+                cast(Primal, x),
+                jnp.where(ok, merit_soc, merit_trial),
+                jnp.where(ok, rho_soc, rho),
+                ok,
+            )
+
+        def keep() -> tuple[Primal, Scalar, Scalar, Bool[Array, ""]]:
+            return x_trial, merit_trial, rho, jnp.asarray(False)
+
+        return jax.lax.cond(rho < self.eta, attempt, keep)
