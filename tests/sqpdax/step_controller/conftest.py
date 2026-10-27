@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 
+from slsqp_jax.sqpdax.active_set import ActiveSet
 from slsqp_jax.sqpdax.barrier import LogBarrier
+from slsqp_jax.sqpdax.dual import Dual
+from slsqp_jax.sqpdax.lagrangian import InteriorPointLagrangian, Lagrangian
 from slsqp_jax.sqpdax.merit import ConstraintViolation, NormMerit
-from slsqp_jax.sqpdax.problem import Problem
+from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal, Slack
+from slsqp_jax.sqpdax.problem import Problem, build_problem
 from slsqp_jax.sqpdax.step_controller import (
     ArmijoLineSearch,
+    LeastNormCorrection,
+    StepCorrection,
     TrustFunnelManager,
     TrustRegionManager,
 )
+from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
+from slsqp_jax.sqpdax.subproblem.scaled_barrier import ScaledBarrierSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     TrustFunnelSolverState,
     TrustRegionSolverState,
@@ -108,3 +119,114 @@ def make_tr_state(
         on_boundary=jnp.asarray(on_boundary),
         rho=jnp.asarray(1.0),
     )
+
+
+# --- second-order correction ------------------------------------------------
+
+
+def make_circle_problem(
+    *,
+    inequality: bool = False,
+    lb: jax.Array | None = None,
+    ub: jax.Array | None = None,
+) -> Problem:
+    """Nocedal & Wright Example 15.4: ``min 2(x₁²+x₂²−1) − x₁`` on the unit circle.
+
+    The constraint is ``x₁² + x₂² − 1 = 0`` (``≤ 0`` with ``inequality=True``).
+    Near ``x* = (1, 0)`` the full SQP step increases the ℓ1 merit: the
+    Maratos example.
+    """
+
+    def circle(x):
+        return jnp.array([x @ x - 1.0])
+
+    rows: dict[str, Any] = (
+        {"mineq": 1, "ineq_fn": circle} if inequality else {"meq": 1, "eq_fn": circle}
+    )
+    return build_problem(
+        lambda x: 2.0 * (x @ x - 1.0) - x[0],
+        n=2,
+        lb=lb,
+        ub=ub,
+        autodiff_mode="jax",
+        force_hvp_in_jax_mode=True,
+        **rows,
+    )
+
+
+def zero_dual(problem: Problem) -> Dual:
+    """All-zero multipliers sized for ``problem``."""
+    n = problem.n
+    return Dual(
+        jnp.zeros(problem.meq), jnp.zeros(problem.mineq), jnp.zeros(n), jnp.zeros(n)
+    )
+
+
+def bind_active_set_correction(
+    problem: Problem,
+    x: jax.Array,
+    *,
+    enabled: bool = True,
+    correction: StepCorrection | None = None,
+) -> tuple[Primal, StepCorrection]:
+    """``(x0, correction)`` bound to a working-set QP with every inequality active."""
+    lagrangian = Lagrangian(problem)
+    primal = Primal(jnp.asarray(x))
+    dual = zero_dual(problem)
+    working_set = ActiveSet(
+        meq=problem.meq,
+        active_inequalities=jnp.ones(problem.mineq, bool),
+        active_lb=jnp.zeros(problem.n, bool),
+        active_ub=jnp.zeros(problem.n, bool),
+    )
+    subproblem = ActiveSetSubProblem(lagrangian(primal, dual), working_set)
+    bound = (correction or LeastNormCorrection()).bind(
+        subproblem=subproblem,
+        lagrangian=lagrangian,
+        dual=dual,
+        enabled=jnp.asarray(enabled),
+        default_tol=1e-8,
+    )
+    return primal, bound
+
+
+def bind_interior_point_correction(
+    problem: Problem,
+    x: jax.Array,
+    *,
+    slack: float = 0.5,
+    enabled: bool = True,
+    correction: StepCorrection | None = None,
+) -> tuple[InteriorPointPrimal, StepCorrection]:
+    """``(x0, correction)`` bound to the scaled-barrier subproblem at ``(x, s)``."""
+    barrier = LogBarrier(
+        weight=jnp.asarray(0.1), null_lb=problem.null_lb, null_ub=problem.null_ub
+    )
+    lagrangian = InteriorPointLagrangian(
+        problem, secant=None, barrier=barrier, primal_dual=True
+    )
+    n = problem.n
+    primal = InteriorPointPrimal(
+        x=jnp.asarray(x),
+        slack=Slack(
+            s=jnp.full(problem.mineq, slack), s_lb=jnp.ones(n), s_ub=jnp.ones(n)
+        ),
+    )
+    dual = zero_dual(problem)
+    subproblem = ScaledBarrierSubProblem(lagrangian(primal, dual))
+    bound = (correction or LeastNormCorrection()).bind(
+        subproblem=subproblem,
+        lagrangian=lagrangian,
+        dual=dual,
+        enabled=jnp.asarray(enabled),
+        default_tol=1e-8,
+    )
+    return primal, bound
+
+
+def tangent_step(x0: Primal, t: float) -> Primal:
+    """Step of length ``t`` tangent to the circle through ``x0.x`` (slacks fixed)."""
+    x = x0.x
+    d = t * jnp.array([-x[1], x[0]]) / jnp.linalg.norm(x)
+    step = jax.tree.map(jnp.zeros_like, x0)
+    return eqx.tree_at(lambda p: p.x, step, d)
