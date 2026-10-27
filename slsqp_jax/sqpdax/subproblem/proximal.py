@@ -116,6 +116,29 @@ class ProximalActiveSetSubProblem(ActiveSetSubProblem):
         """Rebuild with a new working set, keeping ``mu`` and ``eq_center``."""
         return type(self)(self.lagrangian, active_set, self.mu, self.eq_center)
 
+    def constraint_residual(self, trial: EvaluatedLagrangian[Primal]) -> Dual:
+        """Working-set residual at a trial point without the equality rows.
+
+        Parameters
+        ----------
+        trial
+            Lagrangian evaluated at the trial point.
+
+        Returns
+        -------
+        Dual
+            The masked residual of the parent with the equality block zeroed,
+            matching :attr:`L_k`: the equalities are not rows of this model
+            (they enter through the proximal term), so a least-norm step on
+            the model's rows cannot and must not target them.
+        """
+        residual = super().constraint_residual(trial)
+        return tree_at(
+            lambda d: d.eq_multipliers,
+            residual,
+            jnp.zeros_like(residual.eq_multipliers),
+        )
+
     @property
     def eq_jac(self):
         """Unmasked equality Jacobian ``A_eq`` (shape ``(meq, n)``)."""

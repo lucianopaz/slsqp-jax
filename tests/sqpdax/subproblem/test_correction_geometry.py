@@ -45,11 +45,23 @@ SUBPROBLEMS: dict[str, Callable[[], SubProblem]] = {
     "funnel-barrier": make_funnel_barrier_subproblem,
 }
 WORKING_SET_SUBPROBLEMS = ["active-set", "proximal"]
+# Re-evaluate each family's Lagrangian at a native trial point.
+TRIAL_LAGRANGIANS: dict[str, Callable] = {
+    "active-set": lambda p: make_evaluated_lagrangian(primal=p),
+    "proximal": lambda p: make_evaluated_lagrangian(primal=p),
+    "scaled-barrier": lambda p: make_ip_evaluated(primal=p),
+    "funnel-barrier": lambda p: make_ip_evaluated(primal=p),
+}
 
 
 @pytest.fixture(params=list(SUBPROBLEMS))
-def subproblem(request) -> SubProblem:
-    return SUBPROBLEMS[request.param]()
+def family(request) -> str:
+    return request.param
+
+
+@pytest.fixture
+def subproblem(family: str) -> SubProblem:
+    return SUBPROBLEMS[family]()
 
 
 def materialise(sub: SubProblem) -> np.ndarray:
@@ -80,6 +92,18 @@ def test_constraint_residual_at_the_reference_is_dual_grad(subproblem: SubProble
         subproblem.constraint_residual(subproblem.lagrangian).flatten(),
         subproblem.dual_grad().flatten(),
     )
+
+
+def test_constraint_residual_only_has_model_rows(family: str):
+    sub = SUBPROBLEMS[family]()
+    a = materialise(sub)
+    flat = sub.lagrangian.ref.flatten()
+    trial = TRIAL_LAGRANGIANS[family](sub.unflatten_primal(flat + 0.1))
+    residual = np.asarray(sub.constraint_residual(trial).flatten())
+    # Rows the model does not carry (zero operator row and zero dual_grad):
+    # inactive working-set rows, and the proximal model's equality rows.
+    absent = ~np.any(a != 0.0, axis=1) & (np.asarray(sub.dual_grad().flatten()) == 0)
+    np.testing.assert_array_equal(residual[absent], 0.0)
 
 
 @pytest.mark.parametrize("name", WORKING_SET_SUBPROBLEMS)

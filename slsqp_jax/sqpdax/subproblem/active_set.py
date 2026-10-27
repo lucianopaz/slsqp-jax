@@ -157,9 +157,7 @@ class ActiveSetSubProblem(SubProblem[Primal]):
         -------
         Dual
             ``trial.dual_grad`` restricted to the equalities and the
-            inequality / bound rows of :attr:`active_set`. Inherited unchanged
-            by the proximal subproblem, so the residual is the plain constraint
-            value without the proximal shift of its equality rows.
+            inequality / bound rows of :attr:`active_set`.
         """
         return self.active_set.mask_lagrangian(trial).dual_grad
 
