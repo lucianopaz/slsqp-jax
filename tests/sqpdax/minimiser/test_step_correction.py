@@ -23,7 +23,11 @@ MINIMISERS = {
     "pasls": ProximalActiveSetLineSearchMinimiser,
     "trip": TrustRegionInteriorPointMinimiser,
 }
-DEFAULT_CORRECTION = {"asls": None, "pasls": None, "trip": None}
+DEFAULT_CORRECTION = {
+    "asls": LeastNormCorrection(),
+    "pasls": LeastNormCorrection(),
+    "trip": None,
+}
 THETA = 0.3
 
 
@@ -81,6 +85,24 @@ def test_active_set_correction_shortens_the_maratos_run():
     assert int(plain.stats["n_soc_accepts"]) == 0
     assert int(corrected.stats["n_soc_accepts"]) > 0
     np.testing.assert_allclose(np.asarray(corrected.value), [1.0, 0.0], atol=1e-6)
+
+
+def test_active_set_default_run_uses_the_correction():
+    # No option: the default correction is on and matches the explicit one.
+    with jax.enable_x64(True):
+        problem = make_circle_problem()
+        solver = ActiveSetLineSearchMinimiser(curvature="secant", rtol=1e-8, atol=1e-8)
+        explicit = _solve(solver, problem, {})
+        default = minimise(
+            problem,
+            solver,
+            jnp.array([jnp.cos(THETA), jnp.sin(THETA)], jnp.float64),
+            max_steps=100,
+            throw=False,
+        )
+    assert int(default.stats["n_soc_accepts"]) > 0
+    assert int(default.stats["num_steps"]) == int(explicit.stats["num_steps"])
+    np.testing.assert_allclose(np.asarray(default.value), np.asarray(explicit.value))
 
 
 def test_trust_region_interior_point_runs_with_a_correction():
