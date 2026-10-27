@@ -78,6 +78,8 @@ def test_active_set_correction_shortens_the_maratos_run():
     assert bool(is_successful(plain.result))
     assert bool(is_successful(corrected.result))
     assert int(corrected.stats["num_steps"]) < int(plain.stats["num_steps"])
+    assert int(plain.stats["n_soc_accepts"]) == 0
+    assert int(corrected.stats["n_soc_accepts"]) > 0
     np.testing.assert_allclose(np.asarray(corrected.value), [1.0, 0.0], atol=1e-6)
 
 

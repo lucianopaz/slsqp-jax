@@ -12,6 +12,7 @@ from tests.sqpdax.minimiser.diagnostics.conftest import make_prediction
 COUNTERS = (
     "n_armijo_accepts",
     "n_fallback_accepts",
+    "n_soc_accepts",
     "n_lpeca_bypassed",
     "n_lpeca_capped",
     "n_lpeca_bounds_prefixed",
@@ -21,42 +22,71 @@ COUNTERS = (
 def test_zero_carry_is_all_zero(zero_als_diagnostics: ActiveSetLineSearchDiagnostics):
     """``zero()`` starts every counter at zero with the fallback flag cleared."""
     assert not bool(zero_als_diagnostics.last_ls_fallback)
+    assert not bool(zero_als_diagnostics.last_soc)
     for name in COUNTERS:
         value = getattr(zero_als_diagnostics, name)
         assert int(value) == 0
         assert value.dtype == jnp.int32
-    assert set(zero_als_diagnostics.stats()) == {"last_ls_fallback", *COUNTERS}
+    assert set(zero_als_diagnostics.stats()) == {
+        "last_ls_fallback",
+        "last_soc",
+        *COUNTERS,
+    }
 
 
 @pytest.mark.parametrize(
-    ("steps", "expected_armijo", "expected_fallback", "expected_last"),
+    (
+        "steps",
+        "expected_armijo",
+        "expected_fallback",
+        "expected_last",
+        "expected_soc",
+        "expected_last_soc",
+    ),
     [
-        # (accepted, accepted_by_fallback) per step
-        ([(True, False)], 1, 0, False),
-        ([(True, True)], 0, 1, True),
-        ([(False, True)], 0, 0, False),
-        ([(True, False), (True, True), (False, False)], 1, 1, False),
-        ([(True, False), (True, True)], 1, 1, True),
+        # (accepted, accepted_by_fallback, corrected) per step
+        ([(True, False, False)], 1, 0, False, 0, False),
+        ([(True, True, False)], 0, 1, True, 0, False),
+        ([(False, True, False)], 0, 0, False, 0, False),
+        (
+            [(True, False, False), (True, True, False), (False, False, False)],
+            1,
+            1,
+            False,
+            0,
+            False,
+        ),
+        ([(True, False, False), (True, True, False)], 1, 1, True, 0, False),
+        # A corrected acceptance is an Armijo acceptance that is also counted
+        # as a correction; a rejected corrected trial counts nowhere.
+        ([(True, False, True)], 1, 0, False, 1, True),
+        ([(False, False, True)], 0, 0, False, 0, False),
+        ([(True, False, True), (True, False, False)], 2, 0, False, 1, False),
     ],
 )
 def test_record_step_counts_acceptance_kind(
     zero_als_diagnostics: ActiveSetLineSearchDiagnostics,
-    steps: list[tuple[bool, bool]],
+    steps: list[tuple[bool, bool, bool]],
     expected_armijo: int,
     expected_fallback: int,
     expected_last: bool,
+    expected_soc: int,
+    expected_last_soc: bool,
 ):
-    """Armijo and fallback acceptances are counted separately; rejections count nowhere."""
+    """Armijo, fallback and corrected acceptances are counted; rejections count nowhere."""
     diag = zero_als_diagnostics
-    for accepted, by_fallback in steps:
+    for accepted, by_fallback, corrected in steps:
         diag = diag.record_step(
             accepted=jnp.asarray(accepted),
             accepted_by_fallback=jnp.asarray(by_fallback),
+            corrected=jnp.asarray(corrected),
         )
     assert int(diag.n_armijo_accepts) == expected_armijo
     assert int(diag.n_fallback_accepts) == expected_fallback
     assert bool(diag.last_ls_fallback) is expected_last
-    for name in COUNTERS[2:]:
+    assert int(diag.n_soc_accepts) == expected_soc
+    assert bool(diag.last_soc) is expected_last_soc
+    for name in COUNTERS[3:]:
         assert int(getattr(diag, name)) == 0
 
 

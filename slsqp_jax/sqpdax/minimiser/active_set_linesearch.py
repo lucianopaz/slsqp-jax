@@ -1199,7 +1199,9 @@ class ActiveSetLineSearchMinimiser(
             jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
         )
         diagnostics = self.diagnostics.record_step(
-            accepted=result.accepted, accepted_by_fallback=result.accepted_by_fallback
+            accepted=result.accepted,
+            accepted_by_fallback=result.accepted_by_fallback,
+            corrected=result.corrected,
         )
 
         self.logger.warning(
@@ -1317,7 +1319,7 @@ class ActiveSetLineSearchMinimiser(
         octx: OptimisationContext[Primal, ActiveSetStateType],
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> dict[str, Any]:
-        """Stationarity / feasibility, penalty, QP outcome and failure streaks."""
+        """Stationarity / feasibility, penalty, QP outcome, correction and streaks."""
         solver_state = cast(ActiveSetStateType, result.solver_state)
         return {
             "kkt": (metrics.stationarity, ".2e"),
@@ -1328,6 +1330,7 @@ class ActiveSetLineSearchMinimiser(
             "qp_iters": solver_state.last_n_iter,
             "cg_iters": solver_state.last_n_cg_iter,
             "ls_fallback": self.diagnostics.last_ls_fallback,
+            "soc": result.corrected,
             "qp_fail": self.consecutive_qp_failures,
             "ls_fail": self.consecutive_ls_failures,
             "stall": self.steps_without_improvement,
@@ -1341,7 +1344,7 @@ class ActiveSetLineSearchMinimiser(
         octx: OptimisationContext[Primal, ActiveSetStateType],
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> dict[str, Any]:
-        """Base payload plus penalty, failure streaks and the QP working set."""
+        """Base payload plus penalty, failure streaks, correction and QP working set."""
         fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
         solver_state = cast(ActiveSetStateType, result.solver_state)
         fields.update(
@@ -1353,6 +1356,7 @@ class ActiveSetLineSearchMinimiser(
                 "steps_without_improvement": self.steps_without_improvement,
                 "blowup_count": self.blowup_count,
                 "last_ls_fallback": self.diagnostics.last_ls_fallback,
+                "corrected": result.corrected,
                 "diagnostics": self.diagnostics,
                 "qp_result": solver_state.qp_result,
                 "qp_active_set": solver_state.active_set,
