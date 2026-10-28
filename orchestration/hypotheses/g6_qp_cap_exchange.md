@@ -139,3 +139,13 @@ violated row to leave). Plain ratio test is best.
 
 Open: the rank-deficient case (a_p independent of a full, dependent set) is left unchanged; not counted yet. HS97 false
 success of the 10-14 prototype not seen in this run (HS97 not among the changed tasks).
+
+**G1** (all 388 unsolved asls / pasls tasks of v9, flag on, `diagnostics/wse/g1`): **21/388 solved, all attributable**
+(the 7 not already in the tiny attribution re-run with the flag off: none solves). HS98 ×5, OPTCNTRL craig / minresqlp /
+pcg / pasls (3 steps; the cap diagnosis of OPTCNTRL), GOULDQP1 minresqlp / pcg / pcg-exact, HS23 pcg-exact / pasls,
+DEGENQP / LSNNODOC pasls, HS116 minresqlp, OET1 / HS81 pcg-exact, OET4 minresqlp, TENBARS1 pcg. Gap: sqpdax union
+255 → 257 / 303, scipy deficit 9 → 8 (HS98 leaves). With the 7 tiny losses, per config approximately craig 228 → 228,
+pcg 226 → 230, pcg-exact 239 → 242, minresqlp 218 → 223, pasls 209 → 211 (+21 / −7).
+
+**Decision:** default `exchange_when_full=True` (`SingleExchangeWorkingSetPolicy` keeps False). Non-slow sqpdax suite
+with the new default: 1819 passed, 9 skipped.
