@@ -275,7 +275,8 @@ def test_single_exchange_changes_at_most_one_row(current, step, expected):
     [
         # Two violated inequalities: only the more violated row 1 fits.
         (_active(), _step([2.0, -3.0]), _active(ineq=(False, True))),
-        # A row already in the set is kept in preference to a new violation.
+        # Without the exchange, a row already in the set is kept in
+        # preference to a new violation.
         (
             _active(ineq=(True, False)),
             _step([0.0, -3.0], ineq=(1.0, 0.0)),
@@ -295,7 +296,7 @@ def test_cap_limits_the_working_set_to_the_degrees_of_freedom(
     policy_cls, current, step, expected
 ):
     lag = _lagrangian(bounded=False)
-    policy = policy_cls(tol=TOL)
+    policy = policy_cls(tol=TOL, exchange_when_full=False)
     assert policy.cap_working_set
     next_set, _, _ = policy.update(lag, step, current, policy.init_state(current))
     assert _mask_count(next_set) <= lag.n - lag.meq == 1
@@ -502,9 +503,12 @@ def test_exchange_row_follows_the_goldfarb_idnani_ratio(
     assert out.tolist() == [*map(bool, expected), False, False]
 
 
-@pytest.mark.parametrize("exchange", [False, True], ids=["cap", "exchange"])
+@pytest.mark.parametrize(
+    "exchange", [False, True, None], ids=["cap", "exchange", "default"]
+)
 def test_full_set_admits_violated_row_only_with_exchange(exchange):
-    """A full set keeps a violated row out unless ``exchange_when_full``."""
+    """A full set keeps a violated row out unless ``exchange_when_full`` (the
+    default)."""
     lag = _exchange_lagrangian((-1.0, -2.0), equality=False)
     current = ActiveSet(
         meq=0,
@@ -521,7 +525,9 @@ def test_full_set_admits_violated_row_only_with_exchange(exchange):
             ub_multipliers=jnp.zeros(2),
         ),
     )
-    policy = ThresholdWorkingSetPolicy(tol=TOL, exchange_when_full=exchange)
+    kwargs = {} if exchange is None else {"exchange_when_full": exchange}
+    policy = ThresholdWorkingSetPolicy(tol=TOL, **kwargs)
+    exchange = policy.exchange_when_full
     proposed = policy.propose(lag, step, current, jnp.asarray(TOL))
     assert bool(proposed.active_inequalities[0]) is exchange
     assert proposed.active_lb.tolist() == ([True, False] if exchange else [True, True])
