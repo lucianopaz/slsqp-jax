@@ -113,3 +113,29 @@ HS106 (scipy-only win) is not blocked by the cap on any config. Its trajectory i
 outer crawl with ρ = 2.6e4 (G6 H1, decaying penalty). HS97/HS98 asls-pcg-exact end at the local point f = 4.0712 with gi.
 HS114 pasls keeps 2-3 blocked QPs with no r_i > 0 (ratio test empty: inconsistent proximal linearisation). Leave that to the
 proximal μ work.
+
+## Re-measurement (2026-10-28, branch `working-set-exchange`)
+
+Found again from the HS64 bound crossing while tracing the per-row merit penalty (branch `vector_rho`, independent of this change): at step 11 of HS64
+asls-minresqlp / pasls the set {h0, l0, l2} is full (cap 3), l1 is violated by the step (x₂ 220 → −668) and cannot
+enter; the QP reports `working_set_converged`. With the cap off, or with H1, HS64 solves in 19 steps (also under the per-row
+penalty rule of `vector_rho`). This note was missed before the re-implementation.
+
+Implementation `2083ba2` (`exchange_row` + `ThresholdWorkingSetPolicy.exchange_when_full`, default off, 9 tests): a
+Gram--Schmidt QR of `[eq rows | selected rows]` gives α; leaving row `argmin_{αⱼ>0} λⱼ/αⱼ` (λ clipped at 0); unchanged when
+a_p is independent of the span (rank-deficient set) or no αⱼ > 0. Gated on `full & any(rejected)` after `_select_rows`.
+
+**Tiny tier** (flag on, scalar merit rule, measured on a tree whose solver code equals `main` plus this change; `diagnostics/exchange/`): craig 216→215, minresqlp 210→213, pcg 218→220,
+pcg-exact 224→226, pasls 203→204. **+14 / −7, all 21 attributable** (re-run with the flag off and on).
+- Gained: HS98 ×5 (all configs; 191 → 9 steps on craig/pcg/minresqlp), HS23 pcg-exact + pasls, HS116 minresqlp, HS81
+  pcg-exact, DEGENQP / LSNNODOC pasls, OET1 pcg-exact, OET4 minresqlp, TENBARS1 pcg.
+- Lost: CSFI2 pcg-exact (infeasible start; the first QP exchanges on clipped-zero multipliers and x₅ runs to 4.5e4),
+  HS41 pcg-exact (infeasible start → degenerate vertex x = 0, 5 rows in 4-D, ∇f = 0: a first-order KKT point, f = 2 vs
+  1.926), HS102 / HS69 / DUALC5 pasls, HS116 / TENBARS2 craig (not traced).
+
+**Leaving-row variants** (the 21 tasks only): exchange only at feasible references 3 gains / 1 loss (HS98 and most gains
+need exchanges at infeasible references); never remove a row violated at x_k + max-α ties 7 / 4 (HS98 lost: it needs a
+violated row to leave). Plain ratio test is best.
+
+Open: the rank-deficient case (a_p independent of a full, dependent set) is left unchanged; not counted yet. HS97 false
+success of the 10-14 prototype not seen in this run (HS97 not among the changed tasks).
