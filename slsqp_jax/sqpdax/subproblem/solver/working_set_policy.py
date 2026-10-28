@@ -625,7 +625,7 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
         the most violated one in for the row chosen by the Goldfarb--Idnani
         ratio test (see :func:`exchange_row`). Without it the refresh
         reproduces the full set and the loop reports convergence on a step
-        that violates the excluded row. Off by default.
+        that violates the excluded row. On by default.
 
     Examples
     --------
@@ -656,7 +656,7 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
     expand_factor: float = 0.0
     drop_floor: float = 0.0
     ping_pong_threshold: int | None = eqx.field(static=True, default=None)
-    exchange_when_full: bool = eqx.field(static=True, default=False)
+    exchange_when_full: bool = eqx.field(static=True, default=True)
 
     def __check_init__(self) -> None:
         """Validate the knobs."""
@@ -876,6 +876,8 @@ class SingleExchangeWorkingSetPolicy(ThresholdWorkingSetPolicy):
     >>> solver.max_iter
     30
     """
+
+    exchange_when_full: bool = eqx.field(static=True, default=False)
 
     def __check_init__(self) -> None:
         """Reject the full-set exchange, which this uncapped policy never uses."""
