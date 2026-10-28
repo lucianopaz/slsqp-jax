@@ -698,10 +698,7 @@ class TrustFunnelSolver(
             ),
         )
         w = to_primal(w_flat)
-        step_primal = cast(
-            InteriorPointPrimal,
-            InteriorPointPrimal(x=w.x, slack=subproblem._slack_to_orig_scale(w.slack)),
-        )
+        step_primal = subproblem.to_native_primal(w)
 
         def ratio(dm: Scalar, cauchy: Scalar) -> Scalar:
             return jnp.where(cauchy > 0.0, dm / jnp.maximum(cauchy, tiny), 1.0)

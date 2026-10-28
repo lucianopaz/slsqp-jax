@@ -11,7 +11,8 @@ solver classes, so that every solver reuses one implementation:
 * :mod:`~slsqp_jax.sqpdax.linalg.box` — ray / box intersections behind the
   fraction-to-boundary backtracks
   (:func:`~slsqp_jax.sqpdax.linalg.box.box_ray_length`,
-  :func:`~slsqp_jax.sqpdax.linalg.box.box_fraction`).
+  :func:`~slsqp_jax.sqpdax.linalg.box.box_fraction`,
+  :func:`~slsqp_jax.sqpdax.linalg.box.box_segment_fraction`).
 * :mod:`~slsqp_jax.sqpdax.linalg.projection` — matrix-free orthogonal
   projection onto ``null(A)`` via CG on the normal equations
   (:func:`~slsqp_jax.sqpdax.linalg.projection.null_space_projector`,
@@ -30,7 +31,7 @@ solver classes, so that every solver reuses one implementation:
 """
 
 from . import box, operator_norm, projection, scaled_normal_equations, steihaug
-from .box import box_fraction, box_ray_length
+from .box import box_fraction, box_ray_length, box_segment_fraction
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .scaled_normal_equations import (
@@ -69,6 +70,7 @@ __all__ = [
     "steihaug_step",
     "box_fraction",
     "box_ray_length",
+    "box_segment_fraction",
     "cg_normal_equations",
     "null_space_projector",
 ]

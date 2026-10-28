@@ -322,13 +322,7 @@ class TrustRegionInteriorPointSolver(
         )
 
         # --- recover the native primal step p = (p_x, p_s = S p_s_tilde) ---
-        step_primal = cast(
-            InteriorPointPrimal,
-            InteriorPointPrimal(
-                x=tang_primal.x,
-                slack=subproblem._slack_to_orig_scale(tang_primal.slack),
-            ),
-        )
+        step_primal = subproblem.to_native_primal(tang_primal)
 
         # --- multipliers (eq. 19.37 least squares + eq. 19.38 safeguard by
         # default).  The scaled-barrier primal carries slacks, so the recovery runs

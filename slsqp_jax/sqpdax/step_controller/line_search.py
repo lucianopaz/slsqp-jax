@@ -50,6 +50,11 @@ class LineSearchState(Module):
         Optional flag reserved for concrete searches.
     break_loop
         Optional early-exit flag reserved for concrete searches.
+    correction
+        Second-order correction added to the trial point (``None`` when the
+        search carries no correction; zeros until a correction is tried).
+    corrected
+        Whether the current trial is the corrected point ``x0 + step + d̂``.
     """
 
     # --- required (populated by LineSearch.step) ---
@@ -67,17 +72,22 @@ class LineSearchState(Module):
     )
     success: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
     break_loop: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
+    correction: Primal | None = None
+    corrected: Bool[Array, ""] = eqx.field(default_factory=lambda: jnp.asarray(False))
 
     @property
     def x(self) -> Primal:
-        """Current trial iterate ``x0 + alpha * step``.
+        """Current trial iterate ``x0 + alpha * step (+ correction)``.
 
         A plain property (not ``cached_property``): caching would write into
         the frozen Module's ``__dict__``, which Equinox folds into the pytree
         metadata and breaks the ``while_loop`` carry-structure invariant.
         """
         scaled = jax.tree.map(lambda s: self.alpha * s, self.step)
-        return jax.tree.map(jnp.add, self.x0, scaled)
+        x = jax.tree.map(jnp.add, self.x0, scaled)
+        if self.correction is not None:
+            x = jax.tree.map(jnp.add, x, self.correction)
+        return x
 
 
 class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
@@ -93,6 +103,13 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
     The incoming ``solver_state`` is returned unchanged — a line search does
     not own subproblem-solver control such as a trust-region radius.
 
+    With a :attr:`~slsqp_jax.sqpdax.step_controller.base.StepController.correction`
+    the search follows Nocedal & Wright Algorithm 18.3: when the full step
+    ``α = 1`` fails :meth:`stop_search`, the corrected point ``x0 + d + d̂``
+    is scored and accepted by the same test (still with the slope of ``d``);
+    otherwise backtracking along ``d`` continues from the ``α = 1`` trial,
+    so the correction costs no extra trial evaluation on the ray.
+
     Attributes
     ----------
     merit
@@ -100,6 +117,8 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
     max_steps
         Maximum number of trial evaluations inside the search loop.
     """
+
+    supports_correction = True
 
     max_steps: int = eqx.field(default=20)
 
@@ -243,6 +262,11 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
                 & (state.iteration < self.max_steps)
             )
 
+        if self.correction is not None:
+            state = self._full_step_with_correction(
+                cast(LineSearchState, state), x0, direction, direction_finite, body_fun
+            )
+
         state = cast(
             LineSearchState,
             jax.lax.while_loop(
@@ -257,6 +281,7 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
         # search refused.
         accepted = self.stop_search(state)
         accepted_by_fallback = accepted & self.accepted_by_fallback(state)
+        corrected = accepted & state.corrected
         proposed_step_norm = jnp.linalg.norm(state.step.x)
         rounding_level = at_rounding_level(merit0_grad_dot_step, merit0_val)
         self.logger.info(
@@ -291,6 +316,7 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
                 proposed_step_norm=proposed_step_norm,
                 accepted_by_fallback=accepted_by_fallback,
                 rounding_level=rounding_level,
+                corrected=corrected,
             ),
             lambda: StepResult(
                 x=x0,
@@ -304,6 +330,79 @@ class LineSearch(MeritStepController[Primal, SubProblemSolverState]):
             ),
         )
         return cast(StepResult[Primal, SubProblemSolverState], result)
+
+    def _full_step_with_correction(
+        self,
+        state: LineSearchState,
+        x0: Primal,
+        direction: Primal,
+        direction_finite: Bool[Array, ""],
+        body_fun,
+    ) -> LineSearchState:
+        """Run the ``α = 1`` trial and, if it fails, the corrected trial.
+
+        Parameters
+        ----------
+        state
+            Seeded carry (no trial evaluated yet).
+        x0, direction
+            Current iterate and full step.
+        direction_finite
+            Whether ``direction`` may be evaluated at all.
+        body_fun
+            The search's trial-and-count body (one evaluation along the ray).
+
+        Returns
+        -------
+        LineSearchState
+            The accepted corrected trial (``corrected=True``, ``α = 1``), or
+            the ``α = 1`` trial on the ray from which backtracking continues.
+            The seeded state when ``direction`` is not finite.
+        """
+        state = eqx.tree_at(
+            lambda s: s.correction,
+            state,
+            jax.tree.map(jnp.zeros_like, direction),
+            is_leaf=lambda z: z is None,
+        )
+        full = jax.lax.cond(direction_finite, body_fun, lambda s: s, state)
+
+        def try_correction(st: LineSearchState) -> LineSearchState:
+            x_soc, result = self._corrected_point(x0, direction)
+            merit_soc = self.merit(x_soc)
+            candidate = eqx.tree_at(
+                lambda s: (s.merit_val, s.correction, s.corrected),
+                st,
+                (merit_soc, result.step, jnp.asarray(True)),
+            )
+            ok = result.valid & self.stop_search(candidate)
+            fields = dict(
+                res=result.residual_norm,
+                t=result.fraction,
+                merit0=st.merit0_val,
+                merit=merit_soc,
+            )
+            self.logger.info(
+                "second-order correction accepted: |c(x+d)|={res:.3e} "
+                "fraction={t:.3e} merit {merit0:.6e} -> {merit:.6e}",
+                when=ok,
+                **fields,
+            )
+            self.logger.debug(
+                "second-order correction rejected: valid={valid} "
+                "|c(x+d)|={res:.3e} fraction={t:.3e} merit {merit0:.6e} -> "
+                "{merit:.6e}",
+                when=~ok,
+                valid=result.valid,
+                **fields,
+            )
+            return jax.lax.cond(ok, lambda: candidate, lambda: st)
+
+        need = direction_finite & jnp.logical_not(self.stop_search(full))
+        return cast(
+            LineSearchState,
+            jax.lax.cond(need, try_correction, lambda s: s, full),
+        )
 
 
 class ArmijoLineSearch(LineSearch):

@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
+from slsqp_jax.sqpdax.barrier import LogBarrier
+from slsqp_jax.sqpdax.merit import NormMerit
 from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.step_controller import TrustRegionManager
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS, SubProblemSolverState
 
-from .conftest import make_tr_manager, make_tr_state
+from .conftest import (
+    NeverValidCorrection,
+    bind_active_set_correction,
+    bind_interior_point_correction,
+    make_circle_problem,
+    make_tr_manager,
+    make_tr_state,
+    maratos_step,
+    tangent_step,
+)
 
 
 @pytest.mark.parametrize(
@@ -137,3 +151,75 @@ def test_trust_region_requires_trust_region_state():
     )
     with pytest.raises(TypeError, match="TrustRegionSolverState"):
         mgr.step(x0, direction, bad)  # type: ignore[arg-type]
+
+
+# --- second-order correction stage -------------------------------------------
+
+ON_CIRCLE = jnp.array([np.cos(0.3), np.sin(0.3)])
+PENALTY = 10.0
+
+
+def _active_set_case():
+    """Maratos step on the equality circle, ℓ1 merit."""
+    problem = make_circle_problem()
+    x0, least_norm = bind_active_set_correction(problem, ON_CIRCLE)
+    merit = NormMerit(
+        problem,
+        barrier=None,
+        problem_weight=jnp.asarray(1.0),
+        feasibility_weight=jnp.asarray(PENALTY),
+        norm=1,
+    )
+    return merit, x0, maratos_step(x0), least_norm
+
+
+def _interior_point_case():
+    """Tangent step on the slack-augmented inequality circle, barrier ℓ2 merit."""
+    problem = make_circle_problem(inequality=True)
+    x0, least_norm = bind_interior_point_correction(problem, np.sqrt(0.5) * ON_CIRCLE)
+    barrier = LogBarrier(
+        weight=jnp.asarray(0.1), null_lb=problem.null_lb, null_ub=problem.null_ub
+    )
+    merit = NormMerit(
+        problem,
+        barrier=barrier,
+        problem_weight=jnp.asarray(1.0),
+        barrier_weight=jnp.asarray(1.0),
+        feasibility_weight=jnp.asarray(PENALTY),
+        norm=2,
+    )
+    # Along the tangent that increases x₁ (descent for f).
+    return merit, x0, tangent_step(x0, -0.2), least_norm
+
+
+CASES = {"active-set": _active_set_case, "interior-point": _interior_point_case}
+
+
+@pytest.mark.parametrize("family", CASES)
+@pytest.mark.parametrize(
+    ("correction", "corrected"),
+    [("none", False), ("never-valid", False), ("least-norm", True)],
+)
+def test_maratos_step_is_accepted_only_with_a_correction(family, correction, corrected):
+    merit, x0, d, least_norm = CASES[family]()
+    x_soc = jax.tree.map(lambda a, b, c: a + b + c, x0, d, least_norm(x0, d).step)
+    # The model predicts exactly the decrease the corrected point achieves,
+    # while the uncorrected trial increases the merit.
+    pred = merit(x0) - merit(x_soc)
+    x_plain = jax.tree.map(jnp.add, x0, d)
+    assert pred > 0.0 and merit(x_plain) > merit(x0)
+
+    corrections = {
+        "none": None,
+        "never-valid": NeverValidCorrection(),
+        "least-norm": least_norm,
+    }
+    manager = TrustRegionManager(merit=merit, correction=corrections[correction])
+    result = manager.step(x0, d, make_tr_state(radius=1.0, predicted_reduction=pred))
+
+    assert bool(result.accepted) is corrected
+    assert bool(result.corrected) is corrected
+    expected_x = x_soc if corrected else x0
+    assert jnp.allclose(result.x.flatten(), expected_x.flatten(), atol=1e-6)
+    expected_radius = 1.0 if corrected else manager.shrink_factor
+    assert float(result.solver_state.radius) == pytest.approx(expected_radius)

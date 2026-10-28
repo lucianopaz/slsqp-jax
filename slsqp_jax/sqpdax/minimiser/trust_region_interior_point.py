@@ -367,6 +367,7 @@ class TrustRegionInteriorPointMinimiser(
                 shrink_factor=self.shrink_factor,
                 grow_factor=self.grow_factor,
                 max_radius=self.max_radius,
+                correction=self._bind_step_correction(ctx, solver_state),
             ),
         )
 

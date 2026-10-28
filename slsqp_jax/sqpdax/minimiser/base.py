@@ -35,7 +35,12 @@ from ..secant import (
     SecantResetSignals,
     SecantStatistics,
 )
-from ..step_controller import StepController, StepResult
+from ..step_controller import (
+    LeastNormCorrection,
+    StepController,
+    StepCorrection,
+    StepResult,
+)
 from ..subproblem.base import SubProblemType
 from ..subproblem.solver import SubProblemSolver, SubProblemSolverStateType
 from ..subproblem.solver.base import SubproblemContext
@@ -319,6 +324,17 @@ class CommonMinimiser(
         :class:`~slsqp_jax.sqpdax.secant.reset.SecantResetSignals` (the
         active-set loops use the first two, the trust-region interior-point
         loop the last).
+    step_correction
+        Unbound :class:`~slsqp_jax.sqpdax.step_controller.correction.StepCorrection`
+        (configuration only) bound to every step by
+        :meth:`_bind_step_correction` and handed to the step controller,
+        which tries it on a rejected full step; ``None`` disables it. Set
+        through ``options['minimiser']['step_correction']`` as an instance,
+        ``None``, or a mapping of fields applied to the current correction
+        (to a default
+        :class:`~slsqp_jax.sqpdax.step_controller.correction.LeastNormCorrection`
+        when there is none). Off by default here; minimisers whose controller
+        supports it may turn it on.
     secant_stats
         :class:`~slsqp_jax.sqpdax.secant.statistics.SecantStatistics` of the
         maintained secant, or ``None`` when no secant is kept.
@@ -357,6 +373,7 @@ class CommonMinimiser(
     secant_reset: SecantResetPolicy = eqx.field(
         static=True, default_factory=SecantResetPolicy
     )
+    step_correction: StepCorrection | None = eqx.field(static=True, default=None)
     logger: Logger = eqx.field(static=True, default_factory=Logger.disabled)
 
     def __check_init__(self) -> None:
@@ -472,6 +489,7 @@ class CommonMinimiser(
         static_names = static_field_names(type(self)) - {
             "preconditioner",
             "secant_reset",
+            "step_correction",
             "logger",
         }
         updates = {k: mopts[k] for k in mopts if k in static_names}
@@ -486,6 +504,16 @@ class CommonMinimiser(
             updates["secant_reset"] = (
                 self.secant_reset.init(**spec) if isinstance(spec, Mapping) else spec
             )
+        if "step_correction" in mopts:
+            spec = mopts["step_correction"]
+            if isinstance(spec, Mapping):
+                current = (
+                    self.step_correction
+                    if self.step_correction is not None
+                    else cast(StepCorrection, LeastNormCorrection())
+                )
+                spec = current.init(**spec)
+            updates["step_correction"] = spec
         if updates:
             base = replace(base, **updates)
         return base
@@ -988,6 +1016,58 @@ class CommonMinimiser(
             Line search or trust-region manager for this step.
         """
         ...
+
+    def _correction_subproblem(
+        self,
+        ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
+        solver_state: SubProblemSolverStateType,
+    ) -> SubProblemType:
+        """Subproblem whose rows and coordinates the step correction uses.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context.
+        solver_state
+            Solver carry after the subproblem solve.
+
+        Returns
+        -------
+        SubProblemType
+            ``ctx.subproblem`` by default; working-set minimisers return it
+            rebuilt on the solver's final working set.
+        """
+        return ctx.subproblem
+
+    def _bind_step_correction(
+        self,
+        ctx: SubproblemContext[PrimalType, SubProblemType, SubProblemSolverStateType],
+        solver_state: SubProblemSolverStateType,
+    ) -> StepCorrection | None:
+        """Bind :attr:`step_correction` to this step's data, or ``None``.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context (problem, Lagrangian module).
+        solver_state
+            Solver carry after the subproblem solve; a failed solve disables
+            the correction through its ``success`` flag.
+
+        Returns
+        -------
+        StepCorrection or None
+            The bound correction to hand to the step controller.
+        """
+        if self.step_correction is None:
+            return None
+        return self.step_correction.bind(
+            subproblem=self._correction_subproblem(ctx, solver_state),
+            lagrangian=ctx.lagrangian,
+            dual=cast(Dual, self.dual),
+            enabled=jnp.asarray(solver_state.success),
+            default_tol=self.atol,
+        )
 
     def _execute_step(
         self,

@@ -1,4 +1,4 @@
-"""Cumulative line-search and LPEC-A predictor counters of the active-set minimiser."""
+"""Cumulative line-search, correction and LPEC-A counters of the active-set minimiser."""
 
 from __future__ import annotations
 
@@ -31,6 +31,11 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
     n_armijo_accepts, n_fallback_accepts
         Cumulative number of steps accepted by the Armijo test and by the
         fallback rule respectively.
+    last_soc
+        Whether the last accepted step was the second-order corrected point.
+    n_soc_accepts
+        Cumulative number of accepted second-order corrected steps (a subset
+        of ``n_armijo_accepts``).
     n_lpeca_bypassed, n_lpeca_capped, n_lpeca_bounds_prefixed
         Cumulative predictor diagnostics: steps whose prediction was
         discarded (trust gate or warm-up), steps where the rank cap
@@ -54,6 +59,8 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
     last_ls_fallback: Bool[Array, ""]
     n_armijo_accepts: Int[Array, ""]
     n_fallback_accepts: Int[Array, ""]
+    last_soc: Bool[Array, ""]
+    n_soc_accepts: Int[Array, ""]
     n_lpeca_bypassed: Int[Array, ""]
     n_lpeca_capped: Int[Array, ""]
     n_lpeca_bounds_prefixed: Int[Array, ""]
@@ -66,6 +73,8 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
             last_ls_fallback=jnp.asarray(False),
             n_armijo_accepts=zero,
             n_fallback_accepts=zero,
+            last_soc=jnp.asarray(False),
+            n_soc_accepts=zero,
             n_lpeca_bypassed=zero,
             n_lpeca_capped=zero,
             n_lpeca_bounds_prefixed=zero,
@@ -96,7 +105,11 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
         )
 
     def record_step(
-        self, *, accepted: Bool[Array, ""], accepted_by_fallback: Bool[Array, ""]
+        self,
+        *,
+        accepted: Bool[Array, ""],
+        accepted_by_fallback: Bool[Array, ""],
+        corrected: Bool[Array, ""] | bool = False,
     ) -> Self:
         """Accumulate the acceptance outcome of one line-search step.
 
@@ -107,22 +120,34 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
         accepted_by_fallback
             Whether the acceptance came from the fallback rule rather than
             the Armijo test (only meaningful when ``accepted`` is true).
+        corrected
+            Whether the accepted point was the second-order corrected trial
+            (only meaningful when ``accepted`` is true).
 
         Returns
         -------
         Self
-            Carry with ``last_ls_fallback`` refreshed and the acceptance
-            counters advanced.
+            Carry with ``last_ls_fallback`` / ``last_soc`` refreshed and the
+            acceptance counters advanced.
         """
         fallback_accept = accepted & accepted_by_fallback
         armijo_accept = accepted & ~accepted_by_fallback
+        soc_accept = accepted & jnp.asarray(corrected)
         return eqx.tree_at(
-            lambda d: (d.last_ls_fallback, d.n_armijo_accepts, d.n_fallback_accepts),
+            lambda d: (
+                d.last_ls_fallback,
+                d.n_armijo_accepts,
+                d.n_fallback_accepts,
+                d.last_soc,
+                d.n_soc_accepts,
+            ),
             self,
             (
                 fallback_accept,
                 self.n_armijo_accepts + armijo_accept.astype(jnp.int32),
                 self.n_fallback_accepts + fallback_accept.astype(jnp.int32),
+                soc_accept,
+                self.n_soc_accepts + soc_accept.astype(jnp.int32),
             ),
         )
 
@@ -135,4 +160,6 @@ class ActiveSetLineSearchDiagnostics(eqx.Module):
             "last_ls_fallback": self.last_ls_fallback,
             "n_armijo_accepts": self.n_armijo_accepts,
             "n_fallback_accepts": self.n_fallback_accepts,
+            "last_soc": self.last_soc,
+            "n_soc_accepts": self.n_soc_accepts,
         }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -16,6 +17,13 @@ from slsqp_jax.sqpdax.step_controller.base import (
 )
 from slsqp_jax.sqpdax.subproblem.solver.base import SubProblemSolverState
 from tests.sqpdax.lagrangian.conftest import make_problem
+
+from .conftest import (
+    bind_active_set_correction,
+    make_circle_problem,
+    make_funnel_manager,
+    tangent_step,
+)
 
 
 class _BareController(StepController[Primal, SubProblemSolverState]):
@@ -77,3 +85,52 @@ def test_step_result_rounding_level_defaults_to_false():
         x=Primal(jnp.zeros(2)), accepted=jnp.asarray(True), merit_val=jnp.asarray(0.0)
     )
     assert not bool(result.rounding_level)
+
+
+class _Correctable(StepController[Primal, SubProblemSolverState]):
+    """Controller that declares a correction stage (for the base mechanics)."""
+
+    supports_correction = True
+
+    def step(self, x0, direction, solver_state=None):
+        raise NotImplementedError
+
+
+def _bound_correction():
+    x0 = jnp.array([jnp.cos(0.3), jnp.sin(0.3)])
+    return bind_active_set_correction(make_circle_problem(), x0)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda correction: _BareController(correction=correction),
+        lambda correction: make_funnel_manager(make_problem(), correction=correction),
+    ],
+    ids=["bare", "trust-funnel"],
+)
+def test_controller_without_a_stage_refuses_a_correction(build):
+    _, correction = _bound_correction()
+    with pytest.raises(ValueError, match="no second-order correction stage"):
+        build(correction)
+    assert build(None).correction is None
+
+
+def test_corrected_point_adds_the_correction():
+    x0, correction = _bound_correction()
+    d = tangent_step(x0, 0.1)
+    x, result = _Correctable(correction=correction)._corrected_point(x0, d)
+    assert bool(result.valid)
+    expected = jax.tree.map(lambda a, b, c: a + b + c, x0, d, result.step)
+    assert jnp.allclose(x.x, expected.x)
+
+
+def test_corrected_point_needs_a_correction():
+    x0, _ = _bound_correction()
+    with pytest.raises(ValueError, match="carries no correction"):
+        _Correctable()._corrected_point(x0, x0)
+
+
+def test_step_result_is_uncorrected_by_default():
+    result = StepResult(x=Primal(jnp.zeros(2)), accepted=True, merit_val=0.0)
+    assert not bool(result.corrected)

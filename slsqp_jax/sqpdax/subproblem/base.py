@@ -10,6 +10,7 @@ from jaxtyping import Array, Bool, Float
 
 from ..dual import Dual
 from ..lagrangian import EvaluatedLagrangian
+from ..linalg.projection import cg_normal_equations
 from ..primal import PrimalType
 from ..types import Scalar
 
@@ -222,6 +223,167 @@ class SubProblem(Module, Generic[PrimalType]):
         """
         m = self.nonbound_constraint_jac().shape[0]
         return jnp.ones((m,), dtype=bool)
+
+    def constraint_residual(self, trial: EvaluatedLagrangian[PrimalType]) -> Dual:
+        """Rows of :meth:`dual_grad` re-evaluated at a trial point.
+
+        Parameters
+        ----------
+        trial
+            Lagrangian evaluated at the trial point (same problem, any
+            multipliers: the residual does not depend on them).
+
+        Returns
+        -------
+        Dual
+            Constraint residual at the trial point, in the layout and with the
+            row masks of :meth:`dual_grad`, so that
+            ``constraint_residual(trial) ≈ dual_grad() + A w`` for the model
+            step ``w`` that leads to the trial point.
+
+        Notes
+        -----
+        The default returns ``trial.dual_grad`` unchanged, which is right for
+        models whose :meth:`dual_grad` is the Lagrangian's own residual (the
+        interior-point subproblems). Working-set subproblems override this to
+        apply their masks.
+        """
+        return trial.dual_grad
+
+    def violated_part(self, residual: Dual) -> Dual:
+        """Part of a :meth:`dual_grad`-layout residual that is a violation.
+
+        Parameters
+        ----------
+        residual
+            Constraint residual in the layout of :meth:`dual_grad`.
+
+        Returns
+        -------
+        Dual
+            ``residual`` itself by default: every row of the model is an
+            equality (``c(x) = 0``, or ``c(x) + s = 0`` with slacks), so any
+            nonzero entry is infeasibility. Models with inequality rows
+            override this to keep only the positive (violated) part, so that
+            the distance of a satisfied working-set row to its face is not
+            mistaken for infeasibility.
+        """
+        return residual
+
+    def range_space_solve(
+        self,
+        rhs: Dual,
+        *,
+        tol: float = 1e-10,
+        max_iter: int | None = None,
+    ) -> Dual:
+        """Minimum-norm solution ``y`` of ``A Aᵀ y = rhs``.
+
+        ``A`` is the dual-primal block of the model
+        (:meth:`kkt_mvp_lower_offdiag`) and ``Aᵀ`` its transpose
+        (:meth:`kkt_mvp_upper_offdiag`), both in model coordinates and over
+        the rows of :meth:`dual_grad`.
+
+        Parameters
+        ----------
+        rhs
+            Right-hand side in the :class:`~slsqp_jax.sqpdax.dual.Dual` layout.
+        tol
+            Relative residual tolerance of the conjugate-gradient solve.
+        max_iter
+            Iteration cap; ``None`` uses the number of dual rows.
+
+        Returns
+        -------
+        Dual
+            ``(A Aᵀ)⁺ rhs`` for a ``rhs`` in the range of ``A``.
+
+        Notes
+        -----
+        The default is matrix-free conjugate gradients
+        (:func:`~slsqp_jax.sqpdax.linalg.projection.cg_normal_equations`)
+        started at ``y = 0``. Rows that the model zeroes (inactive
+        constraints, null bounds) keep a zero right-hand side and stay at
+        zero. Subproblems with a factorisation of ``A Aᵀ`` override this.
+        """
+        sizes = rhs.sizes
+        zero_primal = cast(
+            PrimalType, jax.tree.map(jnp.zeros_like, self.lagrangian.ref)
+        )
+        zero_dual = cast(Dual, jax.tree.map(jnp.zeros_like, rhs))
+
+        def normal_op(y_flat: Float[Array, " m"]) -> Float[Array, " m"]:
+            y = Dual.from_flat(y_flat, *sizes)
+            aty = self.kkt_mvp_upper_offdiag((zero_primal, y))
+            return self.kkt_mvp_lower_offdiag((aty, zero_dual)).flatten()
+
+        b = rhs.flatten()
+        iters = int(b.shape[0]) if max_iter is None else max_iter
+        y = cg_normal_equations(normal_op, b, tol=tol, max_iter=max(iters, 1))
+        return Dual.from_flat(y, *sizes)
+
+    def least_norm_step(
+        self,
+        rhs: Dual,
+        *,
+        tol: float = 1e-10,
+        max_iter: int | None = None,
+    ) -> PrimalType:
+        """Minimum-norm model step ``w`` with ``A w = rhs``.
+
+        Parameters
+        ----------
+        rhs
+            Target change of the constraint rows, in the
+            :class:`~slsqp_jax.sqpdax.dual.Dual` layout of :meth:`dual_grad`.
+        tol, max_iter
+            Forwarded to :meth:`range_space_solve`.
+
+        Returns
+        -------
+        PrimalType
+            ``w = Aᵀ (A Aᵀ)⁺ rhs`` in model coordinates (Nocedal & Wright
+            eq. 15.36 / 18.16 when ``rhs = -c``). Rows that are identity rows
+            of ``A`` with a zero target (active bounds of a working set) leave
+            their coordinate at zero.
+        """
+        y = self.range_space_solve(rhs, tol=tol, max_iter=max_iter)
+        zero_primal = cast(
+            PrimalType, jax.tree.map(jnp.zeros_like, self.lagrangian.ref)
+        )
+        return self.kkt_mvp_upper_offdiag((zero_primal, y))
+
+    def to_native_primal(self, w: PrimalType) -> PrimalType:
+        """Map a primal step from model to native coordinates.
+
+        Parameters
+        ----------
+        w
+            Primal step in the coordinates of :meth:`kkt_mvp_lower_offdiag`,
+            :meth:`primal_box` and :meth:`least_norm_step`.
+
+        Returns
+        -------
+        PrimalType
+            The same step in the coordinates of the iterate (identity by
+            default; scaled subproblems unscale here).
+        """
+        return w
+
+    def to_model_primal(self, p: PrimalType) -> PrimalType:
+        """Map a primal step from native to model coordinates.
+
+        Parameters
+        ----------
+        p
+            Primal step in the coordinates of the iterate.
+
+        Returns
+        -------
+        PrimalType
+            Inverse of :meth:`to_native_primal` (identity by default).
+        """
+        return p
 
     def kkt_operator(self, step: tuple[PrimalType, Dual]) -> tuple[PrimalType, Dual]:
         """Assemble the saddle-point operator ``K z``.

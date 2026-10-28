@@ -263,6 +263,14 @@ class ActiveSetLineSearchMinimiser(
     restoration_cg_iter
         CGLS iterations of the normal-step solve (``1`` gives the Cauchy
         step).
+    step_correction
+        Second-order correction tried when the full QP step fails the
+        Armijo test (Nocedal & Wright Alg. 18.3), e.g. a
+        :class:`~slsqp_jax.sqpdax.step_controller.correction.LeastNormCorrection`
+        on the QP's final working set
+        (``options['minimiser']['step_correction'] = {}``). Off by default:
+        on the benchmark it changed no solved task (see
+        ``orchestration/hypotheses/soc_least_norm.md``).
     """
 
     # QP inner solve
@@ -930,7 +938,12 @@ class ActiveSetLineSearchMinimiser(
         step_dual: Dual,
         solver_state: ActiveSetStateType,
     ) -> StepController[Primal, ActiveSetStateType]:
-        """Armijo line search on the adaptively updated L1 merit."""
+        """Armijo line search on the adaptively updated L1 merit.
+
+        Carries the bound :attr:`step_correction` (see
+        :meth:`_bind_step_correction`), tried when the full QP step fails the
+        Armijo test.
+        """
         return cast(
             StepController[Primal, ActiveSetStateType],
             ArmijoLineSearch(
@@ -939,8 +952,33 @@ class ActiveSetLineSearchMinimiser(
                 max_steps=self.line_search_max_steps,
                 c1=self.armijo_c1,
                 backtrack=self.armijo_backtrack,
+                correction=self._bind_step_correction(ctx, solver_state),
             ),
         )
+
+    def _correction_subproblem(
+        self,
+        ctx: SubproblemContext[Primal, ActiveSetSubProblem, ActiveSetStateType],
+        solver_state: ActiveSetStateType,
+    ) -> ActiveSetSubProblem:
+        """The QP subproblem on its final working set.
+
+        Parameters
+        ----------
+        ctx
+            Per-step subproblem context; its subproblem carries the empty
+            initial working set.
+        solver_state
+            QP carry after the solve.
+
+        Returns
+        -------
+        ActiveSetSubProblem
+            ``ctx.subproblem`` rebuilt with ``solver_state.active_set``, the
+            rows the QP step satisfies (shifted and proximal variants keep
+            their extra parameters through ``with_active_set``).
+        """
+        return ctx.subproblem.with_active_set(solver_state.active_set)
 
     def _l1_merit(
         self,
@@ -1169,7 +1207,9 @@ class ActiveSetLineSearchMinimiser(
             jnp.where(feasible, self.consecutive_ls_failures + 1, 0),
         )
         diagnostics = self.diagnostics.record_step(
-            accepted=result.accepted, accepted_by_fallback=result.accepted_by_fallback
+            accepted=result.accepted,
+            accepted_by_fallback=result.accepted_by_fallback,
+            corrected=result.corrected,
         )
 
         self.logger.warning(
@@ -1287,7 +1327,7 @@ class ActiveSetLineSearchMinimiser(
         octx: OptimisationContext[Primal, ActiveSetStateType],
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> dict[str, Any]:
-        """Stationarity / feasibility, penalty, QP outcome and failure streaks."""
+        """Stationarity / feasibility, penalty, QP outcome, correction and streaks."""
         solver_state = cast(ActiveSetStateType, result.solver_state)
         return {
             "kkt": (metrics.stationarity, ".2e"),
@@ -1298,6 +1338,7 @@ class ActiveSetLineSearchMinimiser(
             "qp_iters": solver_state.last_n_iter,
             "cg_iters": solver_state.last_n_cg_iter,
             "ls_fallback": self.diagnostics.last_ls_fallback,
+            "soc": result.corrected,
             "qp_fail": self.consecutive_qp_failures,
             "ls_fail": self.consecutive_ls_failures,
             "stall": self.steps_without_improvement,
@@ -1311,7 +1352,7 @@ class ActiveSetLineSearchMinimiser(
         octx: OptimisationContext[Primal, ActiveSetStateType],
         metrics: ActiveSetLineSearchTerminationMetrics,
     ) -> dict[str, Any]:
-        """Base payload plus penalty, failure streaks and the QP working set."""
+        """Base payload plus penalty, failure streaks, correction and QP working set."""
         fields = super()._diagnostic_fields(ctx, result, step_dual, octx, metrics)
         solver_state = cast(ActiveSetStateType, result.solver_state)
         fields.update(
@@ -1323,6 +1364,7 @@ class ActiveSetLineSearchMinimiser(
                 "steps_without_improvement": self.steps_without_improvement,
                 "blowup_count": self.blowup_count,
                 "last_ls_fallback": self.diagnostics.last_ls_fallback,
+                "corrected": result.corrected,
                 "diagnostics": self.diagnostics,
                 "qp_result": solver_state.qp_result,
                 "qp_active_set": solver_state.active_set,
