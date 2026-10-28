@@ -18,6 +18,7 @@ from slsqp_jax.sqpdax.subproblem.solver import (
 )
 from slsqp_jax.sqpdax.subproblem.solver.working_set_policy import (
     cap_rows,
+    exchange_row,
     independent_rows,
 )
 from tests.sqpdax.lagrangian.conftest import make_primal, make_problem
@@ -431,3 +432,101 @@ def test_single_exchange_inherits_ramp_and_cycle_guard():
     assert float(state.working_tol) == pytest.approx(TOL * 1.25)
     next_set, state, cycled = policy.update(lag, _step([2.0, 0.0]), set_b, state)
     assert bool(eqx.tree_equal(next_set, set_a)) and bool(cycled)
+
+
+def _exchange_lagrangian(a_row, *, equality: bool):
+    """``n = 2``, one inequality ``a·x + 1 ≤ 0``, ``x ≥ 0``, optionally ``x₁ = 0``.
+
+    At ``x = 0`` the inequality is violated by 1 and both lower bounds are
+    active; stacked rows are ``[a | -e₀ | -e₁ | +e₀ | +e₁]``.
+    """
+    A = jnp.asarray([a_row], float)
+    eq = (
+        {
+            "meq": 1,
+            "eq_fn": lambda x: x[1:],
+            "eq_fn_jac": lambda x: jnp.array([[0.0, 1.0]]),
+            "eq_fn_hvp": lambda x, v: jnp.zeros((1, 2)),
+        }
+        if equality
+        else {}
+    )
+    problem = build_problem(
+        n=2,
+        fn=lambda x: jnp.sum(x**2),
+        grad=lambda x: 2 * x,
+        hvp=lambda x, v: 2 * v,
+        ineq_fn=lambda x: A @ x + 1.0,
+        ineq_fn_jac=lambda x: A,
+        ineq_fn_hvp=lambda x, v: jnp.zeros((1, 2)),
+        lb=jnp.zeros(2),
+        **eq,
+    )
+    return Lagrangian(problem)(Primal(jnp.zeros(2)), None)
+
+
+@pytest.mark.parametrize(
+    ("a_row", "equality", "selected", "lam", "expected"),
+    [
+        # a = e₀·1 + e₁·2 in the (-e₀, -e₁) rows: alpha = (1, 2), min λ/α.
+        ((-1.0, -2.0), False, (1, 1), (1.0, 1.0), (1, 1, 0)),
+        ((-1.0, -2.0), False, (1, 1), (0.1, 1.0), (1, 0, 1)),
+        # alpha = (1, -2): only the first bound can leave, whatever λ says.
+        ((-1.0, 2.0), False, (1, 1), (5.0, 0.0), (1, 0, 1)),
+        # alpha = (-1, -1): the linearised rows are inconsistent, no exchange.
+        ((1.0, 1.0), False, (1, 1), (1.0, 1.0), (0, 1, 1)),
+        # a is independent of span{-e₀}: the set is rank-deficient, no exchange.
+        ((-1.0, -2.0), False, (1, 0), (1.0, 0.0), (0, 1, 0)),
+        # The equality row carries the e₁ part and never leaves.
+        ((-1.0, -2.0), True, (1, 0), (1.0, 0.0), (1, 0, 0)),
+    ],
+    ids=[
+        "ratio",
+        "ratio-small-lam",
+        "one-positive",
+        "inconsistent",
+        "independent",
+        "eq",
+    ],
+)
+def test_exchange_row_follows_the_goldfarb_idnani_ratio(
+    a_row, equality, selected, lam, expected
+):
+    """The leaving row has ``αⱼ > 0`` and the smallest ``λⱼ / αⱼ``."""
+    lag = _exchange_lagrangian(a_row, equality=equality)
+    sel = jnp.array([False, *map(bool, selected), False, False])
+    rejected = jnp.array([True, False, False, False, False])
+    values = jnp.array([1.0, 0.0, 0.0, -jnp.inf, -jnp.inf])
+    multipliers = jnp.array([0.0, *lam, 0.0, 0.0])
+    out = exchange_row(sel, rejected, values, multipliers, lag)
+    assert out.tolist() == [*map(bool, expected), False, False]
+
+
+@pytest.mark.parametrize("exchange", [False, True], ids=["cap", "exchange"])
+def test_full_set_admits_violated_row_only_with_exchange(exchange):
+    """A full set keeps a violated row out unless ``exchange_when_full``."""
+    lag = _exchange_lagrangian((-1.0, -2.0), equality=False)
+    current = ActiveSet(
+        meq=0,
+        active_inequalities=jnp.array([False]),
+        active_lb=jnp.array([True, True]),
+        active_ub=jnp.array([False, False]),
+    )
+    step = (
+        Primal(jnp.zeros(2)),
+        Dual(
+            eq_multipliers=jnp.zeros((0,)),
+            ineq_multipliers=jnp.zeros((1,)),
+            lb_multipliers=jnp.ones(2),
+            ub_multipliers=jnp.zeros(2),
+        ),
+    )
+    policy = ThresholdWorkingSetPolicy(tol=TOL, exchange_when_full=exchange)
+    proposed = policy.propose(lag, step, current, jnp.asarray(TOL))
+    assert bool(proposed.active_inequalities[0]) is exchange
+    assert proposed.active_lb.tolist() == ([True, False] if exchange else [True, True])
+
+
+def test_single_exchange_rejects_full_set_exchange():
+    with pytest.raises(ValueError, match="exchange_when_full"):
+        SingleExchangeWorkingSetPolicy(exchange_when_full=True)

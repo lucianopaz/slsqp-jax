@@ -29,6 +29,7 @@ __all__ = [
     "ThresholdWorkingSetPolicy",
     "SingleExchangeWorkingSetPolicy",
     "cap_rows",
+    "exchange_row",
     "independent_rows",
 ]
 
@@ -148,9 +149,8 @@ def independent_rows(
     [False, True, True]
     """
     m = keep.shape[0]
-    n, meq, mineq = int(lag.n), int(lag.meq), int(lag.mineq)
+    n, meq = int(lag.n), int(lag.meq)
     eq_jac = lag.eq_fn_jac_val
-    ineq_jac = lag.ineq_fn_jac_val
     dtype = eq_jac.dtype
     eligible = keep | candidates
     priority = jnp.where(
@@ -161,15 +161,7 @@ def independent_rows(
     tol_arr = jnp.asarray(tol, dtype)
 
     def stacked_row(j: Int[Array, ""]) -> Array:
-        if mineq:
-            a_ineq = ineq_jac[jnp.minimum(j, mineq - 1)]
-        else:
-            a_ineq = jnp.zeros((n,), dtype)
-        b = j - mineq
-        is_lb = b < n
-        idx = jnp.clip(jnp.where(is_lb, b, b - n), 0, n - 1)
-        e = jax.nn.one_hot(idx, n, dtype=dtype) * jnp.where(is_lb, -1.0, 1.0)
-        return jnp.where(j < mineq, a_ineq, e)
+        return _stacked_row(lag, j)
 
     def insert(carry, a, allow):
         """Append ``a`` to the orthonormal basis when allowed and independent."""
@@ -206,6 +198,156 @@ def independent_rows(
     )
     # ``keep`` rows beyond the visited prefix are selected all the same.
     return selected | keep
+
+
+def _stacked_row(lag: EvaluatedLagrangian[Primal], j: Int[Array, ""]) -> Array:
+    """Gradient of stacked row ``j`` of ``[inequalities | lower | upper bounds]``.
+
+    Bound rows are ``-eᵢ`` (lower) and ``+eᵢ`` (upper), the gradients of
+    ``lb - x ≤ 0`` and ``x - ub ≤ 0``.
+    """
+    n, mineq = int(lag.n), int(lag.mineq)
+    dtype = lag.eq_fn_jac_val.dtype
+    if mineq:
+        a_ineq = lag.ineq_fn_jac_val[jnp.minimum(j, mineq - 1)]
+    else:
+        a_ineq = jnp.zeros((n,), dtype)
+    b = j - mineq
+    is_lb = b < n
+    idx = jnp.clip(jnp.where(is_lb, b, b - n), 0, n - 1)
+    e = jax.nn.one_hot(idx, n, dtype=dtype) * jnp.where(is_lb, -1.0, 1.0)
+    return jnp.where(j < mineq, a_ineq, e)
+
+
+def exchange_row(
+    selected: Bool[Array, " m"],
+    rejected: Bool[Array, " m"],
+    values: Array,
+    multipliers: Array,
+    lag: EvaluatedLagrangian[Primal],
+    *,
+    tol: float = 1e-4,
+) -> Bool[Array, " m"]:
+    """Swap the most violated ``rejected`` row into a full working set.
+
+    The row ``p`` with the largest ``values`` among ``rejected`` is expanded
+    in the span of the equality Jacobian and the ``selected`` rows,
+    ``a_p = Σⱼ αⱼ aⱼ`` (a Gram--Schmidt QR of the rows, ``O(n³)``). As in the
+    dual active-set method of Goldfarb & Idnani (1983), raising the
+    multiplier of ``p`` by ``t`` moves the others to ``λⱼ - t αⱼ``; the row
+    that leaves is the inequality / bound row with ``αⱼ > 0`` reaching zero
+    first, ``argmin λⱼ / αⱼ``. A row with ``αⱼ = 0`` never leaves, so the
+    exchanged set has the rank of ``selected``. Nothing changes when ``a_p``
+    is independent of the span (``selected`` is rank-deficient) or when no
+    ``αⱼ`` is positive (the linearised rows are inconsistent).
+
+    Parameters
+    ----------
+    selected
+        Stacked ``[ineq | lb | ub]`` mask of the full working set.
+    rejected
+        Violated rows the cap kept out.
+    values
+        Linearised violation of every stacked row at the computed step.
+    multipliers
+        Stacked multipliers of the step (negative values count as zero).
+    lag
+        Lagrangian evaluation providing the Jacobians and sizes.
+    tol
+        Relative tolerance of the dependence test and of ``αⱼ > 0``.
+
+    Returns
+    -------
+    Bool[Array, "m"]
+        ``selected`` with one row exchanged for ``p``, or ``selected``.
+
+    Examples
+    --------
+    ``x₀ ≥ 0``, ``x₁ ≥ 0`` fill the set of a 2-variable problem; the violated
+    row ``1 - x₀ - 2x₁ ≤ 0`` replaces ``x₁ ≥ 0`` (``α = (1, 2)``,
+    ``λ / α = (1, 0.5)``).
+
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.lagrangian import Lagrangian
+    >>> from slsqp_jax.sqpdax.primal import Primal
+    >>> from slsqp_jax.sqpdax.problem import build_problem
+    >>> from slsqp_jax.sqpdax.subproblem.solver.working_set_policy import (
+    ...     exchange_row,
+    ... )
+    >>> A = jnp.array([[-1.0, -2.0]])
+    >>> problem = build_problem(
+    ...     n=2,
+    ...     fn=lambda x: jnp.sum(x**2),
+    ...     grad=lambda x: 2 * x,
+    ...     hvp=lambda x, v: 2 * v,
+    ...     ineq_fn=lambda x: A @ x + 1.0,
+    ...     ineq_fn_jac=lambda x: A,
+    ...     ineq_fn_hvp=lambda x, v: jnp.zeros((1, 2)),
+    ...     lb=jnp.zeros(2),
+    ... )
+    >>> lag = Lagrangian(problem)(Primal(jnp.zeros(2)), None)
+    >>> selected = jnp.array([False, True, True, False, False])
+    >>> rejected = jnp.array([True, False, False, False, False])
+    >>> values = jnp.array([1.0, 0.0, 0.0, -jnp.inf, -jnp.inf])
+    >>> multipliers = jnp.array([0.0, 1.0, 1.0, 0.0, 0.0])
+    >>> exchange_row(selected, rejected, values, multipliers, lag).tolist()
+    [True, True, False, False, False]
+    """
+    m = selected.shape[0]
+    n, meq = int(lag.n), int(lag.meq)
+    dtype = lag.eq_fn_jac_val.dtype
+    tol_arr = jnp.asarray(tol, dtype)
+    p = jnp.argmax(jnp.where(rejected, values, -jnp.inf))
+    a_p = _stacked_row(lag, p)
+
+    def project(basis: Array, a: Array) -> tuple[Array, Array]:
+        """Coefficients on ``basis`` and residual, two Gram--Schmidt passes."""
+        c1 = basis.T @ a
+        r = a - basis @ c1
+        c2 = basis.T @ r
+        return c1 + c2, r - basis @ c2
+
+    def insert(carry, a, allow, row):
+        basis, coeffs, rows, k = carry
+        c, r = project(basis, a)
+        norm_r = jnp.linalg.norm(r)
+        accept = allow & (norm_r > tol_arr * jnp.linalg.norm(a)) & (k < n)
+        slot = jnp.minimum(k, n - 1)
+        q = r / jnp.where(norm_r > 0.0, norm_r, 1.0)
+        basis = jnp.where(accept, basis.at[:, slot].set(q), basis)
+        coeffs = jnp.where(
+            accept, coeffs.at[:, slot].set(c.at[slot].set(norm_r)), coeffs
+        )
+        rows = jnp.where(accept, rows.at[slot].set(row), rows)
+        return basis, coeffs, rows, k + accept.astype(k.dtype)
+
+    # ``coeffs`` is the upper-triangular R of ``[eq rows | selected rows] = Q R``;
+    # unused slots keep an identity column so the triangular solve is defined.
+    carry = (
+        jnp.zeros((n, n), dtype),
+        jnp.eye(n, dtype=dtype),
+        jnp.full((n,), -1, jnp.int32),
+        jnp.asarray(0, jnp.int32),
+    )
+    eq_row = jnp.asarray(-1, jnp.int32)
+    for i in range(meq):
+        carry = insert(carry, lag.eq_fn_jac_val[i], jnp.asarray(True), eq_row)
+    order = jnp.argsort(~selected, stable=True)
+
+    def body(i, carry):
+        j = order[i]
+        return insert(carry, _stacked_row(lag, j), selected[j], j.astype(jnp.int32))
+
+    basis, coeffs, rows, _ = jax.lax.fori_loop(0, min(m, 2 * n), body, carry)
+    c_p, r_p = project(basis, a_p)
+    dependent = jnp.linalg.norm(r_p) <= tol_arr * jnp.linalg.norm(a_p)
+    alpha = jax.scipy.linalg.solve_triangular(coeffs, c_p, lower=False)
+    movable = (rows >= 0) & (alpha > tol_arr * jnp.max(jnp.abs(alpha)))
+    lam = jnp.maximum(multipliers[jnp.maximum(rows, 0)], 0.0)
+    ratio = jnp.where(movable, lam / jnp.where(movable, alpha, 1.0), jnp.inf)
+    leave = rows[jnp.argmin(ratio)]
+    swapped = selected.at[leave].set(False).at[p].set(True)
+    return jnp.where(dependent & jnp.any(movable), swapped, selected)
 
 
 def _split_active(
@@ -478,6 +620,12 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
     ping_pong_threshold
         Consecutive cycle detections before the loop is stopped; ``None``
         (default) disables the guard.
+    exchange_when_full
+        When the capped set is full and a violated row was kept out, swap
+        the most violated one in for the row chosen by the Goldfarb--Idnani
+        ratio test (see :func:`exchange_row`). Without it the refresh
+        reproduces the full set and the loop reports convergence on a step
+        that violates the excluded row. Off by default.
 
     Examples
     --------
@@ -508,6 +656,7 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
     expand_factor: float = 0.0
     drop_floor: float = 0.0
     ping_pong_threshold: int | None = eqx.field(static=True, default=None)
+    exchange_when_full: bool = eqx.field(static=True, default=False)
 
     def __check_init__(self) -> None:
         """Validate the knobs."""
@@ -619,6 +768,22 @@ class ThresholdWorkingSetPolicy(WorkingSetPolicy):
         add = jnp.concatenate([add_ai, add_alb, add_aub])
         values = jnp.concatenate([ineq_lin, lag.lb - x_new, x_new - lag.ub])
         kept = self._select_rows(lag, keep, add, values)
+        if self.exchange_when_full:
+            rejected = add & ~kept
+            full = jnp.sum(kept) >= self._row_cap(lag)
+            multipliers = jnp.concatenate([lam_ineq, lam_lb, lam_ub])
+            kept = jax.lax.cond(
+                full & jnp.any(rejected),
+                lambda: exchange_row(
+                    kept,
+                    rejected,
+                    values,
+                    multipliers,
+                    lag,
+                    tol=self.independence_tol or 1e-4,
+                ),
+                lambda: kept,
+            )
         return _split_active(kept, current.meq, lag.mineq, lag.n)
 
     def update(
@@ -711,6 +876,14 @@ class SingleExchangeWorkingSetPolicy(ThresholdWorkingSetPolicy):
     >>> solver.max_iter
     30
     """
+
+    def __check_init__(self) -> None:
+        """Reject the full-set exchange, which this uncapped policy never uses."""
+        if self.exchange_when_full:
+            raise ValueError(
+                "SingleExchangeWorkingSetPolicy adds one row at a time without "
+                "the cap; exchange_when_full is not supported"
+            )
 
     def propose(
         self,
