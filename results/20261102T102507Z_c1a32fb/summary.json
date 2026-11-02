@@ -1,0 +1,447 @@
+{
+ "by_config": [
+  {
+   "config": "asls-craig",
+   "n_tasks": 273,
+   "n_solved": 214,
+   "solve_rate": 0.7838827839,
+   "median_time_s": 0.011016124,
+   "median_steps": 9.0,
+   "median_compile_s": 6.5783975815
+  },
+  {
+   "config": "asls-minresqlp",
+   "n_tasks": 273,
+   "n_solved": 212,
+   "solve_rate": 0.7765567766,
+   "median_time_s": 0.012981122,
+   "median_steps": 9.0,
+   "median_compile_s": 5.7740531915
+  },
+  {
+   "config": "asls-pcg",
+   "n_tasks": 273,
+   "n_solved": 219,
+   "solve_rate": 0.8021978022,
+   "median_time_s": 0.005489824,
+   "median_steps": 9.0,
+   "median_compile_s": 5.7286276295
+  },
+  {
+   "config": "asls-pcg-exact",
+   "n_tasks": 273,
+   "n_solved": 224,
+   "solve_rate": 0.8205128205,
+   "median_time_s": 0.0016207233,
+   "median_steps": 6.0,
+   "median_compile_s": 4.405102564
+  },
+  {
+   "config": "pasls",
+   "n_tasks": 273,
+   "n_solved": 202,
+   "solve_rate": 0.7399267399,
+   "median_time_s": 0.0069565675,
+   "median_steps": 10.5,
+   "median_compile_s": 6.782208388
+  },
+  {
+   "config": "scipy-slsqp",
+   "n_tasks": 273,
+   "n_solved": 161,
+   "solve_rate": 0.5897435897,
+   "median_time_s": 0.00160983,
+   "median_steps": 8.0,
+   "median_compile_s": 0.158529855
+  },
+  {
+   "config": "scipy-trust-constr",
+   "n_tasks": 273,
+   "n_solved": 165,
+   "solve_rate": 0.6043956044,
+   "median_time_s": 0.030287007,
+   "median_steps": 17.0,
+   "median_compile_s": 0.291637625
+  },
+  {
+   "config": "tfip",
+   "n_tasks": 273,
+   "n_solved": 171,
+   "solve_rate": 0.6263736264,
+   "median_time_s": 0.01841318,
+   "median_steps": 24.0,
+   "median_compile_s": 6.917618153
+  },
+  {
+   "config": "trip",
+   "n_tasks": 273,
+   "n_solved": 168,
+   "solve_rate": 0.6153846154,
+   "median_time_s": 0.0104174503,
+   "median_steps": 18.0,
+   "median_compile_s": 4.548445114
+  }
+ ],
+ "by_collection_config": [
+  {
+   "collection": "bounded",
+   "config": "asls-craig",
+   "n_tasks": 62,
+   "n_solved": 37,
+   "solve_rate": 0.5967741935,
+   "median_time_s": 0.019881603,
+   "median_steps": 20.0,
+   "median_compile_s": 5.7822113505
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-minresqlp",
+   "n_tasks": 62,
+   "n_solved": 38,
+   "solve_rate": 0.6129032258,
+   "median_time_s": 0.022121596,
+   "median_steps": 20.0,
+   "median_compile_s": 5.4931769825
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg",
+   "n_tasks": 62,
+   "n_solved": 38,
+   "solve_rate": 0.6129032258,
+   "median_time_s": 0.0146408675,
+   "median_steps": 20.0,
+   "median_compile_s": 5.243718917
+  },
+  {
+   "collection": "bounded",
+   "config": "asls-pcg-exact",
+   "n_tasks": 62,
+   "n_solved": 45,
+   "solve_rate": 0.7258064516,
+   "median_time_s": 0.002333908,
+   "median_steps": 10.0,
+   "median_compile_s": 4.007439597
+  },
+  {
+   "collection": "bounded",
+   "config": "pasls",
+   "n_tasks": 62,
+   "n_solved": 37,
+   "solve_rate": 0.5967741935,
+   "median_time_s": 0.0104765965,
+   "median_steps": 20.0,
+   "median_compile_s": 5.9117166505
+  },
+  {
+   "collection": "bounded",
+   "config": "scipy-slsqp",
+   "n_tasks": 62,
+   "n_solved": 8,
+   "solve_rate": 0.1290322581,
+   "median_time_s": 0.001348247,
+   "median_steps": 7.0,
+   "median_compile_s": 0.1324682615
+  },
+  {
+   "collection": "bounded",
+   "config": "scipy-trust-constr",
+   "n_tasks": 62,
+   "n_solved": 38,
+   "solve_rate": 0.6129032258,
+   "median_time_s": 0.0871285213,
+   "median_steps": 37.0,
+   "median_compile_s": 0.2790879655
+  },
+  {
+   "collection": "bounded",
+   "config": "tfip",
+   "n_tasks": 62,
+   "n_solved": 24,
+   "solve_rate": 0.3870967742,
+   "median_time_s": 0.0206088598,
+   "median_steps": 27.0,
+   "median_compile_s": 6.394700794
+  },
+  {
+   "collection": "bounded",
+   "config": "trip",
+   "n_tasks": 62,
+   "n_solved": 24,
+   "solve_rate": 0.3870967742,
+   "median_time_s": 0.0179568297,
+   "median_steps": 25.5,
+   "median_compile_s": 4.351860059
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-craig",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.001604785,
+   "median_steps": 2.0,
+   "median_compile_s": 4.477303303
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.00171239,
+   "median_steps": 2.0,
+   "median_compile_s": 2.619508465
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.001147667,
+   "median_steps": 2.0,
+   "median_compile_s": 2.612867988
+  },
+  {
+   "collection": "bqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.001104292,
+   "median_steps": 1.0,
+   "median_compile_s": 1.844338608
+  },
+  {
+   "collection": "bqp",
+   "config": "pasls",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.002752776,
+   "median_steps": 2.0,
+   "median_compile_s": 4.012959691
+  },
+  {
+   "collection": "bqp",
+   "config": "scipy-slsqp",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.000292089,
+   "median_steps": 2.0,
+   "median_compile_s": 0.043016212
+  },
+  {
+   "collection": "bqp",
+   "config": "scipy-trust-constr",
+   "n_tasks": 1,
+   "n_solved": 0,
+   "solve_rate": 0.0,
+   "median_time_s": null,
+   "median_steps": null,
+   "median_compile_s": 0.093515219
+  },
+  {
+   "collection": "bqp",
+   "config": "tfip",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.007159136,
+   "median_steps": 12.0,
+   "median_compile_s": 5.332903978
+  },
+  {
+   "collection": "bqp",
+   "config": "trip",
+   "n_tasks": 1,
+   "n_solved": 1,
+   "solve_rate": 1.0,
+   "median_time_s": 0.004764234,
+   "median_steps": 12.0,
+   "median_compile_s": 2.96012362
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-craig",
+   "n_tasks": 196,
+   "n_solved": 166,
+   "solve_rate": 0.8469387755,
+   "median_time_s": 0.0103045445,
+   "median_steps": 9.0,
+   "median_compile_s": 6.753996642
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-minresqlp",
+   "n_tasks": 196,
+   "n_solved": 165,
+   "solve_rate": 0.8418367347,
+   "median_time_s": 0.011622298,
+   "median_steps": 8.0,
+   "median_compile_s": 5.930866671
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg",
+   "n_tasks": 196,
+   "n_solved": 170,
+   "solve_rate": 0.8673469388,
+   "median_time_s": 0.0045783715,
+   "median_steps": 9.0,
+   "median_compile_s": 5.850041838
+  },
+  {
+   "collection": "constrained",
+   "config": "asls-pcg-exact",
+   "n_tasks": 196,
+   "n_solved": 168,
+   "solve_rate": 0.8571428571,
+   "median_time_s": 0.001541806,
+   "median_steps": 6.0,
+   "median_compile_s": 4.548315078
+  },
+  {
+   "collection": "constrained",
+   "config": "pasls",
+   "n_tasks": 196,
+   "n_solved": 156,
+   "solve_rate": 0.7959183673,
+   "median_time_s": 0.0066172095,
+   "median_steps": 10.0,
+   "median_compile_s": 6.9259106145
+  },
+  {
+   "collection": "constrained",
+   "config": "scipy-slsqp",
+   "n_tasks": 196,
+   "n_solved": 147,
+   "solve_rate": 0.75,
+   "median_time_s": 0.00161765,
+   "median_steps": 8.0,
+   "median_compile_s": 0.1646091995
+  },
+  {
+   "collection": "constrained",
+   "config": "scipy-trust-constr",
+   "n_tasks": 196,
+   "n_solved": 119,
+   "solve_rate": 0.6071428571,
+   "median_time_s": 0.022381585,
+   "median_steps": 15.0,
+   "median_compile_s": 0.2886420475
+  },
+  {
+   "collection": "constrained",
+   "config": "tfip",
+   "n_tasks": 196,
+   "n_solved": 141,
+   "solve_rate": 0.7193877551,
+   "median_time_s": 0.018465316,
+   "median_steps": 24.0,
+   "median_compile_s": 7.0779707705
+  },
+  {
+   "collection": "constrained",
+   "config": "trip",
+   "n_tasks": 196,
+   "n_solved": 137,
+   "solve_rate": 0.6989795918,
+   "median_time_s": 0.009362966,
+   "median_steps": 18.0,
+   "median_compile_s": 4.5758246745
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-craig",
+   "n_tasks": 14,
+   "n_solved": 10,
+   "solve_rate": 0.7142857143,
+   "median_time_s": 0.0251003332,
+   "median_steps": 9.0,
+   "median_compile_s": 8.0881056865
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-minresqlp",
+   "n_tasks": 14,
+   "n_solved": 8,
+   "solve_rate": 0.5714285714,
+   "median_time_s": 0.0212626135,
+   "median_steps": 8.0,
+   "median_compile_s": 7.008866478
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg",
+   "n_tasks": 14,
+   "n_solved": 10,
+   "solve_rate": 0.7142857143,
+   "median_time_s": 0.0188373622,
+   "median_steps": 9.0,
+   "median_compile_s": 6.3711999645
+  },
+  {
+   "collection": "cqp",
+   "config": "asls-pcg-exact",
+   "n_tasks": 14,
+   "n_solved": 10,
+   "solve_rate": 0.7142857143,
+   "median_time_s": 0.0056672862,
+   "median_steps": 2.0,
+   "median_compile_s": 5.246935253
+  },
+  {
+   "collection": "cqp",
+   "config": "pasls",
+   "n_tasks": 14,
+   "n_solved": 8,
+   "solve_rate": 0.5714285714,
+   "median_time_s": 0.0086055952,
+   "median_steps": 6.5,
+   "median_compile_s": 8.3998323055
+  },
+  {
+   "collection": "cqp",
+   "config": "scipy-slsqp",
+   "n_tasks": 14,
+   "n_solved": 5,
+   "solve_rate": 0.3571428571,
+   "median_time_s": 0.0017319145,
+   "median_steps": 5.0,
+   "median_compile_s": 0.2815107975
+  },
+  {
+   "collection": "cqp",
+   "config": "scipy-trust-constr",
+   "n_tasks": 14,
+   "n_solved": 8,
+   "solve_rate": 0.5714285714,
+   "median_time_s": 0.3680711115,
+   "median_steps": 60.5,
+   "median_compile_s": 0.543899836
+  },
+  {
+   "collection": "cqp",
+   "config": "tfip",
+   "n_tasks": 14,
+   "n_solved": 5,
+   "solve_rate": 0.3571428571,
+   "median_time_s": 0.014217753,
+   "median_steps": 21.0,
+   "median_compile_s": 8.3426961815
+  },
+  {
+   "collection": "cqp",
+   "config": "trip",
+   "n_tasks": 14,
+   "n_solved": 6,
+   "solve_rate": 0.4285714286,
+   "median_time_s": 0.011752006,
+   "median_steps": 17.0,
+   "median_compile_s": 5.494130266
+  }
+ ]
+}
