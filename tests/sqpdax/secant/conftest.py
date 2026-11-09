@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax.sqpdax.secant import LBFGS, Secant
+from slsqp_jax.sqpdax.secant import LBFGS, LimitedMemoryReducedHessian, Secant
 
 # Compiled once per static configuration; eager ``append`` retraces its
 # ``lax.cond`` on every call and dominates the runtime of history-building tests.
@@ -45,6 +45,20 @@ def build_lbfgs_with_pairs(
 ) -> LBFGS:
     """Append ``(s, y)`` pairs sequentially to a new :class:`LBFGS`."""
     hist = LBFGS(n=n, memory=memory, **kwargs)
+    for s, y in pairs:
+        hist = append_jit(hist, jnp.asarray(s), jnp.asarray(y))
+    return hist
+
+
+def build_lrh_with_pairs(
+    n: int,
+    pairs: list[tuple],
+    *,
+    memory: int = 10,
+    **kwargs,
+) -> LimitedMemoryReducedHessian:
+    """Append ``(s, y)`` pairs sequentially to a new LRH secant."""
+    hist = LimitedMemoryReducedHessian(n=n, memory=memory, **kwargs)
     for s, y in pairs:
         hist = append_jit(hist, jnp.asarray(s), jnp.asarray(y))
     return hist
