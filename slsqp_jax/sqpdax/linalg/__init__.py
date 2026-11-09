@@ -36,10 +36,14 @@ solver classes, so that every solver reuses one implementation:
   (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.bfgs_factor_update`) and
   the removal of the oldest basis vector
   (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.drop_oldest_basis_vector`).
+* :mod:`~slsqp_jax.sqpdax.linalg.free_set_factor` — the factor of the
+  free-variable block of a reduced-Hessian model for a bound working set
+  (:class:`~slsqp_jax.sqpdax.linalg.free_set_factor.FreeSetFactor`).
 """
 
 from . import (
     box,
+    free_set_factor,
     operator_norm,
     projection,
     reduced_hessian,
@@ -47,6 +51,7 @@ from . import (
     steihaug,
 )
 from .box import box_fraction, box_ray_length
+from .free_set_factor import FreeSetFactor
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .reduced_hessian import (
@@ -72,6 +77,7 @@ from .steihaug import (
 
 __all__ = [
     "box",
+    "free_set_factor",
     "operator_norm",
     "projection",
     "reduced_hessian",
@@ -79,6 +85,7 @@ __all__ = [
     "steihaug",
     "power_iteration_norm",
     "spectral_norm_estimate",
+    "FreeSetFactor",
     "bfgs_factor_update",
     "drop_oldest_basis_vector",
     "orthogonalize_against",
