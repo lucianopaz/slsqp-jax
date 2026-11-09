@@ -27,12 +27,25 @@ solver classes, so that every solver reuses one implementation:
   estimates of spectral norms used by the diagnostics
   (:func:`~slsqp_jax.sqpdax.linalg.operator_norm.power_iteration_norm`,
   :func:`~slsqp_jax.sqpdax.linalg.operator_norm.spectral_norm_estimate`).
+* :mod:`~slsqp_jax.sqpdax.linalg.reduced_hessian` — dense kernels of the
+  limited-memory reduced-Hessian secant: QR with a non-negative diagonal
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.positive_qr`) and
+  twice-iterated Gram–Schmidt
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.orthogonalize_against`).
 """
 
-from . import box, operator_norm, projection, scaled_normal_equations, steihaug
+from . import (
+    box,
+    operator_norm,
+    projection,
+    reduced_hessian,
+    scaled_normal_equations,
+    steihaug,
+)
 from .box import box_fraction, box_ray_length
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
+from .reduced_hessian import orthogonalize_against, positive_qr
 from .scaled_normal_equations import (
     NormalEquationsStrategy,
     ResolvedNormalEquationsStrategy,
@@ -52,10 +65,13 @@ __all__ = [
     "box",
     "operator_norm",
     "projection",
+    "reduced_hessian",
     "scaled_normal_equations",
     "steihaug",
     "power_iteration_norm",
     "spectral_norm_estimate",
+    "orthogonalize_against",
+    "positive_qr",
     "NormalEquationsStrategy",
     "ResolvedNormalEquationsStrategy",
     "SchurNormalEquations",
