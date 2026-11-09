@@ -228,8 +228,8 @@ class DenseLRHReference:
         As in PLAN.md section 3.3 (``1e-8``, ``1e-4``, ``0.2``, ``1e-4``,
         ``1e6``).
     sigma_rule
-        ``"yy_over_sy"`` (paper, ``y_dᵀy_d / s̃ᵀy_d``) or ``"sy_over_ss"``
-        (``s̃ᵀy_d / s̃ᵀs̃``).
+        ``"sy_over_ss"`` (default, ``s̃ᵀy_d / s̃ᵀs̃``) or ``"yy_over_sy"``
+        (paper, ``y_dᵀy_d / s̃ᵀy_d``).
     initial_sigma
         Initial complement curvature; the empty model is ``σ I``.
 
@@ -262,7 +262,7 @@ class DenseLRHReference:
         damping_threshold: float = 0.2,
         sigma_floor: float = 1e-4,
         sigma_ceil: float = 1e6,
-        sigma_rule: str = "yy_over_sy",
+        sigma_rule: str = "sy_over_ss",
         initial_sigma: float = 1.0,
     ):
         if sigma_rule not in ("yy_over_sy", "sy_over_ss"):

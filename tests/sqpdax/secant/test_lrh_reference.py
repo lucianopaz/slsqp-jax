@@ -371,9 +371,13 @@ def _sigma_preserving_pairs(
 def test_matches_plain_dense_bfgs_when_nothing_is_dropped_or_damped(
     n, memory, sigma, seed
 ):
-    """With no drop, damping, rejection or sigma change, ``B`` is plain BFGS."""
+    """With no drop, damping, rejection or sigma change, ``B`` is plain BFGS.
+
+    The pairs satisfy ``yᵀy / sᵀy = σ``, so they preserve ``σ`` only under the
+    paper's rule, which is therefore passed explicitly (it is not the default).
+    """
     pairs = _sigma_preserving_pairs(seed, n, memory, sigma)
-    ref = DenseLRHReference(n, memory, initial_sigma=sigma)
+    ref = DenseLRHReference(n, memory, initial_sigma=sigma, sigma_rule="yy_over_sy")
     history = replay_pairs(ref, pairs)
 
     expected = sigma * np.eye(n)

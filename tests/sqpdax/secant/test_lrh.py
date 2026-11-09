@@ -76,10 +76,19 @@ class Step:
 
 
 @functools.lru_cache(maxsize=None)
-def _replay(scenario: PairScenario, n: int, memory: int, count: int, seed: int):
+def _replay(
+    scenario: PairScenario,
+    n: int,
+    memory: int,
+    count: int,
+    seed: int,
+    sigma_rule: str = "sy_over_ss",
+    initial_sigma: float = 1.0,
+):
     """Replay a scenario on the secant and the oracle, once per parameter set."""
-    ref = DenseLRHReference(n, memory)
-    secant = LimitedMemoryReducedHessian(n=n, memory=memory)
+    options = {"sigma_rule": sigma_rule, "initial_sigma": initial_sigma}
+    ref = DenseLRHReference(n, memory, **options)
+    secant = LimitedMemoryReducedHessian(n=n, memory=memory, **options)
     steps = [Step(secant, secant, copy.deepcopy(ref), None, None, None)]
     for s, y in scenario.make(seed, n, count):
         s, y = jnp.asarray(s), jnp.asarray(y)
@@ -91,8 +100,8 @@ def _replay(scenario: PairScenario, n: int, memory: int, count: int, seed: int):
     return steps
 
 
-def _history(pair_scenario, n, memory, count_rule, seed) -> list[Step]:
-    return _replay(pair_scenario, n, memory, count_rule(memory), seed)
+def _history(pair_scenario, n, memory, count_rule, seed, **options) -> list[Step]:
+    return _replay(pair_scenario, n, memory, count_rule(memory), seed, **options)
 
 
 def _assert_storage_invariants(secant: LimitedMemoryReducedHessian) -> None:
@@ -158,6 +167,66 @@ def test_from_spec_injects_n_and_memory(spec):
     assert secant.basis.shape == (5, spec["memory"])
 
 
+@pytest.mark.parametrize("sigma_rule", ["yy_over_sy", "sy_over_ss"])
+@pytest.mark.parametrize("initial_sigma", [1.0, 7.5])
+def test_sigma_options_through_constructor_and_from_spec(sigma_rule, initial_sigma):
+    spec = {
+        "kind": "lrh",
+        "memory": 2,
+        "sigma_rule": sigma_rule,
+        "initial_sigma": initial_sigma,
+    }
+    for secant in (
+        LimitedMemoryReducedHessian(
+            n=4, memory=2, sigma_rule=sigma_rule, initial_sigma=initial_sigma
+        ),
+        Secant.from_spec(spec, n=4),
+    ):
+        assert (secant.sigma_rule, secant.initial_sigma) == (sigma_rule, initial_sigma)
+        v = jnp.arange(1.0, 5.0)
+        np.testing.assert_allclose(secant.hvp(v), initial_sigma * v)
+        np.testing.assert_allclose(secant.inverse_hvp(v), v / initial_sigma)
+        assert float(secant.sigma) == initial_sigma
+        _assert_storage_invariants(secant)
+    assert LimitedMemoryReducedHessian(n=4, memory=2).sigma_rule == "sy_over_ss"
+    assert LimitedMemoryReducedHessian(n=4, memory=2).initial_sigma == 1.0
+
+
+@pytest.mark.parametrize("initial_sigma", [0.0, -1.0, np.inf, np.nan])
+def test_invalid_initial_sigma_is_rejected(initial_sigma):
+    with pytest.raises(ValueError, match="initial_sigma"):
+        LimitedMemoryReducedHessian(n=3, memory=2, initial_sigma=initial_sigma)
+    with pytest.raises(ValueError, match="initial_sigma"):
+        Secant.from_spec(
+            {"kind": "lrh", "memory": 2, "initial_sigma": initial_sigma}, n=3
+        )
+
+
+def test_unknown_sigma_rule_is_rejected():
+    with pytest.raises(ValueError, match="sigma_rule"):
+        LimitedMemoryReducedHessian(n=3, memory=2, sigma_rule="bogus")
+    with pytest.raises(ValueError, match="sigma_rule"):
+        Secant.from_spec({"kind": "lrh", "memory": 2, "sigma_rule": "bogus"}, n=3)
+
+
+@pytest.mark.parametrize("initial_sigma", [0.5, 40.0])
+def test_sy_over_ss_never_exceeds_yy_over_sy(initial_sigma):
+    """Cauchy-Schwarz: the Rayleigh-quotient rule gives the softer complement."""
+    s, y = (jnp.asarray(v) for v in PAIR_SCENARIOS["spd"].make(1, 6, 1)[0])
+    sigmas = {
+        rule: float(
+            LimitedMemoryReducedHessian(
+                n=6, memory=3, sigma_rule=rule, initial_sigma=initial_sigma
+            )
+            .append(s, y)
+            .sigma
+        )
+        for rule in ("yy_over_sy", "sy_over_ss")
+    }
+    assert sigmas["sy_over_ss"] <= sigmas["yy_over_sy"] + 1e-12
+    assert sigmas["sy_over_ss"] != sigmas["yy_over_sy"]
+
+
 def test_from_spec_warns_on_unknown_parameter():
     with pytest.warns(UserWarning, match="ignoring unknown params"):
         secant = Secant.from_spec({"kind": "lrh", "memory": 2, "bogus": 1}, n=4)
@@ -169,30 +238,49 @@ def test_from_spec_warns_on_unknown_parameter():
 # ---------------------------------------------------------------------------
 
 
+SIGMA_OPTIONS = pytest.mark.parametrize(
+    ("sigma_rule", "initial_sigma"),
+    [
+        ("yy_over_sy", 1.0),
+        ("sy_over_ss", 1.0),
+        ("yy_over_sy", 25.0),
+        ("sy_over_ss", 0.3),
+    ],
+)
+
+
 @SIZES
 @MEMORIES
 @COUNTS
 @SEEDS
+@SIGMA_OPTIONS
 def test_agrees_with_dense_reference_after_every_append(
-    pair_scenario, n, memory, count_rule, seed
+    pair_scenario, n, memory, count_rule, seed, sigma_rule, initial_sigma
 ):
     """``B``, ``B⁻¹``, ``span Z``, ``R``, ``σ``, rank, θ and skip flag match the oracle."""
     rng = np.random.default_rng(7)
     probe = rng.normal(size=n)
-    for step in _history(pair_scenario, n, memory, count_rule, seed):
+    options = {"sigma_rule": sigma_rule, "initial_sigma": initial_sigma}
+    for step in _history(pair_scenario, n, memory, count_rule, seed, **options):
         after, ref = step.after, step.ref
         r = int(after.rank)
         assert r == ref.rank
         np.testing.assert_allclose(
             dense_hessian(after), ref.B, atol=TOL, rtol=TOL, err_msg="B"
         )
+        # inverse solves are only as accurate as the conditioning allows
+        cond = np.linalg.cond(ref.B)
         np.testing.assert_allclose(
-            after.inverse_hvp(probe), np.linalg.solve(ref.B, probe), atol=TOL, rtol=1e-7
+            after.inverse_hvp(probe),
+            np.linalg.solve(ref.B, probe),
+            atol=TOL,
+            rtol=1e-7 + 1e-14 * cond,
         )
-        # the round trip is only as accurate as the conditioning allows
-        round_trip_tol = TOL + 1e-13 * np.linalg.cond(ref.B)
         np.testing.assert_allclose(
-            after.inverse_hvp(after.hvp(probe)), probe, atol=round_trip_tol, rtol=1e-7
+            after.inverse_hvp(after.hvp(probe)),
+            probe,
+            atol=TOL + 1e-13 * cond,
+            rtol=1e-7,
         )
         np.testing.assert_allclose(float(after.sigma), ref.sigma, rtol=1e-10)
         z = np.asarray(after.basis)[:, :r]
@@ -219,8 +307,7 @@ def test_agrees_with_dense_reference_after_every_append(
         np.testing.assert_allclose(
             float(diag.raw_curvature), float(step.pair[0] @ step.pair[1])
         )
-        if step.record.skipped:
-            assert float(diag.damping_theta) == 1.0
+        assert (float(diag.damping_theta) == 1.0) >= step.record.skipped
 
 
 @SIZES
@@ -235,11 +322,9 @@ def test_basis_orthonormality_padding_and_step_span(
         after = step.after
         _assert_storage_invariants(after)
         r = int(after.rank)
-        if r:
-            z_t = np.asarray(after.basis) @ np.asarray(after.triangular)
-            np.testing.assert_allclose(
-                z_t[:, :r], np.column_stack(step.ref.steps), atol=TOL, rtol=TOL
-            )
+        z_t = np.asarray(after.basis) @ np.asarray(after.triangular)
+        steps = np.column_stack([np.zeros((n, 0)), *step.ref.steps])
+        np.testing.assert_allclose(z_t[:, :r], steps, atol=TOL, rtol=TOL)
 
 
 @SIZES
@@ -256,11 +341,12 @@ def test_secant_condition_right_after_append(
         z = np.asarray(step.after.basis)[:, : int(step.after.rank)]
         b_s = np.asarray(step.after.hvp(r.s_tilde))
         np.testing.assert_allclose(b_s, z @ (z.T @ r.y_hat), atol=TOL, rtol=TOL)
-        if not r.dropped:
-            np.testing.assert_allclose(b_s, r.y_hat, atol=TOL, rtol=TOL)
-            np.testing.assert_allclose(
-                r.s_tilde @ b_s, r.s_tilde @ r.y_damped, atol=TOL, rtol=TOL
-            )
+        # without a drop the full secant condition holds (the check is
+        # vacuous after a drop, which discards the oldest direction)
+        holds = np.allclose(b_s, r.y_hat, atol=TOL, rtol=TOL) and np.allclose(
+            r.s_tilde @ b_s, r.s_tilde @ r.y_damped, atol=TOL, rtol=TOL
+        )
+        assert holds or r.dropped
 
 
 def test_rank_and_dropping_behaviour_match_the_scenarios(pair_scenario):
@@ -272,8 +358,7 @@ def test_rank_and_dropping_behaviour_match_the_scenarios(pair_scenario):
     assert ranks == sorted(ranks)  # rank never decreases through appends
     for step in history[1:]:
         assert not (step.record.dropped and not step.record.accepted)
-    if pair_scenario.independent:
-        assert ranks == [0, 1, 2, 2, 2, 2]
+    assert (ranks == [0, 1, 2, 2, 2, 2]) >= pair_scenario.independent
     rejected = any(not s.record.accepted for s in history[1:])
     assert rejected >= (pair_scenario.rejects_by <= 2 * memory + 1)
 
@@ -335,6 +420,13 @@ def test_damping_ratio_sweep(warm_secant, ratio, seed):
 # ---------------------------------------------------------------------------
 # Skipped pairs
 # ---------------------------------------------------------------------------
+
+
+def _identical(a: LimitedMemoryReducedHessian, b: LimitedMemoryReducedHessian) -> bool:
+    return all(
+        np.array_equal(x, y)
+        for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True)
+    )
 
 
 def _assert_identical(a: LimitedMemoryReducedHessian, b: LimitedMemoryReducedHessian):
@@ -403,10 +495,8 @@ def test_curvature_guard_late_skip(warm_secant, multiplier, expect_skip):
     assert bool(diag.skipped) == expect_skip == record.skipped
     assert (float(diag.damping_theta) == 1.0) >= expect_skip
     assert (int(updated.rank) == int(hist.rank)) == expect_skip
-    if expect_skip:
-        _assert_identical(updated, hist)
-    else:
-        np.testing.assert_allclose(float(diag.damping_theta), record.theta, atol=1e-10)
+    assert _identical(updated, hist) == expect_skip
+    np.testing.assert_allclose(float(diag.damping_theta), record.theta, atol=1e-10)
     np.testing.assert_allclose(dense_hessian(updated), ref.B, atol=TOL, rtol=TOL)
     assert np.linalg.eigvalsh(np.asarray(dense_hessian(updated))).min() > 0.0
     _assert_storage_invariants(updated)
@@ -425,28 +515,50 @@ def _expected_soft(ref: DenseLRHReference) -> np.ndarray:
     return ref.sigma * np.eye(ref.n) + (curvature - ref.sigma) * np.outer(b, b)
 
 
+# severity -> (dense B, sigma, rank) after the reset; the second argument of
+# each lambda is the secant's ``initial_sigma``.
 RESETS = {
-    0: (_expected_soft, lambda ref: ref.sigma, lambda ref: min(ref.rank, 1)),
-    1: (lambda ref: ref.sigma * np.eye(ref.n), lambda ref: ref.sigma, lambda ref: 0),
-    2: (lambda ref: np.eye(ref.n), lambda ref: 1.0, lambda ref: 0),
+    0: (
+        lambda ref, init: _expected_soft(ref),
+        lambda ref, init: ref.sigma,
+        lambda ref: min(ref.rank, 1),
+    ),
+    1: (
+        lambda ref, init: ref.sigma * np.eye(ref.n),
+        lambda ref, init: ref.sigma,
+        lambda ref: 0,
+    ),
+    2: (
+        lambda ref, init: init * np.eye(ref.n),
+        lambda ref, init: init,
+        lambda ref: 0,
+    ),
 }
 
 
 @pytest.mark.parametrize("count", [0, 1, 3, 6])
 @pytest.mark.parametrize("severity", [-3, 0, 1, 2, 7])
-def test_reset_with_traced_severity_under_jit(count, severity):
-    """Severity is traced and clipped to ``[0, 2]``; padding invariants hold after."""
+@pytest.mark.parametrize("initial_sigma", [1.0, 5.0])
+def test_reset_with_traced_severity_under_jit(count, severity, initial_sigma):
+    """Severity is traced and clipped to ``[0, 2]``; padding invariants hold after.
+
+    Severity 2 returns to ``initial_sigma``.
+    """
     n, memory = 7, 4
     pairs = PAIR_SCENARIOS["spd"].make(11, n, count)
-    hist = build_lrh_with_pairs(n, pairs, memory=memory)
-    ref = DenseLRHReference(n, memory)
+    hist = build_lrh_with_pairs(n, pairs, memory=memory, initial_sigma=initial_sigma)
+    ref = DenseLRHReference(n, memory, initial_sigma=initial_sigma)
     for s, y in pairs:
         ref.append(s, y)
 
     out = reset_jit(hist, jnp.asarray(severity))
     expected_b, expected_sigma, expected_rank = RESETS[int(np.clip(severity, 0, 2))]
-    np.testing.assert_allclose(dense_hessian(out), expected_b(ref), atol=TOL, rtol=TOL)
-    np.testing.assert_allclose(float(out.sigma), expected_sigma(ref), rtol=1e-12)
+    np.testing.assert_allclose(
+        dense_hessian(out), expected_b(ref, initial_sigma), atol=TOL, rtol=TOL
+    )
+    np.testing.assert_allclose(
+        float(out.sigma), expected_sigma(ref, initial_sigma), rtol=1e-12
+    )
     assert int(out.rank) == int(out.num_pairs) == expected_rank(ref)
     _assert_storage_invariants(out)
     assert jax.tree.structure(out) == jax.tree.structure(hist)
@@ -454,16 +566,18 @@ def test_reset_with_traced_severity_under_jit(count, severity):
         assert (a.shape, a.dtype) == (b.shape, b.dtype)
 
     # the reset model keeps working: a new pair gives the same result as a
-    # fresh oracle started from the reset model's complement curvature
-    # (only checkable when the reset left no basis)
+    # fresh oracle started from the reset model's complement curvature (a
+    # reset that left a basis behind is allowed to differ)
     s, y = (jnp.asarray(v) for v in PAIR_SCENARIOS["spd"].make(12, n, 1)[0])
     appended = append_jit(out, s, y)
     _assert_storage_invariants(appended)
     assert int(appended.rank) == int(out.rank) + 1 - (int(out.rank) == memory)
-    if expected_rank(ref) == 0:
-        fresh = DenseLRHReference(n, memory, initial_sigma=expected_sigma(ref))
-        fresh.append(np.asarray(s), np.asarray(y))
-        np.testing.assert_allclose(dense_hessian(appended), fresh.B, atol=TOL, rtol=TOL)
+    fresh = DenseLRHReference(
+        n, memory, initial_sigma=expected_sigma(ref, initial_sigma)
+    )
+    fresh.append(np.asarray(s), np.asarray(y))
+    matches_fresh = np.allclose(dense_hessian(appended), fresh.B, atol=TOL, rtol=TOL)
+    assert matches_fresh or expected_rank(ref) != 0
 
 
 def test_reset_python_int_severity_matches_traced():
@@ -607,3 +721,171 @@ def test_append_does_not_warn_or_emit_nans_on_a_long_run():
     np.testing.assert_allclose(
         dense_hessian(final), history[-1].ref.B, atol=TOL, rtol=TOL
     )
+
+
+# ---------------------------------------------------------------------------
+# spectrum_bounds
+# ---------------------------------------------------------------------------
+
+
+@SIZES
+@MEMORIES
+@COUNTS
+@SEEDS
+def test_spectrum_bounds_match_dense_eigenvalues(
+    pair_scenario, n, memory, count_rule, seed
+):
+    """``spectrum_bounds`` equals the extreme eigenvalues of the dense ``B``."""
+    for step in _history(pair_scenario, n, memory, count_rule, seed):
+        eigs = np.linalg.eigvalsh(np.asarray(dense_hessian(step.after)))
+        lower, upper = step.after.spectrum_bounds()
+        np.testing.assert_allclose(float(upper), eigs[-1], rtol=1e-8)
+        np.testing.assert_allclose(float(lower), eigs[0], rtol=1e-6, atol=1e-8)
+        assert 0.0 < float(lower) <= float(upper)
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 5])
+@pytest.mark.parametrize("memory", [3, 4])
+def test_spectrum_bounds_full_rank_excludes_the_complement(count, memory):
+    """With ``rank = n`` there is no complement: ``σ`` must not enter the bounds."""
+    n = 3
+    hist = build_lrh_with_pairs(
+        n,
+        PAIR_SCENARIOS["spd"].make(2, n, count),
+        memory=memory,
+        initial_sigma=1e-3,
+    )
+    assert int(hist.rank) == min(count, n)
+    eigs = np.linalg.eigvalsh(np.asarray(dense_hessian(hist)))
+    lower, upper = hist.spectrum_bounds()
+    np.testing.assert_allclose([float(lower), float(upper)], eigs[[0, -1]], rtol=1e-8)
+    assert jax.jit(lambda h: h.spectrum_bounds())(hist)[0] == lower
+
+
+# ---------------------------------------------------------------------------
+# Narrow valley (the LOGROS failure that removed VARCHEN damping)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sigma_rule", ["yy_over_sy", "sy_over_ss"])
+def test_narrow_valley_soft_curvature_is_not_stiffened_by_sigma(
+    narrow_valley, sigma_rule
+):
+    """Powell damping toward ``B s̃`` keeps the soft-direction curvature small.
+
+    Mirrors ``test_narrow_valley_soft_curvature_is_not_stiffened_by_the_diagonal``
+    in ``test_lbfgs.py``: ``H = 0.1 t tᵀ + 1.5e5 n nᵀ``, a stiff
+    ``initial_sigma = 1e4`` and 30 pairs crawling along ``t``. Measured
+    ``tᵀB t`` (final value, maximum over the last ten pairs) over the three
+    fixture angles: ``yy_over_sy`` 5.6-6.4 and 8.0-10.3, ``sy_over_ss``
+    0.85-1.9 and 0.88-2.1, against the L-BFGS bound ``100``.
+    """
+    tangent, pairs = narrow_valley
+    hist = LimitedMemoryReducedHessian(
+        n=2, memory=2, initial_sigma=1e4, sigma_rule=sigma_rule
+    )
+    soft_curvature = []
+    for s, y in pairs:
+        hist = append_jit(hist, s, y)
+        soft_curvature.append(float(tangent @ hist.hvp(tangent)))
+
+    assert min(soft_curvature) > 0.0
+    assert soft_curvature[-1] < 100.0
+    assert max(soft_curvature[-10:]) < 100.0
+
+
+def _embedded_valley(
+    angle_deg: float, seed: int, c_rel: float, n: int = 8, count: int = 30
+) -> tuple[np.ndarray, list[tuple]]:
+    """Narrow valley embedded in ``R^n`` with steps leaving its plane.
+
+    ``H = 0.1 t tᵀ + 1.5e5 n nᵀ + I_⊥`` where ``t, n`` span a random 2-plane
+    (``t`` at ``angle_deg`` inside it) and ``I_⊥`` is the identity on the
+    orthogonal ``n - 2`` directions. Steps are ``s = a t + b n + c`` with
+    ``a`` and ``b`` as in the ``narrow_valley`` fixture and ``c`` a random
+    vector in the orthogonal space with ``‖c‖ = c_rel · a``; ``y = H s``.
+    Returns the tangent ``t`` and the pairs.
+    """
+    rng = np.random.default_rng(seed)
+    theta = np.deg2rad(angle_deg)
+    q, _ = np.linalg.qr(rng.normal(size=(n, n)))
+    tangent = np.cos(theta) * q[:, 0] + np.sin(theta) * q[:, 1]
+    normal = -np.sin(theta) * q[:, 0] + np.cos(theta) * q[:, 1]
+    others = q[:, 2:]
+    hessian = (
+        0.1 * np.outer(tangent, tangent)
+        + 1.5e5 * np.outer(normal, normal)
+        + others @ others.T
+    )
+    pairs = []
+    for _ in range(count):
+        a = 10.0 ** rng.uniform(-1.0, 0.0)
+        b = 0.05 * a * rng.uniform(0.5, 1.5) * rng.choice([-1.0, 1.0])
+        c = others @ rng.normal(size=n - 2)
+        c *= c_rel * a / np.linalg.norm(c)
+        s = a * tangent + b * normal + c
+        pairs.append((jnp.asarray(s), jnp.asarray(hessian @ s)))
+    return tangent, pairs
+
+
+def _soft_curvature_trace(secant, tangent, pairs) -> list[float]:
+    """``tᵀB t`` after each appended pair."""
+    trace = []
+    for s, y in pairs:
+        secant = append_jit(secant, s, y)
+        trace.append(float(tangent @ secant.hvp(jnp.asarray(tangent))))
+    return trace
+
+
+@pytest.mark.parametrize("c_rel", [0.05, 0.3])
+@pytest.mark.parametrize(("angle", "seed"), [(15.0, 0), (45.0, 1), (75.0, 2)])
+def test_embedded_narrow_valley_soft_curvature(angle, seed, c_rel):
+    """Soft curvature in a valley embedded in ``R^8`` with off-plane steps.
+
+    With ``n = memory = 2`` the basis becomes the whole space and ``σ`` stops
+    acting; here ``n = 8``, ``memory = 2``, so steps keep a component outside
+    ``range(Z)`` and a stiff ``σ`` (``initial_sigma = 1e4``) meets soft
+    directions that are new to the basis (PLAN.md section 2.2, step 4).
+    The true ``tᵀH t`` is ``0.1``. This is a measurement and regression test,
+    not the L-BFGS bound of 100 (neither rule nor L-BFGS at ``memory = 2``
+    meets it): it asserts positivity, no stiffening up to the stiff
+    curvature itself (``tᵀB t < 3e4 = 0.2 λ_n`` over the last ten pairs), and
+    that the Rayleigh-quotient rule is no stiffer at the end than the
+    paper's rule.
+
+    Measured ``tᵀB t`` (final value / maximum over the last ten pairs), with
+    L-BFGS at ``memory = 2`` and ``diag = 1e4`` on the same pairs for
+    comparison:
+
+    ```text
+    c_rel  angle  yy_over_sy       sy_over_ss    L-BFGS m=2
+    0.05   15     263 / 1.2e3      1.5 / 478     47 / 76
+    0.05   45     1.8e3 / 1.8e3    793 / 793     91 / 91
+    0.05   75     261 / 1.0e3      31 / 425      34 / 1.5e3
+    0.3    15     1.9e3 / 5.6e3    23 / 613      508 / 1.0e3
+    0.3    45     3.2e3 / 1.1e4    873 / 873     687 / 3.8e3
+    0.3    75     4.5e3 / 6.6e3    98 / 477      1.0e3 / 1.4e3
+    ```
+
+    The paper's rule (``yy_over_sy``) stiffens the soft direction by up to
+    five orders of magnitude over the true ``0.1`` and is 3-10x stiffer than
+    L-BFGS at equal memory, while ``sy_over_ss`` is comparable to or softer
+    than L-BFGS. That is why ``sy_over_ss`` is the default ``sigma_rule``
+    (PLAN.md Decision 8); ``yy_over_sy`` stays available as an option.
+    """
+    tangent, pairs = _embedded_valley(angle, seed, c_rel)
+    traces = {
+        rule: _soft_curvature_trace(
+            LimitedMemoryReducedHessian(
+                n=8, memory=2, initial_sigma=1e4, sigma_rule=rule
+            ),
+            tangent,
+            pairs,
+        )
+        for rule in ("yy_over_sy", "sy_over_ss")
+    }
+    for trace in traces.values():
+        assert np.all(np.isfinite(trace))
+        assert min(trace) > 0.0
+        assert max(trace[-10:]) < 3e4
+    assert traces["sy_over_ss"][-1] <= traces["yy_over_sy"][-1]

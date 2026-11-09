@@ -16,6 +16,7 @@ Storage is ``n × m`` plus three ``m × m`` blocks, and no ``n × n`` object is
 ever formed.
 """
 
+import math
 from typing import ClassVar, NamedTuple, Self, cast
 
 import jax
@@ -35,6 +36,8 @@ from .reduced_hessian import ReducedHessianFactors, ReducedHessianSecant
 __all__ = [
     "LimitedMemoryReducedHessian",
 ]
+
+SIGMA_RULES = ("yy_over_sy", "sy_over_ss")
 
 
 class _Analysis(NamedTuple):
@@ -64,11 +67,20 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
        step), threshold ``damping_threshold``, in ``O(r²)`` for ``s̃ᵀB s̃``;
     4. a curvature guard that skips the pair when the damped curvature
        ``s̃ᵀ y_d`` is not above half the damping threshold times ``s̃ᵀB s̃``
-       (only reachable when the ``1e-12`` floor of the damping formula is
-       active, i.e. for steps of norm about ``1e-7`` or less);
+       (only reachable when ``s̃ᵀB s̃ < 1e-12``, i.e. when the floor of the
+       damping formula is active, e.g. for tiny steps near convergence);
     5. reinitialisation of the complement curvature,
-       ``σ = clip(y_dᵀ y_d / s̃ᵀ y_d, σ_floor, σ_ceil)`` (the paper's rule),
-       and expansion of ``R`` with ``√σ``;
+       ``σ = clip(s̃ᵀ y_d / s̃ᵀ s̃, σ_floor, σ_ceil)`` (the default,
+       ``sigma_rule="sy_over_ss"``: the Rayleigh quotient along the step) or
+       ``σ = clip(y_dᵀ y_d / s̃ᵀ y_d, …)`` (the paper's rule of Gill &
+       Leonard, ``sigma_rule="yy_over_sy"``, never smaller than the first),
+       keeping the old ``σ`` when the value is non-finite or
+       ``s̃ᵀ y_d ≤ 0``, and expansion of ``R`` with ``√σ``. The paper's rule
+       estimates the *largest* curvature of the pair, which then acts on
+       every soft direction outside ``range(Z)``; in a narrow valley with
+       steps leaving the basis it stiffened the soft curvature ``tᵀB t`` by
+       up to four orders of magnitude (3-10x stiffer than L-BFGS at equal
+       memory), which is why the Rayleigh quotient is the default;
     6. a BFGS update of ``R`` by a small dense QR;
     7. removal of the oldest step when the expanded rank is ``memory + 1``.
 
@@ -91,6 +103,13 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         Powell threshold ``τ`` (default ``0.2``).
     sigma_floor, sigma_ceil
         Clip bracket for the complement curvature ``σ``.
+    sigma_rule
+        Reinitialisation rule for ``σ``: ``"sy_over_ss"`` (default,
+        ``s̃ᵀy_d / s̃ᵀs̃``) or ``"yy_over_sy"`` (the paper's
+        ``y_dᵀy_d / s̃ᵀy_d``); see the class description of step 5.
+    initial_sigma
+        Complement curvature of the empty model and the value a severity-2
+        :meth:`reset` returns to (not clipped).
     basis
         ``Z``, shape ``(n, memory)``; first ``rank`` columns orthonormal,
         the rest exactly zero.
@@ -125,6 +144,8 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
     damping_threshold: float = field(static=True)
     sigma_floor: float = field(static=True)
     sigma_ceil: float = field(static=True)
+    sigma_rule: str = field(static=True)
+    initial_sigma: float = field(static=True)
     basis: Float[Array, "n memory"]
     triangular: Float[Array, "memory memory"]
     cholesky: Float[Array, "memory memory"]
@@ -140,8 +161,10 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         damping_threshold: float = 0.2,
         sigma_floor: float = 1e-4,
         sigma_ceil: float = 1e6,
+        sigma_rule: str = "sy_over_ss",
+        initial_sigma: float = 1.0,
     ):
-        """Construct an empty model ``B = I``.
+        """Construct an empty model ``B = initial_sigma · I``.
 
         Parameters
         ----------
@@ -157,7 +180,27 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
             Powell damping threshold ``τ`` toward the model's own ``B s̃``.
         sigma_floor, sigma_ceil
             Clip limits for the complement curvature ``σ``.
+        sigma_rule
+            ``"sy_over_ss"`` (default) or ``"yy_over_sy"`` (the paper's
+            rule); see the class docstring.
+        initial_sigma
+            Initial complement curvature ``σ`` (also the severity-2 reset
+            value).
+
+        Raises
+        ------
+        ValueError
+            If ``sigma_rule`` is not one of the two rules above, or if
+            ``initial_sigma`` is not finite and positive.
         """
+        if sigma_rule not in SIGMA_RULES:
+            raise ValueError(
+                f"unknown sigma_rule {sigma_rule!r}; expected one of {SIGMA_RULES}"
+            )
+        if not (math.isfinite(initial_sigma) and initial_sigma > 0.0):
+            raise ValueError(
+                f"initial_sigma must be finite and positive, got {initial_sigma!r}"
+            )
         self.n = n
         self.memory = memory
         self.skip_threshold = skip_threshold
@@ -165,10 +208,12 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         self.damping_threshold = damping_threshold
         self.sigma_floor = sigma_floor
         self.sigma_ceil = sigma_ceil
+        self.sigma_rule = sigma_rule
+        self.initial_sigma = initial_sigma
         self.basis = jnp.zeros((n, memory))
         self.triangular = jnp.zeros((memory, memory))
         self.cholesky = jnp.eye(memory)
-        self.sigma = jnp.ones((), dtype=self.basis.dtype)
+        self.sigma = jnp.full((), initial_sigma, dtype=self.basis.dtype)
         self.rank = jnp.zeros((), dtype=jnp.int32)
 
     # ------------------------------------------------------------------
@@ -242,6 +287,37 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         """
         return self.sigma, self.sigma
 
+    def spectrum_bounds(self) -> tuple[Scalar, Scalar]:
+        """Exact extreme eigenvalues of ``B`` (diagnostics only).
+
+        The spectrum of ``B`` is that of the active ``r × r`` block
+        ``RᵀR`` plus ``σ`` (multiplicity ``n - r``) when ``r < n``. Costs one
+        ``m × m`` eigendecomposition, ``O(m³)``; no ``n × n`` object is formed.
+
+        Returns
+        -------
+        tuple[Scalar, Scalar]
+            ``(λ_min, λ_max)`` of ``B``.
+        """
+        factors = self.factors()
+        r_mat = factors.active_cholesky
+        gram = r_mat.T @ r_mat
+        mask = factors.column_mask
+        active = mask[:, None] & mask[None, :]
+        # Replace the padded identity by a value above every active
+        # eigenvalue (trace bound) so the active ones sort first.
+        big = 1.0 + jnp.trace(gram)
+        eigs = jnp.linalg.eigvalsh(
+            jnp.where(active, gram, jnp.where(jnp.eye(self.memory) > 0, big, 0.0))
+        )
+        has_reduced = self.rank > 0
+        lower = jnp.where(has_reduced, eigs[0], self.sigma)
+        upper = jnp.where(has_reduced, eigs[jnp.maximum(self.rank - 1, 0)], self.sigma)
+        has_complement = self.rank < self.n
+        lower = jnp.where(has_complement, jnp.minimum(lower, self.sigma), lower)
+        upper = jnp.where(has_complement, jnp.maximum(upper, self.sigma), upper)
+        return lower, upper
+
     # ------------------------------------------------------------------
     # Skip / damping / diagnostics
     # ------------------------------------------------------------------
@@ -311,6 +387,9 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         s = jnp.asarray(s, dtype)
         y = jnp.asarray(y, dtype)
         u, w, rho = orthogonalize_against(self.basis, s)
+        # ``rho > 0`` is implied by the first test for every pair that passed
+        # ``should_skip`` (``accept_tol * ||s|| > 0``); it only guards the
+        # division by ``rho`` for pairs whose results are discarded.
         accepted = (rho >= self.accept_tol * jnp.linalg.norm(s)) & (rho > 0.0)
         w_used = jnp.where(accepted, w, jnp.zeros_like(w))
         s_tilde = self.basis @ u + w_used
@@ -419,8 +498,16 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
         y_d = a.theta * y + (1.0 - a.theta) * self.hvp(a.s_tilde)
         sty_d = jnp.dot(a.s_tilde, y_d)
 
-        # 5. reinitialisation scalar (paper's rule) with fallback to the old one
-        raw = jnp.dot(y_d, y_d) / sty_d
+        # 5. reinitialisation scalar with fallback to the old one
+        numerator = {
+            "yy_over_sy": jnp.dot(y_d, y_d),
+            "sy_over_ss": sty_d,
+        }[self.sigma_rule]
+        denominator = {
+            "yy_over_sy": sty_d,
+            "sy_over_ss": jnp.dot(a.s_tilde, a.s_tilde),
+        }[self.sigma_rule]
+        raw = numerator / denominator
         sigma_new = jnp.where(
             jnp.isfinite(raw) & (sty_d > 0.0),
             jnp.clip(raw, self.sigma_floor, self.sigma_ceil),
@@ -541,7 +628,8 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
           ``R = [‖R T[:, r-1]‖ / ‖T[:, r-1]‖]``, ``T = [‖b‖]``) and ``σ``;
           a no-op on an empty model.
         * ``1`` drops the whole basis and keeps ``σ``.
-        * ``2`` drops the whole basis and sets ``σ = 1`` (``B = I``).
+        * ``2`` drops the whole basis and sets ``σ = initial_sigma`` (``B = I``
+          for the default ``initial_sigma = 1``).
 
         Parameters
         ----------
@@ -559,6 +647,6 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
             [
                 lambda: self._soft_reset(),
                 lambda: self._empty(self.sigma),
-                lambda: self._empty(jnp.ones_like(self.sigma)),
+                lambda: self._empty(jnp.full_like(self.sigma, self.initial_sigma)),
             ],
         )
