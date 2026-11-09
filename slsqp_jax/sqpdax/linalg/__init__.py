@@ -41,13 +41,20 @@ solver classes, so that every solver reuses one implementation:
   (:class:`~slsqp_jax.sqpdax.linalg.free_set_factor.FreeSetFactor`).
 * :mod:`~slsqp_jax.sqpdax.linalg.lawson_hanson` — Lawson–Hanson non-negative
   least squares (:func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.nnls`,
-  :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.NNLSResult`).
+  :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.NNLSResult`) and the
+  least-distance problem built on it
+  (:func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.ldp`).
+* :mod:`~slsqp_jax.sqpdax.linalg.lsei` — the least-distance problem with
+  equality and inequality constraints, reduced to an LDP on the constraint
+  count (:func:`~slsqp_jax.sqpdax.linalg.lsei.least_distance_lsei`,
+  :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`).
 """
 
 from . import (
     box,
     free_set_factor,
     lawson_hanson,
+    lsei,
     operator_norm,
     projection,
     reduced_hessian,
@@ -57,6 +64,7 @@ from . import (
 from .box import box_fraction, box_ray_length
 from .free_set_factor import FreeSetFactor
 from .lawson_hanson import LDP_RESULTS, LDPResult, NNLSResult, ldp, nnls
+from .lsei import LSEIResult, least_distance_lsei
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .reduced_hessian import (
@@ -84,6 +92,7 @@ __all__ = [
     "box",
     "free_set_factor",
     "lawson_hanson",
+    "lsei",
     "operator_norm",
     "projection",
     "reduced_hessian",
@@ -97,6 +106,8 @@ __all__ = [
     "LDP_RESULTS",
     "LDPResult",
     "ldp",
+    "LSEIResult",
+    "least_distance_lsei",
     "bfgs_factor_update",
     "drop_oldest_basis_vector",
     "orthogonalize_against",
