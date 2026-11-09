@@ -31,7 +31,11 @@ solver classes, so that every solver reuses one implementation:
   limited-memory reduced-Hessian secant: QR with a non-negative diagonal
   (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.positive_qr`) and
   twice-iterated Gram–Schmidt
-  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.orthogonalize_against`).
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.orthogonalize_against`),
+  the BFGS update of the reduced-Hessian factor
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.bfgs_factor_update`) and
+  the removal of the oldest basis vector
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.drop_oldest_basis_vector`).
 """
 
 from . import (
@@ -45,7 +49,12 @@ from . import (
 from .box import box_fraction, box_ray_length
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
-from .reduced_hessian import orthogonalize_against, positive_qr
+from .reduced_hessian import (
+    bfgs_factor_update,
+    drop_oldest_basis_vector,
+    orthogonalize_against,
+    positive_qr,
+)
 from .scaled_normal_equations import (
     NormalEquationsStrategy,
     ResolvedNormalEquationsStrategy,
@@ -70,6 +79,8 @@ __all__ = [
     "steihaug",
     "power_iteration_norm",
     "spectral_norm_estimate",
+    "bfgs_factor_update",
+    "drop_oldest_basis_vector",
     "orthogonalize_against",
     "positive_qr",
     "NormalEquationsStrategy",

@@ -7,7 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from slsqp_jax.sqpdax.linalg import orthogonalize_against, positive_qr
+from slsqp_jax.sqpdax.linalg import (
+    bfgs_factor_update,
+    drop_oldest_basis_vector,
+    orthogonalize_against,
+    positive_qr,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -76,11 +81,20 @@ def test_positive_qr_jit_matches_eager(mode):
     np.testing.assert_allclose(r_j, r_e, atol=1e-13)
 
 
-# name -> (builder(in_span, generic) -> v, upper bound on rho)
+# name -> (builder(in_span, generic) -> v, upper bound on rho,
+#           bound on ||basis^T residual|| / rho)
+# The residual of a vector inside the span is pure roundoff, so its direction
+# is meaningless and carries no relative-orthogonality bound (``NO_BOUND``;
+# finite so that ``NO_BOUND * 0`` is ``0`` and not ``nan``).
+NO_BOUND = np.finfo(float).max
 V_KINDS = {
-    "generic": (lambda in_span, generic: generic, np.inf),
-    "in_span": (lambda in_span, generic: in_span, 1e-12),
-    "nearly_dependent": (lambda in_span, generic: in_span + 1e-10 * generic, 1e-9),
+    "generic": (lambda in_span, generic: generic, np.inf, 1e-12),
+    "in_span": (lambda in_span, generic: in_span, 1e-12, NO_BOUND),
+    "nearly_dependent": (
+        lambda in_span, generic: in_span + 1e-10 * generic,
+        1e-9,
+        1e-12,
+    ),
 }
 
 
@@ -97,7 +111,7 @@ def test_orthogonalize_against(seed, n, m, rank_fraction, kind):
     rng = np.random.default_rng(100 + seed)
     generic = rng.standard_normal(n)
     in_span = basis @ rng.standard_normal(m)
-    build, rho_max = V_KINDS[kind]
+    build, rho_max, rel_orth = V_KINDS[kind]
     v = build(in_span, generic)
 
     coeffs, residual, rho = orthogonalize_against(jnp.asarray(basis), jnp.asarray(v))
@@ -106,6 +120,8 @@ def test_orthogonalize_against(seed, n, m, rank_fraction, kind):
     assert bool(jnp.all(jnp.isfinite(coeffs))) and bool(jnp.all(jnp.isfinite(residual)))
     np.testing.assert_allclose(basis @ coeffs + residual, v, atol=1e-13)
     np.testing.assert_allclose(basis.T @ residual, 0.0, atol=1e-12)
+    # The normalised residual (what the LRH update appends) is orthogonal too.
+    assert np.linalg.norm(basis.T @ residual) <= rel_orth * float(rho)
     np.testing.assert_allclose(rho, np.linalg.norm(residual), rtol=1e-12, atol=1e-15)
     # Padded columns carry a zero coefficient.
     np.testing.assert_array_equal(coeffs[rank:], 0.0)
@@ -144,6 +160,130 @@ def test_orthogonalize_against_forms_no_square_n_array():
     basis = jnp.zeros((n, k))
     v = jnp.zeros(n)
     jaxpr = jax.make_jaxpr(orthogonalize_against)(basis, v)
+    for eqn in jaxpr.eqns:
+        for var in eqn.outvars:
+            shape = getattr(var.aval, "shape", ())
+            assert shape.count(n) <= 1, (eqn.primitive, shape)
+
+
+def _upper_triangular_factor(seed: int, k: int) -> np.ndarray:
+    """Well-conditioned upper-triangular matrix with a positive diagonal."""
+    tri = np.triu(_random_matrix(seed, (k, k)), 1) * 0.5
+    return tri + np.diag(1.0 + np.random.default_rng(seed + 50).random(k))
+
+
+def _curvature_pair(seed: int, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Reduced step/curvature vectors with ``y^T s > 0`` (sign-fixed, branch-free)."""
+    rng = np.random.default_rng(seed + 100)
+    s, y = rng.standard_normal(k), rng.standard_normal(k)
+    return s, y * np.sign(y @ s)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("k", [1, 3, 5, 8])
+@pytest.mark.parametrize("n_padded", [0, 2])
+def test_bfgs_factor_update(seed, k, n_padded):
+    """`R_new^T R_new` is the dense BFGS update; padded identity slots are untouched."""
+    r_live = _upper_triangular_factor(seed, k)
+    s_live, y_live = _curvature_pair(seed, k)
+    size = k + n_padded
+    r = np.eye(size)
+    r[:k, :k] = r_live
+    s = np.zeros(size)
+    s[:k] = s_live
+    y = np.zeros(size)
+    y[:k] = y_live
+
+    r_new = np.asarray(
+        bfgs_factor_update(jnp.asarray(r), jnp.asarray(s), jnp.asarray(y))
+    )
+
+    b = r.T @ r  # dense reference (tiny)
+    bs = b @ s
+    b_expected = b - np.outer(bs, bs) / (s @ bs) + np.outer(y, y) / (y @ s)
+    assert r_new.shape == (size, size)
+    np.testing.assert_allclose(r_new.T @ r_new, b_expected, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(np.tril(r_new, -1), 0.0, atol=1e-13)
+    assert np.all(np.diagonal(r_new) >= 0.0)
+    # Secant equation of the updated model: B_new s = y.
+    np.testing.assert_allclose(r_new.T @ (r_new @ s), y, rtol=1e-10, atol=1e-10)
+    # Padded slots stay the identity.
+    np.testing.assert_allclose(r_new[k:, k:], np.eye(n_padded), atol=1e-13)
+    np.testing.assert_allclose(r_new[:k, k:], 0.0, atol=1e-13)
+
+
+def test_bfgs_factor_update_jit_matches_eager():
+    r = jnp.asarray(_upper_triangular_factor(0, 4))
+    s, y = (jnp.asarray(v) for v in _curvature_pair(0, 4))
+    np.testing.assert_allclose(
+        jax.jit(bfgs_factor_update)(r, s, y), bfgs_factor_update(r, s, y), atol=1e-13
+    )
+
+
+@pytest.fixture(params=[0, 1, 2])
+def expanded_state(request):
+    """Builder of a full expanded LRH state with `m + 1` slots.
+
+    Returns ``make(n, m) -> (steps, basis, tri, chol, sigma)`` where
+    ``basis @ tri == steps`` (the last ``m + 1`` steps, oldest first),
+    ``basis`` is orthonormal and ``chol`` is an upper-triangular factor.
+    """
+    seed = request.param
+
+    def make(n, m):
+        steps = _random_matrix(seed, (n, m + 1))
+        basis, tri = positive_qr(jnp.asarray(steps))
+        chol = _upper_triangular_factor(seed, m + 1)
+        sigma = 0.5 + np.random.default_rng(seed).random()
+        return steps, np.asarray(basis), np.asarray(tri), chol, sigma
+
+    return make
+
+
+@pytest.mark.parametrize("n", [6, 15])
+@pytest.mark.parametrize("m", [1, 3, 5])
+def test_drop_oldest_basis_vector(expanded_state, n, m):
+    """Dropping the oldest step keeps the newest `m` steps and the projected model."""
+    steps, basis, tri, chol, sigma = expanded_state(n, m)
+
+    z_new, t_new, r_new = (
+        np.asarray(x)
+        for x in drop_oldest_basis_vector(
+            jnp.asarray(basis), jnp.asarray(tri), jnp.asarray(chol)
+        )
+    )
+
+    assert z_new.shape == (n, m) and t_new.shape == (m, m) and r_new.shape == (m, m)
+    np.testing.assert_allclose(z_new.T @ z_new, np.eye(m), atol=1e-12)
+    np.testing.assert_allclose(z_new @ t_new, steps[:, 1:], atol=1e-12)
+    np.testing.assert_allclose(np.tril(t_new, -1), 0.0, atol=1e-13)
+    np.testing.assert_allclose(np.tril(r_new, -1), 0.0, atol=1e-13)
+    assert np.all(np.diagonal(t_new) >= 0.0) and np.all(np.diagonal(r_new) >= 0.0)
+    # Dense reference (tiny n): B'' restricted to the new basis equals R^T R.
+    b_full = basis @ chol.T @ chol @ basis.T + sigma * (np.eye(n) - basis @ basis.T)
+    np.testing.assert_allclose(
+        r_new.T @ r_new, z_new.T @ b_full @ z_new, rtol=1e-10, atol=1e-10
+    )
+
+
+def test_drop_oldest_basis_vector_jit_matches_eager(expanded_state):
+    _, basis, tri, chol, _ = expanded_state(9, 3)
+    args = tuple(jnp.asarray(x) for x in (basis, tri, chol))
+    for a, b in zip(
+        drop_oldest_basis_vector(*args),
+        jax.jit(drop_oldest_basis_vector)(*args),
+        strict=True,
+    ):
+        np.testing.assert_allclose(b, a, atol=1e-13)
+
+
+def test_drop_oldest_basis_vector_forms_no_square_n_array():
+    """Jaxpr audit: only `n × k` and `n`-sized intermediates (memory budget)."""
+    n, m = 40, 3
+    basis = jnp.zeros((n, m + 1))
+    tri = jnp.eye(m + 1)
+    chol = jnp.eye(m + 1)
+    jaxpr = jax.make_jaxpr(drop_oldest_basis_vector)(basis, tri, chol)
     for eqn in jaxpr.eqns:
         for var in eqn.outvars:
             shape = getattr(var.aval, "shape", ())

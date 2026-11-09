@@ -1,11 +1,12 @@
 """Dense kernels for the limited-memory reduced-Hessian (LRH) secant.
 
 Small, pure building blocks used by the LRH update (Gill & Leonard, 2003,
-*SIAM J. Optim.* 14): a QR factorisation with a non-negative diagonal and the
+*SIAM J. Optim.* 14): a QR factorisation with a non-negative diagonal, the
 twice-iterated classical Gram–Schmidt step that orthogonalises a new step
-against the current basis. Every array that is not an ``n``-vector has at
-most ``m + 1`` columns (``m`` = LRH memory), so no ``n × n`` object is ever
-formed.
+against the current basis, the BFGS update of the triangular Cholesky factor
+of the reduced Hessian, and the removal of the oldest basis vector. Every
+array that is not an ``n``-vector has at most ``m + 1`` columns (``m`` = LRH
+memory), so no ``n × n`` object is ever formed.
 """
 
 from typing import Literal
@@ -18,6 +19,8 @@ from ..types import Scalar, Vector_n
 __all__ = [
     "positive_qr",
     "orthogonalize_against",
+    "bfgs_factor_update",
+    "drop_oldest_basis_vector",
 ]
 
 
@@ -40,7 +43,10 @@ def positive_qr(
     mode
         ``"reduced"`` gives ``Q`` of shape ``(p, k)`` and ``R`` of shape
         ``(k, q)`` with ``k = min(p, q)``; ``"complete"`` gives a square
-        ``Q`` of shape ``(p, p)`` and ``R`` of shape ``(p, q)``.
+        ``Q`` of shape ``(p, p)`` and ``R`` of shape ``(p, q)``. Use
+        ``"complete"`` only for small inputs (the ``(m + 1)``-sized matrices
+        of the LRH update), never for matrices with ``n`` rows, since the
+        ``p × p`` factor ``Q`` would be an ``O(n²)`` object.
 
     Returns
     -------
@@ -111,3 +117,118 @@ def orthogonalize_against(
     coeffs = coeffs + correction
     residual = residual - basis @ correction
     return coeffs, residual, jnp.linalg.norm(residual)
+
+
+def bfgs_factor_update(
+    r: Float[Array, "k k"],
+    s_r: Float[Array, " k"],
+    y_r: Float[Array, " k"],
+) -> Float[Array, "k k"]:
+    """BFGS update of the upper-triangular factor of the reduced Hessian.
+
+    Given ``B = RᵀR`` this returns the upper-triangular ``R_new`` (with a
+    non-negative diagonal) such that
+
+    ``R_newᵀ R_new = B - B s sᵀ B / (sᵀ B s) + y yᵀ / (yᵀ s)``
+
+    where ``s = s_r`` and ``y = y_r`` are the step and curvature vectors in
+    the reduced (basis) coordinates. The rank-one-modified matrix
+    ``R + u vᵀ`` with ``u = R s / ‖R s‖`` and
+    ``v = y / sqrt(yᵀ s) - Rᵀ u`` satisfies
+    ``(R + u vᵀ)ᵀ (R + u vᵀ) = R_newᵀ R_new``; triangularity is restored with
+    a small dense QR (Gill & Leonard, 2003, sec. 2). Padded rows/columns of
+    ``R`` that are the identity (with zero entries of ``s_r`` and ``y_r``)
+    are left unchanged; a zero padded block stays zero, so callers must keep
+    identity padding. Costs ``O(k³)`` for the ``k × k`` factor.
+
+    The caller must guarantee ``y_rᵀ s_r > 0`` and ``‖R s_r‖ > 0``; no guard
+    is applied here.
+
+    Parameters
+    ----------
+    r
+        Upper-triangular factor, shape ``(k, k)``.
+    s_r
+        Step in reduced coordinates, shape ``(k,)``.
+    y_r
+        Curvature vector in reduced coordinates, shape ``(k,)``.
+
+    Returns
+    -------
+    Array
+        Updated upper-triangular factor, shape ``(k, k)``, ``diag >= 0``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import bfgs_factor_update
+    >>> r = jnp.eye(2)
+    >>> s, y = jnp.array([1.0, 0.0]), jnp.array([4.0, 0.0])
+    >>> r_new = bfgs_factor_update(r, s, y)
+    >>> bool(jnp.allclose(r_new.T @ r_new, jnp.diag(jnp.array([4.0, 1.0]))))
+    True
+    """
+    a = r @ s_r
+    u = a / jnp.linalg.norm(a)
+    v = y_r / jnp.sqrt(y_r @ s_r) - r.T @ u
+    _, r_new = positive_qr(r + jnp.outer(u, v), mode="reduced")
+    return r_new
+
+
+def drop_oldest_basis_vector(
+    basis: Float[Array, "n k1"],
+    tri: Float[Array, "k1 k1"],
+    chol: Float[Array, "k1 k1"],
+) -> tuple[Float[Array, "n k"], Float[Array, "k k"], Float[Array, "k k"]]:
+    """Drop the oldest step from an expanded LRH basis (``k1 = k + 1`` slots).
+
+    The inputs describe a full basis of ``k + 1`` orthonormal columns
+    ``Z'`` (``basis``), the upper-triangular ``T''`` (``tri``) such that
+    ``Z' T''`` holds the last ``k + 1`` steps (oldest first), and the
+    upper-triangular Cholesky factor ``R''`` (``chol``) of the reduced
+    Hessian in the basis ``Z'``. Removing the first column of ``T''`` leaves
+    an upper-Hessenberg ``(k + 1) × k`` matrix; a complete QR
+    ``T''[:, 1:] = Q_s [T̄; 0]`` (Gill & Leonard, 2003, sec. 3.2) gives the
+    new basis ``Z̄ = (Z' Q_s)[:, :k]`` (one ``n × (k+1)`` by ``(k+1) × k``
+    product), the new triangle ``T̄`` and the new factor ``R̄``, the leading
+    ``k × k`` block of the triangular factor of ``R'' Q_s``. Then
+
+    * ``Z̄ T̄`` equals the newest ``k`` steps and ``Z̄ᵀ Z̄ = I``;
+    * ``R̄ᵀ R̄ = Z̄ᵀ B'' Z̄`` where ``B'' = Z' R''ᵀR'' Z'ᵀ + σ (I - Z' Z'ᵀ)``.
+
+    Only ``n × (k + 1)`` and ``(k + 1) × (k + 1)`` arrays are formed. The
+    basis is assumed full (no padded slot); a padded input still returns
+    finite arrays (so a ``lax.cond`` over this kernel that ``vmap`` turns
+    into a select is safe), but the result is then not meaningful.
+
+    Parameters
+    ----------
+    basis
+        Orthonormal basis ``Z'``, shape ``(n, k + 1)``.
+    tri
+        Upper-triangular ``T''``, shape ``(k + 1, k + 1)``.
+    chol
+        Upper-triangular reduced-Hessian factor ``R''``, shape
+        ``(k + 1, k + 1)``.
+
+    Returns
+    -------
+    basis_new, tri_new, chol_new
+        Arrays of shapes ``(n, k)``, ``(k, k)`` and ``(k, k)``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import drop_oldest_basis_vector
+    >>> basis = jnp.eye(4)[:, :3]
+    >>> tri = jnp.eye(3)
+    >>> z, t, r = drop_oldest_basis_vector(basis, tri, jnp.eye(3))
+    >>> z.shape, t.shape, r.shape
+    ((4, 2), (2, 2), (2, 2))
+    """
+    k = basis.shape[1] - 1
+    q_s, h = positive_qr(tri[:, 1:], mode="complete")
+    basis_new = basis @ q_s[:, :k]
+    tri_new = h[:k, :]
+    _, r_s = positive_qr(chol @ q_s, mode="reduced")
+    return basis_new, tri_new, r_s[:k, :k]
