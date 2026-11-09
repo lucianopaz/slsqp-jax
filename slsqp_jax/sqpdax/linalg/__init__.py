@@ -39,11 +39,15 @@ solver classes, so that every solver reuses one implementation:
 * :mod:`~slsqp_jax.sqpdax.linalg.free_set_factor` — the factor of the
   free-variable block of a reduced-Hessian model for a bound working set
   (:class:`~slsqp_jax.sqpdax.linalg.free_set_factor.FreeSetFactor`).
+* :mod:`~slsqp_jax.sqpdax.linalg.lawson_hanson` — Lawson–Hanson non-negative
+  least squares (:func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.nnls`,
+  :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.NNLSResult`).
 """
 
 from . import (
     box,
     free_set_factor,
+    lawson_hanson,
     operator_norm,
     projection,
     reduced_hessian,
@@ -52,6 +56,7 @@ from . import (
 )
 from .box import box_fraction, box_ray_length
 from .free_set_factor import FreeSetFactor
+from .lawson_hanson import NNLSResult, nnls
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .reduced_hessian import (
@@ -78,6 +83,7 @@ from .steihaug import (
 __all__ = [
     "box",
     "free_set_factor",
+    "lawson_hanson",
     "operator_norm",
     "projection",
     "reduced_hessian",
@@ -86,6 +92,8 @@ __all__ = [
     "power_iteration_norm",
     "spectral_norm_estimate",
     "FreeSetFactor",
+    "NNLSResult",
+    "nnls",
     "bfgs_factor_update",
     "drop_oldest_basis_vector",
     "orthogonalize_against",
