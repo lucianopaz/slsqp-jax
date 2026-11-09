@@ -56,7 +56,7 @@ from . import (
 )
 from .box import box_fraction, box_ray_length
 from .free_set_factor import FreeSetFactor
-from .lawson_hanson import NNLSResult, nnls
+from .lawson_hanson import LDP_RESULTS, LDPResult, NNLSResult, ldp, nnls
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .reduced_hessian import (
@@ -94,6 +94,9 @@ __all__ = [
     "FreeSetFactor",
     "NNLSResult",
     "nnls",
+    "LDP_RESULTS",
+    "LDPResult",
+    "ldp",
     "bfgs_factor_update",
     "drop_oldest_basis_vector",
     "orthogonalize_against",

@@ -15,6 +15,11 @@ for rank-deficient passive sets. The whole algorithm is one flat
 optimality and move the index of the largest positive dual into the passive
 set) or a *solve* step (passive-set least squares followed by the
 Lawson–Hanson interpolation back into the feasible region).
+
+:func:`ldp` builds on it: the least-distance problem
+``min ‖x‖  s.t.  g x ≥ h`` is turned into one NNLS problem (Lawson & Hanson,
+ch. 23), whose residual decides feasibility and yields the solution and the
+multipliers.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-__all__ = ["NNLSResult", "nnls"]
+__all__ = ["NNLSResult", "nnls", "LDP_RESULTS", "LDPResult", "ldp"]
 
 
 class NNLSResult(eqx.Module):
@@ -236,4 +241,218 @@ def nnls(
         passive=passive,
         n_iter=n_iter,
         converged=converged,
+    )
+
+
+class LDP_RESULTS(eqx.Enumeration):
+    """Outcomes of :func:`ldp`.
+
+    ``inconsistent_equalities`` is defined here for the benefit of the
+    equality-constrained reduction built on top of :func:`ldp` (the LSEI step
+    of the direct QP solver); :func:`ldp` itself never produces it.
+    """
+
+    feasible = "The constraints are feasible; x is the least-norm point."
+    infeasible = "The constraints g x >= h have no solution."
+    inconsistent_equalities = (
+        "The equality constraints are inconsistent "
+        "(only produced by the LSEI reduction, never by ldp)."
+    )
+    max_iter_reached = "The NNLS iteration budget was exhausted."
+    nonfinite = "The data or the computed solution contain non-finite values."
+
+
+class LDPResult(eqx.Module):
+    """Solution of a least-distance problem.
+
+    Attributes
+    ----------
+    x
+        Minimum-norm point of ``{x : g x ≥ h}``, shape ``(n,)``. Zero unless
+        ``status`` is ``feasible``.
+    multipliers
+        Multipliers ``μ ≥ 0`` of the constraints, shape ``(k,)``, with
+        ``x = gᵀ μ`` and ``μ_i (g x - h)_i = 0``. Zero unless ``status`` is
+        ``feasible``.
+    status
+        :class:`LDP_RESULTS` code.
+    n_iter
+        Number of NNLS steps performed (``int32`` scalar).
+    """
+
+    x: Float[Array, " n"]
+    multipliers: Float[Array, " k"]
+    status: LDP_RESULTS
+    n_iter: Int[Array, ""]
+
+
+def ldp(
+    g: Float[Array, "k n"],
+    h: Float[Array, " k"],
+    max_iter: int | None = None,
+    tol: float | None = None,
+    ldp_tol: float | None = None,
+) -> LDPResult:
+    """Least-distance problem ``min ‖x‖₂  s.t.  g x ≥ h`` by NNLS.
+
+    Lawson & Hanson (1974), ch. 23. With ``E = [gᵀ; hᵀ]`` (shape
+    ``(n + 1, k)``) and ``f = e_{n+1}``, solve ``min ‖E u - f‖, u ≥ 0`` with
+    :func:`nnls` and let ``r = E u - f``. Optimality of the NNLS problem gives
+    ``r_{n+1} = -‖r‖²``, so
+
+    * if ``‖r‖ ≤ ldp_tol`` the constraints are infeasible;
+    * otherwise ``x = r_{:n} / ‖r‖² = gᵀ μ`` and the multipliers are
+      ``μ = u / ‖r‖² ≥ 0`` (complementarity holds because ``u`` vanishes
+      off the NNLS passive set). At the optimum these equal
+      ``-r_{:n} / r_{n+1}`` and ``u / (1 - hᵀu)``, but ``r_{n+1} = hᵀu - 1``
+      is computed by cancellation (relative error of ``x`` about
+      ``eps ‖x‖²``, garbage for ``‖x‖ ≳ 1e8``), whereas ``‖r‖²`` is
+      determined by the accurately computed ``r_{:n}`` (relative error about
+      ``eps ‖x‖``). For ``‖r‖² ≤ 1/4`` it is evaluated from ``‖r_{:n}‖²``
+      alone, through ``‖r‖² = ‖r_{:n}‖² + ‖r‖⁴``, so that the rounding noise
+      of ``r_{n+1}`` does not enter even for ``‖x‖ ~ 1e12``.
+
+    ``ldp`` normalises the data internally, in ``O(k n)``: rows of ``g`` to
+    unit norm, then ``h`` to unit sup-norm (``y = x / s`` with
+    ``s = max_i |h_i| / ‖g_i‖``; zero rows and a zero ``h`` keep scale 1),
+    and rescales ``x = s y`` and ``μ_i = s μ̂_i / ‖g_i‖`` afterwards.
+    Without it the NNLS dual tolerance, which grows with ``‖h‖``, would
+    exceed the true duals (``∝ 1/‖x‖``) and stop NNLS early. Callers must
+    not normalise themselves, and ``tol`` and ``ldp_tol`` apply to the
+    normalised problem. Non-finite checks use the original data.
+
+    Status codes, in order of precedence: ``nonfinite`` when ``g``, ``h``,
+    the NNLS residual or the solution contain a non-finite value (NNLS runs
+    to its budget on such data); ``infeasible`` when ``‖r‖ ≤ ldp_tol``
+    (also if NNLS ran out of budget: ``u ≥ 0`` with ``gᵀu ≈ 0``,
+    ``hᵀu ≈ 1`` already certifies infeasibility); ``max_iter_reached`` when
+    NNLS did not converge; else ``feasible``. ``feasible`` always means that
+    ``x`` and ``multipliers`` were formed; otherwise both are zero. Zero
+    constraints (``k == 0``) are handled by a static branch: ``x = 0``,
+    feasible.
+
+    Parameters
+    ----------
+    g
+        Constraint matrix, shape ``(k, n)``.
+    h
+        Right-hand side, shape ``(k,)``.
+    max_iter
+        NNLS step budget (see :func:`nnls`); ``None`` selects ``3 k``.
+    tol
+        NNLS dual tolerance (see :func:`nnls`), applied to the normalised
+        problem; ``None`` selects its default.
+    ldp_tol
+        Infeasibility threshold on ``‖r‖`` of the *normalised* problem (see
+        above). The right-hand side ``f`` has unit norm, so this is a
+        relative quantity. ``None`` selects the
+        rounding-error level of the residual,
+        ``10 · eps · max(n + 1, k) · (‖E‖_F ‖u‖ + 1)``: data that is
+        infeasible by less than that is reported feasible, with a (very)
+        large ``x``.
+
+    Returns
+    -------
+    LDPResult
+        ``x``, ``multipliers``, ``status`` and ``n_iter``. The float dtype
+        follows the inputs (at least ``float32``).
+
+    Examples
+    --------
+    Distance from the origin to the half-space ``x_1 + x_2 ≥ 2``:
+
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import LDP_RESULTS, ldp
+    >>> res = ldp(jnp.array([[1.0, 1.0]]), jnp.array([2.0]))
+    >>> [round(float(v), 6) for v in res.x]
+    [1.0, 1.0]
+    >>> [round(float(v), 6) for v in res.multipliers]
+    [1.0]
+    >>> bool(res.status == LDP_RESULTS.feasible)
+    True
+    """
+    dtype = jnp.result_type(g, h, jnp.float32)
+    g = jnp.asarray(g, dtype=dtype)
+    h = jnp.asarray(h, dtype=dtype)
+    k, n = g.shape
+
+    if k == 0:  # static shape: no constraint, the origin is optimal
+        return LDPResult(  # ty: ignore[invalid-return-type]
+            x=jnp.zeros((n,), dtype),
+            multipliers=jnp.zeros((0,), dtype),
+            status=LDP_RESULTS.feasible,
+            n_iter=jnp.zeros((), jnp.int32),
+        )
+
+    # Normalise before the NNLS (O(k n)): unit rows, then h of unit sup-norm.
+    # The NNLS dual tolerance scales with ‖E‖_F (hence with ‖h‖) whereas the
+    # true duals shrink like 1/‖x‖, so without this NNLS stops early for
+    # ‖h‖ ≳ 1e6 and a wrong ``feasible`` results. With y = x / s the problem
+    # is ĝ y ≥ ĥ / s, and x = s y, μ_i = s μ̂_i / ‖g_i‖.
+    row_norm = jnp.linalg.norm(g, axis=1)
+    row_norm = jnp.where(row_norm > 0.0, row_norm, 1.0)
+    h_hat = h / row_norm
+    h_scale = jnp.max(jnp.abs(h_hat))
+    h_scale = jnp.where(h_scale > 0.0, h_scale, 1.0)
+    g_n = g / row_norm[:, None]
+    h_n = h_hat / h_scale
+
+    e = jnp.concatenate([g_n.T, h_n[None, :]], axis=0)  # (n + 1, k)
+    f = jnp.zeros((n + 1,), dtype).at[n].set(1.0)
+    res = nnls(e, f, max_iter=max_iter, tol=tol)
+    u, r = res.x, res.residual
+
+    eps = float(jnp.finfo(dtype).eps)
+    if ldp_tol is None:
+        infeasible_tol = (
+            10.0 * eps * max(n + 1, k) * (jnp.linalg.norm(e) * jnp.linalg.norm(u) + 1.0)
+        )
+    else:
+        infeasible_tol = jnp.asarray(ldp_tol, dtype)
+    infeasible = jnp.linalg.norm(r) <= infeasible_tol
+
+    # ρ = ‖r‖² (= -r_n at the NNLS optimum). Summing all squares is accurate
+    # unless ρ is tiny: then the cancelled entry r_n = hᵀu - 1 carries an
+    # absolute error of order eps and its square pollutes ρ at the relative
+    # level (eps/‖r‖)². Since ρ = a + ρ² with a = ‖r_{:n}‖², the small root
+    # ρ = 2a / (1 + √(1 - 4a)) uses only the accurate part r_{:n}; it is used
+    # for ρ ≤ 1/4, where the square root is well conditioned.
+    usable = ~infeasible & res.converged
+    a = jnp.sum(r[:n] ** 2)
+    rho_full = a + r[n] ** 2
+    rho_small = 2.0 * a / (1.0 + jnp.sqrt(jnp.maximum(1.0 - 4.0 * a, 0.0)))
+    rho = jnp.where(rho_full <= 0.25, rho_small, rho_full)
+    denom = jnp.where(usable, jnp.maximum(rho, jnp.finfo(dtype).tiny), 1.0)
+    x = jnp.where(usable, r[:n] / denom, 0.0)
+    multipliers = jnp.where(usable, u / denom, 0.0)
+    # Undo the normalisation (before the finiteness check, so an overflow of
+    # the rescaled solution is reported as ``nonfinite``).
+    x = h_scale * x
+    multipliers = h_scale * multipliers / row_norm
+
+    finite = (
+        jnp.all(jnp.isfinite(g))
+        & jnp.all(jnp.isfinite(h))
+        & jnp.all(jnp.isfinite(r))
+        & jnp.all(jnp.isfinite(x))
+        & jnp.all(jnp.isfinite(multipliers))
+    )
+    # ``feasible`` is derived from ``usable``: it implies x, μ were formed.
+    status = LDP_RESULTS.where(
+        finite,
+        LDP_RESULTS.where(
+            infeasible,
+            LDP_RESULTS.infeasible,
+            LDP_RESULTS.where(
+                usable, LDP_RESULTS.feasible, LDP_RESULTS.max_iter_reached
+            ),
+        ),
+        LDP_RESULTS.nonfinite,
+    )
+    ok = finite & usable
+    return LDPResult(  # ty: ignore[invalid-return-type]
+        x=jnp.where(ok, x, 0.0),
+        multipliers=jnp.where(ok, multipliers, 0.0),
+        status=status,
+        n_iter=res.n_iter,
     )

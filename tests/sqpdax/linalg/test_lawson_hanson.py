@@ -6,9 +6,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.optimize import minimize as scipy_minimize
 from scipy.optimize import nnls as scipy_nnls
 
-from slsqp_jax.sqpdax.linalg import NNLSResult, nnls
+from slsqp_jax.sqpdax.linalg import LDP_RESULTS, LDPResult, NNLSResult, ldp, nnls
 
 jax.config.update("jax_enable_x64", True)
 
@@ -353,3 +354,356 @@ def test_skip_rule_with_negative_tol(m, k, seed):
     assert bool(res.converged)
     np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=1e-9)
     assert int(res.n_iter) > int(jnp.sum(res.passive))
+
+
+# --------------------------------------------------------------------------
+# ldp: min ||x|| s.t. g x >= h
+# --------------------------------------------------------------------------
+
+LDP_SHAPES = [(k, n) for k in (1, 3, 8, 20) for n in (1, 2, 5, 12)]
+LDP_SEEDS = (0, 1)
+LDP_TOL = 1e-9
+
+
+def _feasible_slack(rng, k):
+    return rng.uniform(0.0, 1.0, size=k)
+
+
+def ldp_random(k, n, seed):
+    """Feasible by construction (``x0`` satisfies ``g x0 - h = slack >= 0``)."""
+    rng = np.random.default_rng(100 * seed + 7 * k + n)
+    g = rng.standard_normal((k, n))
+    return g, g @ (2.0 * rng.standard_normal(n)) - _feasible_slack(rng, k)
+
+
+def ldp_rank_deficient(k, n, seed):
+    """Rows of ``g`` are multiples of two directions: ``rank(g) <= 2``."""
+    rng = np.random.default_rng(100 * seed + 7 * k + n)
+    basis = rng.standard_normal((2, n))
+    g = rng.standard_normal((k, 2)) @ basis
+    return g, g @ (2.0 * rng.standard_normal(n)) - _feasible_slack(rng, k)
+
+
+def ldp_tied(k, n, seed):
+    """Unit rows ``e_{i mod n}`` with ``h = 1``: duplicated, tied constraints."""
+    del seed
+    g = np.eye(n)[np.arange(k) % n]
+    return g, np.ones(k)
+
+
+def ldp_origin_feasible(k, n, seed):
+    """``h <= 0``: the origin is feasible, hence optimal."""
+    rng = np.random.default_rng(100 * seed + 7 * k + n)
+    return rng.standard_normal((k, n)), -rng.uniform(0.0, 1.0, size=k)
+
+
+LDP_GENERATORS = {
+    "random": ldp_random,
+    "rank-deficient": ldp_rank_deficient,
+    "tied": ldp_tied,
+    "origin-feasible": ldp_origin_feasible,
+}
+
+
+def scipy_ldp(g, h):
+    """Reference: SLSQP on ``½‖x‖²`` with the linear inequality constraints."""
+    n = g.shape[1]
+    out = scipy_minimize(
+        lambda x: 0.5 * x @ x,
+        np.zeros(n),
+        jac=lambda x: x,
+        constraints=[{"type": "ineq", "fun": lambda x: g @ x - h, "jac": lambda x: g}],
+        method="SLSQP",
+        options={"ftol": 1e-12, "maxiter": 1000},
+    )
+    assert out.success
+    return out.x
+
+
+def assert_ldp_kkt(res: LDPResult, g, h, tol: float = LDP_TOL, scale=None):
+    """KKT conditions of ``min ½‖x‖²  s.t.  g x ≥ h`` (certify optimality)."""
+    x = np.asarray(res.x)
+    mu = np.asarray(res.multipliers)
+    slack = g @ x - h
+    if scale is None:
+        scale = max(1.0, np.linalg.norm(g), np.linalg.norm(h))
+    assert np.all(mu >= 0.0)
+    np.testing.assert_allclose(x, g.T @ mu, atol=tol * scale)  # stationarity
+    assert np.all(slack >= -tol * scale)  # primal feasibility
+    assert np.all(np.abs(mu * slack) <= tol * scale * max(1.0, np.max(mu)))
+
+
+@pytest.mark.parametrize("seed", LDP_SEEDS)
+@pytest.mark.parametrize("k, n", LDP_SHAPES)
+@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
+def test_ldp_feasible_kkt_and_scipy(make, k, n, seed):
+    """Feasible problems: status, KKT certificate and SLSQP agreement."""
+    g, h = make(k, n, seed)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert res.x.shape == (n,) and res.multipliers.shape == (k,)
+    assert 0 <= int(res.n_iter) <= 3 * k
+    assert_ldp_kkt(res, g, h)
+    np.testing.assert_allclose(np.asarray(res.x), scipy_ldp(g, h), atol=1e-6)
+
+
+@pytest.mark.parametrize("k, n", LDP_SHAPES)
+def test_ldp_origin_feasible_is_zero(k, n):
+    """``h ≤ 0``: ``x = 0`` and no multiplier is active."""
+    g, h = ldp_origin_feasible(k, n, 0)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+
+
+def ldp_opposite_half_spaces(k, n, seed):
+    """Rows 0 and 1 are ``x_0 ≥ 1`` and ``-x_0 ≥ 1``; the rest is random."""
+    rng = np.random.default_rng(100 * seed + 7 * k + n)
+    g = rng.standard_normal((k, n))
+    h = -rng.uniform(0.0, 1.0, size=k)
+    g[0], h[0] = np.eye(n)[0], 1.0
+    g[1], h[1] = -np.eye(n)[0], 1.0
+    return g, h
+
+
+@pytest.mark.parametrize("seed", LDP_SEEDS)
+@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
+def test_ldp_infeasible(k, n, seed):
+    """An infeasible pair of opposite half-spaces is detected."""
+    g, h = ldp_opposite_half_spaces(k, n, seed)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+
+
+NONFINITE = {
+    "nan-g": (lambda g, h: (g.at[0, 0].set(jnp.nan), h)),
+    "nan-h": (lambda g, h: (g, h.at[1].set(jnp.nan))),
+    "inf-h": (lambda g, h: (g, h.at[2].set(jnp.inf))),
+    "inf-g": (lambda g, h: (g.at[1, 1].set(-jnp.inf), h)),
+}
+
+
+@pytest.mark.parametrize("corrupt", NONFINITE.values(), ids=NONFINITE.keys())
+def test_ldp_nonfinite(corrupt):
+    """Non-finite data gives ``nonfinite`` (not ``max_iter_reached``)."""
+    g, h = map(jnp.asarray, ldp_random(8, 5, 0))
+    res = ldp(*corrupt(g, h))
+    assert bool(res.status == LDP_RESULTS.nonfinite)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+
+
+@pytest.mark.parametrize("max_iter", [0, 1, 3, 7, 8])
+def test_ldp_max_iter(max_iter):
+    """``g = I``, ``h = 1`` needs 8 NNLS additions: a smaller budget stops early."""
+    k = 8
+    g, h = np.eye(k), np.ones(k)
+    res = ldp(jnp.asarray(g), jnp.asarray(h), max_iter=max_iter)
+    assert bool(res.status == LDP_RESULTS.max_iter_reached) == (max_iter < k)
+    assert bool(res.status == LDP_RESULTS.feasible) == (max_iter >= k)
+    assert int(res.n_iter) == min(max_iter, k)
+    np.testing.assert_allclose(np.asarray(res.x), (max_iter >= k) * np.ones(k))
+
+
+@pytest.mark.parametrize(
+    "h, expected",
+    [
+        (np.array([-1.0, 0.0, -0.5]), LDP_RESULTS.feasible),
+        (np.array([-1.0, 1e-3, -0.5]), LDP_RESULTS.infeasible),
+    ],
+    ids=["feasible", "infeasible"],
+)
+def test_ldp_no_unknowns(h, expected):
+    """``n = 0``: the constraints read ``0 ≥ h``."""
+    res = ldp(jnp.zeros((3, 0)), jnp.asarray(h))
+    assert bool(res.status == expected)
+    assert res.x.shape == (0,)
+    assert res.multipliers.shape == (3,)
+
+
+@pytest.mark.parametrize("n", [0, 1, 4])
+def test_ldp_no_constraints(n):
+    """``k = 0`` (static shape): the origin, feasible, no iterations."""
+    res = ldp(jnp.zeros((0, n)), jnp.zeros((0,)))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert res.x.shape == (n,)
+    assert res.multipliers.shape == (0,)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    assert int(res.n_iter) == 0
+
+
+@pytest.mark.parametrize(
+    "make", [ldp_random, ldp_opposite_half_spaces], ids=["feasible", "infeasible"]
+)
+def test_ldp_jit(make):
+    """``jit`` (also with traced budgets) reproduces the eager result."""
+    g, h = map(jnp.asarray, make(8, 5, 1))
+    eager = ldp(g, h)
+    jitted = jax.jit(ldp)(g, h)
+    traced = jax.jit(ldp)(g, h, 24, 1e-12, 1e-12)
+    for res in (jitted, traced):
+        assert bool(res.status == eager.status)
+        assert int(res.n_iter) == int(eager.n_iter)
+        np.testing.assert_allclose(np.asarray(res.x), np.asarray(eager.x), atol=ATOL)
+        np.testing.assert_allclose(
+            np.asarray(res.multipliers), np.asarray(eager.multipliers), atol=ATOL
+        )
+
+
+@pytest.mark.parametrize(
+    "ldp_tol, expected",
+    [(1e-12, LDP_RESULTS.feasible), (1e3, LDP_RESULTS.infeasible)],
+    ids=["tight", "huge"],
+)
+def test_ldp_tol_override(ldp_tol, expected):
+    """A huge ``ldp_tol`` reports even a feasible problem as infeasible."""
+    g, h = map(jnp.asarray, ldp_random(5, 3, 0))
+    assert bool(ldp(g, h, ldp_tol=ldp_tol).status == expected)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+def test_ldp_dtype_follows_input(dtype):
+    """Outputs carry the input float dtype."""
+    g, h = ldp_random(5, 3, 0)
+    res = ldp(jnp.asarray(g, dtype), jnp.asarray(h, dtype))
+    assert res.x.dtype == dtype and res.multipliers.dtype == dtype
+    assert res.n_iter.dtype == jnp.int32
+    assert bool(res.status == LDP_RESULTS.feasible)
+    atol = 1e-4 if dtype == jnp.float32 else 1e-8
+    np.testing.assert_allclose(np.asarray(res.x), scipy_ldp(g, h), atol=atol)
+
+
+def test_ldp_results_enumeration():
+    """The documented codes exist; ``inconsistent_equalities`` is never produced."""
+    names = ("feasible", "infeasible", "inconsistent_equalities")
+    names += ("max_iter_reached", "nonfinite")
+    assert all(hasattr(LDP_RESULTS, name) for name in names)
+    g, h = map(jnp.asarray, ldp_random(5, 3, 0))
+    assert bool(ldp(g, h).status != LDP_RESULTS.inconsistent_equalities)
+
+
+SCALES = [1.0, 1e3, 1e6, 1e9, 1e12]
+
+
+@pytest.mark.parametrize("c", SCALES)
+def test_ldp_half_space_scale(c):
+    """One active half-space plus an inactive row, ``h`` scaled by ``c``.
+
+    ``x* = c g₀ / ‖g₀‖²`` has norm ``∝ c``. The result must stay accurate
+    (relative error of order ``eps``) and feasible, however large ``‖x*‖``.
+    """
+    g = np.array([[1.2, 1.6], [0.0, 1.0]])
+    h = np.array([c, -c])
+    x_star = c * g[0] / (g[0] @ g[0])
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(np.asarray(res.x), x_star, rtol=1e-12, atol=0.0)
+    # x* = μ₀ g₀ with μ₀ = c / ‖g₀‖²; the inactive row has no multiplier.
+    np.testing.assert_allclose(
+        np.asarray(res.multipliers), [c / (g[0] @ g[0]), 0.0], rtol=1e-12, atol=0.0
+    )
+    assert_ldp_kkt(res, g, h, tol=1e-11, scale=np.linalg.norm(x_star))
+
+
+def test_ldp_feasible_status_implies_formed_solution():
+    """The ``g = [[.6, .8], [0, 1]]``, ``h = [c, -c]`` case at ``c = 1e9``.
+
+    The status must match the outputs: ``feasible`` with ``x ≈ c (.6, .8)``,
+    never ``feasible`` with a zeroed ``x``.
+    """
+    c = 1e9
+    g = np.array([[0.6, 0.8], [0.0, 1.0]])
+    res = ldp(jnp.asarray(g), jnp.asarray([c, -c]))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(np.asarray(res.x), c * g[0], rtol=1e-12)
+
+
+@pytest.mark.parametrize("eps_par", [1e-2, 1e-4, 1e-6, 1e-8])
+def test_ldp_near_parallel_constraints(eps_par):
+    """``x₁ ≥ 1`` and ``-x₁ + ε x₂ ≥ 0`` meet at ``x* = (1, 1/ε)``.
+
+    The conditioning degrades as ``ε → 0`` (``‖x*‖ ~ 1/ε``); the solution must
+    still be feasible and accurate to ``1e3 · eps · ‖x*‖`` (relative).
+    """
+    g = np.array([[1.0, 0.0], [-1.0, eps_par]])
+    h = np.array([1.0, 0.0])
+    x_star = np.array([1.0, 1.0 / eps_par])
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    bound = 1e3 * np.finfo(np.float64).eps * np.linalg.norm(x_star)
+    err = np.linalg.norm(np.asarray(res.x) - x_star) / np.linalg.norm(x_star)
+    assert err <= bound
+    # KKT residuals are only small relative to ‖x*‖ (the problem is ill conditioned).
+    assert_ldp_kkt(res, g, h, tol=1e-7, scale=np.linalg.norm(x_star))
+
+
+@pytest.mark.parametrize(
+    "ldp_tol, expected",
+    [(None, LDP_RESULTS.max_iter_reached), (1e3, LDP_RESULTS.infeasible)],
+    ids=["default-tol", "residual-certifies-infeasible"],
+)
+def test_ldp_budget_exhausted_with_small_residual(ldp_tol, expected):
+    """Budget exhausted: ``‖r‖ ≤ ldp_tol`` is already an infeasibility certificate.
+
+    ``g = I``, ``h = 1`` needs 8 NNLS additions; with one step the residual is
+    still large for the default tolerance (``max_iter_reached``) but below a
+    generous ``ldp_tol`` (``infeasible``).
+    """
+    g, h = np.eye(8), np.ones(8)
+    res = ldp(jnp.asarray(g), jnp.asarray(h), max_iter=1, ldp_tol=ldp_tol)
+    assert bool(res.status == expected)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+
+
+def test_ldp_nonfinite_precedes_budget_and_residual():
+    """``nonfinite`` wins over both ``max_iter_reached`` and ``infeasible``."""
+    g, h = np.eye(8), np.ones(8)
+    h[3] = np.nan
+    res = ldp(jnp.asarray(g), jnp.asarray(h), max_iter=1, ldp_tol=1e3)
+    assert bool(res.status == LDP_RESULTS.nonfinite)
+
+
+def ldp_scaled(k, n, seed, s):
+    """Feasible problem with uneven row scales and ``h`` of magnitude ``∝ s``.
+
+    ``h_i = s (g_i·x0 - slack_i ‖g_i‖)`` so that ``x0 · s`` is feasible.
+    """
+    rng = np.random.default_rng(10_000 * seed + 100 * k + n)
+    g = rng.standard_normal((k, n)) * 10.0 ** rng.uniform(-1.0, 1.0, size=(k, 1))
+    x0 = 2.0 * rng.standard_normal(n)
+    slack = rng.uniform(0.0, 1.0, size=k) * np.linalg.norm(g, axis=1)
+    return g, s * (g @ x0 - slack)
+
+
+SCALED_SIZES = [(14, 7), (8, 5), (5, 3)]
+SCALED_MAGNITUDES = [1e-3, 1.0, 1e4, 7e5, 1e8, 1e10]
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("s", SCALED_MAGNITUDES)
+@pytest.mark.parametrize("k, n", SCALED_SIZES)
+def test_ldp_scale_invariance_random(k, n, s, seed):
+    """Random feasible problems keep a valid KKT certificate for any ``‖h‖``.
+
+    The NNLS dual tolerance grows with ``‖E‖_F`` (hence with ``‖h‖``) while the
+    true duals shrink like ``1/‖x‖``; without internal normalisation NNLS stops
+    early and reports a wrong ``feasible`` for ``‖h‖ ≳ 1e6``. KKT residuals are
+    measured in row-normalised units and relative to
+    ``max(‖x‖, max_i |h_i| / ‖g_i‖)``.
+    """
+    g, h = ldp_scaled(k, n, seed, s)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    x, mu = np.asarray(res.x), np.asarray(res.multipliers)
+    rn = np.linalg.norm(g, axis=1)
+    scale = max(np.linalg.norm(x), np.max(np.abs(h) / rn))
+    tol = 1e-9 * scale
+    slack = (g @ x - h) / rn  # row-normalised slack
+    mu_hat = mu * rn  # multipliers of the row-normalised constraints
+    assert np.all(mu >= 0.0)
+    assert np.all(slack >= -tol)  # primal feasibility
+    np.testing.assert_allclose(x, (g / rn[:, None]).T @ mu_hat, atol=tol, rtol=0.0)
+    assert np.all(np.abs(mu_hat * slack) <= tol * max(1.0, np.max(mu_hat)))
