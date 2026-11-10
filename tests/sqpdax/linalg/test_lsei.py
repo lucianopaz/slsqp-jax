@@ -625,3 +625,215 @@ def test_zero_row_violation_is_infeasible(n_zero, n_other):
     res = run(g.T.copy(), h, 0)
     assert bool(res.status == LDP_RESULTS.infeasible)
     assert_zero_outputs(res)
+
+
+# --------------------------------------------------------------------------
+# Farkas certificates of infeasibility (C11c)
+#
+# Convention: y = [cert_eq; cert_ineq] with y_I >= 0, Gᵀ y = 0, hᵀ y < 0,
+# ‖y‖_∞ = 1 (original, un-equilibrated units).
+# --------------------------------------------------------------------------
+
+
+def _e0(n):
+    a = np.zeros((n, 1))
+    a[0, 0] = 1.0
+    return a
+
+
+def _contradictory_inequalities(n, m_e, seed):
+    """Random feasible equalities plus ``a·w ≤ -1`` and ``-a·w ≤ -1``."""
+    g_t, h = make_problem(n, m_e, 0, False, seed)
+    a = _e0(n)
+    return np.concatenate([g_t, a, -a], axis=1), np.concatenate([h, [-1.0, -1.0]]), m_e
+
+
+def _inconsistent_dependent_equalities(n, m_e, seed):
+    """A duplicated equality row with a different right-hand side (+ ineqs)."""
+    g_t, h = make_problem(n, 3, 2, True, seed)
+    h = h.copy()
+    h[2] += 1.0
+    return g_t, h, 3
+
+
+def _inconsistent_independent_equalities(n, m_e, seed):
+    """``n + 1`` generic equality rows in ``R^n``: inconsistent."""
+    del m_e
+    rng = np.random.default_rng(seed + n)
+    g_t = rng.standard_normal((n, n + 1))
+    return g_t, rng.standard_normal(n + 1), n + 1
+
+
+def _infeasible_after_elimination(n, m_e, seed):
+    """``w_0 + w_1 = 0`` with ``w_0 ≤ -1`` and ``w_1 ≤ -1``: a joint defect.
+
+    Neither inequality is infeasible alone; only after the equality is
+    eliminated do they contradict each other.
+    """
+    del m_e
+    rng = np.random.default_rng(seed + n)
+    extra = rng.standard_normal((n, 2))
+    e0, e1 = np.zeros((n, 1)), np.zeros((n, 1))
+    e0[0, 0], e1[1, 0] = 1.0, 1.0
+    g_t = np.concatenate([e0 + e1, e0, e1, extra], axis=1)
+    h = np.concatenate([[0.0, -1.0, -1.0], 5.0 * rng.random(2)])
+    return g_t, h, 1
+
+
+def _zero_row_violation(n, m_e, seed):
+    """An inequality row in the span of the equality rows with a violated rhs."""
+    del m_e
+    rng = np.random.default_rng(seed + n)
+    row = rng.standard_normal((n, 1))
+    g_t = np.concatenate([row, 2.0 * row, rng.standard_normal((n, 1))], axis=1)
+    h = np.array([1.0, 2.0 - 0.5, 0.3])  # row·w = 1 forces 2 row·w = 2 > 1.5
+    return g_t, h, 1
+
+
+INFEASIBLE, INCONSISTENT = LDP_RESULTS.infeasible, LDP_RESULTS.inconsistent_equalities
+INFEASIBLE_PROBLEMS = {
+    "contradictory-ineq": (_contradictory_inequalities, INFEASIBLE),
+    "inconsistent-dependent-eq": (_inconsistent_dependent_equalities, INCONSISTENT),
+    "inconsistent-independent-eq": (
+        _inconsistent_independent_equalities,
+        INCONSISTENT,
+    ),
+    "after-elimination": (_infeasible_after_elimination, INFEASIBLE),
+    "ineq-in-equality-span": (_zero_row_violation, INFEASIBLE),
+}
+
+
+def assert_lsei_certificate(res: LSEIResult, g_t, h, m_eq, status):
+    """``y_I ≥ 0``, ``Gᵀ y ≈ 0``, ``hᵀ y < 0``, ``‖y‖_∞ = 1``; zero outputs."""
+    assert bool(res.status == status)
+    assert bool(res.has_certificate)
+    y_e, y_i = np.asarray(res.cert_eq), np.asarray(res.cert_ineq)
+    assert y_e.shape == (m_eq,) and y_i.shape == (g_t.shape[1] - m_eq,)
+    y = np.concatenate([y_e, y_i])
+    assert np.all(np.isfinite(y))
+    assert np.all(y_i >= 0.0)
+    np.testing.assert_allclose(np.max(np.abs(y)), 1.0, rtol=1e-12)
+    g_norm = np.linalg.norm(g_t)
+    assert np.linalg.norm(g_t @ y) <= 1e-8 * g_norm
+    assert h @ y < 0.0
+    # the sign is not a rounding artefact
+    assert h @ y <= -1e-6 * (np.abs(h) @ np.abs(y))
+    assert_zero_outputs(res)
+
+
+def scale_problem(g_t, h, row, col):
+    """Rescale constraint rows (columns of ``g_t``, with ``h``) and variables."""
+    return col[:, None] * g_t * row[None, :], h * row
+
+
+SCALINGS = {
+    "none": (0.0, 0.0),
+    "rows": (3.0, 0.0),
+    "variables": (0.0, 3.0),
+    "both": (3.0, 3.0),
+}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("scaling", SCALINGS.values(), ids=SCALINGS.keys())
+@pytest.mark.parametrize("n", [4, 10])
+@pytest.mark.parametrize("m_e", [0, 2])
+@pytest.mark.parametrize(
+    "make, expected",
+    INFEASIBLE_PROBLEMS.values(),
+    ids=INFEASIBLE_PROBLEMS.keys(),
+)
+def test_certificate_proves_infeasibility(make, expected, m_e, n, scaling, seed):
+    """Every infeasible kind carries a valid certificate, also when the rows
+    and the variables are rescaled over several decades (the equilibration
+    and the normalisation are undone correctly)."""
+    g_t, h, m_eq = make(n, m_e, seed)
+    rng = np.random.default_rng(seed)
+    row_dec, col_dec = scaling
+    row = 10.0 ** rng.uniform(-row_dec, row_dec, size=g_t.shape[1])
+    col = 10.0 ** rng.uniform(-col_dec, col_dec, size=n)
+    g_t, h = scale_problem(g_t, h, row, col)
+    res = run(g_t, h, m_eq)
+    assert_lsei_certificate(res, g_t, h, m_eq, expected)
+
+
+def assert_no_certificate(res: LSEIResult, m_eq: int, m: int):
+    assert not bool(res.has_certificate)
+    assert res.cert_eq.shape == (m_eq,) and res.cert_ineq.shape == (m - m_eq,)
+    np.testing.assert_array_equal(np.asarray(res.cert_eq), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.cert_ineq), 0.0)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("n", DIMS)
+@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
+def test_certificate_is_zero_on_feasible_problems(n, m_e, m_i, dup, seed):
+    g_t, h = make_problem(n, m_e, m_i, dup, seed)
+    res = run(g_t, h, m_e)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert_no_certificate(res, m_e, m_e + m_i)
+
+
+def _post_check_infeasible():
+    """A coarse NNLS tolerance: the LDP's primal check reports ``infeasible``.
+
+    ``w_i ≤ -(1 + noise)`` style rows (as in the LDP tests' coarse problem,
+    in the LSEI sign convention) that need several NNLS additions.
+    """
+    rng = np.random.default_rng(0)
+    n, m = 5, 8
+    g = rng.standard_normal((m, n))
+    y0 = 2.0 * rng.standard_normal(n)
+    # LDP form g x >= h  <=>  (-g) x <= -h
+    h_ldp = g @ y0 + np.abs(rng.standard_normal(m)) * (rng.random(m) < 0.5) + 1.0
+    return -g.T, -h_ldp, 0, {"tol": 0.5}, LDP_RESULTS.infeasible
+
+
+def _budget_exhausted():
+    n = 6
+    return np.eye(n), -np.ones(n), 0, {"max_iter": 0}, LDP_RESULTS.max_iter_reached
+
+
+def _nonfinite():
+    g_t, h = make_problem(5, 2, 3, False, seed=0)
+    g_t = g_t.copy()
+    g_t[0, 0] = np.nan
+    return g_t, h, 2, {}, LDP_RESULTS.nonfinite
+
+
+@pytest.mark.parametrize(
+    "make", [_post_check_infeasible, _budget_exhausted, _nonfinite]
+)
+def test_no_certificate_without_a_certified_exit(make):
+    """The LDP's primal-check ``infeasible``, ``max_iter_reached`` and
+    ``nonfinite`` carry no certificate."""
+    g_t, h, m_eq, kwargs, expected = make()
+    res = run(g_t, h, m_eq, **kwargs)
+    assert bool(res.status == expected)
+    assert_no_certificate(res, m_eq, g_t.shape[1])
+
+
+@pytest.mark.parametrize("n, m_e, m_i", [(1, 0, 0), (4, 0, 0), (3, 0, 2), (3, 2, 0)])
+def test_certificate_shapes_and_zero_size(n, m_e, m_i):
+    g_t, h = make_problem(n, m_e, m_i, False, seed=0)
+    res = run(g_t, h, m_e)
+    assert res.cert_eq.shape == (m_e,) and res.cert_ineq.shape == (m_i,)
+    assert res.has_certificate.shape == ()
+
+
+@pytest.mark.parametrize(
+    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+)
+def test_certificate_jit_matches_eager(make, expected):
+    g_t, h, m_eq = make(6, 2, 0)
+    eager = run(g_t, h, m_eq)
+    jitted = jax.jit(least_distance_lsei, static_argnums=(2,))(
+        jnp.asarray(g_t), jnp.asarray(h), m_eq, EQ_TOL
+    )
+    assert bool(jitted.status == expected) and bool(jitted.has_certificate)
+    np.testing.assert_allclose(
+        np.asarray(jitted.cert_eq), np.asarray(eager.cert_eq), atol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(jitted.cert_ineq), np.asarray(eager.cert_ineq), atol=1e-10
+    )

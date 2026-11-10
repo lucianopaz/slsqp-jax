@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import equinox as eqx
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from ...dual import Dual
 from ...lagrangian.evaluated import EvaluatedLagrangian
@@ -76,6 +76,31 @@ class FixedBoundsQPResult(eqx.Module):
         fallback step too, where it measures how far ``d_fix`` is from
         satisfying the general constraints. The bound constraints are met by
         construction on ``W`` and are not part of it.
+    certificate_eq
+        Equality part ``y_E`` (free sign) of the Farkas certificate of the
+        pinned QP, shape ``(m_E,)``. Zero unless ``has_ray``.
+    certificate_ineq
+        Inequality part ``y_I ≥ 0`` of the certificate, shape ``(m_I,)``.
+        Zero unless ``has_ray``. With ``y = [y_E; y_I]``, ``A_Fᵀ y ≈ 0`` on
+        the free variables and ``b̃ᵀ y < 0`` (``b̃ = b - A d_fix``), scaled to
+        ``‖y‖_∞ = 1``: it proves the pinned QP infeasible.
+    ray_lb, ray_ub
+        Ray of the bound multipliers of the pinned QP, shape ``(n,)``.
+        With ``ρ_y = A_Eᵀ y_E + A_Iᵀ y_I``, ``ray_lb = ρ_y`` on the lower
+        pins and ``ray_ub = -ρ_y`` on the upper pins, zero elsewhere (the
+        stationarity formula without ``B d + g``), so
+        ``A_Eᵀ y_E + A_Iᵀ y_I - ray_lb + ray_ub = 0`` on all ``n``
+        coordinates (zero on the free ones: ``ρ_y`` vanishes there). Along
+        the ray the dual objective grows at rate ``-b̃ᵀ y > 0``. On an
+        ``lb == ub`` pin (carried by the lower face) the entry is
+        free-signed. Zero unless ``has_ray``.
+    has_ray
+        Boolean scalar: true iff ``ldp_status`` is ``infeasible`` or
+        ``inconsistent_equalities`` and a finite certificate was formed
+        (see :func:`~slsqp_jax.sqpdax.linalg.lsei.least_distance_lsei`).
+        False, with all four fields above zero, when the status is
+        ``feasible``, ``max_iter_reached`` or ``nonfinite``, and on the
+        primal-check ``infeasible`` of the least-distance solver.
     """
 
     step: Vector_n
@@ -83,6 +108,11 @@ class FixedBoundsQPResult(eqx.Module):
     ldp_status: LDP_RESULTS
     n_nnls_iter: Int[Array, ""]
     feasibility_residual: Scalar
+    certificate_eq: Float[Array, " m_eq"]
+    certificate_ineq: Float[Array, " m_ineq"]
+    ray_lb: Vector_n
+    ray_ub: Vector_n
+    has_ray: Bool[Array, ""]
 
 
 def solve_fixed_bounds_qp(
@@ -128,6 +158,16 @@ def solve_fixed_bounds_qp(
     unconstrained step ``-B_FF⁻¹ g̃``, which is why it is not returned). No
     elastic relaxation is attempted here.
 
+    **Farkas certificate.** When the pinned QP is infeasible (``ldp_status``
+    ``infeasible`` or ``inconsistent_equalities``) and the least-distance
+    solver formed a certificate, ``has_ray`` is true and the result carries
+    ``y = [certificate_eq; certificate_ineq]`` with ``y_I ≥ 0``,
+    ``A_Fᵀ y ≈ 0`` (``Gᵀ y = 0`` with ``Gᵀ = C_F⁻ᵀ A_Fᵀ``) and
+    ``b̃ᵀ y < 0`` (``hᵀ y = b̃ᵀ y + (Gᵀ y)ᵀ C_F⁻ᵀ g̃ = b̃ᵀ y``), plus the ray
+    ``ρ_y = A_Eᵀ y_E + A_Iᵀ y_I`` of the bound multipliers: ``ray_lb = ρ_y``
+    on the lower pins, ``ray_ub = -ρ_y`` on the upper pins. It costs
+    ``O(n m_c)`` and no extra solve.
+
     Parameters
     ----------
     lagrangian
@@ -156,8 +196,10 @@ def solve_fixed_bounds_qp(
     Returns
     -------
     FixedBoundsQPResult
-        ``step``, ``dual``, ``ldp_status``, ``n_nnls_iter`` and
-        ``feasibility_residual``.
+        ``step``, ``dual``, ``ldp_status``, ``n_nnls_iter``,
+        ``feasibility_residual`` and the certificate fields
+        (``certificate_eq``, ``certificate_ineq``, ``ray_lb``, ``ray_ub``,
+        ``has_ray``).
 
     Examples
     --------
@@ -284,10 +326,33 @@ def solve_fixed_bounds_qp(
     else:
         feasibility_residual = jnp.zeros((), dtype)
 
+    # Farkas ray (the stationarity formula without ``B d + g``): zero unless
+    # the least-distance solver formed a certificate.
+    has_ray = (
+        lsei.has_certificate
+        & finite
+        & (
+            (status == LDP_RESULTS.infeasible)
+            | (status == LDP_RESULTS.inconsistent_equalities)
+        )
+    )
+    cert_eq = jnp.where(has_ray, lsei.cert_eq, 0.0)
+    cert_ineq = jnp.where(has_ray, lsei.cert_ineq, 0.0)
+    rho_ray = cert_eq @ ev.eq_fn_jac_val.astype(dtype) + cert_ineq @ (
+        ev.ineq_fn_jac_val.astype(dtype)
+    )
+    ray_lb = jnp.where(has_ray & pin_lb, rho_ray, 0.0)
+    ray_ub = jnp.where(has_ray & pin_ub, -rho_ray, 0.0)
+
     return FixedBoundsQPResult(  # ty: ignore[invalid-return-type]
         step=step,
         dual=dual,
         ldp_status=status,
         n_nnls_iter=lsei.n_iter,
         feasibility_residual=feasibility_residual,
+        certificate_eq=cert_eq,
+        certificate_ineq=cert_ineq,
+        ray_lb=ray_lb,
+        ray_ub=ray_ub,
+        has_ray=has_ray,
     )

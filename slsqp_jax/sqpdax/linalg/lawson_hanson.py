@@ -309,12 +309,19 @@ class LDPResult(eqx.Module):
         :class:`LDP_RESULTS` code.
     n_iter
         Number of NNLS steps performed (``int32`` scalar).
+    certificate
+        Farkas certificate of infeasibility, shape ``(k,)``: ``c ≥ 0`` with
+        ``‖c‖_∞ = 1``, ``gᵀc ≈ 0`` and ``hᵀc > 0``, which proves
+        ``g x ≥ h`` has no solution. Nonzero only when ``status`` is
+        ``infeasible`` because of the residual test ``‖r‖ ≤ ldp_tol``; zero
+        for every other status, the primal-check ``infeasible`` included.
     """
 
     x: Float[Array, " n"]
     multipliers: Float[Array, " k"]
     status: LDP_RESULTS
     n_iter: Int[Array, ""]
+    certificate: Float[Array, " k"]
 
 
 def ldp(
@@ -379,6 +386,15 @@ def ldp(
     constraints (``k == 0``) are handled by a static branch: ``x = 0``,
     feasible.
 
+    **Farkas certificate.** At an ``infeasible`` exit by the residual test
+    the NNLS solution ``û ≥ 0`` of the normalised problem satisfies
+    ``ĝᵀû ≈ 0`` and ``(ĥ/s)ᵀû ≈ 1``. Then ``c = û / ‖g_i‖`` (elementwise),
+    scaled to ``‖c‖_∞ = 1``, is returned as ``certificate``: ``c ≥ 0``,
+    ``gᵀc ≈ 0`` and ``hᵀc > 0``, which proves ``g x ≥ h`` infeasible. It is
+    ``û`` itself (not recomputed), so the tolerance that decides
+    ``infeasible`` also decides when it is a certificate. For every other
+    status, including the primal-check ``infeasible``, it is zero.
+
     Parameters
     ----------
     g
@@ -409,8 +425,8 @@ def ldp(
     Returns
     -------
     LDPResult
-        ``x``, ``multipliers``, ``status`` and ``n_iter``. The float dtype
-        follows the inputs (at least ``float32``).
+        ``x``, ``multipliers``, ``status``, ``n_iter`` and ``certificate``.
+        The float dtype follows the inputs (at least ``float32``).
 
     Examples
     --------
@@ -437,6 +453,7 @@ def ldp(
             multipliers=jnp.zeros((0,), dtype),
             status=LDP_RESULTS.feasible,
             n_iter=jnp.zeros((), jnp.int32),
+            certificate=jnp.zeros((0,), dtype),
         )
 
     # Normalise before the NNLS (O(k n)): unit rows, then h of unit sup-norm.
@@ -467,6 +484,13 @@ def ldp(
     else:
         infeasible_tol = jnp.asarray(ldp_tol, dtype)
     infeasible = jnp.linalg.norm(r) <= infeasible_tol
+    # Farkas certificate: at a residual-test exit the NNLS solution û ≥ 0 has
+    # ĝᵀû ≈ 0 and (ĥ/s)ᵀû ≈ 1, so c = û / ‖g_i‖ (the rows' own units, scaled
+    # to unit sup-norm) satisfies c ≥ 0, gᵀc ≈ 0, hᵀc > 0. It is û itself:
+    # never recomputed. Masked by the final status below.
+    cert = u / row_norm
+    cert = cert / jnp.maximum(jnp.max(jnp.abs(cert)), jnp.finfo(dtype).tiny)
+    cert_ok = infeasible
 
     # ρ = ‖r‖² (= -r_n at the NNLS optimum). Summing all squares is accurate
     # unless ρ is tiny: then the cancelled entry r_n = hᵀu - 1 carries an
@@ -522,4 +546,7 @@ def ldp(
         multipliers=jnp.where(ok, multipliers, 0.0),
         status=status,
         n_iter=res.n_iter,
+        certificate=jnp.where(
+            cert_ok & finite & (status == LDP_RESULTS.infeasible), cert, 0.0
+        ),
     )

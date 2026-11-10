@@ -847,3 +847,116 @@ def test_ldp_check_tol_override(check_tol, expected):
     feasible = expected == LDP_RESULTS.feasible
     assert bool(np.any(x)) == feasible  # zero outputs unless feasible
     assert violation(g, h, x) > 1e-3 or not feasible  # the unchecked x is garbage
+
+
+# --------------------------------------------------------------------------
+# ldp: Farkas certificates of infeasibility (C11c)
+# --------------------------------------------------------------------------
+
+
+def farkas_infeasible(k, n, seed, s=1.0, decades=0.0):
+    """Infeasible ``g x ≥ h`` by construction: ``y > 0`` with ``gᵀy = 0``, ``hᵀy > 0``.
+
+    The last row of ``g`` is chosen so that ``gᵀy = 0`` exactly, ``h`` is
+    shifted to give ``hᵀy = 1``. Then ``yᵀ(g x - h) = -1 < 0`` for every
+    ``x``, whatever the row scales (``10^{±decades}`` per row, applied to
+    ``g`` and ``h`` together) and the magnitude ``s`` of ``h``.
+    """
+    rng = np.random.default_rng(10_000 * seed + 100 * k + n)
+    g = rng.standard_normal((k, n))
+    y = rng.uniform(0.5, 1.5, size=k)
+    g[-1] = -(y[:-1] @ g[:-1]) / y[-1]
+    h = rng.standard_normal(k)
+    h[-1] += (1.0 - h @ y) / y[-1]
+    scale = 10.0 ** rng.uniform(-decades, decades, size=k)
+    return g * scale[:, None], s * h * scale
+
+
+def assert_ldp_certificate(res: LDPResult, g, h):
+    """``c ≥ 0``, ``‖c‖_∞ = 1``, ``gᵀc ≈ 0`` and ``hᵀc > 0``."""
+    c = np.asarray(res.certificate)
+    assert c.shape == (g.shape[0],)
+    assert np.all(c >= 0.0)
+    np.testing.assert_allclose(np.max(c), 1.0, rtol=1e-12)
+    assert np.linalg.norm(g.T @ c) <= 1e-8 * np.linalg.norm(g)
+    assert h @ c > 0.0
+    # the sign is not a rounding artefact: it is a sizeable part of |h|ᵀc
+    assert h @ c >= 1e-6 * (np.abs(h) @ c)
+
+
+INFEASIBLE_GENERATORS = {
+    "opposite": ldp_opposite_half_spaces,
+    "farkas": farkas_infeasible,
+    "farkas-uneven-rows": lambda k, n, seed: farkas_infeasible(k, n, seed, decades=3.0),
+    "farkas-large-h": lambda k, n, seed: farkas_infeasible(k, n, seed, s=1e6),
+    "farkas-small-h": lambda k, n, seed: farkas_infeasible(k, n, seed, s=1e-4),
+}
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
+@pytest.mark.parametrize(
+    "make", INFEASIBLE_GENERATORS.values(), ids=INFEASIBLE_GENERATORS.keys()
+)
+def test_ldp_certificate_proves_infeasibility(make, k, n, seed):
+    """An infeasible exit carries a valid Farkas certificate."""
+    g, h = make(k, n, seed)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    assert_ldp_certificate(res, g, h)
+
+
+@pytest.mark.parametrize("seed", LDP_SEEDS)
+@pytest.mark.parametrize("k, n", LDP_SHAPES)
+@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
+def test_ldp_certificate_is_zero_on_feasible(make, k, n, seed):
+    g, h = make(k, n, seed)
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert res.certificate.shape == (k,)
+    np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
+
+
+def _post_check_infeasible():
+    g, h = coarse_ldp_problem(8, 5, 0)
+    return g, h, {"tol": 0.5}, LDP_RESULTS.infeasible
+
+
+def _budget_exhausted():
+    g, h = ldp_random(8, 5, 0)
+    return g, h, {"max_iter": 0}, LDP_RESULTS.max_iter_reached
+
+
+def _nonfinite():
+    g, h = ldp_random(8, 5, 0)
+    g = g.copy()
+    g[0, 0] = np.nan
+    return g, h, {}, LDP_RESULTS.nonfinite
+
+
+@pytest.mark.parametrize(
+    "make", [_post_check_infeasible, _budget_exhausted, _nonfinite]
+)
+def test_ldp_certificate_is_zero_without_a_residual_infeasible_exit(make):
+    """Only the residual test certifies: the primal-check ``infeasible``,
+    ``max_iter_reached`` and ``nonfinite`` carry no certificate."""
+    g, h, kwargs, expected = make()
+    res = ldp(jnp.asarray(g), jnp.asarray(h), **kwargs)
+    assert bool(res.status == expected)
+    np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
+
+
+@pytest.mark.parametrize("n", [1, 4])
+def test_ldp_certificate_without_constraints(n):
+    res = ldp(jnp.zeros((0, n)), jnp.zeros((0,)))
+    assert res.certificate.shape == (0,)
+
+
+def test_ldp_certificate_jit_matches_eager():
+    g, h = farkas_infeasible(8, 5, 0, decades=2.0)
+    eager = ldp(jnp.asarray(g), jnp.asarray(h))
+    jitted = jax.jit(ldp)(jnp.asarray(g), jnp.asarray(h))
+    assert bool(jitted.status == LDP_RESULTS.infeasible)
+    np.testing.assert_allclose(
+        np.asarray(jitted.certificate), np.asarray(eager.certificate), atol=1e-12
+    )

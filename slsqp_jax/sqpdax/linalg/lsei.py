@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import equinox as eqx
 from jax import numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from .lawson_hanson import LDP_RESULTS, ldp
 
@@ -72,6 +72,20 @@ class LSEIResult(eqx.Module):
     n_iter
         Number of NNLS steps of the LDP (``int32`` scalar; zero without
         inequalities).
+    cert_eq
+        Equality part of the Farkas certificate, shape ``(m_E,)`` (free
+        sign). See ``has_certificate``.
+    cert_ineq
+        Inequality part of the Farkas certificate, shape ``(m_I,)``, ``≥ 0``.
+        See ``has_certificate``.
+    has_certificate
+        Boolean scalar. True iff ``status`` is ``infeasible`` or
+        ``inconsistent_equalities``, a certificate was formed and it is
+        finite. Then ``y = [cert_eq; cert_ineq]`` satisfies
+        ``y_I ≥ 0``, ``Gᵀ y ≈ 0`` and ``hᵀ y < 0`` (in the original,
+        un-equilibrated units), which proves ``G_E w = h_E, G_I w ≤ h_I``
+        infeasible, and is scaled to ``‖y‖_∞ = 1``. Otherwise ``cert_eq`` and
+        ``cert_ineq`` are zero.
     """
 
     w: Float[Array, " n"]
@@ -79,6 +93,9 @@ class LSEIResult(eqx.Module):
     lam_ineq: Float[Array, " m_ineq"]
     status: LDP_RESULTS
     n_iter: Int[Array, ""]
+    cert_eq: Float[Array, " m_eq"]
+    cert_ineq: Float[Array, " m_ineq"]
+    has_certificate: Bool[Array, ""]
 
 
 def least_distance_lsei(
@@ -129,6 +146,18 @@ def least_distance_lsei(
     Unless the status is ``feasible``, ``w`` and both multiplier vectors are
     zero, and callers must branch on the status and never use them.
 
+    **Farkas certificate.** When the status is ``infeasible`` (by the LDP's
+    residual test) or ``inconsistent_equalities``, ``cert_eq`` and
+    ``cert_ineq`` hold a vector ``y`` with ``y_I ≥ 0``, ``Gᵀ y ≈ 0`` and
+    ``hᵀ y < 0``, scaled to ``‖y‖_∞ = 1`` (``has_certificate`` is then true).
+    For inconsistent equalities ``ŷ_E = -U_⊥ U_⊥ᵀ ĥ_E`` and ``ŷ_I = 0``.
+    For an infeasible LDP, the LDP certificate ``u`` gives ``ŷ_I = u`` and
+    ``ŷ_E = -R_EE⁺ R_EI u`` (the multiplier formula with ``z = 0``). It is
+    computed in the equilibrated units and divided by the column norms, as
+    the multipliers are. The ``infeasible`` outcome of the LDP's primal
+    check carries no certificate (``has_certificate`` false, both parts
+    zero).
+
     Parameters
     ----------
     g_t
@@ -155,8 +184,9 @@ def least_distance_lsei(
     Returns
     -------
     LSEIResult
-        ``w``, ``lam_eq``, ``lam_ineq``, ``status`` and ``n_iter``. The float
-        dtype follows the inputs (at least ``float32``).
+        ``w``, ``lam_eq``, ``lam_ineq``, ``status``, ``n_iter`` and the
+        Farkas certificate ``cert_eq``, ``cert_ineq``, ``has_certificate``.
+        The float dtype follows the inputs (at least ``float32``).
 
     Examples
     --------
@@ -189,6 +219,9 @@ def least_distance_lsei(
             lam_ineq=jnp.zeros((0,), dtype),
             status=LDP_RESULTS.feasible,
             n_iter=jnp.zeros((), jnp.int32),
+            cert_eq=jnp.zeros((0,), dtype),
+            cert_ineq=jnp.zeros((0,), dtype),
+            has_certificate=jnp.zeros((), bool),
         )
 
     eps = float(jnp.finfo(dtype).eps)
@@ -231,6 +264,9 @@ def least_distance_lsei(
             jnp.where(keep, 0.0, u_h)
         ) > eq_tol * jnp.maximum(1.0, jnp.linalg.norm(h_e))
         v_null = v * (~keep)[None, :].astype(dtype)  # zero columns: determined
+        # Certificate of inconsistent equalities: ŷ_E = -U_⊥ U_⊥ᵀ ĥ_E has
+        # R_EE ŷ_E = 0 and ĥ_Eᵀ ŷ_E = -‖U_⊥ᵀ ĥ_E‖² < 0.
+        cert_inc_e = -(u @ jnp.where(keep, 0.0, u_h))
     else:
         z_e0 = jnp.zeros((0,), dtype)
         inconsistent = jnp.zeros((), bool)
@@ -263,6 +299,7 @@ def least_distance_lsei(
         lam_i = res.multipliers
         ldp_status = res.status
         n_iter = res.n_iter
+        cert_i = res.certificate  # u ≥ 0, cᵀu = 0, rhsᵀu < 0 (ĥ-units)
         t, z_i = zeta[:m_e], zeta[m_e:]
     else:
         t = jnp.zeros((m_e,), dtype)
@@ -270,6 +307,7 @@ def least_distance_lsei(
         lam_i = jnp.zeros((0,), dtype)
         ldp_status = LDP_RESULTS.feasible
         n_iter = jnp.zeros((), jnp.int32)
+        cert_i = jnp.zeros((0,), dtype)
 
     # Primal point and the equality multipliers: stationarity z = -R λ gives
     # R_EE λ_E = -(z_E + R_EI λ_I), solved in the least-squares sense with
@@ -283,6 +321,20 @@ def least_distance_lsei(
     w = (q @ jnp.concatenate([z_e, z_i]))[:n]
     lam_e = lam_e / col_norm[:m_e]
     lam_i = lam_i / col_norm[m_e:]
+
+    # Farkas certificate. LDP infeasible: ŷ_I = u and ŷ_E = -R_EE⁺ R_EI u
+    # (the multiplier formula with z = 0); then R_G ŷ = 0, i.e. Ĝᵀŷ = 0, and
+    # ĥᵀŷ = rhsᵀu < 0. Inconsistent equalities take precedence (as the
+    # status does), with ŷ_I = 0. Divide by the column norms as the
+    # multipliers are (so that Gᵀy = 0, hᵀy = ĥᵀŷ), then scale to ‖y‖_∞ = 1.
+    if m_e > 0:
+        cert_e_ldp = u @ (inv_s * (v.T @ -(r_ei @ cert_i)))
+        cert_e = jnp.where(inconsistent, cert_inc_e, cert_e_ldp)
+    else:
+        cert_e = jnp.zeros((0,), dtype)
+    cert_i = jnp.where(inconsistent, 0.0, cert_i)
+    cert_e = cert_e / col_norm[:m_e]
+    cert_i = cert_i / col_norm[m_e:]
 
     finite = (
         jnp.all(jnp.isfinite(g_t))
@@ -299,10 +351,28 @@ def least_distance_lsei(
         LDP_RESULTS.nonfinite,
     )
     ok = status == LDP_RESULTS.feasible
+    cert_scale = jnp.maximum(
+        jnp.max(jnp.abs(cert_e), initial=0.0), jnp.max(jnp.abs(cert_i), initial=0.0)
+    )
+    has_cert = (
+        finite
+        & (inconsistent | (jnp.max(jnp.abs(cert_i), initial=0.0) > 0.0))
+        & (
+            (status == LDP_RESULTS.infeasible)
+            | (status == LDP_RESULTS.inconsistent_equalities)
+        )
+        & jnp.all(jnp.isfinite(cert_e))
+        & jnp.all(jnp.isfinite(cert_i))
+        & (cert_scale > 0.0)
+    )
+    cert_div = jnp.where(has_cert, cert_scale, 1.0)
     return LSEIResult(  # ty: ignore[invalid-return-type]
         w=jnp.where(ok, w, 0.0),
         lam_eq=jnp.where(ok, lam_e, 0.0),
         lam_ineq=jnp.where(ok, lam_i, 0.0),
         status=status,
         n_iter=n_iter,
+        cert_eq=jnp.where(has_cert, cert_e / cert_div, 0.0),
+        cert_ineq=jnp.where(has_cert, cert_i / cert_div, 0.0),
+        has_certificate=has_cert,
     )

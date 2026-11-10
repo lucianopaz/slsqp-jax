@@ -612,3 +612,145 @@ class TestDegenerateFeasibleSets:
         assert np.all(slack >= -1e-8)
         assert np.all(lam_i >= -1e-10 * scale)
         assert np.all(np.abs(lam_i * slack) <= 1e-8 * scale)
+
+
+# ---------------------------------------------------------------------------
+# Farkas certificates and rays (C11c).
+#
+# When the pinned QP is infeasible the result carries y = [y_E; y_I] with
+# y_I >= 0, A_Fᵀ y ≈ 0, b̃ᵀ y < 0 (b̃ = b - A d_fix), ‖y‖_∞ = 1, and the ray
+# ρ_y = A_Eᵀ y_E + A_Iᵀ y_I of the bound multipliers:
+# ray_lb = ρ_y on lower pins, ray_ub = -ρ_y on upper pins.
+# ---------------------------------------------------------------------------
+
+NOT_FEASIBLE = (LDP_RESULTS.infeasible, LDP_RESULTS.inconsistent_equalities)
+
+
+def assert_ray_certificate(case: Case, res: FixedBoundsQPResult) -> None:
+    """The certificate and ray identities, measured in the data's own units."""
+    qp = case.qp
+    lower, upper = case.lower, case.upper
+    pin_lb = lower & np.isfinite(qp.lb)
+    pin_ub = upper & ~lower & np.isfinite(qp.ub)
+    free = ~(pin_lb | pin_ub)
+    assert bool(res.has_ray)
+    assert any(bool(res.ldp_status == s) for s in NOT_FEASIBLE)
+
+    m_e = qp.a_eq.shape[0]
+    a_all = np.concatenate([qp.a_eq, qp.a_ineq])
+    b_all = np.concatenate([qp.b_eq, qp.b_ineq])
+    y_e, y_i = np.asarray(res.certificate_eq), np.asarray(res.certificate_ineq)
+    assert y_e.shape == (m_e,) and y_i.shape == (qp.a_ineq.shape[0],)
+    y = np.concatenate([y_e, y_i])
+    assert np.all(np.isfinite(y)) and np.all(y_i >= 0.0)
+    np.testing.assert_allclose(np.max(np.abs(y)), 1.0, rtol=1e-12)
+
+    d_fix = np.where(pin_lb, qp.lb - qp.x, np.where(pin_ub, qp.ub - qp.x, 0.0))
+    b_tilde = b_all - a_all @ d_fix
+    a_norm = np.linalg.norm(a_all)
+    assert np.linalg.norm(a_all[:, free].T @ y) <= 1e-8 * a_norm
+    assert b_tilde @ y < 0.0
+    assert b_tilde @ y <= -1e-6 * (np.abs(b_tilde) @ np.abs(y))
+
+    ray_lb, ray_ub = np.asarray(res.ray_lb), np.asarray(res.ray_ub)
+    rho = a_all.T @ y
+    np.testing.assert_allclose(ray_lb, np.where(pin_lb, rho, 0.0), atol=1e-12 * a_norm)
+    np.testing.assert_allclose(ray_ub, np.where(pin_ub, -rho, 0.0), atol=1e-12 * a_norm)
+    # the ray identity on all n coordinates (free ones: ρ_y itself vanishes)
+    assert np.linalg.norm(rho - ray_lb + ray_ub) <= 1e-8 * a_norm
+
+
+def assert_no_ray(qp: RandomQP, res: FixedBoundsQPResult) -> None:
+    m_e, m_i = qp.a_eq.shape[0], qp.a_ineq.shape[0]
+    assert not bool(res.has_ray)
+    assert res.certificate_eq.shape == (m_e,)
+    assert res.certificate_ineq.shape == (m_i,)
+    assert res.ray_lb.shape == res.ray_ub.shape == qp.x.shape
+    for leaf in (res.certificate_eq, res.certificate_ineq, res.ray_lb, res.ray_ub):
+        np.testing.assert_array_equal(np.asarray(leaf), 0.0)
+
+
+def _over_pinned(mix, kind, seed):
+    """A QP with a feasible box but pins at bounds that miss ``A d = b``."""
+    n = 6
+    qp = make_random_lrh_qp(n, 2, *mix, seed=seed, dup=mix[0] == 3)
+    pinned = {"all": _mask(n, range(n)), "all-but-one": _mask(n, range(1, n))}[kind]
+    upper = pinned & (np.random.default_rng(seed).random(n) < 0.5)
+    return Case(qp, pinned & ~upper, upper)
+
+
+def _box_too_tight(mix, kind, seed):
+    """An inequality supported only on a variable whose pin overshoots it."""
+    n = 6
+    scale = 10.0 ** {"unit": 0.0, "large": 3.0, "small": -3.0}[kind]
+    upper = _mask(n, [0])  # not passed to the generator: ub = x + d0 + (0.5..1.5)
+    qp = make_random_lrh_qp(n, 2, *mix, seed=seed, dup=mix[0] == 3)
+    a_in, b_in = qp.a_ineq.copy(), qp.b_ineq.copy()
+    a_in[0] = 0.0
+    a_in[0, 0] = scale
+    b_in[0] = scale * (qp.d0[0] + 0.1)  # the pin sits at d0[0] + (0.5..1.5)
+    qp = with_rows(qp, qp.a_eq, qp.b_eq, a_in, b_in)
+    return Case(qp, _mask(n, []), upper)
+
+
+CERTIFICATE_SCENARIOS = {
+    "over-pinned-all": (_over_pinned, "all", [(2, 0), (2, 3), (3, 2)]),
+    "over-pinned-all-but-one": (_over_pinned, "all-but-one", [(2, 0), (2, 3), (3, 2)]),
+    "box-too-tight-unit": (_box_too_tight, "unit", [(0, 3), (2, 3)]),
+    "box-too-tight-large": (_box_too_tight, "large", [(0, 3), (2, 3)]),
+    "box-too-tight-small": (_box_too_tight, "small", [(0, 3), (2, 3)]),
+}
+CERTIFICATE_PARAMS = [
+    (make, kind, mix)
+    for make, kind, mixes in CERTIFICATE_SCENARIOS.values()
+    for mix in mixes
+]
+CERTIFICATE_IDS = [
+    f"{name}-{mix[0]}-{mix[1]}"
+    for name, (_, _, mixes) in CERTIFICATE_SCENARIOS.items()
+    for mix in mixes
+]
+
+
+class TestFarkasCertificates:
+    @pytest.mark.parametrize("seed", range(4))
+    @pytest.mark.parametrize("make, kind, mix", CERTIFICATE_PARAMS, ids=CERTIFICATE_IDS)
+    def test_over_pinned_and_tight_box_certificates(self, make, kind, mix, seed):
+        case = make(mix, kind, seed)
+        assert_ray_certificate(case, run(case))
+
+    @pytest.mark.parametrize("kind", WORKING_SETS)
+    @pytest.mark.parametrize("name", ["inconsistent", "infeasible"])
+    def test_status_cases_carry_certificates(self, name, kind):
+        """Duplicated equalities with clashing rhs, opposite half-spaces."""
+        mix, mutate, expected = STATUS_CASES[name]
+        lower, upper = working_set(kind, 6, 0)
+        case = Case(_status_qp(mix, mutate, lower, upper), lower, upper)
+        res = run(case)
+        assert bool(res.ldp_status == expected)
+        assert_ray_certificate(case, res)
+
+    def test_feasible_problems_have_no_ray(self, case: Case):
+        res = run(case)
+        assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        assert_no_ray(case.qp, res)
+
+    def test_nonfinite_has_no_ray(self):
+        mix, mutate, expected = STATUS_CASES["nonfinite"]
+        lower, upper = working_set("random", 6, 0)
+        qp = _status_qp(mix, mutate, lower, upper)
+        res = run(Case(qp, lower, upper))
+        assert bool(res.ldp_status == expected)
+        assert_no_ray(qp, res)
+
+    @pytest.mark.parametrize("mix", [(2, 0), (2, 3)])
+    def test_ray_follows_the_face_of_the_pin(self, mix):
+        """A variable flagged on both faces is pinned at the lower one, so the
+        ray lives in ``ray_lb`` and ``ray_ub`` stays zero there."""
+        case = _over_pinned(mix, "all", 0)
+        both = np.ones(6, dtype=bool)
+        res = run(case, lower=both, upper=both)
+        both_case = Case(case.qp, both, np.zeros(6, dtype=bool))
+        assert_ray_certificate(both_case, res)
+        assert np.any(np.asarray(res.ray_lb) != 0.0)
+        np.testing.assert_array_equal(np.asarray(res.ray_ub), 0.0)
