@@ -56,7 +56,7 @@ import jax
 from equinox import tree_at
 from jax import numpy as jnp
 from jax.typing import DTypeLike
-from jaxtyping import Array, Int
+from jaxtyping import Array, Bool, Int
 
 from ...active_set import ActiveSet
 from ...dual import Dual
@@ -230,6 +230,15 @@ class LRHDirectQPSolver(
     ``ρ`` is returned split as ``λ_lb = max(ρ, 0)`` and
     ``λ_ub = max(-ρ, 0)``: both faces are active, so complementarity holds,
     and every bound multiplier is non-negative.
+
+    **Logging.** The solver uses the inherited ``logger`` (minimisers inject
+    their ``minimiser.subproblem`` child through ``init``). Per solve it emits
+    an ``INFO`` line on convergence, a ``WARNING`` line on every other exit, a
+    further ``WARNING`` on a stall, and a ``"qp"`` diagnostic record with the
+    keys of the active-set solver's record plus ``n_nnls_iter``,
+    ``last_ldp_status``, ``warm_trial_accepted`` / ``warm_trial_rejected``,
+    ``n_ray_steps``, ``n_safeguard``, ``stalled`` and ``n_pinned``. Logging
+    never changes the returned values.
 
     Attributes
     ----------
@@ -427,7 +436,9 @@ class LRHDirectQPSolver(
         # Carry: working set (A_lb, A_ub), multipliers (mu_lb, mu_ub), pins added
         # by the last full step whose multiplier is still 0 (fresh_*), the most
         # violated one of them (p, p_ub; p = -1: none), the last full step and
-        # its dual, the last oracle status, NNLS count, iteration count, outcome.
+        # its dual, the monitoring counters (ray steps, safeguard firings, warm
+        # trial rejected; they never feed back into the loop), the last oracle
+        # status, NNLS count, iteration count, outcome.
         if self.warm_start:
             aset = initial_state.active_set
             warm_lb = jnp.asarray(aset.active_lb, bool) & jnp.isfinite(lo) & ~fixed
@@ -448,6 +459,9 @@ class LRHDirectQPSolver(
             jnp.asarray(False),
             zeros_n,
             dual_zero,
+            zero_i,
+            zero_i,
+            zero_i,
             LDP_RESULTS.feasible,
             zero_i,
             zero_i,
@@ -476,6 +490,9 @@ class LRHDirectQPSolver(
                 p_ub,
                 d_full,
                 dual_full,
+                n_ray,
+                n_safeguard,
+                n_reject,
                 _status,
                 n_nnls,
                 n_it,
@@ -602,6 +619,7 @@ class LRHDirectQPSolver(
                 res.dual,
                 dual_full,
             )
+            reject = jnp.asarray(False)
             if self.warm_start:
                 # First iteration = warm trial: unless it is a dual-feasible
                 # full step, discard it and restart from the cold carry (the
@@ -627,6 +645,12 @@ class LRHDirectQPSolver(
                 infeasible = infeasible & ~reject
                 oracle_failure = oracle_failure & ~reject
                 stalled = stalled & ~reject
+            # Monitoring counters (outside the numerics above).
+            n_ray_next = n_ray + (ray_step & ~stalled & ~reject).astype(jnp.int32)
+            n_safeguard_next = n_safeguard + (use_deg & ~stalled & ~reject).astype(
+                jnp.int32
+            )
+            n_reject_next = n_reject + reject.astype(jnp.int32)
             outcome = jnp.where(
                 converged,
                 _CONVERGED,
@@ -651,6 +675,9 @@ class LRHDirectQPSolver(
                 p_ub_next,
                 d_full_next,
                 dual_full_next,
+                n_ray_next,
+                n_safeguard_next,
+                n_reject_next,
                 res.ldp_status,
                 n_nnls + res.n_nnls_iter.astype(jnp.int32),
                 n_it + 1,
@@ -668,6 +695,9 @@ class LRHDirectQPSolver(
             _p_ub_f,
             d_full_f,
             dual_full_f,
+            n_ray_f,
+            n_safeguard_f,
+            n_reject_f,
             ldp_f,
             n_nnls_f,
             n_it_f,
@@ -798,4 +828,102 @@ class LRHDirectQPSolver(
             ),
         )
         step = cast(Primal, Primal(x=step_f))
+        self._log_solve(
+            step,
+            dual_out,
+            new_state,
+            n_pinned=jnp.sum(a_lb_f, dtype=jnp.int32)
+            + jnp.sum(a_ub_f, dtype=jnp.int32),
+            n_ray=jnp.asarray(n_ray_f, jnp.int32),
+            n_safeguard=jnp.asarray(n_safeguard_f, jnp.int32),
+            n_nnls=n_nnls_f,
+            trial_rejected=jnp.asarray(n_reject_f, jnp.int32) > 0,
+        )
         return (step, dual_out), new_state
+
+    def _log_solve(
+        self,
+        step: Primal,
+        dual: Dual,
+        state: LRHQPSolverState,
+        *,
+        n_pinned: Int[Array, ""],
+        n_ray: Int[Array, ""],
+        n_safeguard: Int[Array, ""],
+        n_nnls: Int[Array, ""],
+        trial_rejected: Bool[Array, ""],
+    ) -> None:
+        """Logger lines and ``"qp"`` diagnostic record of one solve.
+
+        Pure monitoring: nothing here feeds back into the returned values.
+        The record carries the keys of
+        :class:`~slsqp_jax.sqpdax.subproblem.solver.active_set_loop.ActiveSetQPSolver`
+        (``iters`` = bound working-set iterations, ``cg_iters`` = NNLS
+        iterations of this solve) plus ``n_nnls_iter`` (same value),
+        ``last_ldp_status``, ``warm_trial_accepted`` / ``warm_trial_rejected``
+        (both ``False`` without :attr:`warm_start`), ``n_ray_steps``,
+        ``n_safeguard`` (degenerate steps resolved by the most-violated-pin
+        safeguard), ``stalled`` and ``n_pinned`` (final bound working set).
+        ``n_ray_steps`` counts the iterations that move along a certificate
+        ray; neither counter includes the iteration that stalls (it takes no
+        step), the terminal certified-infeasible iteration, or a discarded
+        (rejected) warm trial. ``warm_trial_accepted`` is ``False`` when no
+        trial ran (``max_iter = 0``).
+        """
+        converged = state.success
+        stalled = state.qp_result == ACTIVE_SET_QP_RESULTS.anti_cycling
+        self.logger.info(
+            "qp solved: iters={iters} nnls_iters={nnls_iters} pinned={n_pinned} "
+            "rays={n_ray} safeguards={n_safeguard}",
+            when=converged,
+            iters=state.last_n_iter,
+            nnls_iters=n_nnls,
+            n_pinned=n_pinned,
+            n_ray=n_ray,
+            n_safeguard=n_safeguard,
+        )
+        self.logger.warning(
+            "qp failed: result={qp_result} status={status} iters={iters} "
+            "nnls_iters={nnls_iters} ldp_status={ldp_status} kkt_reason={kkt_reason}",
+            when=~converged,
+            qp_result=state.qp_result,
+            status=state.status,
+            iters=state.last_n_iter,
+            nnls_iters=n_nnls,
+            ldp_status=state.last_ldp_status,
+            kkt_reason=state.last_kkt_reason,
+        )
+        self.logger.warning(
+            "qp bound loop stalled: iters={iters} pinned={n_pinned}",
+            when=stalled,
+            iters=state.last_n_iter,
+            n_pinned=n_pinned,
+        )
+        warm = jnp.asarray(self.warm_start)
+        self.logger.diagnostic(
+            "qp",
+            lambda: {
+                "qp_result": state.qp_result,
+                "status": state.status,
+                "success": state.success,
+                "iters": state.last_n_iter,
+                "cg_iters": state.last_n_cg_iter,
+                "step": step,
+                "dual": dual,
+                "active_set": state.active_set,
+                "qp_dual": state.dual,
+                "final_working_tol": state.final_working_tol,
+                "n_anti_cycling": state.n_anti_cycling,
+                "kkt_feasibility_residual": state.last_kkt_feasibility_residual,
+                "kkt_n_refinements": state.last_kkt_n_refinements,
+                "kkt_reason": state.last_kkt_reason,
+                "n_nnls_iter": n_nnls,
+                "last_ldp_status": state.last_ldp_status,
+                "warm_trial_accepted": warm & (state.last_n_iter > 0) & ~trial_rejected,
+                "warm_trial_rejected": warm & trial_rejected,
+                "n_ray_steps": n_ray,
+                "n_safeguard": n_safeguard,
+                "stalled": stalled,
+                "n_pinned": n_pinned,
+            },
+        )

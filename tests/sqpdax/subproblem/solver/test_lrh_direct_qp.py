@@ -10,6 +10,7 @@ tests; the code under test never forms an ``n × n`` object.
 
 from __future__ import annotations
 
+import functools
 from typing import Callable, NamedTuple
 
 import equinox as eqx
@@ -22,6 +23,7 @@ from scipy.optimize import linprog, minimize
 from slsqp_jax.sqpdax.dual import Dual
 from slsqp_jax.sqpdax.lagrangian.evaluated import EvaluatedLagrangian
 from slsqp_jax.sqpdax.linalg import LDP_RESULTS
+from slsqp_jax.sqpdax.logging import Logger, MemoryDiagnosticsHandler, MemoryHandler
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.secant import LBFGS, LimitedMemoryReducedHessian
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
@@ -340,13 +342,17 @@ class RefLoop(NamedTuple):
     active_lb: np.ndarray
     active_ub: np.ndarray
     step: np.ndarray
+    n_ray: int  # iterations that take a ray step (and do not stall)
+    n_safeguard: int  # degenerate steps resolved by the safeguard (not stalls)
 
 
 def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefLoop:
     """The dual bound loop of PLAN 3.5 rev 11 in NumPy, one oracle call per pass.
 
     Asserts its own invariants: ``μ ≥ 0`` off the ``lb == ub`` pins after every
-    dual step, and the values ``q(d̂)`` of the full steps never decrease.
+    dual step, and the values ``q(d̂)`` of the full steps never decrease. It also
+    counts the ray steps and the safeguard firings, neither of them including the
+    stalling iteration (nor the terminal certified-infeasible one).
     """
     lag, factors = qp.lagrangian, qp.factors
     n = qp.x.shape[0]
@@ -359,13 +365,17 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
     fresh_lb, fresh_ub = np.zeros(n, bool), np.zeros(n, bool)
     p, p_ub = -1, False
     d_full, last_q = np.zeros(n), -np.inf
+    n_ray = n_safeguard = 0
 
     def done(result, it):
-        return RefLoop(result, it, a_lb, a_ub, np.clip(d_full, lo, hi))
+        return RefLoop(
+            result, it, a_lb, a_ub, np.clip(d_full, lo, hi), n_ray, n_safeguard
+        )
 
     for it in range(1, max_iter + 1):
         res = _oracle(lag, factors, jnp.asarray(a_lb), jnp.asarray(a_ub))
         drop_lb, drop_ub = a_lb & ~fixed, a_ub.copy()
+        is_ray = False
         if bool(res.ldp_status == LDP_RESULTS.feasible):
             mh_lb = np.asarray(res.dual.lb_multipliers)
             mh_ub = np.asarray(res.dual.ub_multipliers)
@@ -400,6 +410,7 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
                 continue
             dir_lb, dir_ub = mh_lb - mu_lb, mh_ub - mu_ub
         elif bool(res.has_ray):
+            is_ray = True
             dir_lb, dir_ub = np.asarray(res.ray_lb), np.asarray(res.ray_ub)
             r_scale = max(
                 np.abs(dir_lb[drop_lb]).max(initial=0.0),
@@ -427,8 +438,13 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
             if p >= 0 and (blk_ub if p_ub else blk_lb)[p]:
                 blk_lb, blk_ub = fresh_lb.copy(), fresh_ub.copy()
                 (blk_ub if p_ub else blk_lb)[p] = False
+                safeguard = True
+            else:
+                safeguard = False
             if not (blk_lb.any() or blk_ub.any()):
                 return done(STALL, it)
+            n_safeguard += safeguard
+        n_ray += is_ray
         assert np.all(mu_lb[a_lb & ~fixed] >= -1e-9 * max(1.0, np.abs(mu_lb).max()))
         assert np.all(mu_ub[a_ub] >= -1e-9 * max(1.0, np.abs(mu_ub).max()))
         a_lb, a_ub = a_lb & ~blk_lb, a_ub & ~blk_ub
@@ -438,10 +454,23 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
     return done(BUDGET, max_iter)
 
 
+@functools.cache
+def _shared_logged_solver() -> tuple[LRHDirectQPSolver, LogView]:
+    """One logged solver for the batteries (one compilation per shape)."""
+    return with_logger(LRHDirectQPSolver())
+
+
 def assert_matches_reference(qp: RandomQP) -> None:
-    """The solver takes the reference's path: outcome, iterations, set, step."""
+    """The solver takes the reference's path: outcome, iterations, set, step.
+
+    The ``"qp"`` record's ray-step and safeguard counts equal the reference's.
+    """
     ref = reference_loop(qp)
-    res = run(qp)
+    solver, logged = _shared_logged_solver()
+    res = run(qp, solver)
+    values = logged.records[-1].values
+    assert values["n_ray_steps"] == ref.n_ray
+    assert values["n_safeguard"] == ref.n_safeguard
     assert bool(res.state.qp_result == ref.qp_result)
     assert int(res.state.last_n_iter) == ref.n_iter
     np.testing.assert_array_equal(
@@ -756,7 +785,11 @@ class TestReferenceLoop:
         """A budget exit matches the reference truncated at the same budget."""
         qp = make_case(20, 0.8, True, (2, 3), seed=1)
         ref = reference_loop(qp, max_iter=budget)
-        res = run(qp, LRHDirectQPSolver(max_iter=budget))
+        solver, logged = with_logger(LRHDirectQPSolver(max_iter=budget))
+        res = run(qp, solver)
+        values = logged.records[-1].values
+        assert values["n_ray_steps"] == ref.n_ray
+        assert values["n_safeguard"] == ref.n_safeguard
         assert bool(res.state.qp_result == ref.qp_result)
         assert int(res.state.last_n_iter) == ref.n_iter
         np.testing.assert_allclose(res.step, ref.step, atol=1e-12, rtol=0)
@@ -1375,10 +1408,13 @@ class TestWarmStart:
         qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
         cold = run(qp)
         real = lrh_direct_qp.solve_fixed_bounds_qp
+        # Infinite lower faces are never pinned, so "everything pinned" means
+        # every variable with a finite lower bound.
+        lo, _ = make_subproblem(qp).primal_box()
 
         def patched(lag, factors, a_lb, a_ub, **kwargs):
             res = real(lag, factors, a_lb, a_ub, **kwargs)
-            bad = jnp.all(a_lb)
+            bad = jnp.all(a_lb | ~jnp.isfinite(lo))
             return eqx.tree_at(
                 lambda r: (r.ldp_status, r.has_ray),
                 res,
@@ -1446,6 +1482,252 @@ class TestWarmStart:
                 np.asarray(step.x), run(qp).step, atol=1e-6, rtol=0
             )
         assert len(traces) == 1
+
+
+# ---------------------------------------------------------------------------
+# Logging and the "qp" diagnostic record (C14)
+# ---------------------------------------------------------------------------
+
+RECORD_KEYS = {
+    # Keys of the ActiveSetQPSolver "qp" record.
+    "qp_result",
+    "status",
+    "success",
+    "iters",
+    "cg_iters",
+    "step",
+    "dual",
+    "active_set",
+    "qp_dual",
+    "final_working_tol",
+    "n_anti_cycling",
+    "kkt_feasibility_residual",
+    "kkt_n_refinements",
+    "kkt_reason",
+    # LRH-specific keys.
+    "n_nnls_iter",
+    "last_ldp_status",
+    "warm_trial_accepted",
+    "warm_trial_rejected",
+    "n_ray_steps",
+    "n_safeguard",
+    "stalled",
+    "n_pinned",
+}
+
+
+def with_logger(solver: LRHDirectQPSolver) -> tuple[LRHDirectQPSolver, LogView]:
+    """``solver`` with a DEBUG logger and diagnostics sent to memory handlers."""
+    handler, diag = MemoryHandler(), MemoryDiagnosticsHandler()
+    logger = Logger.from_options(
+        {"level": "DEBUG", "handler": handler, "diagnostics": diag}
+    ).child("subproblem")
+    return solver.init(logger=logger), LogView(handler, diag)
+
+
+class LogView:
+    """Live view of the handlers (callbacks fire after the solve returns)."""
+
+    def __init__(self, handler, diag):
+        self._handler, self._diag = handler, diag
+
+    @property
+    def lines(self) -> list[tuple[str, str]]:
+        jax.effects_barrier()
+        return [(r.levelname, r.message) for r in self._handler.records]
+
+    @property
+    def records(self) -> list:
+        jax.effects_barrier()
+        return list(self._diag.records)
+
+
+QP_RESULT_NAMES = (
+    "working_set_converged",
+    "kkt_solver_failure",
+    "max_iter_reached",
+    "anti_cycling",
+)
+STATUS_NAMES = ("successful", "singular", "max_steps_reached")
+LDP_NAMES = (
+    "feasible",
+    "infeasible",
+    "inconsistent_equalities",
+    "nonfinite",
+    "max_iter_reached",
+)
+LINE_PREFIX = {"INFO": "qp solved", "WARNING": "qp failed"}
+
+
+def item_name(item, enum, names) -> str:
+    """Name of an enumeration item, as the record payload spells it."""
+    return next(n for n in names if bool(item == getattr(enum, n)))
+
+
+def leaves_equal(a, b) -> bool:
+    return all(
+        np.array_equal(np.asarray(u), np.asarray(v), equal_nan=True)
+        for u, v in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True)
+    )
+
+
+class TestLogging:
+    @pytest.mark.parametrize("name", list(EXIT_PATHS))
+    def test_record_keys_and_values(self, name):
+        make_qp, solver, *_ = EXIT_PATHS[name]
+        qp = make_qp()
+        solver, logged = with_logger(solver)
+        res = run(qp, solver)
+        state = res.state
+        (rec,) = logged.records
+        assert rec.kind == "qp" and rec.name == "minimiser.subproblem"
+        v = rec.values
+        assert set(v) == RECORD_KEYS
+        assert v["iters"] == int(state.last_n_iter)
+        assert v["cg_iters"] == int(state.last_n_cg_iter) == v["n_nnls_iter"]
+        assert v["success"] == bool(state.success)
+        assert v["qp_result"] == item_name(
+            state.qp_result, ACTIVE_SET_QP_RESULTS, QP_RESULT_NAMES
+        )
+        assert v["status"] == item_name(state.status, RESULTS, STATUS_NAMES)
+        assert v["last_ldp_status"] == item_name(
+            state.last_ldp_status, LDP_RESULTS, LDP_NAMES
+        )
+        assert v["n_anti_cycling"] == int(state.n_anti_cycling)
+        assert v["stalled"] == bool(state.qp_result == STALL)
+        np.testing.assert_array_equal(np.asarray(v["step"].x), res.step)
+        assert v["n_pinned"] == int(
+            np.sum(np.asarray(state.active_set.active_lb))
+            + np.sum(np.asarray(state.active_set.active_ub))
+        )
+        assert 0 <= v["n_ray_steps"] <= v["iters"]
+        assert 0 <= v["n_safeguard"] <= v["iters"]
+        # No warm start: neither trial flag is set.
+        assert not v["warm_trial_accepted"] and not v["warm_trial_rejected"]
+
+    @pytest.mark.parametrize("name", list(EXIT_PATHS))
+    def test_lines_fire_on_the_exit_taken(self, name):
+        make_qp, solver, *_ = EXIT_PATHS[name]
+        solver, logged = with_logger(solver)
+        res = run(make_qp(), solver)
+        converged = bool(res.state.success)
+        level = "INFO" if converged else "WARNING"
+        result = item_name(res.state.qp_result, ACTIVE_SET_QP_RESULTS, QP_RESULT_NAMES)
+        ((got_level, msg),) = logged.lines
+        assert got_level == level
+        assert msg.startswith(LINE_PREFIX[level])
+        assert f"iters={int(res.state.last_n_iter)}" in msg
+        assert (f"result={result}" in msg) == (not converged)
+
+    @pytest.mark.parametrize("seed", [3, 5])
+    def test_ray_and_safeguard_counters_match_the_reference(self, seed):
+        """Near-infeasible QPs take ray steps and degenerate (safeguard) steps."""
+        qp = near_infeasible_case(8, seed, False)
+        ref = reference_loop(qp)
+        solver, logged = with_logger(LRHDirectQPSolver())
+        run(qp, solver)
+        (rec,) = logged.records
+        assert rec.values["n_ray_steps"] == ref.n_ray > 0
+        assert rec.values["n_safeguard"] == ref.n_safeguard
+        assert ref.n_ray + ref.n_safeguard <= ref.n_iter
+
+    def test_safeguard_counter_is_exercised(self):
+        qp = near_infeasible_case(8, 3, False)
+        assert reference_loop(qp).n_safeguard > 0
+
+    @pytest.mark.parametrize("feasible", [True, False], ids=["feasible", "infeasible"])
+    @pytest.mark.parametrize("seed", [5, 6, 7])
+    def test_rejected_ray_trial_is_not_counted(self, seed, feasible):
+        """A warm trial that is a ray step but is discarded counts nothing.
+
+        With everything pinned the oracle returns a decreasing certificate ray
+        on these QPs, so the trial would be a ray step if it were counted.
+        """
+        qp = near_infeasible_case(20, seed, feasible)
+        cold_solver, cold_logged = with_logger(LRHDirectQPSolver())
+        cold = run(qp, cold_solver)
+        n = qp.x.shape[0]
+        state = with_warm_set(cold_state(qp), np.ones(n, bool), np.zeros(n, bool))
+        warm_solver, warm_logged = with_logger(WARM)
+        warm = run(qp, warm_solver, state)
+        cold_values = cold_logged.records[-1].values
+        warm_values = warm_logged.records[-1].values
+        assert warm_values["warm_trial_rejected"]
+        assert int(warm.state.last_n_iter) == int(cold.state.last_n_iter) + 1
+        assert warm_values["n_ray_steps"] == cold_values["n_ray_steps"]
+        assert warm_values["n_safeguard"] == cold_values["n_safeguard"]
+
+    def test_no_trial_no_warm_flags(self):
+        qp = near_infeasible_case(8, 0, True)
+        solver, logged = with_logger(LRHDirectQPSolver(warm_start=True, max_iter=0))
+        res = run(qp, solver)
+        (rec,) = logged.records
+        assert int(res.state.last_n_iter) == 0
+        assert not rec.values["warm_trial_accepted"]
+        assert not rec.values["warm_trial_rejected"]
+
+    def test_stall_is_logged_and_counted(self, monkeypatch):
+        qp = _one_bound_qp()
+        _patch_first_pin_multiplier(monkeypatch, lambda m: -m)
+        solver, logged = with_logger(LRHDirectQPSolver())
+        _, state = _solve_unjitted(qp, solver)
+        assert bool(state.qp_result == STALL)
+        (rec,) = logged.records
+        assert rec.values["stalled"] and rec.values["n_anti_cycling"] == 1
+        # The stalling iteration takes no step, so it is neither a ray step nor
+        # a safeguard firing.
+        assert rec.values["n_safeguard"] == 0 and rec.values["n_ray_steps"] == 0
+        msgs = [m for _, m in logged.lines]
+        assert any(m.startswith("qp bound loop stalled") for m in msgs)
+        assert any(m.startswith("qp failed") for m in msgs)
+        assert not any(m.startswith("qp solved") for m in msgs)
+
+    @pytest.mark.parametrize("perturb", [_keep, _wrong_face, _everything_pinned])
+    @pytest.mark.parametrize(
+        "n, frac, x_on_bound, mix, seed, variant", list(_warm_cases())[:3]
+    )
+    def test_warm_trial_flags(self, n, frac, x_on_bound, mix, seed, variant, perturb):
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        lb, ub = perturb(
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+            np.random.default_rng(seed),
+        )
+        solver, logged = with_logger(WARM)
+        run(qp, solver, with_warm_set(cold_state(qp), lb, ub))
+        (rec,) = logged.records
+        rejected = trial_is_rejected(qp, lb, ub)
+        assert rec.values["warm_trial_rejected"] == rejected
+        assert rec.values["warm_trial_accepted"] == (not rejected)
+
+    @pytest.mark.parametrize("name", list(EXIT_PATHS))
+    def test_logging_does_not_change_the_result(self, name):
+        make_qp, solver, *_ = EXIT_PATHS[name]
+        qp = make_qp()
+        plain = run(qp, solver)
+        logged_solver, _ = with_logger(solver)
+        logged = run(qp, logged_solver)
+        assert leaves_equal(plain.step, logged.step)
+        assert leaves_equal(plain.dual, logged.dual)
+        assert leaves_equal(plain.state, logged.state)
+
+    @pytest.mark.parametrize("perturb", [_keep, _everything_pinned])
+    def test_logging_does_not_change_the_warm_result(self, perturb):
+        qp = make_case(8, 0.8, False, (2, 3), seed=1)
+        cold = run(qp)
+        lb, ub = perturb(
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+            np.random.default_rng(1),
+        )
+        state = with_warm_set(cold_state(qp), lb, ub)
+        plain = run(qp, WARM, state)
+        logged_solver, _ = with_logger(WARM)
+        logged = run(qp, logged_solver, state)
+        assert leaves_equal(plain.step, logged.step)
+        assert leaves_equal(plain.dual, logged.dual)
+        assert leaves_equal(plain.state, logged.state)
 
 
 # ---------------------------------------------------------------------------
