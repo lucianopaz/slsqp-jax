@@ -1024,10 +1024,12 @@ def _patch_first_pin_multiplier(monkeypatch, transform) -> None:
     monkeypatch.setattr(lrh_direct_qp, "solve_fixed_bounds_qp", patched)
 
 
-def _solve_unjitted(qp: RandomQP):
+def _solve_unjitted(qp: RandomQP, solver=None, state=None):
     # Not jitted: a cached compilation would not see the patched oracle.
+    solver = LRHDirectQPSolver() if solver is None else solver
+    state = cold_state(qp) if state is None else state
     x0 = (Primal(jnp.zeros_like(qp.lagrangian.x_ref)), qp.lagrangian.dual)
-    return LRHDirectQPSolver().solve(make_subproblem(qp), x0, cold_state(qp))
+    return solver.solve(make_subproblem(qp), x0, state)
 
 
 class TestStall:
@@ -1084,6 +1086,366 @@ class TestStall:
             )
             _, state = _solve_unjitted(qp)
             assert bool(state.qp_result == expected)
+
+
+# ---------------------------------------------------------------------------
+# Warm start (C13)
+# ---------------------------------------------------------------------------
+
+WARM = LRHDirectQPSolver(warm_start=True)
+
+
+def with_warm_set(state: LRHQPSolverState, lb_mask, ub_mask) -> LRHQPSolverState:
+    """``state`` with its bound working set replaced by the given masks."""
+    return eqx.tree_at(
+        lambda s: (s.active_set.active_lb, s.active_set.active_ub),
+        state,
+        (jnp.asarray(lb_mask, bool), jnp.asarray(ub_mask, bool)),
+    )
+
+
+def trial_is_rejected(qp: RandomQP, lb_mask, ub_mask) -> bool:
+    """Classify the warm trial independently, with the standalone oracle.
+
+    Mirrors the solver's filtering of the warm set and its full-step test: the
+    trial is rejected unless the oracle solved the pinned problem and no
+    droppable multiplier is below ``-τ max(1, ‖μ̂_D‖∞)``. It depends on
+    ``ldp_status`` and the multipliers only, never on ``has_ray``.
+    """
+    lag = qp.lagrangian
+    lo, hi = make_subproblem(qp).primal_box()
+    fixed = ~lag.null_lb & ~lag.null_ub & (lag.lb == lag.ub)
+    warm_lb = jnp.asarray(lb_mask, bool) & jnp.isfinite(lo) & ~fixed
+    warm_ub = jnp.asarray(ub_mask, bool) & jnp.isfinite(hi) & ~warm_lb & ~fixed
+    a_lb = fixed | warm_lb
+    res = _oracle(lag, lag.secant.factors(), a_lb, warm_ub)
+    tau = max(1e-8, 100.0 * float(jnp.finfo(lag.x_ref.dtype).eps))
+    m_lb = np.where(np.asarray(a_lb & ~fixed), np.asarray(res.dual.lb_multipliers), 0.0)
+    m_ub = np.where(np.asarray(warm_ub), np.asarray(res.dual.ub_multipliers), 0.0)
+    scale = max(
+        1.0, np.max(np.abs(m_lb), initial=0.0), np.max(np.abs(m_ub), initial=0.0)
+    )
+    negative = np.any(m_lb < -tau * scale) | np.any(m_ub < -tau * scale)
+    return bool((res.ldp_status != LDP_RESULTS.feasible) | negative)
+
+
+def same_outcome_as(res: Run, cold: Run, extra_iters: int) -> bool:
+    """``res`` is ``cold`` plus ``extra_iters`` iterations, otherwise identical."""
+    a, b = res.state, cold.state
+    return bool(
+        (int(a.last_n_iter) == int(b.last_n_iter) + extra_iters)
+        & (a.qp_result == b.qp_result)
+        & (a.status == b.status)
+        & (a.last_ldp_status == b.last_ldp_status)
+        & np.allclose(res.step, cold.step, atol=1e-12, rtol=0)
+        & np.all(
+            [
+                np.array_equal(np.asarray(u), np.asarray(v))
+                for u, v in zip(
+                    jax.tree.leaves(a.active_set), jax.tree.leaves(b.active_set)
+                )
+            ]
+        )
+        & np.all(
+            [
+                np.allclose(np.asarray(u), np.asarray(v), atol=1e-12, rtol=0)
+                for u, v in zip(jax.tree.leaves(res.dual), jax.tree.leaves(cold.dual))
+            ]
+        )
+    )
+
+
+# Perturbations of the optimal warm set (lb, ub) -> (lb, ub), one per way a
+# warm set can be wrong; ``rng`` is seeded per case.
+def _keep(lb, ub, rng):
+    return lb, ub
+
+
+def _extra_pins(lb, ub, rng):
+    return lb | (rng.random(lb.shape) < 0.4), ub | (rng.random(ub.shape) < 0.4)
+
+
+def _missing_pins(lb, ub, rng):
+    return lb & (rng.random(lb.shape) < 0.5), ub & (rng.random(ub.shape) < 0.5)
+
+
+def _wrong_face(lb, ub, rng):
+    return ub.copy(), lb.copy()
+
+
+def _everything_pinned(lb, ub, rng):
+    return np.ones_like(lb), np.ones_like(ub)
+
+
+def _both_faces_marked(lb, ub, rng):
+    return lb | ub, lb | ub
+
+
+def _empty(lb, ub, rng):
+    return np.zeros_like(lb), np.zeros_like(ub)
+
+
+PERTURBATIONS = [
+    _extra_pins,
+    _missing_pins,
+    _wrong_face,
+    _everything_pinned,
+    _both_faces_marked,
+    _empty,
+]
+
+
+def _warm_cases():
+    for n, frac, x_on_bound, mix, seed, variant in [
+        (8, 0.8, False, (2, 3), 1, {}),
+        (8, 0.8, True, (3, 2), 2, {}),
+        (20, 0.3, False, (0, 3), 3, {}),
+        (20, 0.8, True, (2, 0), 4, {}),
+        (8, 0.8, False, (2, 3), 5, dict(n_fixed=2)),
+        (20, 0.8, True, (2, 3), 6, dict(one_sided=True)),
+        (8, 0.3, False, (0, 0), 7, dict(n_fixed=2, one_sided=True)),
+    ]:
+        yield pytest.param(
+            n,
+            frac,
+            x_on_bound,
+            mix,
+            seed,
+            variant,
+            id=f"{n}-{frac}-{x_on_bound}-{seed}",
+        )
+
+
+class TestWarmStart:
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_optimal_set_converges_in_one_iteration(
+        self, n, frac, x_on_bound, mix, seed, variant
+    ):
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        assert_converged(cold)
+        res = run(qp, WARM, cold.state)
+        assert_converged(res)
+        assert int(res.state.last_n_iter) == 1
+        np.testing.assert_allclose(res.step, cold.step, atol=1e-10, rtol=0)
+        for a, b in zip(jax.tree.leaves(res.dual), jax.tree.leaves(cold.dual)):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-8)
+        np.testing.assert_array_equal(
+            np.asarray(res.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_lb),
+        )
+        # Counters advance by the one trial iteration on top of the cold solve.
+        assert int(res.state.n_iter) == int(cold.state.n_iter) + 1
+
+    @pytest.mark.parametrize("perturb", PERTURBATIONS, ids=lambda f: f.__name__)
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_wrong_set_still_reaches_the_solution(
+        self, n, frac, x_on_bound, mix, seed, variant, perturb
+    ):
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        lb, ub = perturb(
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+            np.random.default_rng(seed),
+        )
+        state = with_warm_set(cold_state(qp), lb, ub)
+        res = run(qp, WARM, state)
+        assert_converged(res)
+        np.testing.assert_allclose(res.step, cold.step, atol=1e-6, rtol=0)
+        assert_kkt(qp, res.step, res.dual)
+        assert_in_box(qp, res.step)
+        # A rejected trial is discarded: the cold run plus one iteration.
+        rejected = trial_is_rejected(qp, lb, ub)
+        assert (not rejected) or same_outcome_as(res, cold, 1)
+
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_cold_solver_ignores_the_state_working_set(
+        self, n, frac, x_on_bound, mix, seed, variant
+    ):
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        junk = with_warm_set(
+            cold_state(qp),
+            np.ones(n, bool),
+            np.random.default_rng(seed).random(n) < 0.5,
+        )
+        res = run(qp, LRHDirectQPSolver(warm_start=False), junk)
+        np.testing.assert_array_equal(res.step, cold.step)
+        assert int(res.state.last_n_iter) == int(cold.state.last_n_iter)
+        assert int(res.state.last_n_cg_iter) == int(cold.state.last_n_cg_iter)
+        for a, b in zip(jax.tree.leaves(res.dual), jax.tree.leaves(cold.dual)):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    @pytest.mark.parametrize(
+        "perturb", [_keep, *PERTURBATIONS], ids=lambda f: f.__name__
+    )
+    @pytest.mark.parametrize("seed", range(4))
+    @pytest.mark.parametrize("n", [8, 20])
+    def test_infeasible_qp_gives_the_cold_certified_outcome(self, n, seed, perturb):
+        """The base set is the cold run's final (certifying) working set."""
+        qp = near_infeasible_case(n, seed, False)
+        cold = run(qp)
+        assert bool(cold.state.qp_result == FAILURE)
+        lb, ub = perturb(
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+            np.random.default_rng(seed),
+        )
+        res = run(qp, WARM, with_warm_set(cold_state(qp), lb, ub))
+        state = res.state
+        assert bool(state.qp_result == FAILURE) and not bool(state.success)
+        assert bool(state.status == cold.state.status)
+        assert bool(state.last_ldp_status == cold.state.last_ldp_status)
+        for leaf in jax.tree.leaves(res.dual):
+            assert np.all(np.asarray(leaf) == 0.0)
+        assert_in_box(qp, res.step)
+        rejected = trial_is_rejected(qp, lb, ub)
+        assert (not rejected) or same_outcome_as(res, cold, 1)
+
+    @pytest.mark.parametrize("budget", [0, 1, 2])
+    def test_trial_consumes_budget(self, budget):
+        qp = _hard_case()
+        cold = run(qp)
+        res = run(qp, LRHDirectQPSolver(warm_start=True, max_iter=budget), cold.state)
+        assert int(res.state.last_n_iter) == min(budget, 1)
+        assert bool(res.state.success) == (budget >= 1)
+        assert_in_box(qp, res.step)
+
+    @pytest.mark.parametrize("perturb", PERTURBATIONS, ids=lambda f: f.__name__)
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_rejected_trial_with_one_iteration_budget(
+        self, n, frac, x_on_bound, mix, seed, variant, perturb
+    ):
+        """A rejected trial uses the whole budget: clipped origin, no dual."""
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        lb, ub = perturb(
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+            np.random.default_rng(seed),
+        )
+        res = run(
+            qp,
+            LRHDirectQPSolver(warm_start=True, max_iter=1),
+            with_warm_set(cold_state(qp), lb, ub),
+        )
+        state = res.state
+        rejected = trial_is_rejected(qp, lb, ub)
+        zero_dual = all(
+            np.all(np.asarray(leaf) == 0.0) for leaf in jax.tree.leaves(res.dual)
+        )
+        origin = np.clip(0.0, qp.lb - qp.x, qp.ub - qp.x)
+        budget_exit = (
+            bool(state.qp_result == BUDGET)
+            and bool(state.status == RESULTS.max_steps_reached)
+            and not bool(state.success)
+            and int(state.last_n_iter) == 1
+            and zero_dual
+            and np.array_equal(res.step, origin)
+        )
+        assert (not rejected) or budget_exit
+        assert_in_box(qp, res.step)
+
+    def test_both_outcomes_occur_in_the_battery(self):
+        """Guards the implications above against being vacuous."""
+        flags = []
+        for case in _warm_cases():
+            n, frac, x_on_bound, mix, seed, variant = case.values
+            qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+            cold = run(qp)
+            base = (
+                np.asarray(cold.state.active_set.active_lb),
+                np.asarray(cold.state.active_set.active_ub),
+            )
+            for perturb in PERTURBATIONS:
+                lb, ub = perturb(*base, np.random.default_rng(seed))
+                flags.append(trial_is_rejected(qp, lb, ub))
+        assert any(flags) and not all(flags)
+
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_oracle_failure_of_the_trial_is_not_reported(
+        self, monkeypatch, n, frac, x_on_bound, mix, seed, variant
+    ):
+        """An oracle failure on the warm set must not become a QP failure.
+
+        The oracle is made to fail (``max_iter_reached``, no certificate) on
+        the everything-pinned set, which the cold path never visits.
+        """
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        real = lrh_direct_qp.solve_fixed_bounds_qp
+
+        def patched(lag, factors, a_lb, a_ub, **kwargs):
+            res = real(lag, factors, a_lb, a_ub, **kwargs)
+            bad = jnp.all(a_lb)
+            return eqx.tree_at(
+                lambda r: (r.ldp_status, r.has_ray),
+                res,
+                (
+                    LDP_RESULTS.where(
+                        bad, LDP_RESULTS.max_iter_reached, res.ldp_status
+                    ),
+                    res.has_ray & ~bad,
+                ),
+            )
+
+        monkeypatch.setattr(lrh_direct_qp, "solve_fixed_bounds_qp", patched)
+        state = with_warm_set(cold_state(qp), np.ones(n, bool), np.zeros(n, bool))
+        (step, dual), out = _solve_unjitted(qp, WARM, state)
+        assert_converged(Run(np.asarray(step.x), dual, out))
+        np.testing.assert_allclose(np.asarray(step.x), cold.step, atol=1e-9, rtol=0)
+        assert int(out.last_n_iter) == int(cold.state.last_n_iter) + 1
+
+    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    def test_warm_filters_keep_the_optimal_set_optimal(
+        self, n, frac, x_on_bound, mix, seed, variant
+    ):
+        """Infinite faces are never pinned and the lower face wins ties.
+
+        The optimal set plus marks on every infinite face and on the upper
+        face of every lower-pinned variable is still accepted as is, so it
+        converges in one iteration.
+        """
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        cold = run(qp)
+        lb = np.asarray(cold.state.active_set.active_lb)
+        ub = np.asarray(cold.state.active_set.active_ub)
+        noisy_lb = lb | ~np.isfinite(qp.lb)
+        noisy_ub = ub | ~np.isfinite(qp.ub) | lb
+        res = run(qp, WARM, with_warm_set(cold_state(qp), noisy_lb, noisy_ub))
+        assert_converged(res)
+        assert int(res.state.last_n_iter) == 1
+        np.testing.assert_allclose(res.step, cold.step, atol=1e-10, rtol=0)
+        # The working set is the filtered one, not the noisy one.
+        for face in ("active_lb", "active_ub"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(res.state.active_set, face)),
+                np.asarray(getattr(cold.state.active_set, face)),
+            )
+
+    def test_single_compilation_across_warm_sets(self):
+        traces = []
+
+        @jax.jit
+        def solve(sub, state):
+            traces.append(1)
+            lag = sub.lagrangian
+            return WARM.solve(sub, (Primal(jnp.zeros_like(lag.x_ref)), lag.dual), state)
+
+        for seed in range(3):
+            qp = make_case(8, 0.8, True, (2, 3), seed=seed)
+            state = with_warm_set(
+                cold_state(qp),
+                np.random.default_rng(seed).random(8) < 0.5,
+                np.random.default_rng(seed + 9).random(8) < 0.5,
+            )
+            (step, _), out = solve(make_subproblem(qp), state)
+            assert bool(out.success)
+            np.testing.assert_allclose(
+                np.asarray(step.x), run(qp).step, atol=1e-6, rtol=0
+            )
+        assert len(traces) == 1
 
 
 # ---------------------------------------------------------------------------

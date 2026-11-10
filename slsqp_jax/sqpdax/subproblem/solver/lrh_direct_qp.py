@@ -248,6 +248,24 @@ class LRHDirectQPSolver(
     eq_tol
         Equality-consistency tolerance of the least-distance reduction
         (``None``: ``√eps``).
+    warm_start
+        Seed the bound working set from ``initial_state.active_set`` (default
+        ``False``: cold start, the state's working set is ignored). The warm
+        set is the *bound* part of that working set (``active_lb`` /
+        ``active_ub``); the general-constraint part is ignored, since the
+        oracle chooses it. Infinite bounds are never pinned, the lower face
+        wins when both faces are marked, and ``lb == ub`` variables are always
+        pinned. The first iteration is a *trial*: one oracle call on
+        ``fixed ∪ warm set`` with ``μ = 0``. It is accepted only if it is a
+        dual-feasible full step (the same test as the loop: the oracle solved
+        the pinned problem and no droppable multiplier is negative); the loop
+        then continues from it (the warm pins keep the trial's multipliers,
+        and an optimal warm set converges in this one iteration). Otherwise
+        the trial is discarded and the loop continues exactly as the cold
+        start. The trial counts as an iteration (``n_iter`` /
+        ``last_n_iter``, and its NNLS iterations in ``n_cg_iter`` /
+        ``n_nnls_iter``), whether accepted or not, and consumes one unit of
+        ``max_iter``.
 
     Examples
     --------
@@ -314,6 +332,7 @@ class LRHDirectQPSolver(
     nnls_max_iter: int | None = eqx.field(static=True, default=None)
     rank_tol: float | None = eqx.field(static=True, default=None)
     eq_tol: float | None = eqx.field(static=True, default=None)
+    warm_start: bool = eqx.field(static=True, default=False)
 
     def requires_secant(self) -> bool:
         """``True``: the model ``B`` comes from a reduced-Hessian secant."""
@@ -409,9 +428,18 @@ class LRHDirectQPSolver(
         # by the last full step whose multiplier is still 0 (fresh_*), the most
         # violated one of them (p, p_ub; p = -1: none), the last full step and
         # its dual, the last oracle status, NNLS count, iteration count, outcome.
+        if self.warm_start:
+            aset = initial_state.active_set
+            warm_lb = jnp.asarray(aset.active_lb, bool) & jnp.isfinite(lo) & ~fixed
+            warm_ub = (
+                jnp.asarray(aset.active_ub, bool) & jnp.isfinite(hi) & ~warm_lb & ~fixed
+            )
+            start_lb, start_ub = fixed | warm_lb, warm_ub
+        else:
+            start_lb, start_ub = fixed, false_n
         init = (
-            fixed,
-            false_n,
+            start_lb,
+            start_ub,
             zeros_n,
             zeros_n,
             false_n,
@@ -574,6 +602,31 @@ class LRHDirectQPSolver(
                 res.dual,
                 dual_full,
             )
+            if self.warm_start:
+                # First iteration = warm trial: unless it is a dual-feasible
+                # full step, discard it and restart from the cold carry (the
+                # iteration and NNLS counts below still include the trial).
+                # Only the resets of ``A``, ``infeasible`` and
+                # ``oracle_failure`` are live. Equivalent mutants: the resets
+                # of ``mu`` (it is 0 throughout a rejected trial, so every
+                # ratio is 0 and nothing moves), ``fresh`` and ``p`` (still
+                # at their cold values, since only a batch or a positive step
+                # changes them), ``converged`` (``converged`` implies
+                # ``full``) and ``stalled`` (with ``p = -1`` a negative
+                # multiplier always has a blocker, so no stall).
+                reject = (n_it == 0) & ~full
+                a_lb_next = jnp.where(reject, fixed, a_lb_next)
+                a_ub_next = jnp.where(reject, false_n, a_ub_next)
+                mu_lb_next = jnp.where(reject, 0.0, mu_lb_next)
+                mu_ub_next = jnp.where(reject, 0.0, mu_ub_next)
+                fresh_lb_next = fresh_lb_next & ~reject
+                fresh_ub_next = fresh_ub_next & ~reject
+                p_next = jnp.where(reject, -1, p_next).astype(jnp.int32)
+                p_ub_next = p_ub_next & ~reject
+                converged = converged & ~reject
+                infeasible = infeasible & ~reject
+                oracle_failure = oracle_failure & ~reject
+                stalled = stalled & ~reject
             outcome = jnp.where(
                 converged,
                 _CONVERGED,
