@@ -11,7 +11,7 @@ tests; the code under test never forms an ``n × n`` object.
 from __future__ import annotations
 
 import itertools
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
@@ -25,7 +25,13 @@ from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
     FixedBoundsQPResult,
     solve_fixed_bounds_qp,
 )
-from tests.sqpdax.subproblem.solver.conftest import RandomQP, make_random_lrh_qp
+from tests.sqpdax.subproblem.solver.conftest import (
+    RandomQP,
+    index_mask,
+    make_random_lrh_qp,
+    walk_avals,
+    with_rows,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -390,20 +396,6 @@ class TestStatusPropagation:
         )
 
 
-def _walk_avals(jaxpr: Any):
-    """Yield the shape of every variable of a jaxpr, sub-jaxprs included."""
-    for var in itertools.chain(jaxpr.invars, jaxpr.constvars):
-        yield var.aval.shape
-    for eqn in jaxpr.eqns:
-        for var in eqn.outvars:
-            yield getattr(var.aval, "shape", ())
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, (tuple, list)) else (param,):
-                inner = getattr(sub, "jaxpr", sub)
-                if hasattr(inner, "eqns"):
-                    yield from _walk_avals(inner)
-
-
 class TestMemoryBudget:
     def test_no_n_by_n_intermediate(self):
         """No array of the jaxpr has two axes as large as ``n``."""
@@ -416,7 +408,7 @@ class TestMemoryBudget:
             jnp.asarray(lower),
             jnp.asarray(upper),
         )
-        shapes = set(_walk_avals(jaxpr.jaxpr))
+        shapes = set(walk_avals(jaxpr.jaxpr))
         offenders = [s for s in shapes if sum(1 for d in s if d >= n) >= 2]
         assert not offenders, offenders
         assert max(int(np.prod(s)) for s in shapes) <= n * max(m_c, 4) + n
@@ -432,29 +424,6 @@ class TestMemoryBudget:
 # ``feasible``. A row supported only on pinned variables is a zero column of
 # the reduced system (rounding noise instead of an exact zero).
 # ---------------------------------------------------------------------------
-
-
-def with_rows(qp: RandomQP, a_eq, b_eq, a_ineq, b_ineq) -> RandomQP:
-    """Replace the general constraint rows of ``qp`` (NumPy and Lagrangian)."""
-    ev = qp.lagrangian.evaluated
-    ev = eqx.tree_at(
-        lambda e: (e.eq_fn_val, e.eq_fn_jac_val, e.ineq_fn_val, e.ineq_fn_jac_val),
-        ev,
-        (
-            jnp.asarray(-b_eq),
-            jnp.asarray(a_eq),
-            jnp.asarray(-b_ineq),
-            jnp.asarray(a_ineq),
-        ),
-    )
-    lag = eqx.tree_at(
-        lambda lg: (lg.evaluated, lg.dual.eq_multipliers, lg.dual.ineq_multipliers),
-        qp.lagrangian,
-        (ev, jnp.zeros(len(b_eq)), jnp.zeros(len(b_ineq))),
-    )
-    return qp._replace(
-        lagrangian=lag, a_eq=a_eq, b_eq=b_eq, a_ineq=a_ineq, b_ineq=b_ineq
-    )
 
 
 def with_stiff_model(qp: RandomQP, factor: float) -> RandomQP:
@@ -474,42 +443,36 @@ def with_stiff_model(qp: RandomQP, factor: float) -> RandomQP:
     return qp._replace(factors=fac, dense_b=dense_b)
 
 
-def _mask(n: int, idx) -> np.ndarray:
-    mask = np.zeros(n, dtype=bool)
-    mask[idx] = True
-    return mask
-
-
 def _scenario_row_on_pinned_variable(seed: int, scale: float):
     """One inequality supported only on a pinned variable, others general."""
     n = 6
-    upper = _mask(n, [0])
+    upper = index_mask(n, [0])
     qp = make_random_lrh_qp(n, 2, 0, 3, seed=seed, upper=upper)
     a_in, b_in = qp.a_ineq.copy(), qp.b_ineq.copy()
     a_in[0] = 0.0
     a_in[0, 0] = scale
     b_in[0] = scale * qp.d0[0]  # active at the pinned step
     qp = with_rows(qp, qp.a_eq, qp.b_eq, a_in, b_in)
-    return qp, _mask(n, []), upper, None
+    return qp, index_mask(n, []), upper, None
 
 
 def _scenario_all_rows_on_pinned_variables(seed: int, scale: float):
     """Every inequality is supported only on pinned variables (zero columns)."""
     n = 6
     rng = np.random.default_rng(seed)
-    upper = _mask(n, [0, 1])
+    upper = index_mask(n, [0, 1])
     qp = make_random_lrh_qp(n, 2, 0, 2, seed=seed, upper=upper)
     a_in = np.zeros((2, n))
     a_in[:, :2] = rng.standard_normal((2, 2)) * scale
     qp = with_rows(qp, np.zeros((0, n)), np.zeros(0), a_in, a_in @ qp.d0)
-    return qp, _mask(n, []), upper, None
+    return qp, index_mask(n, []), upper, None
 
 
 def _scenario_two_opposite_inequalities(seed: int, scale: float):
     """3 free variables, 2 equalities, 2 opposite inequalities: singleton set."""
     n = 6
     rng = np.random.default_rng(seed)
-    lower = _mask(n, [0, 1, 2])
+    lower = index_mask(n, [0, 1, 2])
     qp = make_random_lrh_qp(n, 2, 2, 1, seed=seed, lower=lower)
     a_e = qp.a_eq * scale
     free = ~lower
@@ -520,14 +483,19 @@ def _scenario_two_opposite_inequalities(seed: int, scale: float):
     )
     a_i[:, lower] = rng.standard_normal((2, 3))
     a_i *= scale
-    return with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0), lower, _mask(n, []), "d0"
+    return (
+        with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0),
+        lower,
+        index_mask(n, []),
+        "d0",
+    )
 
 
 def _scenario_vertex_in_a_null_space(seed: int, scale: float):
     """1 equality, 3 inequalities positively spanning the 2-D null space."""
     n = 6
     rng = np.random.default_rng(seed)
-    lower = _mask(n, [0, 1, 2])
+    lower = index_mask(n, [0, 1, 2])
     qp = make_random_lrh_qp(n, 2, 1, 1, seed=seed, lower=lower)
     a_e = qp.a_eq[:1] * scale
     free = ~lower
@@ -538,7 +506,12 @@ def _scenario_vertex_in_a_null_space(seed: int, scale: float):
     a_i[:, free] = dirs @ null.T + rng.standard_normal((3, 1)) @ a_e[:, free]
     a_i[:, lower] = rng.standard_normal((3, 3))
     a_i *= scale
-    return with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0), lower, _mask(n, []), "d0"
+    return (
+        with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0),
+        lower,
+        index_mask(n, []),
+        "d0",
+    )
 
 
 DEGENERATE_SCENARIOS = {
@@ -583,12 +556,14 @@ class TestDegenerateFeasibleSets:
         subspace, leaving ``d0`` as the only feasible step.
         """
         n = 8
-        lower = _mask(n, list(range(n_free, n)))  # the first n_free variables are free
+        lower = index_mask(
+            n, list(range(n_free, n))
+        )  # the first n_free variables are free
         qp = make_random_lrh_qp(
             n, 3, m_e, tight + 1, seed=seed, tight=tight, lower=lower
         )
         qp = with_stiff_model(qp, np.sqrt(curvature))
-        res = run(Case(qp, lower, _mask(n, [])))
+        res = run(Case(qp, lower, index_mask(n, [])))
         assert bool(res.ldp_status == LDP_RESULTS.feasible)
         # Convex QP: a KKT point is the solution (the enumeration reference
         # cannot pick non-negative multipliers of a degenerate vertex).
@@ -674,7 +649,10 @@ def _over_pinned(mix, kind, seed):
     """A QP with a feasible box but pins at bounds that miss ``A d = b``."""
     n = 6
     qp = make_random_lrh_qp(n, 2, *mix, seed=seed, dup=mix[0] == 3)
-    pinned = {"all": _mask(n, range(n)), "all-but-one": _mask(n, range(1, n))}[kind]
+    pinned = {
+        "all": index_mask(n, range(n)),
+        "all-but-one": index_mask(n, range(1, n)),
+    }[kind]
     upper = pinned & (np.random.default_rng(seed).random(n) < 0.5)
     return Case(qp, pinned & ~upper, upper)
 
@@ -683,14 +661,14 @@ def _box_too_tight(mix, kind, seed):
     """An inequality supported only on a variable whose pin overshoots it."""
     n = 6
     scale = 10.0 ** {"unit": 0.0, "large": 3.0, "small": -3.0}[kind]
-    upper = _mask(n, [0])  # not passed to the generator: ub = x + d0 + (0.5..1.5)
+    upper = index_mask(n, [0])  # not passed to the generator: ub = x + d0 + (0.5..1.5)
     qp = make_random_lrh_qp(n, 2, *mix, seed=seed, dup=mix[0] == 3)
     a_in, b_in = qp.a_ineq.copy(), qp.b_ineq.copy()
     a_in[0] = 0.0
     a_in[0, 0] = scale
     b_in[0] = scale * (qp.d0[0] + 0.1)  # the pin sits at d0[0] + (0.5..1.5)
     qp = with_rows(qp, qp.a_eq, qp.b_eq, a_in, b_in)
-    return Case(qp, _mask(n, []), upper)
+    return Case(qp, index_mask(n, []), upper)
 
 
 CERTIFICATE_SCENARIOS = {

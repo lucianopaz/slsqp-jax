@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple
+import itertools
+from typing import Any, Callable, NamedTuple
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -388,3 +389,47 @@ def make_random_lrh_qp(
 def random_lrh_qp() -> Callable[..., RandomQP]:
     """Factory of random convex LRH QPs (:func:`make_random_lrh_qp`)."""
     return make_random_lrh_qp
+
+
+def with_rows(qp: RandomQP, a_eq, b_eq, a_ineq, b_ineq) -> RandomQP:
+    """Replace the general constraint rows of ``qp`` (NumPy and Lagrangian)."""
+    ev = qp.lagrangian.evaluated
+    ev = eqx.tree_at(
+        lambda e: (e.eq_fn_val, e.eq_fn_jac_val, e.ineq_fn_val, e.ineq_fn_jac_val),
+        ev,
+        (
+            jnp.asarray(-b_eq),
+            jnp.asarray(a_eq),
+            jnp.asarray(-b_ineq),
+            jnp.asarray(a_ineq),
+        ),
+    )
+    lag = eqx.tree_at(
+        lambda lg: (lg.evaluated, lg.dual.eq_multipliers, lg.dual.ineq_multipliers),
+        qp.lagrangian,
+        (ev, jnp.zeros(len(b_eq)), jnp.zeros(len(b_ineq))),
+    )
+    return qp._replace(
+        lagrangian=lag, a_eq=a_eq, b_eq=b_eq, a_ineq=a_ineq, b_ineq=b_ineq
+    )
+
+
+def index_mask(n: int, idx) -> np.ndarray:
+    """Boolean mask of length ``n`` that is true on ``idx``."""
+    mask = np.zeros(n, dtype=bool)
+    mask[idx] = True
+    return mask
+
+
+def walk_avals(jaxpr: Any):
+    """Yield the shape of every variable of a jaxpr, sub-jaxprs included."""
+    for var in itertools.chain(jaxpr.invars, jaxpr.constvars):
+        yield var.aval.shape
+    for eqn in jaxpr.eqns:
+        for var in eqn.outvars:
+            yield getattr(var.aval, "shape", ())
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (tuple, list)) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    yield from walk_avals(inner)

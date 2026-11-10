@@ -11,6 +11,9 @@ Public leaf solvers:
   — primal-dual active-set loop around an inner KKT solver.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.proximal_active_set_loop.ProximalActiveSetQPSolver`
   — stabilised-SQP (proximal equality) variant of the active-set loop.
+* :class:`~slsqp_jax.sqpdax.subproblem.solver.lrh_direct_qp.LRHDirectQPSolver`
+  — direct (non-iterative) QP solver for a limited-memory reduced-Hessian
+  model, with an ``O(n)`` bound working-set loop.
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.gradient_projection.GradientProjection`
   — bound-constrained Cauchy / subspace step (N&W §16.7).
 * :class:`~slsqp_jax.sqpdax.subproblem.solver.dogleg.DogLegSolver`
@@ -46,6 +49,7 @@ from . import (
     funnel_multipliers,
     funnel_tangential_step,
     gradient_projection,
+    lrh_direct_qp,
     minres_qlp,
     multiplier_recovery,
     projected_cg,
@@ -89,6 +93,7 @@ from .funnel_tangential_step import (
     FunnelTangentialStepState,
 )
 from .gradient_projection import GradientProjection, GradientProjectionState
+from .lrh_direct_qp import LRHDirectQPSolver, LRHQPSolverState
 from .minres_qlp import MinresQLPState, MinresQLPSubProblemSolver
 from .multiplier_recovery import (
     BarrierSafeguard,
@@ -136,6 +141,7 @@ __all__ = [
     "funnel_multipliers",
     "funnel_tangential_step",
     "gradient_projection",
+    "lrh_direct_qp",
     "minres_qlp",
     "multiplier_recovery",
     "projected_cg",
@@ -172,6 +178,8 @@ __all__ = [
     "FunnelTangentialStepState",
     "GradientProjectionState",
     "GradientProjection",
+    "LRHQPSolverState",
+    "LRHDirectQPSolver",
     "ProjectedCGState",
     "ProjectedCGSubProblemSolver",
     "MinresQLPState",
