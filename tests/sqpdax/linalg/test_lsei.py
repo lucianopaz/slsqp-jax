@@ -523,3 +523,105 @@ def test_inequality_in_span_of_equalities_with_free_directions(n, slack, seed):
         np.asarray(res.w), w_ref, atol=REF_TOL * max(1.0, np.linalg.norm(w_ref))
     )
     assert_lsei_kkt(res, g_t, h, m_e)
+
+
+# --------------------------------------------------------------------------
+# Degenerate polytopes (empty interior) and zero rows (C11b)
+# --------------------------------------------------------------------------
+
+
+def singleton_vertex_problem(m_e, p, extra, cond, spread, seed):
+    """Problem whose feasible set is the single point ``w0``.
+
+    ``m_E`` equalities leave a ``p``-dimensional null space; ``p + 1``
+    inequality rows ``dirs @ Nᵀ`` (plus row-space components) positively span
+    it (``dirs`` has a positive linear dependency), so ``G_I (w - w0) ≤ 0``
+    forces ``w = w0``. All rows are passed through the ill-conditioned map
+    ``C⁻¹`` (``C`` symmetric with ``cond(C) = cond``), the way the reduced
+    system of a stiff reduced-Hessian model looks, and then rescaled by
+    ``10^U(-spread, spread)`` row by row. ``extra`` further inequalities have
+    positive slack at ``w0``. Dense NumPy: reference / generator only.
+    """
+    rng = np.random.default_rng(1000 * seed + 100 * m_e + 10 * p + extra)
+    n = m_e + p
+    a_e = rng.standard_normal((m_e, n))
+    null = np.linalg.svd(a_e)[2][m_e:].T if m_e else np.eye(n)
+    dirs = rng.standard_normal((p + 1, p))
+    dirs[-1] = -(rng.uniform(0.5, 2.0, p) @ dirs[:-1])
+    a_i = dirs @ null.T + rng.standard_normal((p + 1, m_e)) @ a_e
+    a_x = rng.standard_normal((extra, n))
+    a = np.concatenate([a_e, a_i, a_x])
+    u = np.linalg.qr(rng.standard_normal((n, n)))[0]
+    c_inv = u @ np.diag(np.logspace(0.0, -np.log10(cond), n)) @ u.T
+    g = a @ c_inv
+    w0 = rng.standard_normal(n) * 10.0 ** rng.uniform(-2.0, 3.0)
+    h = g @ w0
+    h[m_e + p + 1 :] += np.linalg.norm(g[m_e + p + 1 :], axis=1) * rng.uniform(
+        0.1, 1.0, extra
+    )
+    row_scale = 10.0 ** rng.uniform(-spread, spread, len(g))
+    return (g * row_scale[:, None]).T.copy(), h * row_scale, w0
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("extra", [0, 2])
+@pytest.mark.parametrize("spread", [0.0, 2.0])
+@pytest.mark.parametrize("cond", [1e4, 1e5])
+@pytest.mark.parametrize("m_e, p", [(0, 1), (0, 3), (2, 1), (2, 3)])
+def test_singleton_vertex_is_found(m_e, p, cond, spread, extra, seed):
+    """``p + 1`` positively spanning active rows in a ``p``-dim null space.
+
+    The feasible set is one point, so the minimum-norm solution is ``w0``;
+    NNLS sees dependent columns, which a plain Lawson-Hanson turns into a
+    false ``infeasible`` (or a garbage ``w``) once the rows are
+    ill-conditioned.
+    """
+    g_t, h, w0 = singleton_vertex_problem(m_e, p, extra, cond, spread, seed)
+    res = run(g_t, h, m_e, eq_tol=1.5e-8)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(
+        np.asarray(res.w), w0, rtol=0.0, atol=1e-8 * np.linalg.norm(w0)
+    )
+    assert_lsei_kkt(res, g_t, h, m_e, tol=1e-7)
+
+
+def zero_row_problem(n_zero, n_other, rhs, seed):
+    """``n_zero`` exactly zero ``Gᵀ`` columns with right-hand side ``rhs``."""
+    rng = np.random.default_rng(seed + 10 * n_zero + n_other)
+    n = 5
+    g = np.concatenate([np.zeros((n_zero, n)), rng.standard_normal((n_other, n))])
+    h = g @ rng.standard_normal(n)
+    h[:n_zero] = rhs
+    h[n_zero:] += 0.3
+    return g, h
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("rhs", [0.0, -1e-16, -1e-12, -1e-10])
+@pytest.mark.parametrize("n_other", [0, 3])
+@pytest.mark.parametrize("n_zero", [1, 2])
+def test_zero_rows_without_equalities(n_zero, n_other, rhs, seed):
+    """Inequalities supported only on pinned variables are exactly zero rows.
+
+    Without equalities (``m_E = 0``) such a row (``0 ≤ rhs``) must not be
+    amplified by the LDP normalisation into a random constraint: it is
+    satisfied up to the ``eq_tol`` floor (``rhs ≥ -eq_tol``) and the other
+    rows are solved as if the zero rows were absent.
+    """
+    g, h = zero_row_problem(n_zero, n_other, rhs, seed)
+    res = run(g.T.copy(), h, 0)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    w_ref, _, lam_ref = dense_reference(g[n_zero:].T.copy(), h[n_zero:], 0)
+    np.testing.assert_allclose(np.asarray(res.w), w_ref, atol=REF_TOL)
+    np.testing.assert_allclose(np.asarray(res.lam_ineq)[n_zero:], lam_ref, atol=REF_TOL)
+    np.testing.assert_array_equal(np.asarray(res.lam_ineq)[:n_zero], 0.0)
+
+
+@pytest.mark.parametrize("n_other", [0, 3])
+@pytest.mark.parametrize("n_zero", [1, 2])
+def test_zero_row_violation_is_infeasible(n_zero, n_other):
+    """A zero row with a genuinely violated right-hand side stays ``infeasible``."""
+    g, h = zero_row_problem(n_zero, n_other, -1e-3, 0)
+    res = run(g.T.copy(), h, 0)
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    assert_zero_outputs(res)

@@ -707,3 +707,143 @@ def test_ldp_scale_invariance_random(k, n, s, seed):
     assert np.all(slack >= -tol)  # primal feasibility
     np.testing.assert_allclose(x, (g / rn[:, None]).T @ mu_hat, atol=tol, rtol=0.0)
     assert np.all(np.abs(mu_hat * slack) <= tol * max(1.0, np.max(mu_hat)))
+
+
+# --------------------------------------------------------------------------
+# dep_tol: dependent columns are frozen, never added (C11b)
+# --------------------------------------------------------------------------
+
+
+def near_duplicate_problem(m: int, spread: float, noise: float, seed: int):
+    """``E = [a0 a1 a2 a0']`` with ``a0' = a0 + spread · noise``; ``f ≈ a0+a1+a2``.
+
+    The fourth column lies within relative distance about ``spread`` of the
+    span of the others, so at the optimum it is redundant: with the first
+    column passive its dual is only ``O(spread · ‖r‖)``, noise above the
+    default dual tolerance.
+    """
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal((m, 3))
+    e = np.column_stack([a, a[:, 0] + spread * rng.standard_normal(m)])
+    return e, a.sum(axis=1) + noise * rng.standard_normal(m)
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+@pytest.mark.parametrize("spread", [1e-9, 1e-12])
+def test_nnls_dep_tol_freezes_dependent_column(spread, noise, seed):
+    """Only one of two dependent columns enters; the optimum is unchanged.
+
+    The frozen column is implied by the passive ones up to its distance to
+    their span, so the optimal value moves by at most about ``spread``.
+    """
+    e, f = near_duplicate_problem(8, spread, noise, seed)
+    res = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=1e-6)
+    passive = np.asarray(res.passive)
+    assert bool(res.converged)
+    assert passive.sum() == 3
+    assert not (passive[0] and passive[3])
+    assert np.all(np.asarray(res.x)[passive] > 0.0)
+    assert np.all(np.asarray(res.x)[~passive] == 0.0)
+    _, rnorm_ref = scipy_nnls(e, f)
+    assert abs(float(jnp.linalg.norm(res.residual)) - rnorm_ref) <= 20 * spread + 1e-12
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("m, k", SHAPES)
+def test_nnls_dep_tol_only_removes_dependent_columns(m, k, seed):
+    """``dep_tol = 0`` is plain Lawson-Hanson, and independent columns are
+    never frozen: a positive ``dep_tol`` gives the same iterates on random
+    full-rank data (every shape here has ``m ≥ k``)."""
+    e, f = random_problem(m, k, seed)
+    plain = nnls(jnp.asarray(e), jnp.asarray(f))
+    zero = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=0.0)
+    guarded = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=1e-8)
+    for res in (zero, guarded):
+        np.testing.assert_array_equal(np.asarray(res.x), np.asarray(plain.x))
+        np.testing.assert_array_equal(
+            np.asarray(res.passive), np.asarray(plain.passive)
+        )
+        assert int(res.n_iter) == int(plain.n_iter)
+        assert bool(res.converged)
+
+
+def test_nnls_dep_tol_zero_default_reproduces_c08_degenerate_battery():
+    """The degenerate C08 problems solve identically with ``dep_tol = 0``."""
+    for make in DEGENERATE.values():
+        e, f = make(0)
+        a = nnls(jnp.asarray(e), jnp.asarray(f))
+        b = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=0.0)
+        np.testing.assert_array_equal(np.asarray(a.x), np.asarray(b.x))
+        assert int(a.n_iter) == int(b.n_iter)
+
+
+@pytest.mark.parametrize("dep_tol", [1e-8, 1e-6])
+def test_nnls_dep_tol_zero_columns_and_empty_passive_set(dep_tol):
+    """The first addition is never frozen, and a zero column cannot enter."""
+    e = np.array([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    f = np.array([1.0, 0.5, 0.0])
+    res = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=dep_tol)
+    _, rnorm_ref = scipy_nnls(e, f)
+    assert bool(res.converged)
+    assert not bool(res.passive[1])
+    np.testing.assert_allclose(
+        float(jnp.linalg.norm(res.residual)), rnorm_ref, atol=1e-9
+    )
+
+
+# --------------------------------------------------------------------------
+# ldp: feasible must never come with violated constraints (C11b)
+# --------------------------------------------------------------------------
+
+COARSE_PROBLEM_SIZES = [(4, 3), (8, 5), (20, 6)]
+
+
+def coarse_ldp_problem(k: int, n: int, seed: int):
+    """Feasible data; a coarse NNLS dual tolerance then stops far from optimal."""
+    rng = np.random.default_rng(100 * seed + 7 * k + n)
+    g = rng.standard_normal((k, n))
+    y0 = 2.0 * rng.standard_normal(n)
+    h = g @ y0 + np.abs(rng.standard_normal(k)) * (rng.random(k) < 0.5) + 1.0
+    return g, h
+
+
+def violation(g, h, x):
+    """Largest violation of ``g x ≥ h`` in row-normalised units."""
+    return float(np.max(np.maximum((h - g @ x) / np.linalg.norm(g, axis=1), 0.0)))
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("tol", [0.05, 0.2, 0.5])
+@pytest.mark.parametrize("k, n", COARSE_PROBLEM_SIZES)
+def test_ldp_feasible_status_means_constraints_hold(k, n, tol, seed):
+    """A garbage NNLS solution (premature stop) is reported ``infeasible``.
+
+    ``feasible`` holds exactly when the returned point satisfies the
+    constraints; otherwise the status is ``infeasible`` with zero outputs.
+    """
+    g, h = coarse_ldp_problem(k, n, seed)
+    res = ldp(jnp.asarray(g), jnp.asarray(h), tol=tol)
+    feasible = bool(res.status == LDP_RESULTS.feasible)
+    x, mu = np.asarray(res.x), np.asarray(res.multipliers)
+    assert bool(res.status == LDP_RESULTS.infeasible) != feasible
+    holds = violation(g, h, x) <= 1e-6 * max(1.0, np.linalg.norm(x))
+    assert feasible == holds
+    assert feasible or not (np.any(x) or np.any(mu))
+
+
+@pytest.mark.parametrize(
+    "check_tol, expected",
+    [(None, LDP_RESULTS.infeasible), (float("inf"), LDP_RESULTS.feasible)],
+    ids=["default", "disabled"],
+)
+def test_ldp_check_tol_override(check_tol, expected):
+    """``check_tol = inf`` switches the primal check off (violated ``x`` shows)."""
+    g, h = coarse_ldp_problem(8, 5, 0)
+    kwargs = {} if check_tol is None else {"check_tol": check_tol}
+    res = ldp(jnp.asarray(g), jnp.asarray(h), tol=0.5, **kwargs)
+    assert bool(res.status == expected)
+    x = np.asarray(res.x)
+    feasible = expected == LDP_RESULTS.feasible
+    assert bool(np.any(x)) == feasible  # zero outputs unless feasible
+    assert violation(g, h, x) > 1e-3 or not feasible  # the unchecked x is garbage

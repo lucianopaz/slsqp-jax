@@ -29,10 +29,11 @@ The reduction follows the SLSQP chain, with direct linear algebra:
    ``ζ = [t; z_I]`` (fixed size ``m_E + m_I``; determined directions are
    zero columns, so the minimum-norm solution sets them to zero), solved by
    :func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.ldp`. An inequality row in
-   the span of the equality rows has a zero row in this system (``O(eps)``
-   noise in floating point, which ``ldp`` would normalise into a random
-   constraint): such rows are zeroed, and their right-hand side is clamped to
-   ``≥ 0`` unless it is a genuine violation;
+   the span of the equality rows (or, without equalities, an exactly zero
+   column of ``Gᵀ``) has a zero row in this system (``O(eps)`` noise in
+   floating point, which ``ldp`` would normalise into a random constraint):
+   such rows are zeroed, and their right-hand side is clamped to ``≥ 0``
+   unless it is a genuine violation;
 4. the multipliers follow by back-substitution.
 """
 
@@ -120,8 +121,9 @@ def least_distance_lsei(
     ``‖U_⊥ᵀ ĥ_E‖ > eq_tol · max(1, ‖ĥ_E‖)``, where ``ĥ`` is the equilibrated
     right-hand side and ``U_⊥`` spans the left null space of the equality
     rows. It takes precedence over the status of the LDP. Inequality rows
-    whose gradient lies in the span of the equality gradients are neutralised
-    (zero row, right-hand side clamped to non-negative when within the
+    whose gradient lies in the span of the equality gradients (an exactly zero
+    gradient, e.g. a row supported only on pinned variables, included, also
+    without equalities) are neutralised (zero row, right-hand side clamped to non-negative when within the
     ``eq_tol`` floor of feasible) so that rounding noise is not amplified
     into a spurious constraint; a genuine violation stays ``infeasible``.
     Unless the status is ``feasible``, ``w`` and both multiplier vectors are
@@ -239,22 +241,23 @@ def least_distance_lsei(
         if m_e > 0:
             c = jnp.concatenate([r_ei.T @ v_null, r_ii.T], axis=1)
             rhs = h_i - r_ei.T @ z_e0
-            # An inequality gradient in the span of the equality gradients
-            # gives a zero row of c (exact arithmetic) and rhs = its slack at
-            # the point the equalities fix. In floating point the row is
-            # noise that ldp would normalise into an O(1) random constraint.
-            # Zero such rows; a slack >= -eq_tol (floor 1, units of w) counts
-            # as satisfied (rhs -> max(rhs, 0)), a larger violation stays
-            # negative so that ldp reports ``infeasible``.
-            noise = jnp.linalg.norm(c, axis=1) <= rank_tol
-            near_ok = rhs >= -eq_tol * jnp.maximum(
-                1.0, jnp.abs(h_i) + jnp.linalg.norm(z_e0)
-            )
-            c = jnp.where(noise[:, None], 0.0, c)
-            rhs = jnp.where(noise & near_ok, jnp.maximum(rhs, 0.0), rhs)
+            z_e0_norm = jnp.linalg.norm(z_e0)
         else:
             c = r_ii.T
             rhs = h_i
+            z_e0_norm = jnp.zeros((), dtype)
+        # An inequality gradient in the span of the equality gradients (or,
+        # with ``m_E = 0``, an exactly zero ``Gᵀ`` column: a row supported
+        # only on pinned variables) gives a zero row of c (exact arithmetic)
+        # and rhs = its slack at the point the equalities fix. In floating
+        # point the row is noise that ldp would normalise into an O(1) random
+        # constraint. Zero such rows; a slack >= -eq_tol (floor 1, units of
+        # w) counts as satisfied (rhs -> max(rhs, 0)), a larger violation
+        # stays negative so that ldp reports ``infeasible``.
+        noise = jnp.linalg.norm(c, axis=1) <= rank_tol
+        near_ok = rhs >= -eq_tol * jnp.maximum(1.0, jnp.abs(h_i) + z_e0_norm)
+        c = jnp.where(noise[:, None], 0.0, c)
+        rhs = jnp.where(noise & near_ok, jnp.maximum(rhs, 0.0), rhs)
         res = ldp(-c, -rhs, max_iter=max_iter, tol=tol, ldp_tol=ldp_tol)
         zeta = res.x
         lam_i = res.multipliers

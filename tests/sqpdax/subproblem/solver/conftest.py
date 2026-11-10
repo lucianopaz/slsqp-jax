@@ -273,7 +273,7 @@ def make_random_lrh_qp(
     seed: int = 0,
     memory: int = 4,
     dup: bool = False,
-    tight: bool = False,
+    tight: bool | int = False,
     lower: np.ndarray | None = None,
     upper: np.ndarray | None = None,
     infinite: np.ndarray | None = None,
@@ -283,11 +283,11 @@ def make_random_lrh_qp(
     ``B = σ I + Z (RᵀR - σ I) Zᵀ`` has an orthonormal ``Z`` (``rank`` columns
     out of ``memory``, the rest zero) and garbage in the padded block of ``R``.
     A point ``d0`` is feasible for the general constraints by construction;
-    every inequality has a positive slack at ``d0`` except, when ``tight`` is
-    set, the first one (active at ``d0``). Several inequalities active at
-    ``d0`` would make the feasible set of a small free subspace degenerate
-    (empty interior), which a least-distance solver cannot tell from an
-    infeasible one, hence only one. The bounds are
+    every inequality has a positive slack at ``d0`` except the first
+    ``tight`` ones, which are active at ``d0`` (``True`` means one; any number
+    up to ``m_i`` is allowed). Several active inequalities can make the
+    feasible set of a small free subspace degenerate (empty interior, e.g. a
+    single point), which the LDP chain must still solve. The bounds are
     ``x + d0`` on the ``lower`` (resp. ``upper``) coordinates, so that pinning
     exactly those faces keeps the QP feasible; elsewhere they are a random
     distance away, or infinite on the ``infinite`` coordinates. ``dup`` makes
@@ -329,8 +329,7 @@ def make_random_lrh_qp(
     a_ineq = rng.standard_normal((m_i, n))
     b_eq = a_eq @ d0
     slack = 0.05 + 0.5 * np.abs(rng.standard_normal(m_i))
-    if tight and m_i:
-        slack[0] = 0.0
+    slack[: int(tight)] = 0.0
     b_ineq = a_ineq @ d0 + slack
 
     lb = x + d0 - (0.5 + rng.random(n))

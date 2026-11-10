@@ -69,6 +69,7 @@ def nnls(
     f: Float[Array, " m"],
     max_iter: int | None = None,
     tol: float | None = None,
+    dep_tol: float = 0.0,
 ) -> NNLSResult:
     """Solve ``min ‖E x - f‖₂`` subject to ``x ≥ 0``.
 
@@ -82,6 +83,16 @@ def nnls(
     positive) it is skipped until the iterate next moves, as in the original
     algorithm. Passive-set membership is tracked in a mask, never inferred
     from ``x == 0``.
+
+    With ``dep_tol > 0`` a candidate column is also tested for linear
+    dependence on the passive columns before it enters (Kraft's SLSQP does
+    the same): if its relative distance ``‖e_j - E_P E_P⁺ e_j‖ / ‖e_j‖`` from
+    the span of the passive columns is at most ``dep_tol`` it is frozen
+    instead of added, and counts as one step. Frozen indices are released
+    like the ones frozen by the skipping rule above, i.e. when the iterate
+    next moves. Admitting a column that is dependent up to rounding makes
+    the passive least-squares solve explode on degenerate polytopes (see
+    :func:`ldp`). The test costs one least-squares solve per addition.
 
     Parameters
     ----------
@@ -103,6 +114,10 @@ def nnls(
         with a negative dual, whose least-squares coefficient is not
         positive, which exercises the skipping rule (used by the tests).
         ``None`` selects ``10 · eps · ‖E‖_F · max(m, k)``.
+    dep_tol
+        Relative linear-dependence threshold described above. The default
+        ``0.0`` disables the test (plain Lawson–Hanson). Never applied when
+        the passive set is empty.
 
     Returns
     -------
@@ -165,10 +180,26 @@ def nnls(
         j = jnp.argmax(w_masked).astype(jnp.int32)
         optimal = w_masked[j] <= tol_arr  # also true when no candidate is left
         stop = optimal | (n_iter >= max_iter_arr)
-        passive = jnp.where(stop, passive, passive.at[j].set(True))
-        new_idx = jnp.where(stop, jnp.int32(-1), j)
+        if dep_tol > 0.0:
+            # Relative distance of the candidate from span(E_P); a column
+            # that is dependent up to ``dep_tol`` is frozen, not added.
+            e_p = jnp.where(passive[None, :], e, 0.0)
+            col = e[:, j]
+            coef = jnp.linalg.lstsq(e_p, col)[0]
+            dist = jnp.linalg.norm(col - e_p @ coef)
+            dependent = (
+                (dist <= dep_tol * jnp.linalg.norm(col)) & ~stop & jnp.any(passive)
+            )
+        else:
+            dependent = jnp.zeros((), bool)
+        add = ~stop & ~dependent
+        passive = jnp.where(add, passive.at[j].set(True), passive)
+        frozen = jnp.where(dependent, frozen.at[j].set(True), frozen)
+        new_idx = jnp.where(add, j, jnp.int32(-1))
         n_iter = n_iter + jnp.where(stop, 0, 1).astype(jnp.int32)
-        return x, passive, frozen, new_idx, n_iter, stop, stop, optimal
+        # A frozen column leaves the iterate unchanged: go straight back to
+        # the next addition (the state is "feasible").
+        return x, passive, frozen, new_idx, n_iter, stop | dependent, stop, optimal
 
     def solve_step(state):
         x, passive, frozen, new_idx, n_iter, _, _, _ = state
@@ -292,6 +323,8 @@ def ldp(
     max_iter: int | None = None,
     tol: float | None = None,
     ldp_tol: float | None = None,
+    dep_tol: float | None = None,
+    check_tol: float | None = None,
 ) -> LDPResult:
     """Least-distance problem ``min ‖x‖₂  s.t.  g x ≥ h`` by NNLS.
 
@@ -321,11 +354,26 @@ def ldp(
     not normalise themselves, and ``tol`` and ``ldp_tol`` apply to the
     normalised problem. Non-finite checks use the original data.
 
+    **Degenerate polytopes.** If the feasible set has an empty interior (some
+    ``c ≥ 0`` with ``gᵀc = 0`` and ``hᵀc = 0``: e.g. a singleton vertex where
+    more constraints are active than there are free dimensions) the NNLS
+    columns ``E`` are dependent up to rounding. Plain NNLS then admits such a
+    column, its passive solve explodes, and ``ldp`` reports a false
+    ``infeasible`` or, worse, a garbage ``x`` as ``feasible``. Two guards
+    address this. ``dep_tol`` is passed to :func:`nnls` (a candidate column
+    within relative distance ``dep_tol`` of the passive span is frozen, as in
+    Kraft's SLSQP; the frozen constraint is implied by the passive ones up to
+    ``dep_tol``). After forming the solution ``y`` of the normalised problem
+    (``ĝ y ≥ ĥ/s``) its primal violation ``max(ĥ/s - ĝ y, 0)_∞`` is
+    checked: above ``check_tol · max(1, ‖y‖)`` the status is ``infeasible``,
+    so that ``feasible`` never comes with violated constraints.
+
     Status codes, in order of precedence: ``nonfinite`` when ``g``, ``h``,
     the NNLS residual or the solution contain a non-finite value (NNLS runs
     to its budget on such data); ``infeasible`` when ``‖r‖ ≤ ldp_tol``
     (also if NNLS ran out of budget: ``u ≥ 0`` with ``gᵀu ≈ 0``,
-    ``hᵀu ≈ 1`` already certifies infeasibility); ``max_iter_reached`` when
+    ``hᵀu ≈ 1`` already certifies infeasibility) or when the primal check
+    above fails; ``max_iter_reached`` when
     NNLS did not converge; else ``feasible``. ``feasible`` always means that
     ``x`` and ``multipliers`` were formed; otherwise both are zero. Zero
     constraints (``k == 0``) are handled by a static branch: ``x = 0``,
@@ -350,6 +398,13 @@ def ldp(
         ``10 · eps · max(n + 1, k) · (‖E‖_F ‖u‖ + 1)``: data that is
         infeasible by less than that is reported feasible, with a (very)
         large ``x``.
+    dep_tol
+        Linear-dependence threshold of the NNLS (see :func:`nnls`); ``None``
+        selects ``√eps`` of the working dtype, ``0.0`` disables the test.
+    check_tol
+        Tolerance of the primal feasibility check of the solution, relative
+        to ``max(1, ‖y‖)`` in the normalised units (see above); ``None``
+        selects ``100 · √eps``, ``inf`` disables the check.
 
     Returns
     -------
@@ -399,10 +454,12 @@ def ldp(
 
     e = jnp.concatenate([g_n.T, h_n[None, :]], axis=0)  # (n + 1, k)
     f = jnp.zeros((n + 1,), dtype).at[n].set(1.0)
-    res = nnls(e, f, max_iter=max_iter, tol=tol)
+    eps = float(jnp.finfo(dtype).eps)
+    dep_tol = eps**0.5 if dep_tol is None else dep_tol
+    check_tol = 100.0 * eps**0.5 if check_tol is None else check_tol
+    res = nnls(e, f, max_iter=max_iter, tol=tol, dep_tol=dep_tol)
     u, r = res.x, res.residual
 
-    eps = float(jnp.finfo(dtype).eps)
     if ldp_tol is None:
         infeasible_tol = (
             10.0 * eps * max(n + 1, k) * (jnp.linalg.norm(e) * jnp.linalg.norm(u) + 1.0)
@@ -425,6 +482,16 @@ def ldp(
     denom = jnp.where(usable, jnp.maximum(rho, jnp.finfo(dtype).tiny), 1.0)
     x = jnp.where(usable, r[:n] / denom, 0.0)
     multipliers = jnp.where(usable, u / denom, 0.0)
+    # Primal check in the normalised units: a "feasible" answer must never
+    # violate the constraints (garbage x from a near-singular passive solve
+    # on a degenerate polytope). Frozen dependent columns only violate at the
+    # ``dep_tol`` level, far below ``check_tol``.
+    violation = jnp.max(jnp.maximum(h_n - g_n @ x, 0.0))
+    violated = usable & (violation > check_tol * jnp.maximum(1.0, jnp.linalg.norm(x)))
+    infeasible = infeasible | violated
+    usable = usable & ~violated
+    x = jnp.where(violated, 0.0, x)
+    multipliers = jnp.where(violated, 0.0, multipliers)
     # Undo the normalisation (before the finiteness check, so an overflow of
     # the rescaled solution is reported as ``nonfinite``).
     x = h_scale * x

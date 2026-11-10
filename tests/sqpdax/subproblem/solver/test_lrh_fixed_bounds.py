@@ -420,3 +420,195 @@ class TestMemoryBudget:
         offenders = [s for s in shapes if sum(1 for d in s if d >= n) >= 2]
         assert not offenders, offenders
         assert max(int(np.prod(s)) for s in shapes) <= n * max(m_c, 4) + n
+
+
+# ---------------------------------------------------------------------------
+# Degenerate feasible sets (empty interior): C11b.
+#
+# At an SQP vertex the active rows can outnumber the free dimensions, or two
+# rows can be opposite, so the polytope of the reduced LDP is a single point or
+# a flat set. NNLS then sees dependent columns, which plain Lawson-Hanson
+# turns into a false ``infeasible`` or into a garbage step reported
+# ``feasible``. A row supported only on pinned variables is a zero column of
+# the reduced system (rounding noise instead of an exact zero).
+# ---------------------------------------------------------------------------
+
+
+def with_rows(qp: RandomQP, a_eq, b_eq, a_ineq, b_ineq) -> RandomQP:
+    """Replace the general constraint rows of ``qp`` (NumPy and Lagrangian)."""
+    ev = qp.lagrangian.evaluated
+    ev = eqx.tree_at(
+        lambda e: (e.eq_fn_val, e.eq_fn_jac_val, e.ineq_fn_val, e.ineq_fn_jac_val),
+        ev,
+        (
+            jnp.asarray(-b_eq),
+            jnp.asarray(a_eq),
+            jnp.asarray(-b_ineq),
+            jnp.asarray(a_ineq),
+        ),
+    )
+    lag = eqx.tree_at(
+        lambda lg: (lg.evaluated, lg.dual.eq_multipliers, lg.dual.ineq_multipliers),
+        qp.lagrangian,
+        (ev, jnp.zeros(len(b_eq)), jnp.zeros(len(b_ineq))),
+    )
+    return qp._replace(
+        lagrangian=lag, a_eq=a_eq, b_eq=b_eq, a_ineq=a_ineq, b_ineq=b_ineq
+    )
+
+
+def with_stiff_model(qp: RandomQP, factor: float) -> RandomQP:
+    """Scale the Cholesky factor of the model: curvature ``factor²`` in ``Z``.
+
+    ``dense_b`` is rebuilt from the factors (reference only, tiny ``n``).
+    """
+    fac = qp.factors
+    rank = int(fac.rank)
+    chol = np.asarray(fac.cholesky) * factor
+    fac = eqx.tree_at(lambda f: f.cholesky, fac, jnp.asarray(chol))
+    z = np.asarray(fac.basis)[:, :rank]
+    r = chol[:rank, :rank]
+    sigma = float(fac.sigma)
+    n = qp.x.shape[0]
+    dense_b = sigma * np.eye(n) + z @ (r.T @ r - sigma * np.eye(rank)) @ z.T
+    return qp._replace(factors=fac, dense_b=dense_b)
+
+
+def _mask(n: int, idx) -> np.ndarray:
+    mask = np.zeros(n, dtype=bool)
+    mask[idx] = True
+    return mask
+
+
+def _scenario_row_on_pinned_variable(seed: int, scale: float):
+    """One inequality supported only on a pinned variable, others general."""
+    n = 6
+    upper = _mask(n, [0])
+    qp = make_random_lrh_qp(n, 2, 0, 3, seed=seed, upper=upper)
+    a_in, b_in = qp.a_ineq.copy(), qp.b_ineq.copy()
+    a_in[0] = 0.0
+    a_in[0, 0] = scale
+    b_in[0] = scale * qp.d0[0]  # active at the pinned step
+    qp = with_rows(qp, qp.a_eq, qp.b_eq, a_in, b_in)
+    return qp, _mask(n, []), upper, None
+
+
+def _scenario_all_rows_on_pinned_variables(seed: int, scale: float):
+    """Every inequality is supported only on pinned variables (zero columns)."""
+    n = 6
+    rng = np.random.default_rng(seed)
+    upper = _mask(n, [0, 1])
+    qp = make_random_lrh_qp(n, 2, 0, 2, seed=seed, upper=upper)
+    a_in = np.zeros((2, n))
+    a_in[:, :2] = rng.standard_normal((2, 2)) * scale
+    qp = with_rows(qp, np.zeros((0, n)), np.zeros(0), a_in, a_in @ qp.d0)
+    return qp, _mask(n, []), upper, None
+
+
+def _scenario_two_opposite_inequalities(seed: int, scale: float):
+    """3 free variables, 2 equalities, 2 opposite inequalities: singleton set."""
+    n = 6
+    rng = np.random.default_rng(seed)
+    lower = _mask(n, [0, 1, 2])
+    qp = make_random_lrh_qp(n, 2, 2, 1, seed=seed, lower=lower)
+    a_e = qp.a_eq * scale
+    free = ~lower
+    v = np.linalg.svd(a_e[:, free])[2][2]  # null direction of the free equalities
+    a_i = np.zeros((2, n))
+    a_i[:, free] = np.stack([v, -v]) * rng.uniform(0.5, 2, (2, 1)) + (
+        rng.standard_normal((2, 2)) @ a_e[:, free]
+    )
+    a_i[:, lower] = rng.standard_normal((2, 3))
+    a_i *= scale
+    return with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0), lower, _mask(n, []), "d0"
+
+
+def _scenario_vertex_in_a_null_space(seed: int, scale: float):
+    """1 equality, 3 inequalities positively spanning the 2-D null space."""
+    n = 6
+    rng = np.random.default_rng(seed)
+    lower = _mask(n, [0, 1, 2])
+    qp = make_random_lrh_qp(n, 2, 1, 1, seed=seed, lower=lower)
+    a_e = qp.a_eq[:1] * scale
+    free = ~lower
+    null = np.linalg.svd(a_e[:, free])[2][1:].T  # 3 x 2
+    dirs = rng.standard_normal((3, 2))
+    dirs[2] = -(rng.uniform(0.5, 2, 2) @ dirs[:2])  # positively spanning
+    a_i = np.zeros((3, n))
+    a_i[:, free] = dirs @ null.T + rng.standard_normal((3, 1)) @ a_e[:, free]
+    a_i[:, lower] = rng.standard_normal((3, 3))
+    a_i *= scale
+    return with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0), lower, _mask(n, []), "d0"
+
+
+DEGENERATE_SCENARIOS = {
+    "row-on-pinned-variable": _scenario_row_on_pinned_variable,
+    "all-rows-on-pinned-variables": _scenario_all_rows_on_pinned_variables,
+    "two-opposite-inequalities": _scenario_two_opposite_inequalities,
+    "vertex-in-null-space": _scenario_vertex_in_a_null_space,
+}
+
+
+class TestDegenerateFeasibleSets:
+    @pytest.mark.parametrize("curvature", [1.0, 1e6], ids=["soft", "stiff"])
+    @pytest.mark.parametrize("seed", range(10))
+    @pytest.mark.parametrize("name", list(DEGENERATE_SCENARIOS))
+    def test_step_matches_reference(self, name, seed, curvature):
+        """``feasible`` and the exact step, whatever the row scale or model.
+
+        The singleton scenarios have ``d0`` as their only feasible step; for
+        the others the dense KKT enumeration gives the reference.
+        """
+        scale = 10 ** np.random.default_rng(100 + seed).uniform(-2, 4)
+        qp, lower, upper, expected = DEGENERATE_SCENARIOS[name](seed, scale)
+        qp = with_stiff_model(qp, np.sqrt(curvature))
+        case = Case(qp, lower, upper)
+        d_ref = qp.d0 if expected == "d0" else dense_reference(qp, lower, upper)[0]
+        res = run(case)
+        assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        np.testing.assert_allclose(
+            np.asarray(res.step), d_ref, rtol=1e-7, atol=1e-7 * np.linalg.norm(d_ref)
+        )
+        assert float(res.feasibility_residual) <= 1e-8 * max(1.0, scale)
+
+    @pytest.mark.parametrize("curvature", [1.0, 1e6], ids=["soft", "stiff"])
+    @pytest.mark.parametrize("seed", range(12))
+    @pytest.mark.parametrize("m_e", [0, 1])
+    @pytest.mark.parametrize("tight", [2, 3, 4])
+    @pytest.mark.parametrize("n_free", [2, 3])
+    def test_several_tight_inequalities(self, n_free, tight, m_e, seed, curvature):
+        """Several inequalities active at ``d0`` in a small free subspace.
+
+        With ``tight > n_free`` the active rows can positively span the free
+        subspace, leaving ``d0`` as the only feasible step.
+        """
+        n = 8
+        lower = _mask(n, list(range(n_free, n)))  # the first n_free variables are free
+        qp = make_random_lrh_qp(
+            n, 3, m_e, tight + 1, seed=seed, tight=tight, lower=lower
+        )
+        qp = with_stiff_model(qp, np.sqrt(curvature))
+        res = run(Case(qp, lower, _mask(n, [])))
+        assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        # Convex QP: a KKT point is the solution (the enumeration reference
+        # cannot pick non-negative multipliers of a degenerate vertex).
+        d = np.asarray(res.step)
+        dual = res.dual
+        lam_e, lam_i = (
+            np.asarray(dual.eq_multipliers),
+            np.asarray(dual.ineq_multipliers),
+        )
+        terms = [
+            np.linalg.norm(qp.dense_b, 2) * d,  # rounding scale of B d
+            qp.g,
+            qp.a_eq.T @ lam_e,
+            qp.a_ineq.T @ lam_i,
+            np.asarray(dual.lb_multipliers),
+        ]
+        scale = sum(np.linalg.norm(t) for t in terms)
+        assert np.linalg.norm(stationarity_residual(qp, res)) <= 1e-8 * scale
+        np.testing.assert_allclose(qp.a_eq @ d - qp.b_eq, 0.0, atol=1e-8)
+        slack = qp.b_ineq - qp.a_ineq @ d
+        assert np.all(slack >= -1e-8)
+        assert np.all(lam_i >= -1e-10 * scale)
+        assert np.all(np.abs(lam_i * slack) <= 1e-8 * scale)
