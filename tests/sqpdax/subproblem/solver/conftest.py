@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Callable, NamedTuple
+
 import equinox as eqx
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from jax import Array
 
 from slsqp_jax.sqpdax.active_set import ActiveSet
+from slsqp_jax.sqpdax.dual import Dual
+from slsqp_jax.sqpdax.lagrangian.evaluated import EvaluatedLagrangian
 from slsqp_jax.sqpdax.primal import Primal
-from slsqp_jax.sqpdax.problem.basic import Problem
+from slsqp_jax.sqpdax.problem.basic import EvaluatedProblem, Problem
+from slsqp_jax.sqpdax.secant import ReducedHessianFactors
 from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import (
     ACTIVE_SET_QP_RESULTS,
@@ -229,3 +236,156 @@ def make_trust_region_state(
 def unbounded_box(n: int = 2) -> tuple[Array, Array]:
     """Componentwise ``(-inf, +inf)`` bounds of length ``n``."""
     return jnp.full(n, -jnp.inf), jnp.full(n, jnp.inf)
+
+
+class RandomQP(NamedTuple):
+    """Random convex QP of the SQP step with an LRH model (see :func:`make_random_lrh_qp`).
+
+    The QP is ``min gᵀd + ½dᵀBd  s.t.  A_E d = b_E, A_I d ≤ b_I, lb ≤ x + d ≤ ub``
+    with the dense NumPy arrays below (tiny ``n``, reference use only) and the
+    same data packaged as an ``EvaluatedLagrangian`` plus the LRH factors.
+    ``d0`` satisfies every general constraint and has ``x + d0`` on the
+    ``lower`` / ``upper`` bounds.
+    """
+
+    lagrangian: EvaluatedLagrangian
+    factors: ReducedHessianFactors
+    dense_b: np.ndarray
+    g: np.ndarray
+    a_eq: np.ndarray
+    b_eq: np.ndarray
+    a_ineq: np.ndarray
+    b_ineq: np.ndarray
+    lb: np.ndarray
+    ub: np.ndarray
+    x: np.ndarray
+    d0: np.ndarray
+    lower: np.ndarray
+    upper: np.ndarray
+
+
+def make_random_lrh_qp(
+    n: int,
+    rank: int,
+    m_e: int,
+    m_i: int,
+    *,
+    seed: int = 0,
+    memory: int = 4,
+    dup: bool = False,
+    tight: bool = False,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
+    infinite: np.ndarray | None = None,
+) -> RandomQP:
+    """Random feasible convex QP with LRH factors, bounds, equalities, inequalities.
+
+    ``B = σ I + Z (RᵀR - σ I) Zᵀ`` has an orthonormal ``Z`` (``rank`` columns
+    out of ``memory``, the rest zero) and garbage in the padded block of ``R``.
+    A point ``d0`` is feasible for the general constraints by construction;
+    every inequality has a positive slack at ``d0`` except, when ``tight`` is
+    set, the first one (active at ``d0``). Several inequalities active at
+    ``d0`` would make the feasible set of a small free subspace degenerate
+    (empty interior), which a least-distance solver cannot tell from an
+    infeasible one, hence only one. The bounds are
+    ``x + d0`` on the ``lower`` (resp. ``upper``) coordinates, so that pinning
+    exactly those faces keeps the QP feasible; elsewhere they are a random
+    distance away, or infinite on the ``infinite`` coordinates. ``dup`` makes
+    the last equality row a copy of the first.
+    """
+    rng = np.random.default_rng(1000 * seed + 100 * n + 10 * m_e + m_i + rank)
+    false = np.zeros(n, dtype=bool)
+    lower = false if lower is None else np.asarray(lower, dtype=bool)
+    upper = false if upper is None else np.asarray(upper, dtype=bool)
+    infinite = false if infinite is None else np.asarray(infinite, dtype=bool)
+
+    q, _ = np.linalg.qr(rng.standard_normal((n, memory)))
+    basis = np.zeros((n, memory))
+    basis[:, :rank] = q[:, :rank]
+    chol = np.triu(rng.standard_normal((memory, memory)), 1)
+    chol[np.arange(memory), np.arange(memory)] = rng.uniform(0.5, 2.0, memory)
+    sigma = float(rng.uniform(0.5, 2.0))
+    r_act = chol[:rank, :rank]
+    dense_b = (
+        sigma * np.eye(n)
+        + basis[:, :rank] @ (r_act.T @ r_act - sigma * np.eye(rank)) @ basis[:, :rank].T
+    )
+    chol_padded = chol.copy()
+    chol_padded[rank:, :] = 7.5  # garbage: the factors ignore the padded block
+    chol_padded[:, rank:] = 7.5
+    factors = ReducedHessianFactors(
+        basis=jnp.asarray(basis),
+        cholesky=jnp.asarray(np.triu(chol_padded)),
+        sigma=jnp.asarray(sigma),
+        rank=jnp.asarray(rank, dtype=jnp.int32),
+    )
+
+    x = rng.standard_normal(n)
+    d0 = rng.standard_normal(n)
+    g = rng.standard_normal(n)
+    a_eq = rng.standard_normal((m_e, n))
+    if dup and m_e > 1:
+        a_eq[m_e - 1] = a_eq[0]
+    a_ineq = rng.standard_normal((m_i, n))
+    b_eq = a_eq @ d0
+    slack = 0.05 + 0.5 * np.abs(rng.standard_normal(m_i))
+    if tight and m_i:
+        slack[0] = 0.0
+    b_ineq = a_ineq @ d0 + slack
+
+    lb = x + d0 - (0.5 + rng.random(n))
+    ub = x + d0 + (0.5 + rng.random(n))
+    lb[lower] = (x + d0)[lower]
+    ub[upper] = (x + d0)[upper]
+    lb[infinite & ~lower] = -np.inf
+    ub[infinite & ~upper] = np.inf
+
+    evaluated = EvaluatedProblem(
+        ref=Primal(x=jnp.asarray(x)),
+        fn_val=jnp.zeros(()),
+        grad_val=jnp.asarray(g),
+        fn_qvp=None,
+        eq_fn_val=jnp.asarray(-b_eq),
+        eq_fn_jac_val=jnp.asarray(a_eq),
+        eq_fn_qvp=None,
+        ineq_fn_val=jnp.asarray(-b_ineq),
+        ineq_fn_jac_val=jnp.asarray(a_ineq),
+        ineq_fn_qvp=None,
+        lb=jnp.asarray(lb),
+        ub=jnp.asarray(ub),
+        null_lb=jnp.asarray(~np.isfinite(lb)),
+        null_ub=jnp.asarray(~np.isfinite(ub)),
+        aux_val=None,
+    )
+    lagrangian = EvaluatedLagrangian(
+        evaluated=evaluated,
+        secant=None,
+        dual=Dual(
+            eq_multipliers=jnp.zeros((m_e,)),
+            ineq_multipliers=jnp.zeros((m_i,)),
+            lb_multipliers=jnp.zeros((n,)),
+            ub_multipliers=jnp.zeros((n,)),
+        ),
+    )
+    return RandomQP(
+        lagrangian=lagrangian,
+        factors=factors,
+        dense_b=dense_b,
+        g=g,
+        a_eq=a_eq,
+        b_eq=b_eq,
+        a_ineq=a_ineq,
+        b_ineq=b_ineq,
+        lb=lb,
+        ub=ub,
+        x=x,
+        d0=d0,
+        lower=lower,
+        upper=upper,
+    )
+
+
+@pytest.fixture
+def random_lrh_qp() -> Callable[..., RandomQP]:
+    """Factory of random convex LRH QPs (:func:`make_random_lrh_qp`)."""
+    return make_random_lrh_qp
