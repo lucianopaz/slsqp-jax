@@ -35,6 +35,13 @@ The reduction follows the SLSQP chain, with direct linear algebra:
    such rows are zeroed, and their right-hand side is clamped to ``≥ 0``
    unless it is a genuine violation;
 4. the multipliers follow by back-substitution.
+
+:func:`elastic_least_distance_lsei` solves the same problem relaxed by one extra
+scalar ``δ ∈ [0, 1]`` (Kraft's elastic mode, plan §2.5): it appends ``δ`` as
+one more coordinate of ``w`` and two more general inequality rows, and calls
+:func:`least_distance_lsei` unchanged, so that function is not affected. Its
+weight ``ρ_e`` must be on the scale of ``‖w‖²`` (``w`` is accurate relative
+to ``‖(w, √ρ_e δ)‖``): :func:`elastic_weight_scale` gives that scale.
 """
 
 from __future__ import annotations
@@ -45,7 +52,14 @@ from jaxtyping import Array, Bool, Float, Int
 
 from .lawson_hanson import LDP_RESULTS, ldp
 
-__all__ = ["LSEIResult", "least_distance_lsei"]
+__all__ = [
+    "ElasticLSEIResult",
+    "LSEIResult",
+    "elastic_delta_column",
+    "elastic_least_distance_lsei",
+    "elastic_weight_scale",
+    "least_distance_lsei",
+]
 
 
 class LSEIResult(eqx.Module):
@@ -375,4 +389,307 @@ def least_distance_lsei(
         cert_eq=jnp.where(has_cert, cert_e / cert_div, 0.0),
         cert_ineq=jnp.where(has_cert, cert_i / cert_div, 0.0),
         has_certificate=has_cert,
+    )
+
+
+class ElasticLSEIResult(eqx.Module):
+    """Solution of the elastic (relaxed) least-distance problem.
+
+    Attributes
+    ----------
+    w
+        The ``w`` part of the minimiser, shape ``(n,)``. Zero unless
+        ``status`` is ``feasible``.
+    delta
+        The relaxation ``δ ∈ [0, 1]`` (scalar; zero unless ``status`` is
+        ``feasible``). ``δ = 0`` means the plain problem is solved.
+    lam_eq
+        Multipliers of the ``m_E`` general equalities, shape ``(m_E,)``. The
+        extra variable and its two rows never enter this vector.
+    lam_ineq
+        Multipliers of the ``m_I`` general inequalities, shape ``(m_I,)``,
+        ``≥ 0``. Does not contain the multipliers of ``δ``'s own rows.
+    lam_delta
+        Multipliers of ``δ ≥ 0`` and ``δ ≤ 1``, shape ``(2,)``, ``≥ 0``
+        (``[lower, upper]``).
+    status
+        :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.LDP_RESULTS` code of
+        the augmented problem (see
+        :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`).
+    n_iter
+        Number of NNLS steps (``int32`` scalar).
+    cert_eq, cert_ineq, cert_delta
+        Farkas certificate of the augmented problem split into the general
+        equalities, the general inequalities and the two rows of ``δ``
+        (shape ``(2,)``, ``≥ 0``), scaled to unit sup-norm. See
+        ``has_certificate``.
+    has_certificate
+        As in :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`: the stacked
+        ``y = [cert_eq; cert_ineq; cert_delta]`` has ``y_I ≥ 0``,
+        ``G_augᵀ y ≈ 0`` and ``h_augᵀ y < 0``. With ``w = 0, δ = 1`` the
+        relaxed rows hold, so the augmented problem can be infeasible only
+        when that point is excluded, e.g. by pinned variables in the caller's
+        reduction (or when no row is relaxed).
+    """
+
+    w: Float[Array, " n"]
+    delta: Float[Array, ""]
+    lam_eq: Float[Array, " m_eq"]
+    lam_ineq: Float[Array, " m_ineq"]
+    lam_delta: Float[Array, " 2"]
+    status: LDP_RESULTS
+    n_iter: Int[Array, ""]
+    cert_eq: Float[Array, " m_eq"]
+    cert_ineq: Float[Array, " m_ineq"]
+    cert_delta: Float[Array, " 2"]
+    has_certificate: Bool[Array, ""]
+
+
+def elastic_delta_column(b: Float[Array, " m"], m_eq: int) -> Float[Array, " m"]:
+    """Column of ``δ`` for the relaxation of ``A d = b_E``, ``A_I d ≤ b_I``.
+
+    Kraft's relaxation (plan §2.5) is ``A_E d + δ b_E = b_E`` and
+    ``A_I,j d + δ b_I,j ≤ b_I,j`` for the inequality rows violated at
+    ``d = 0`` (``b_I,j < 0``); the other rows are not relaxed. This returns
+    the coefficients of ``δ``: ``b_E`` for the equalities, ``b_I,j`` where it
+    is negative and ``0`` elsewhere. ``b`` is the **unshifted** right-hand
+    side, so the column does not depend on the bound working set.
+
+    Parameters
+    ----------
+    b
+        Unshifted right-hand side, shape ``(m,)``, ordered ``[E, I]``.
+    m_eq
+        Number of equalities (static ``int``).
+
+    Returns
+    -------
+    Array
+        Shape ``(m,)``, to be passed as ``delta_col`` of
+        :func:`elastic_least_distance_lsei`.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import elastic_delta_column
+    >>> elastic_delta_column(jnp.array([2.0, -1.0, 3.0]), m_eq=1).tolist()
+    [2.0, -1.0, 0.0]
+    """
+    b = jnp.asarray(b, dtype=jnp.result_type(b, jnp.float32))
+    return jnp.concatenate([b[:m_eq], jnp.where(b[m_eq:] < 0.0, b[m_eq:], 0.0)])
+
+
+def elastic_weight_scale(
+    g_t: Float[Array, "n m"],
+    h: Float[Array, " m"],
+    delta_col: Float[Array, " m"],
+    m_eq: int,
+) -> Float[Array, ""]:
+    """Scale ``τ²`` of the elastic weight, ``ρ_e = elastic_weight · τ²``.
+
+    :func:`elastic_least_distance_lsei` solves one least-distance problem in
+    ``(w, √ρ_e δ)``, so ``w`` is accurate only relative to
+    ``‖(w, √ρ_e δ)‖``: ``ρ_e`` must have the units of ``‖w‖²``. ``τ`` is the
+    largest distance, in the coordinates of ``w``, that the relaxation has to
+    cover. Over the rows with ``‖G_j‖ > 0`` (``G_j`` is column ``j`` of
+    ``g_t``) it is the maximum of
+
+    * ``|h_j| / ‖G_j‖`` for the equalities,
+    * ``max(-h_j, 0) / ‖G_j‖`` for the inequalities (slack rows are left out
+      on purpose: one far slack row would inflate ``ρ_e`` and spoil the
+      accuracy),
+    * ``|c_j| / ‖G_j‖`` for all rows (``c = delta_col``),
+
+    and ``τ = 1`` when that maximum is zero (the problem is then homogeneous
+    and any ``ρ_e > 0`` gives the same solution). Scaling ``w`` by ``κ``
+    scales ``τ²`` by ``κ²``; rescaling constraint rows leaves it unchanged.
+
+    The cost is ``O(n m)``; the function is jit-able with ``m_eq`` static.
+    Non-finite inputs give a ``nan`` result. For the fixed-bounds QP compute
+    it once from the unpinned data and use the same ``ρ_e`` for every
+    working set.
+
+    Parameters
+    ----------
+    g_t, h
+        As in :func:`least_distance_lsei`.
+    delta_col
+        Column of ``δ``, as in :func:`elastic_least_distance_lsei`.
+    m_eq
+        Number of equalities (static ``int``).
+
+    Returns
+    -------
+    Array
+        The scalar ``τ²``, in the dtype of the inputs (at least ``float32``).
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import elastic_weight_scale
+    >>> g_t = jnp.array([[2.0, 1.0]])  # one equality, one violated inequality
+    >>> float(elastic_weight_scale(g_t, jnp.array([4.0, -3.0]), jnp.zeros(2), 1))
+    9.0
+    """
+    dtype = jnp.result_type(g_t, h, delta_col, jnp.float32)
+    g_t = jnp.asarray(g_t, dtype=dtype)
+    h = jnp.asarray(h, dtype=dtype)
+    delta_col = jnp.asarray(delta_col, dtype=dtype)
+    m = g_t.shape[1]
+    if h.shape != (m,) or delta_col.shape != (m,):
+        raise ValueError(
+            f"h and delta_col must have shape ({m},), got {h.shape} and "
+            f"{delta_col.shape}"
+        )
+    if not 0 <= m_eq <= m:
+        raise ValueError(f"m_eq must lie in [0, {m}], got {m_eq}")
+    norm = jnp.linalg.norm(g_t, axis=0)
+    live = norm > 0.0
+    h_term = jnp.concatenate([jnp.abs(h[:m_eq]), jnp.maximum(-h[m_eq:], 0.0)])
+    dist = jnp.maximum(h_term, jnp.abs(delta_col)) / jnp.where(live, norm, 1.0)
+    tau = jnp.max(jnp.where(live, dist, 0.0), initial=0.0)
+    tau = jnp.where(tau > 0.0, tau, 1.0)
+    finite = jnp.all(jnp.isfinite(g_t)) & jnp.all(jnp.isfinite(h))
+    finite &= jnp.all(jnp.isfinite(delta_col))
+    return jnp.where(finite, tau * tau, jnp.nan)
+
+
+def elastic_least_distance_lsei(
+    g_t: Float[Array, "n m"],
+    h: Float[Array, " m"],
+    m_eq: int,
+    delta_col: Float[Array, " m"],
+    elastic_weight: float | Float[Array, ""],
+    eq_tol: float,
+    max_iter: int | None = None,
+    tol: float | None = None,
+    ldp_tol: float | None = None,
+    rank_tol: float | None = None,
+) -> ElasticLSEIResult:
+    """Solve the relaxed problem ``min ½‖w‖² + ½ρ_e δ²``.
+
+    The constraints are the general rows of
+    :func:`least_distance_lsei`, relaxed by one extra scalar,
+
+    ``G_E w + δ c_E = h_E``,  ``G_I w + δ c_I ≤ h_I``,  ``0 ≤ δ ≤ 1``,
+
+    where ``c = delta_col`` is the column of ``δ`` (zero for rows that are
+    not relaxed; see :func:`elastic_delta_column`) and ``ρ_e =
+    elastic_weight``. It is the problem of plan §2.5 in the coordinates of
+    ``w``. For the fixed-bounds QP with ``w = C_F d_F + C_F⁻ᵀ g̃``, ``G =
+    A_F C_F⁻¹`` and ``h = b̃ + A_F B_FF⁻¹ g̃``, the relaxation
+    ``A_F d_F + δ b = b̃`` has ``c = b``, the *unshifted* right-hand side
+    (only ``h`` carries ``d_fix``). The column is **not** transformed by
+    ``C_F``: the coordinate of ``δ`` is not part of the model, its own factor
+    is ``√ρ_e`` and it has no linear term.
+
+    **Reduction.** ``δ`` becomes the extra coordinate ``w_δ = √ρ_e δ`` and
+    the ``n × m`` matrix is extended to ``(n + 1) × (m + 2)``: row ``n`` of
+    the old columns holds ``c_j / √ρ_e``, and two new inequality columns
+    ``∓e_n / √ρ_e`` (right-hand sides ``0`` and ``1``) encode ``δ ≥ 0`` and
+    ``δ ≤ 1``. These two are *general* rows (columns of ``Gᵀ``), not bounds.
+    The result is passed to :func:`least_distance_lsei` unchanged, which is
+    therefore bit-identical to before when this function is not used. The
+    stationarity condition of the elastic problem is
+    ``w + Gᵀλ = 0`` and ``ρ_e δ + cᵀλ - μ_lo + μ_hi = 0``. Multipliers are
+    those of the original problem (the extra rows' multipliers are returned
+    separately as ``lam_delta``).
+
+    **Weight.** The reduction solves one least-distance problem in
+    ``(w, √ρ_e δ)``, so ``w`` is accurate only relative to
+    ``‖(w, √ρ_e δ)‖``: ``ρ_e`` must be on the scale of ``‖w‖²``. Use
+    ``ρ_e = elastic_weight · elastic_weight_scale(g_t, h, delta_col, m_eq)``
+    with a dimensionless ``elastic_weight`` (about ``1e3``). A fixed ``ρ_e``
+    returns wrong ``feasible`` answers when the data are very small or large.
+
+    **When it is used.** The elastic problem is feasible whenever ``w = 0,
+    δ = 1`` meets the relaxed rows. Callers enter it only after the plain
+    problem is infeasible. On a *feasible* plain problem ``δ`` is not
+    necessarily zero: ``δ > 0`` as soon as a relaxed row is active with a
+    non-zero multiplier (first-order gain ``-cᵀλ``), but it is ``O(1/ρ_e)``;
+    with no active relaxed row the solution is exactly the plain one and
+    ``δ = 0``.
+
+    Parameters
+    ----------
+    g_t, h, m_eq, eq_tol, max_iter, tol, ldp_tol, rank_tol
+        As in :func:`least_distance_lsei`.
+    delta_col
+        Coefficients of ``δ`` in the rows, shape ``(m,)``, ordered ``[E, I]``.
+    elastic_weight
+        ``ρ_e > 0``, the weight of ``½δ²`` relative to ``½‖w‖²``. May be a
+        traced scalar; it is not validated.
+
+    Returns
+    -------
+    ElasticLSEIResult
+        ``w`` (``n`` entries), ``delta ∈ [0, 1]``, the multipliers of the
+        general rows and, separately, those of ``δ``'s rows, the status and
+        the certificate. Unless the status is ``feasible`` the outputs are
+        zero, as for :func:`least_distance_lsei`.
+
+    Examples
+    --------
+    ``w ≤ -1`` and ``-w ≤ 0.9`` are contradictory with a margin of
+    ``0.1``: relaxing the violated row (``c = b``) needs ``δ ≥ 0.1``.
+
+    >>> import jax.numpy as jnp
+    >>> from slsqp_jax.sqpdax.linalg import (
+    ...     LDP_RESULTS,
+    ...     elastic_delta_column,
+    ...     elastic_least_distance_lsei,
+    ...     elastic_weight_scale,
+    ... )
+    >>> g_t = jnp.array([[1.0, -1.0]])
+    >>> h = jnp.array([-1.0, 0.9])
+    >>> c = elastic_delta_column(h, 0)
+    >>> rho = 1e3 * elastic_weight_scale(g_t, h, c, 0)
+    >>> res = elastic_least_distance_lsei(g_t, h, 0, c, rho, eq_tol=1e-8)
+    >>> bool(res.status == LDP_RESULTS.feasible), round(float(res.delta), 6)
+    (True, 0.1)
+    """
+    dtype = jnp.result_type(g_t, h, delta_col, jnp.float32)
+    g_t = jnp.asarray(g_t, dtype=dtype)
+    h = jnp.asarray(h, dtype=dtype)
+    delta_col = jnp.asarray(delta_col, dtype=dtype)
+    n, m = g_t.shape
+    if delta_col.shape != (m,):
+        raise ValueError(f"delta_col must have shape ({m},), got {delta_col.shape}")
+    if h.shape != (m,):
+        raise ValueError(f"h must have shape ({m},), got {h.shape}")
+    if not 0 <= m_eq <= m:
+        raise ValueError(f"m_eq must lie in [0, {m}], got {m_eq}")
+    root = jnp.sqrt(jnp.asarray(elastic_weight, dtype=dtype))
+
+    # (n + 1) x (m + 2): the last row is the coordinate w_δ = √ρ_e δ; the new
+    # columns (general inequality rows) are  -w_δ/√ρ_e ≤ 0  and  w_δ/√ρ_e ≤ 1.
+    delta_row = jnp.concatenate([delta_col, jnp.array([-1.0, 1.0], dtype)]) / root
+    g_aug = jnp.concatenate([g_t, jnp.zeros((n, 2), dtype)], axis=1)
+    g_aug = jnp.concatenate([g_aug, delta_row[None, :]], axis=0)
+    h_aug = jnp.concatenate([h, jnp.array([0.0, 1.0], dtype)])
+    res = least_distance_lsei(
+        g_aug,
+        h_aug,
+        m_eq,
+        eq_tol,
+        max_iter=max_iter,
+        tol=tol,
+        ldp_tol=ldp_tol,
+        rank_tol=rank_tol,
+    )
+    m_i = m - m_eq
+    ok = res.status == LDP_RESULTS.feasible
+    delta = jnp.where(ok, jnp.clip(res.w[n] / root, 0.0, 1.0), 0.0)
+    return ElasticLSEIResult(  # ty: ignore[invalid-return-type]
+        w=res.w[:n],
+        delta=delta,
+        lam_eq=res.lam_eq,
+        lam_ineq=res.lam_ineq[:m_i],
+        lam_delta=res.lam_ineq[m_i:],
+        status=res.status,
+        n_iter=res.n_iter,
+        cert_eq=res.cert_eq,
+        cert_ineq=res.cert_ineq[:m_i],
+        cert_delta=res.cert_ineq[m_i:],
+        has_certificate=res.has_certificate,
     )

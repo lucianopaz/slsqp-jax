@@ -47,7 +47,9 @@ solver classes, so that every solver reuses one implementation:
 * :mod:`~slsqp_jax.sqpdax.linalg.lsei` — the least-distance problem with
   equality and inequality constraints, reduced to an LDP on the constraint
   count (:func:`~slsqp_jax.sqpdax.linalg.lsei.least_distance_lsei`,
-  :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`).
+  :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`) and its elastic
+  (relaxed, always-feasible) variant
+  (:func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_least_distance_lsei`).
 """
 
 from . import (
@@ -64,7 +66,14 @@ from . import (
 from .box import box_fraction, box_ray_length
 from .free_set_factor import FreeSetFactor
 from .lawson_hanson import LDP_RESULTS, LDPResult, NNLSResult, ldp, nnls
-from .lsei import LSEIResult, least_distance_lsei
+from .lsei import (
+    ElasticLSEIResult,
+    LSEIResult,
+    elastic_delta_column,
+    elastic_least_distance_lsei,
+    elastic_weight_scale,
+    least_distance_lsei,
+)
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
 from .reduced_hessian import (
@@ -106,7 +115,11 @@ __all__ = [
     "LDP_RESULTS",
     "LDPResult",
     "ldp",
+    "ElasticLSEIResult",
     "LSEIResult",
+    "elastic_delta_column",
+    "elastic_least_distance_lsei",
+    "elastic_weight_scale",
     "least_distance_lsei",
     "bfgs_factor_update",
     "drop_oldest_basis_vector",

@@ -16,7 +16,11 @@ import pytest
 
 from slsqp_jax.sqpdax.linalg import (
     LDP_RESULTS,
+    ElasticLSEIResult,
     LSEIResult,
+    elastic_delta_column,
+    elastic_least_distance_lsei,
+    elastic_weight_scale,
     least_distance_lsei,
 )
 
@@ -837,3 +841,580 @@ def test_certificate_jit_matches_eager(make, expected):
     np.testing.assert_allclose(
         np.asarray(jitted.cert_ineq), np.asarray(eager.cert_ineq), atol=1e-10
     )
+
+
+# --- elastic mode ------------------------------------------------------------
+#
+# The relaxed problem is ``min ½‖w‖² + ½ρδ²`` s.t. ``G_E w + δ c_E = h_E``,
+# ``G_I w + δ c_I ≤ h_I``, ``0 ≤ δ ≤ 1``. In these tests ``c`` is
+# ``elastic_delta_column(h, m_eq)``: ``h`` plays the role of the unshifted
+# right-hand side of a QP with ``B = I``, ``g = 0`` and no pinned variable, so
+# ``w = d`` and the problem is exactly the elastic QP of the plan (§2.5).
+
+ELASTIC_RHOS = [1.0, 1e3]
+
+
+def run_elastic(g_t, h, m_eq, rho, delta_col=None, eq_tol=EQ_TOL, **kwargs):
+    g_t, h = jnp.asarray(g_t), jnp.asarray(h)
+    if delta_col is None:
+        delta_col = elastic_delta_column(h, m_eq)
+    return elastic_least_distance_lsei(
+        g_t, h, m_eq, jnp.asarray(delta_col), rho, eq_tol, **kwargs
+    )
+
+
+def assert_elastic_kkt(
+    res: ElasticLSEIResult, g_t, h, c, m_eq, rho, tol=1e-8, shape_check=True
+):
+    """KKT of the augmented problem in the original variables ``(w, δ)``.
+
+    Stationarity ``w + Gᵀλ = 0`` and ``ρδ + cᵀλ - μ_lo + μ_hi = 0``,
+    primal feasibility of the relaxed rows and of ``0 ≤ δ ≤ 1``, ``λ_I, μ ≥ 0``
+    and complementarity. The multiplier vectors of the general rows have
+    exactly ``m_E`` / ``m_I`` entries: ``δ``'s rows are reported apart.
+    """
+    g_t, h, c = np.asarray(g_t), np.asarray(h), np.asarray(c)
+    n, m = g_t.shape
+    w, delta = np.asarray(res.w), float(res.delta)
+    lam = np.concatenate([np.asarray(res.lam_eq), np.asarray(res.lam_ineq)])
+    mu_lo, mu_hi = np.asarray(res.lam_delta)
+    if shape_check:
+        assert w.shape == (n,)
+        assert res.lam_eq.shape == (m_eq,) and res.lam_ineq.shape == (m - m_eq,)
+        assert res.lam_delta.shape == (2,)
+    row_norm = np.sqrt(np.sum(g_t**2, axis=0) + c**2 / rho)
+    row_norm = np.where(row_norm > 0, row_norm, 1.0)
+    scale = np.linalg.norm(w) + rho * delta + np.max(np.abs(h) / row_norm, initial=0.0)
+    scale_lam = np.sum(row_norm * np.abs(lam)) + mu_lo + mu_hi
+    assert 0.0 <= delta <= 1.0
+    resid = g_t.T @ w + delta * c - h
+    assert np.linalg.norm(w + g_t @ lam) <= tol * (scale + scale_lam) + 1e-300
+    assert abs(rho * delta + c @ lam - mu_lo + mu_hi) <= tol * (scale + scale_lam)
+    assert np.all(np.abs(resid[:m_eq]) / row_norm[:m_eq] <= tol * scale + 1e-300)
+    assert np.all(resid[m_eq:] / row_norm[m_eq:] <= tol * scale + 1e-300)
+    lam_i = lam[m_eq:]
+    assert np.all(row_norm[m_eq:] * lam_i >= -tol * scale)
+    assert mu_lo >= -tol * scale and mu_hi >= -tol * scale
+    assert np.all(np.abs(lam_i * resid[m_eq:]) <= tol * scale * scale_lam + 1e-300)
+    assert abs(mu_lo * delta) <= tol * scale * scale_lam + 1e-300
+    assert abs(mu_hi * (delta - 1.0)) <= tol * scale * scale_lam + 1e-300
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("rho", ELASTIC_RHOS)
+@pytest.mark.parametrize("n", [4, 10])
+@pytest.mark.parametrize("m_e", [0, 2])
+@pytest.mark.parametrize(
+    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+)
+def test_elastic_solves_infeasible_problems(make, expected, m_e, n, rho, seed):
+    """Every plain-infeasible system has a finite relaxed solution with
+    ``0 < δ ≤ 1`` that satisfies the relaxed rows and the KKT conditions of
+    the augmented problem; the extra variable never enters ``w`` or the
+    general multipliers, and there is no certificate."""
+    g_t, h, m_eq = make(n, m_e, seed)
+    plain = run(g_t, h, m_eq)
+    assert bool(plain.status == expected)
+    res = run_elastic(g_t, h, m_eq, rho)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert np.all(np.isfinite(np.asarray(res.w)))
+    assert 1e-8 < float(res.delta) <= 1.0
+    assert not bool(res.has_certificate)
+    c = np.asarray(elastic_delta_column(jnp.asarray(h), m_eq))
+    assert_elastic_kkt(res, g_t, h, c, m_eq, rho)
+    # the relaxed system is met strictly better than the plain one at w = 0
+    # (δ = 1, w = 0 is always feasible): the objective cannot exceed it.
+    assert float(res.delta) <= 1.0 and (
+        0.5 * float(res.w @ res.w) + 0.5 * rho * float(res.delta) ** 2
+        <= 0.5 * rho + 1e-9
+    )
+
+
+def _relax_nothing(lam_ineq):
+    return np.zeros_like(lam_ineq)
+
+
+def _relax_inactive(lam_ineq):
+    return (lam_ineq == 0.0).astype(float)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("relax", [_relax_nothing, _relax_inactive])
+@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("n", DIMS)
+def test_elastic_leaves_consistent_problems_unchanged(n, m_e, m_i, dup, relax, seed):
+    """With no active relaxed row the elastic problem is the plain one:
+    ``δ = 0`` and the same ``w`` and multipliers (relaxing only inequality
+    rows that are inactive at the plain solution, or none)."""
+    g_t, h = make_problem(n, m_e, m_i, dup, seed)
+    plain = run(g_t, h, m_e)
+    c = np.zeros_like(h)
+    c[m_e:] = -relax(np.asarray(plain.lam_ineq))  # relaxes slack rows
+    res = run_elastic(g_t, h, m_e, 10.0, delta_col=c)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert float(res.delta) <= 1e-12
+    np.testing.assert_allclose(np.asarray(res.w), np.asarray(plain.w), atol=1e-9)
+    np.testing.assert_allclose(
+        np.asarray(res.lam_eq), np.asarray(plain.lam_eq), atol=1e-8
+    )
+    np.testing.assert_allclose(
+        np.asarray(res.lam_ineq), np.asarray(plain.lam_ineq), atol=1e-8
+    )
+    assert_elastic_kkt(res, g_t, h, c, m_e, 10.0)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("rho", [1e2, 1e4, 1e10])
+@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("n", DIMS)
+def test_elastic_on_consistent_problems_is_a_small_perturbation(
+    n, m_e, m_i, dup, rho, seed
+):
+    """When a relaxed row is active the first-order gain makes ``δ`` positive
+    on a consistent problem, but ``δ ≤ max(0, -cᵀλ)/ρ`` (convexity of the value in
+    ``δ``, at the plain multipliers), the relaxed objective is no worse than the plain
+    one, and ``w`` approaches the plain solution as ``ρ`` grows."""
+    g_t, h = make_problem(n, m_e, m_i, dup, seed)
+    plain = run(g_t, h, m_e)
+    c = np.asarray(elastic_delta_column(jnp.asarray(h), m_e))
+    lam = np.concatenate([np.asarray(plain.lam_eq), np.asarray(plain.lam_ineq)])
+    res = run_elastic(g_t, h, m_e, rho)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    delta = float(res.delta)
+    gain = max(0.0, -float(c @ lam))
+    assert delta <= gain / rho * (1.0 + 1e-6) + 1e-12
+    w, w0 = np.asarray(res.w), np.asarray(plain.w)
+    assert 0.5 * w @ w + 0.5 * rho * delta**2 <= 0.5 * w0 @ w0 * (1 + 1e-9) + 1e-12
+    assert_elastic_kkt(res, g_t, h, c, m_e, rho)
+    if rho >= 1e10:
+        assert np.linalg.norm(w - w0) <= 1e-3 * max(1.0, np.linalg.norm(w0))
+
+
+@pytest.mark.parametrize("global_factor", [1e-4, 1.0, 1e4])
+@pytest.mark.parametrize("decades", [0.0, 3.0, 6.0])
+@pytest.mark.parametrize("seed", [0])
+@pytest.mark.parametrize("n", [4, 10])
+@pytest.mark.parametrize(
+    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+)
+def test_elastic_is_invariant_to_row_scaling(
+    make, expected, n, seed, decades, global_factor
+):
+    """Rescaling the rows of ``(Gᵀ, h)`` together (so the feasible set and
+    the relaxation are unchanged) leaves ``w`` and ``δ`` unchanged over many
+    decades: the equilibration of the LSEI reduction also covers the extra
+    column."""
+    g_t, h, m_eq = make(n, 2, seed)
+    rng = np.random.default_rng(seed)
+    row = global_factor * 10.0 ** rng.uniform(-decades, decades, size=g_t.shape[1])
+    ref = run_elastic(g_t, h, m_eq, 10.0)
+    res = run_elastic(g_t * row[None, :], h * row, m_eq, 10.0)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(float(res.delta), float(ref.delta), atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(res.w), np.asarray(ref.w), atol=1e-6 * (1 + np.linalg.norm(ref.w))
+    )
+    c = np.asarray(elastic_delta_column(jnp.asarray(h * row), m_eq))
+    assert_elastic_kkt(res, g_t * row[None, :], h * row, c, m_eq, 10.0, tol=1e-7)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("n", [4, 10])
+@pytest.mark.parametrize("m_e", [0, 2])
+@pytest.mark.parametrize(
+    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+)
+def test_elastic_without_relaxed_rows_keeps_the_plain_certificate(
+    make, expected, m_e, n, seed
+):
+    """With ``c = 0`` the elastic problem is infeasible exactly as the plain
+    one; the certificate then covers ``[E, I, δ rows]``: ``y_I, y_δ ≥ 0``,
+    ``Gᵀy_gen = 0``, the ``δ`` coordinate ``cᵀy_gen - y_lo + y_hi = 0``,
+    ``hᵀy_gen + y_hi < 0``, ``‖y‖_∞ = 1``, zero outputs."""
+    g_t, h, m_eq = make(n, m_e, seed)
+    res = run_elastic(g_t, h, m_eq, 10.0, delta_col=np.zeros_like(h))
+    assert bool(res.status == expected)
+    assert bool(res.has_certificate)
+    y_gen = np.concatenate([np.asarray(res.cert_eq), np.asarray(res.cert_ineq)])
+    y_lo, y_hi = np.asarray(res.cert_delta)
+    y_i = np.asarray(res.cert_ineq)
+    assert y_gen.shape == (g_t.shape[1],) and res.cert_delta.shape == (2,)
+    assert np.all(y_i >= 0.0) and y_lo >= 0.0 and y_hi >= 0.0
+    np.testing.assert_allclose(max(np.max(np.abs(y_gen)), y_lo, y_hi), 1.0, rtol=1e-12)
+    assert np.linalg.norm(g_t @ y_gen) <= 1e-8 * np.linalg.norm(g_t)
+    assert abs(-y_lo + y_hi) <= 1e-8
+    assert h @ y_gen + y_hi < -1e-6 * (np.abs(h) @ np.abs(y_gen) + y_hi)
+    np.testing.assert_array_equal(np.asarray(res.w), 0.0)
+    assert float(res.delta) == 0.0
+    np.testing.assert_array_equal(np.asarray(res.lam_eq), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.lam_ineq), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.lam_delta), 0.0)
+
+
+@pytest.mark.parametrize(
+    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+)
+def test_elastic_jit_matches_eager(make, expected):
+    """jit-able with ``m_eq`` and ``eq_tol`` static and a traced ``ρ``."""
+    g_t, h, m_eq = make(6, 2, 0)
+    c = elastic_delta_column(jnp.asarray(h), m_eq)
+    eager = run_elastic(g_t, h, m_eq, 5.0)
+    jitted = jax.jit(elastic_least_distance_lsei, static_argnums=(2, 5))(
+        jnp.asarray(g_t), jnp.asarray(h), m_eq, c, jnp.asarray(5.0), EQ_TOL
+    )
+    assert bool(jitted.status == eager.status == LDP_RESULTS.feasible)
+    for name in ["w", "delta", "lam_eq", "lam_ineq", "lam_delta"]:
+        np.testing.assert_allclose(
+            np.asarray(getattr(jitted, name)),
+            np.asarray(getattr(eager, name)),
+            atol=1e-10,
+        )
+
+
+@pytest.mark.parametrize(
+    "g_t, h, m_eq, kwargs, expected",
+    [
+        (*make_problem(5, 2, 3, False, seed=0), 2, {}, LDP_RESULTS.feasible),
+        (np.eye(6), -np.ones(6), 0, {"max_iter": 0}, LDP_RESULTS.max_iter_reached),
+        (
+            np.where(
+                np.arange(5)[:, None] == 0, np.nan, make_problem(5, 2, 3, False, 0)[0]
+            ),
+            make_problem(5, 2, 3, False, seed=0)[1],
+            2,
+            {},
+            LDP_RESULTS.nonfinite,
+        ),
+    ],
+    ids=["feasible", "budget", "nonfinite"],
+)
+def test_elastic_statuses_zero_outputs_and_shapes(g_t, h, m_eq, kwargs, expected):
+    """Statuses are those of the augmented LSEI; unless feasible every output
+    is zero; shapes are those of the general rows (the extra variable and its
+    two rows are reported separately)."""
+    n, m = g_t.shape
+    res = run_elastic(g_t, h, m_eq, 10.0, **kwargs)
+    assert bool(res.status == expected)
+    assert res.w.shape == (n,) and res.delta.shape == ()
+    assert res.lam_eq.shape == (m_eq,) and res.lam_ineq.shape == (m - m_eq,)
+    assert res.lam_delta.shape == (2,)
+    assert res.cert_eq.shape == (m_eq,) and res.cert_ineq.shape == (m - m_eq,)
+    assert res.cert_delta.shape == (2,)
+    if expected != LDP_RESULTS.feasible:
+        for name in ["w", "delta", "lam_eq", "lam_ineq", "lam_delta"]:
+            np.testing.assert_array_equal(np.asarray(getattr(res, name)), 0.0)
+
+
+@pytest.mark.parametrize("n, m_e, m_i", [(1, 0, 0), (4, 0, 0), (3, 0, 2), (3, 2, 0)])
+def test_elastic_zero_size_and_consistent_shapes(n, m_e, m_i):
+    """No general rows (or rows of only one kind) work; feasible at ``δ = 0``."""
+    m = m_e + m_i
+    g_t = np.ones((n, m))
+    h = -np.ones(m)
+    res = run_elastic(g_t, h, m_e, 10.0, delta_col=np.zeros(m))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert res.lam_eq.shape == (m_e,) and res.lam_ineq.shape == (m_i,)
+    assert float(res.delta) == 0.0
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+def test_elastic_dtype_follows_input(dtype):
+    g_t, h = make_problem(5, 2, 2, False, seed=0)
+    res = elastic_least_distance_lsei(
+        jnp.asarray(g_t, dtype),
+        jnp.asarray(h, dtype),
+        2,
+        elastic_delta_column(jnp.asarray(h, dtype), 2),
+        10.0,
+        1e-4,
+    )
+    for name in ["w", "delta", "lam_eq", "lam_ineq", "lam_delta"]:
+        assert getattr(res, name).dtype == dtype
+    assert bool(res.status == LDP_RESULTS.feasible)
+
+
+def test_elastic_invalid_arguments():
+    with pytest.raises(ValueError, match="h must have shape"):
+        elastic_least_distance_lsei(
+            jnp.ones((5, 3)), jnp.ones(2), 1, jnp.ones(3), 1.0, EQ_TOL
+        )
+    with pytest.raises(ValueError, match="delta_col"):
+        elastic_least_distance_lsei(
+            jnp.ones((5, 3)), jnp.ones(3), 1, jnp.ones(2), 1.0, EQ_TOL
+        )
+    with pytest.raises(ValueError, match="m_eq"):
+        elastic_least_distance_lsei(
+            jnp.ones((5, 3)), jnp.ones(3), 4, jnp.ones(3), 1.0, EQ_TOL
+        )
+
+
+@pytest.mark.parametrize("m_eq", [0, 1, 2])
+def test_elastic_delta_column(m_eq):
+    """``b`` on the equalities; ``b_I`` where negative, else ``0``."""
+    b = jnp.array([2.0, -1.0, 3.0, -0.5, 0.0])
+    expected = np.concatenate(
+        [np.asarray(b[:m_eq]), np.minimum(np.asarray(b[m_eq:]), 0.0)]
+    )
+    np.testing.assert_array_equal(np.asarray(elastic_delta_column(b, m_eq)), expected)
+
+
+# --- elastic weight scale and the weight rule (plan §2.5 rev 12) -------------
+
+
+def _tau2_reference(g_t, h, c, m_eq):
+    """Plain NumPy ``τ²`` (loop over rows), for the special cases below."""
+    best = 0.0
+    for j in range(g_t.shape[1]):
+        norm = np.linalg.norm(g_t[:, j])
+        if norm == 0.0:
+            continue
+        h_term = abs(h[j]) if j < m_eq else max(-h[j], 0.0)
+        best = max(best, max(h_term, abs(c[j])) / norm)
+    return (best if best > 0.0 else 1.0) ** 2
+
+
+def _scale_w(g_t, h, c, m_eq, kappa=3.0):
+    return g_t / kappa, h, c, m_eq  # w' = κ w
+
+
+def _scale_rows(g_t, h, c, m_eq):
+    row = 10.0 ** np.linspace(-4, 4, g_t.shape[1])
+    return g_t * row[None, :], h * row, c * row, m_eq
+
+
+def _add_slack_rows(g_t, h, c, m_eq):
+    """Far-away slack inequality rows (``h > 0``, not relaxed)."""
+    extra = np.ones((g_t.shape[0], 2))
+    return (
+        np.concatenate([g_t, extra], axis=1),
+        np.concatenate([h, [1e9, 1e12]]),
+        np.concatenate([c, [0.0, 0.0]]),
+        m_eq,
+    )
+
+
+@pytest.mark.parametrize(
+    "transform, factor",
+    [(_scale_w, 9.0), (_scale_rows, 1.0), (_add_slack_rows, 1.0)],
+    ids=["scale-w", "scale-rows", "slack-rows"],
+)
+@pytest.mark.parametrize("m_eq", [0, 2])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_elastic_weight_scale_invariances(transform, factor, m_eq, seed):
+    """Scaling ``w`` by κ multiplies ``τ²`` by κ², rescaling rows (``Gᵀ``, ``h``
+    and ``c`` together) leaves it unchanged, and slack inequality rows
+    do not change it."""
+    rng = np.random.default_rng(seed)
+    g_t = rng.standard_normal((5, 4))
+    h = rng.standard_normal(4)
+    h[m_eq:] = -np.abs(h[m_eq:])  # violated inequalities
+    c = elastic_delta_column(jnp.asarray(h), m_eq)
+    base = float(elastic_weight_scale(g_t, h, c, m_eq))
+    g2, h2, c2, m2 = transform(g_t, h, np.asarray(c), m_eq)
+    scaled = float(elastic_weight_scale(g2, h2, c2, m2))
+    np.testing.assert_allclose(base, _tau2_reference(g_t, h, np.asarray(c), m_eq))
+    np.testing.assert_allclose(scaled, factor * base, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "g_t, h, c, m_eq",
+    [
+        (np.eye(3), np.zeros(3), np.zeros(3), 1),  # homogeneous: τ = 1
+        (
+            np.array([[0.0, 1.0]]),
+            np.array([-100.0, -2.0]),
+            np.zeros(2),
+            0,
+        ),  # ‖G_0‖ = 0, violated
+        (
+            np.array([[2.0, 1.0]]),
+            np.array([-4.0, 3.0]),
+            np.zeros(2),
+            1,
+        ),  # |h_E|, slack I
+        (np.array([[2.0, 1.0]]), np.array([4.0, -3.0]), np.array([0.0, -9.0]), 1),
+        (np.array([[1.0, 1.0]]), np.array([1.0, -1.0]), np.array([5.0, 0.0]), 0),
+    ],
+    ids=[
+        "homogeneous",
+        "zero-column",
+        "eq-abs-slack-ineq",
+        "c-dominates",
+        "c-on-slack",
+    ],
+)
+def test_elastic_weight_scale_special_cases(g_t, h, c, m_eq):
+    """Homogeneous data give 1; zero columns and slack inequalities are left
+    out; ``|c_j|`` counts on every row."""
+    got = float(elastic_weight_scale(g_t, h, c, m_eq))
+    np.testing.assert_allclose(got, _tau2_reference(g_t, h, c, m_eq), rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda g_t, h, c: (g_t.at[0, 0].set(jnp.nan), h, c),
+        lambda g_t, h, c: (g_t, h.at[0].set(jnp.inf), c),
+        lambda g_t, h, c: (g_t, h, c.at[1].set(jnp.nan)),
+        lambda g_t, h, c: (g_t.at[:, 0].set(0.0), h.at[0].set(jnp.nan), c),
+    ],
+    ids=["nan-g", "inf-h", "nan-c", "nan-h-on-zero-column"],
+)
+def test_elastic_weight_scale_propagates_nonfinite_and_jits(corrupt):
+    g_t = jnp.arange(1.0, 7.0).reshape(3, 2)
+    h, c = jnp.array([1.0, -2.0]), jnp.array([0.5, 0.25])
+    assert np.isfinite(float(elastic_weight_scale(g_t, h, c, 1)))
+    bad = corrupt(g_t, h, c)
+    assert np.isnan(float(elastic_weight_scale(*bad, 1)))
+    jitted = jax.jit(elastic_weight_scale, static_argnums=(3,))
+    assert np.isnan(float(jitted(*bad, 1)))
+    np.testing.assert_allclose(
+        float(jitted(g_t, h, c, 1)), float(elastic_weight_scale(g_t, h, c, 1))
+    )
+
+
+def test_elastic_weight_scale_invalid_arguments():
+    with pytest.raises(ValueError, match="delta_col"):
+        elastic_weight_scale(jnp.ones((5, 3)), jnp.ones(3), jnp.ones(2), 1)
+    with pytest.raises(ValueError, match="m_eq"):
+        elastic_weight_scale(jnp.ones((5, 3)), jnp.ones(3), jnp.ones(3), 4)
+
+
+def sqp_elastic_problem(n, s, g_scale, delta_min, seed, with_equality=True):
+    """SQP-like elastic data with ``B = I``: ``G = A``, ``h = b + A g``.
+
+    Rows ``[E, I]``: (``with_equality``) an equality with ``b = 0``; the contradictory pair
+    ``a·d ≤ -s`` and ``-a·d ≤ s(1 - δ_min)`` (``δ`` must reach ``δ_min``);
+    two slack rows; one far slack row (distance ``1e6 s``). ``g`` has size
+    ``g_scale`` (independent of the data scale ``s``). Returns
+    ``(g_t, h, c, m_eq)``.
+    """
+    rng = np.random.default_rng(seed)
+    m_eq = int(with_equality)
+    a = rng.standard_normal(n)
+    a_mat = np.vstack(
+        [rng.standard_normal((m_eq, n)), a, -a, rng.standard_normal((3, n))]
+    )
+    b = s * np.concatenate(
+        [np.zeros(m_eq), [-1.0, 1.0 - delta_min, 0.5 + rng.random(), 0.7, 1e6]]
+    )
+    g = g_scale * rng.standard_normal(n)
+    c = np.asarray(elastic_delta_column(jnp.asarray(b), m_eq))
+    return a_mat.T.copy(), b + a_mat @ g, c, m_eq
+
+
+def relative_row_violation(g_t, h, c, m_eq, w, delta):
+    """Largest row-normalised violation of the relaxed rows, over ``‖w‖``."""
+    resid = (g_t.T @ w + delta * c - h) / np.linalg.norm(g_t, axis=0)
+    viol = np.maximum(resid, 0.0)
+    viol[:m_eq] = np.abs(resid[:m_eq])
+    return np.max(viol) / np.linalg.norm(w)
+
+
+# (data scale s, scale of g): g scaled with the data, g = 0, g = O(1).
+SCALE_AND_G = (
+    [(s, s) for s in [1e-8, 1e-4, 1.0, 1e4]]
+    + [(s, 0.0) for s in [1e-8, 1e-4, 1.0, 1e4]]
+    + [(s, 1.0) for s in [1e-4, 1.0, 1e4]]
+)
+
+
+# (δ_min, dimensionless weight). The quadratic penalty is exact only when
+# ``δ_min`` exceeds the unconstrained trade-off ``≈ 1/(1 + weight·c)``: with
+# weight 1e3 that holds for δ_min = 0.3, while δ_min = 1e-3 needs 1e5 (at 1e3
+# it settles up to 5e-4 above δ_min). A larger weight costs accuracy of ``w``.
+DELTA_AND_WEIGHT = [(0.3, 1e3), (1e-3, 1e5)]
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("delta_min, weight", DELTA_AND_WEIGHT)
+@pytest.mark.parametrize("s, g_scale", SCALE_AND_G)
+@pytest.mark.parametrize("with_equality", [False, True], ids=["no-eq", "eq"])
+def test_elastic_scale_battery_with_the_weight_rule(
+    with_equality, s, g_scale, delta_min, weight, seed
+):
+    """With ``ρ_e = weight · τ²`` the relaxation settles at ``δ_min`` and the
+    relaxed rows hold to ``1e-8 ‖w‖``, whatever the data scale (``1e-8`` to
+    ``1e4``), also for ``g = 0``, ``g = O(1)`` and with a far slack row (a
+    fixed ``ρ_e`` fails here)."""
+    g_t, h, c, m_eq = sqp_elastic_problem(8, s, g_scale, delta_min, seed, with_equality)
+    rho = weight * elastic_weight_scale(g_t, h, c, m_eq)
+    res = elastic_least_distance_lsei(g_t, h, m_eq, c, rho, EQ_TOL)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    assert abs(float(res.delta) - delta_min) <= 1e-8
+    w = np.asarray(res.w)
+    assert relative_row_violation(g_t, h, c, m_eq, w, float(res.delta)) <= 1e-8
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("delta_min", [1e-3, 0.1, 0.5])
+def test_elastic_interior_delta_approaches_delta_min(delta_min, seed):
+    """An infeasible problem with an interior ``0 < δ_min < 1`` and ``c ≠ h``
+    (``g ≠ 0``): ``δ ≥ δ_min`` always, and ``δ → δ_min`` (non-increasing error) as the
+    dimensionless weight grows; KKT holds at every weight (a small weight
+    over-relaxes, the quadratic penalty is not exact)."""
+    g_t, h, c, m_eq = sqp_elastic_problem(8, 1.0, 0.1, delta_min, seed)
+    tau2 = float(elastic_weight_scale(g_t, h, c, m_eq))
+    assert not np.allclose(c, h)
+    errors = []
+    for weight in [1e-2, 1.0, 1e5]:
+        res = elastic_least_distance_lsei(g_t, h, m_eq, c, weight * tau2, EQ_TOL)
+        assert bool(res.status == LDP_RESULTS.feasible)
+        assert_elastic_kkt(res, g_t, h, c, m_eq, weight * tau2)
+        errors.append(float(res.delta) - delta_min)
+    assert all(e >= -1e-9 for e in errors)
+    assert errors[0] >= errors[1] - 1e-9 and errors[1] >= errors[2] - 1e-9
+    assert errors[0] > 1e-2 and errors[2] <= 1e-8
+
+
+@pytest.mark.parametrize(
+    "g_t, h, c, rho, delta, w, lam, mu",
+    [
+        # δ ≥ 0 active: c·λ = 1 > 0, so relaxing the row would cost; δ = 0
+        # and μ_lo = cᵀλ.
+        ([[1.0], [0.0]], [-1.0], [1.0], 1e-3, 0.0, [-1.0, 0.0], [1.0], (1.0, 0.0)),
+        # δ ≤ 1 active: unconstrained δ* = 11/(1 + ρ) > 1.
+        ([[1.0]], [-11.0], [-1.0], 1.0, 1.0, [-10.0], [10.0], (0.0, 9.0)),
+    ],
+    ids=["mu-lo", "mu-hi"],
+)
+def test_elastic_multipliers_of_delta_rows(g_t, h, c, rho, delta, w, lam, mu):
+    """Exact values with ``μ_lo > 0`` and with ``μ_hi > 0`` (in that order)."""
+    g_t, h, c = (np.asarray(v, dtype=float) for v in (g_t, h, c))
+    res = elastic_least_distance_lsei(g_t, h, 0, c, rho, EQ_TOL)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(float(res.delta), delta, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(res.w), w, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(res.lam_delta), mu, atol=1e-8)
+    np.testing.assert_allclose(np.asarray(res.lam_ineq), lam, atol=1e-8)
+    assert_elastic_kkt(res, g_t, h, c, 0, rho)
+
+
+@pytest.mark.parametrize(
+    "sign, y_expected, delta_dual",
+    [(1.0, [-1.0, 1.0], (0.0, 1.0)), (-1.0, [1.0, 1.0], (1.0, 0.0))],
+    ids=["y_hi", "y_lo"],
+)
+@pytest.mark.parametrize("n", [4, 9])
+@pytest.mark.parametrize("rho", [1e-2, 1.0, 1e4])
+def test_elastic_certificate_with_delta_rows(sign, y_expected, delta_dual, n, rho):
+    """Certificates in which ``δ``'s rows participate: ``e·w + δ = 3 sign``
+    with ``sign · e·w ≤ 0`` forces ``δ ≥ 3`` (``y_hi``) or ``δ ≤ -3``
+    (``y_lo``). Entries, the stacked identities and zero outputs."""
+    e = np.zeros((n, 1))
+    e[0] = 1.0
+    g_t = np.concatenate([e, sign * e], axis=1)
+    h = np.array([3.0 * sign, 0.0])
+    c = np.array([1.0, 0.0])
+    res = elastic_least_distance_lsei(g_t, h, 1, c, rho, EQ_TOL)
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    assert bool(res.has_certificate)
+    y_gen = np.concatenate([np.asarray(res.cert_eq), np.asarray(res.cert_ineq)])
+    y_lo, y_hi = np.asarray(res.cert_delta)
+    np.testing.assert_allclose(y_gen, y_expected, atol=1e-8)
+    np.testing.assert_allclose((y_lo, y_hi), delta_dual, atol=1e-8)
+    assert np.linalg.norm(g_t @ y_gen) <= 1e-8
+    assert abs(c @ y_gen - y_lo + y_hi) <= 1e-8
+    assert h @ y_gen + y_hi < -1.0
+    np.testing.assert_array_equal(np.asarray(res.w), 0.0)
+    assert float(res.delta) == 0.0
