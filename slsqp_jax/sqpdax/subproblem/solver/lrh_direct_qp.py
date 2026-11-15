@@ -45,6 +45,20 @@ infeasible only means too many pins, never a failure. Pinned variables are
 batched (the iteration count does not grow with the number of active
 bounds); a safeguard keeps the most violated pin of the last addition through
 a degenerate step, which is what prevents batch additions from cycling.
+
+**Elastic mode** (Kraft's device for inconsistent linearisations; on by
+default). When the loop above ends with the QP *certified infeasible* or with
+an oracle failure that has no certificate, the whole loop is re-run on the
+relaxed QP ``A_E d + δ b_E = b_E``, ``A_I,j d + δ b_I,j ≤ b_I,j`` (rows with
+``b_I,j < 0``), ``0 ≤ δ ≤ 1``, objective ``+ ½ ρ_e δ²``
+(:func:`~slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds.solve_fixed_bounds_qp`
+with ``elastic_rho``). The relaxation is defined on the *unshifted* ``b``, so
+it is one fixed QP for every bound working set, and
+``ρ_e = elastic_weight · τ²`` is computed once from the unpinned data
+(:func:`~slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds.elastic_penalty`)
+and frozen. An infeasible pinned elastic LDP is a ray step like any other. A
+QP the plain loop solves never enters elastic mode: the result is then
+bit-identical to ``elastic=False``.
 """
 
 from __future__ import annotations
@@ -63,10 +77,11 @@ from ...dual import Dual
 from ...linalg.lawson_hanson import LDP_RESULTS
 from ...primal import Primal
 from ...secant.reduced_hessian import ReducedHessianSecant
+from ...types import Scalar
 from ..active_set import ActiveSetSubProblem
 from .active_set_loop import ACTIVE_SET_QP_RESULTS, ActiveSetQPSolverState
 from .base import KKT_SOLVER_RESULTS, RESULTS, SubProblemSolver
-from .lrh_fixed_bounds import solve_fixed_bounds_qp
+from .lrh_fixed_bounds import elastic_penalty, solve_fixed_bounds_qp
 
 __all__ = [
     "LRHQPSolverState",
@@ -116,6 +131,14 @@ class LRHQPSolverState(ActiveSetQPSolverState):
       "the direct reduction found no solution"; ``last_ldp_status`` carries
       the exact reason.
 
+    After an **elastic solve** (see :class:`LRHDirectQPSolver`) the same
+    fields describe the elastic bound loop: counters are cumulative over the
+    plain and the elastic loop, and ``success`` is true exactly when the
+    elastic loop converged, i.e. the multipliers are the KKT multipliers of the
+    *relaxed* QP (those of the general rows and bounds; the two rows of ``δ``
+    never appear). ``last_kkt_feasibility_residual`` measures the *unrelaxed*
+    constraints at the step, so it is about ``δ ‖b‖`` there.
+
     Attributes
     ----------
     n_nnls_iter
@@ -123,10 +146,19 @@ class LRHQPSolverState(ActiveSetQPSolverState):
     last_ldp_status
         :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.LDP_RESULTS` code of
         the last fixed-bounds solve of the most recent solve.
+    last_elastic_delta
+        The relaxation ``δ ∈ [0, 1]`` of the most recent solve: ``0`` when
+        elastic mode was not used, and also when it was used but the solve did
+        not return a step (the failure exits, like the dual).
+    n_elastic
+        Cumulative number of solves that entered elastic mode (``int32``),
+        whatever their outcome.
     """
 
     n_nnls_iter: Int[Array, ""]
     last_ldp_status: LDP_RESULTS
+    last_elastic_delta: Scalar
+    n_elastic: Int[Array, ""]
 
     @classmethod
     def cold(cls, n: int, meq: int, mineq: int, dtype: DTypeLike) -> LRHQPSolverState:
@@ -181,6 +213,8 @@ class LRHQPSolverState(ActiveSetQPSolverState):
             last_kkt_reason=KKT_SOLVER_RESULTS.converged,
             n_nnls_iter=zero,
             last_ldp_status=LDP_RESULTS.feasible,
+            last_elastic_delta=jnp.asarray(0.0, dtype),
+            n_elastic=zero,
         )
 
 
@@ -222,6 +256,38 @@ class LRHDirectQPSolver(
     | oracle failure, NNLS budget | ``kkt_solver_failure`` | ``max_steps_reached`` | ``False`` | zeros |
     | oracle failure, non-finite / no certificate | ``kkt_solver_failure`` | ``singular`` | ``False`` | zeros |
 
+    With ``elastic=True`` the rows "QP certified infeasible" and "oracle
+    failure" are the exits of the plain loop, which hands over to the elastic
+    loop (see below); the row finally reported is the one the elastic loop
+    takes. The other rows are unchanged.
+
+    **Elastic mode.** With ``elastic=True`` (default) and at least one general
+    constraint, a plain loop that ends *certified infeasible* or with an
+    *oracle failure* (the two failure rows above) is followed by the same
+    loop on the elastic QP of the module docstring (same start, warm trial
+    included; its own budget of ``max_iter`` oracle calls; the counters are
+    cumulative, ``n_elastic`` is incremented). The returned step is then the
+    step of the relaxed QP, inside the box, and ``last_elastic_delta`` is
+    ``δ``. The relaxed QP is always feasible when ``x`` lies in the box, so the
+    elastic loop converges in the generic case, and ``δ ≤ δ_min + O(1 /
+    elastic_weight)`` with ``δ_min`` the smallest feasible relaxation (the
+    default weight ``1e3`` gives ``δ_min ≤ δ ≤ δ_min + 2 / elastic_weight`` on
+    the SQP-like data of the tests). The step is a descent direction of the L1
+    merit whenever ``δ < 1`` and the merit penalty exceeds ``‖λ‖∞``.
+
+    **What ``success`` means after an elastic solve.** The exit table applies
+    to the elastic loop, so a converged elastic solve reports
+    ``qp_result = working_set_converged``, ``status = successful`` and
+    ``success = True``: the multipliers are a KKT estimate of the *relaxed*
+    QP (finite, ``λ_I ≥ 0`` and bound multipliers ``≥ 0``), which is what the
+    merit-penalty update needs (its descent bound uses ``‖λ‖∞``, plan §2.5).
+    The relaxed step does *not* satisfy the linearised constraints when
+    ``δ > 0``: consumers that read ``success`` as "the linearisation is
+    consistent" must also read ``last_elastic_delta`` (or ``n_elastic``). If
+    the elastic loop itself fails (budget, stall, certified infeasible, oracle
+    failure; e.g. ``x`` outside the box with no relaxed feasible point),
+    ``success`` is ``False`` and the exit is that loop's row of the table.
+
     A stall (a degenerate step with nothing to release) is impossible in exact
     arithmetic; it is reported instead of looped on, and ``n_anti_cycling``
     counts it. ``success == (qp_result == working_set_converged)`` always.
@@ -237,8 +303,10 @@ class LRHDirectQPSolver(
     further ``WARNING`` on a stall, and a ``"qp"`` diagnostic record with the
     keys of the active-set solver's record plus ``n_nnls_iter``,
     ``last_ldp_status``, ``warm_trial_accepted`` / ``warm_trial_rejected``,
-    ``n_ray_steps``, ``n_safeguard``, ``stalled`` and ``n_pinned``. Logging
-    never changes the returned values.
+    ``n_ray_steps``, ``n_safeguard``, ``stalled``, ``n_pinned``, ``elastic``
+    (elastic mode was entered in this solve), ``last_elastic_delta`` and
+    ``n_elastic``. An ``INFO`` line reports an elastic solve. Logging never
+    changes the returned values.
 
     Attributes
     ----------
@@ -257,6 +325,16 @@ class LRHDirectQPSolver(
     eq_tol
         Equality-consistency tolerance of the least-distance reduction
         (``None``: ``√eps``).
+    elastic
+        Enter elastic mode on a certified-infeasible or uncertified-failure
+        exit of the plain loop (default ``True``). ``False`` reproduces the
+        plain behaviour bit-identically (infeasible QPs are failures).
+    elastic_weight
+        Dimensionless weight of the elastic penalty, ``ρ_e = elastic_weight ·
+        τ²`` (default ``1e3``; see
+        :func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_weight_scale`). A larger
+        weight gives ``δ`` closer to ``δ_min`` at the price of accuracy
+        (``∝ √elastic_weight``).
     warm_start
         Seed the bound working set from ``initial_state.active_set`` (default
         ``False``: cold start, the state's working set is ignored). The warm
@@ -342,6 +420,8 @@ class LRHDirectQPSolver(
     rank_tol: float | None = eqx.field(static=True, default=None)
     eq_tol: float | None = eqx.field(static=True, default=None)
     warm_start: bool = eqx.field(static=True, default=False)
+    elastic: bool = eqx.field(static=True, default=True)
+    elastic_weight: float = eqx.field(static=True, default=1e3)
 
     def requires_secant(self) -> bool:
         """``True``: the model ``B`` comes from a reduced-Hessian secant."""
@@ -433,257 +513,319 @@ class LRHDirectQPSolver(
             ub_multipliers=zeros_n,
         )
         zero_i = jnp.asarray(0, jnp.int32)
+        zero_s = jnp.asarray(0.0, dtype)
+
         # Carry: working set (A_lb, A_ub), multipliers (mu_lb, mu_ub), pins added
         # by the last full step whose multiplier is still 0 (fresh_*), the most
         # violated one of them (p, p_ub; p = -1: none), the last full step and
         # its dual, the monitoring counters (ray steps, safeguard firings, warm
         # trial rejected; they never feed back into the loop), the last oracle
         # status, NNLS count, iteration count, outcome.
-        if self.warm_start:
-            aset = initial_state.active_set
-            warm_lb = jnp.asarray(aset.active_lb, bool) & jnp.isfinite(lo) & ~fixed
-            warm_ub = (
-                jnp.asarray(aset.active_ub, bool) & jnp.isfinite(hi) & ~warm_lb & ~fixed
-            )
-            start_lb, start_ub = fixed | warm_lb, warm_ub
-        else:
-            start_lb, start_ub = fixed, false_n
-        init = (
-            start_lb,
-            start_ub,
-            zeros_n,
-            zeros_n,
-            false_n,
-            false_n,
-            jnp.asarray(-1, jnp.int32),
-            jnp.asarray(False),
-            zeros_n,
-            dual_zero,
-            zero_i,
-            zero_i,
-            zero_i,
-            LDP_RESULTS.feasible,
-            zero_i,
-            zero_i,
-            jnp.asarray(_RUNNING, jnp.int32),
-        )
-
-        def cond_fn(carry):
-            return (carry[-1] == _RUNNING) & (carry[-2] < self.max_iter)
-
-        # Equivalent mutants (a mutation run need not chase them): (1) the
-        # partial step with ``dir = mu_hat`` instead of ``mu_hat - mu`` (every
-        # drop decision is invariant to a positive rescaling of ``mu``);
-        # (2) ``fresh`` not cleared after a positive step (``p = -1`` then, so
-        # the safeguard never reads it before the next batch resets it);
-        # (3) ``mu`` not clipped / zeroed off the working set (stale entries
-        # are never read, and a full step resets ``mu``).
-        def body_fn(carry):
-            (
-                a_lb,
-                a_ub,
-                mu_lb,
-                mu_ub,
-                fresh_lb,
-                fresh_ub,
-                p,
-                p_ub,
-                d_full,
-                dual_full,
-                n_ray,
-                n_safeguard,
-                n_reject,
-                _status,
-                n_nnls,
-                n_it,
-                _outcome,
-            ) = carry
-            res = solve_fixed_bounds_qp(
-                lag,
-                factors,
-                a_lb,
-                a_ub,
-                rank_tol=self.rank_tol,
-                eq_tol=self.eq_tol,
-                nnls_max_iter=self.nnls_max_iter,
-            )
-            ok = res.ldp_status == LDP_RESULTS.feasible
-            ray = ~ok & res.has_ray
-            d_hat = res.step.astype(dtype)
-            drop_lb = a_lb & ~fixed  # droppable pins
-            drop_ub = a_ub
-
-            # (F) the oracle solved P(A): negative droppable multipliers?
-            mh_lb = res.dual.lb_multipliers.astype(dtype)
-            mh_ub = res.dual.ub_multipliers.astype(dtype)
-            mu_scale = jnp.maximum(
-                1.0,
-                jnp.maximum(
-                    vmax(jnp.where(drop_lb, mh_lb, 0.0)),
-                    vmax(jnp.where(drop_ub, mh_ub, 0.0)),
-                ),
-            )
-            neg_f_lb = drop_lb & (mh_lb < -tau * mu_scale)
-            neg_f_ub = drop_ub & (mh_ub < -tau * mu_scale)
-            full = ok & ~jnp.any(neg_f_lb | neg_f_ub)
-            partial = ok & ~full
-
-            # Full step: violated bounds of d_hat (batch add).
-            free = ~a_lb & ~a_ub
-            viol_lb = jnp.where(free & jnp.isfinite(lo), lo - d_hat, -inf)
-            viol_ub = jnp.where(free & jnp.isfinite(hi), d_hat - hi, -inf)
-            v_lb = viol_lb > tau * jnp.maximum(1.0, jnp.abs(lo))
-            v_ub = (viol_ub > tau * jnp.maximum(1.0, jnp.abs(hi))) & ~v_lb
-            any_v = jnp.any(v_lb | v_ub)
-            converged = full & ~any_v
-            batch = full & any_v
-            max_lb = jnp.max(jnp.where(v_lb, viol_lb, -inf), initial=-jnp.inf)
-            max_ub = jnp.max(jnp.where(v_ub, viol_ub, -inf), initial=-jnp.inf)
-            p_ub_new = max_ub > max_lb
-            p_new = jnp.where(
-                p_ub_new,
-                jnp.argmax(jnp.where(v_ub, viol_ub, -inf)),
-                jnp.argmax(jnp.where(v_lb, viol_lb, -inf)),
-            ).astype(jnp.int32)
-
-            # (R) the pinned problem is infeasible: ray of the certificate.
-            r_lb = res.ray_lb.astype(dtype)
-            r_ub = res.ray_ub.astype(dtype)
-            r_scale = jnp.maximum(
-                vmax(jnp.where(drop_lb, r_lb, 0.0)), vmax(jnp.where(drop_ub, r_ub, 0.0))
-            )
-            neg_r_lb = drop_lb & (r_lb < -tau * r_scale)
-            neg_r_ub = drop_ub & (r_ub < -tau * r_scale)
-            infeasible = ray & ~jnp.any(neg_r_lb | neg_r_ub)
-            oracle_failure = ~ok & ~res.has_ray
-            ray_step = ray & ~infeasible
-
-            # Dual step (partial towards mu_hat, or along the ray).
-            step = partial | ray_step
-            dir_lb = jnp.where(ray, r_lb, mh_lb - mu_lb)
-            dir_ub = jnp.where(ray, r_ub, mh_ub - mu_ub)
-            neg_lb = jnp.where(ray, neg_r_lb, neg_f_lb) & step
-            neg_ub = jnp.where(ray, neg_r_ub, neg_f_ub) & step
-            safe_lb = jnp.where(neg_lb, -dir_lb, 1.0)
-            safe_ub = jnp.where(neg_ub, -dir_ub, 1.0)
-            ratio_lb = jnp.where(neg_lb, mu_lb / safe_lb, inf)
-            ratio_ub = jnp.where(neg_ub, mu_ub / safe_ub, inf)
-            t = jnp.minimum(
-                jnp.min(ratio_lb, initial=jnp.inf), jnp.min(ratio_ub, initial=jnp.inf)
-            )
-            blk_lb = neg_lb & (ratio_lb <= t * (1.0 + tau))
-            blk_ub = neg_ub & (ratio_ub <= t * (1.0 + tau))
-            positive = t > 0.0
-
-            # Degenerate step (t = 0): keep the most violated pin of the last
-            # addition; release the other fresh pins instead.
-            p_safe = jnp.maximum(p, 0)
-            p_in_blk = (p >= 0) & jnp.where(p_ub, blk_ub[p_safe], blk_lb[p_safe])
-            is_p = iota == p
-            deg_lb = fresh_lb & ~(is_p & ~p_ub)
-            deg_ub = fresh_ub & ~(is_p & p_ub)
-            use_deg = ~positive & p_in_blk
-            blk_lb = jnp.where(use_deg, deg_lb, blk_lb)
-            blk_ub = jnp.where(use_deg, deg_ub, blk_ub)
-            stalled = step & ~positive & ~jnp.any(blk_lb | blk_ub)
-            release = step & ~stalled
-
-            # Next working set and multipliers.
-            a_lb_next = jnp.where(
-                batch, a_lb | v_lb, jnp.where(release, a_lb & ~blk_lb, a_lb)
-            )
-            a_ub_next = jnp.where(
-                batch, a_ub | v_ub, jnp.where(release, a_ub & ~blk_ub, a_ub)
-            )
-            mu_lb_full = jnp.where(a_lb, mh_lb, 0.0)
-            mu_ub_full = jnp.where(a_ub, mh_ub, 0.0)
-            move = release & positive
-            mu_lb_step = jnp.where(a_lb, mu_lb + jnp.where(move, t, 0.0) * dir_lb, 0.0)
-            mu_ub_step = jnp.where(a_ub, mu_ub + jnp.where(move, t, 0.0) * dir_ub, 0.0)
-            mu_lb_new = jnp.where(full, mu_lb_full, jnp.where(step, mu_lb_step, mu_lb))
-            mu_ub_new = jnp.where(full, mu_ub_full, jnp.where(step, mu_ub_step, mu_ub))
-            mu_lb_next, mu_ub_next = clip_mu(mu_lb_new, mu_ub_new, a_lb_next, a_ub_next)
-
-            fresh_lb_next = (
-                jnp.where(batch, v_lb, jnp.where(move, False, fresh_lb)) & a_lb_next
-            )
-            fresh_ub_next = (
-                jnp.where(batch, v_ub, jnp.where(move, False, fresh_ub)) & a_ub_next
-            )
-            p_next = jnp.where(batch, p_new, jnp.where(move, -1, p)).astype(jnp.int32)
-            p_ub_next = jnp.where(batch, p_ub_new, p_ub)
-
-            d_full_next = jnp.where(full, d_hat, d_full)
-            dual_full_next = jax.tree.map(
-                lambda new, old: jnp.where(full, new.astype(dtype), old),
-                res.dual,
-                dual_full,
-            )
-            reject = jnp.asarray(False)
+        def run(elastic_rho):
+            """One bound working-set loop: on the plain QP, or on the elastic QP."""
             if self.warm_start:
-                # First iteration = warm trial: unless it is a dual-feasible
-                # full step, discard it and restart from the cold carry (the
-                # iteration and NNLS counts below still include the trial).
-                # Only the resets of ``A``, ``infeasible`` and
-                # ``oracle_failure`` are live. Equivalent mutants: the resets
-                # of ``mu`` (it is 0 throughout a rejected trial, so every
-                # ratio is 0 and nothing moves), ``fresh`` and ``p`` (still
-                # at their cold values, since only a batch or a positive step
-                # changes them), ``converged`` (``converged`` implies
-                # ``full``) and ``stalled`` (with ``p = -1`` a negative
-                # multiplier always has a blocker, so no stall).
-                reject = (n_it == 0) & ~full
-                a_lb_next = jnp.where(reject, fixed, a_lb_next)
-                a_ub_next = jnp.where(reject, false_n, a_ub_next)
-                mu_lb_next = jnp.where(reject, 0.0, mu_lb_next)
-                mu_ub_next = jnp.where(reject, 0.0, mu_ub_next)
-                fresh_lb_next = fresh_lb_next & ~reject
-                fresh_ub_next = fresh_ub_next & ~reject
-                p_next = jnp.where(reject, -1, p_next).astype(jnp.int32)
-                p_ub_next = p_ub_next & ~reject
-                converged = converged & ~reject
-                infeasible = infeasible & ~reject
-                oracle_failure = oracle_failure & ~reject
-                stalled = stalled & ~reject
-            # Monitoring counters (outside the numerics above).
-            n_ray_next = n_ray + (ray_step & ~stalled & ~reject).astype(jnp.int32)
-            n_safeguard_next = n_safeguard + (use_deg & ~stalled & ~reject).astype(
-                jnp.int32
-            )
-            n_reject_next = n_reject + reject.astype(jnp.int32)
-            outcome = jnp.where(
-                converged,
-                _CONVERGED,
-                jnp.where(
-                    infeasible,
-                    _INFEASIBLE,
-                    jnp.where(
-                        oracle_failure,
-                        _ORACLE_FAILURE,
-                        jnp.where(stalled, _STALLED, _RUNNING),
-                    ),
-                ),
-            ).astype(jnp.int32)
-            return (
-                a_lb_next,
-                a_ub_next,
-                mu_lb_next,
-                mu_ub_next,
-                fresh_lb_next,
-                fresh_ub_next,
-                p_next,
-                p_ub_next,
-                d_full_next,
-                dual_full_next,
-                n_ray_next,
-                n_safeguard_next,
-                n_reject_next,
-                res.ldp_status,
-                n_nnls + res.n_nnls_iter.astype(jnp.int32),
-                n_it + 1,
-                outcome,
+                aset = initial_state.active_set
+                warm_lb = jnp.asarray(aset.active_lb, bool) & jnp.isfinite(lo) & ~fixed
+                warm_ub = (
+                    jnp.asarray(aset.active_ub, bool)
+                    & jnp.isfinite(hi)
+                    & ~warm_lb
+                    & ~fixed
+                )
+                start_lb, start_ub = fixed | warm_lb, warm_ub
+            else:
+                start_lb, start_ub = fixed, false_n
+            init = (
+                start_lb,
+                start_ub,
+                zeros_n,
+                zeros_n,
+                false_n,
+                false_n,
+                jnp.asarray(-1, jnp.int32),
+                jnp.asarray(False),
+                zeros_n,
+                dual_zero,
+                zero_s,
+                zero_i,
+                zero_i,
+                zero_i,
+                LDP_RESULTS.feasible,
+                zero_i,
+                zero_i,
+                jnp.asarray(_RUNNING, jnp.int32),
             )
 
+            def cond_fn(carry):
+                return (carry[-1] == _RUNNING) & (carry[-2] < self.max_iter)
+
+            # Equivalent mutants (a mutation run need not chase them): (1) the
+            # partial step with ``dir = mu_hat`` instead of ``mu_hat - mu`` (every
+            # drop decision is invariant to a positive rescaling of ``mu``);
+            # (2) ``fresh`` not cleared after a positive step (``p = -1`` then, so
+            # the safeguard never reads it before the next batch resets it);
+            # (3) ``mu`` not clipped / zeroed off the working set (stale entries
+            # are never read, and a full step resets ``mu``).
+            def body_fn(carry):
+                (
+                    a_lb,
+                    a_ub,
+                    mu_lb,
+                    mu_ub,
+                    fresh_lb,
+                    fresh_ub,
+                    p,
+                    p_ub,
+                    d_full,
+                    dual_full,
+                    delta_full,
+                    n_ray,
+                    n_safeguard,
+                    n_reject,
+                    _status,
+                    n_nnls,
+                    n_it,
+                    _outcome,
+                ) = carry
+                res = solve_fixed_bounds_qp(
+                    lag,
+                    factors,
+                    a_lb,
+                    a_ub,
+                    rank_tol=self.rank_tol,
+                    eq_tol=self.eq_tol,
+                    nnls_max_iter=self.nnls_max_iter,
+                    elastic_rho=elastic_rho,
+                )
+                ok = res.ldp_status == LDP_RESULTS.feasible
+                ray = ~ok & res.has_ray
+                d_hat = res.step.astype(dtype)
+                drop_lb = a_lb & ~fixed  # droppable pins
+                drop_ub = a_ub
+
+                # (F) the oracle solved P(A): negative droppable multipliers?
+                mh_lb = res.dual.lb_multipliers.astype(dtype)
+                mh_ub = res.dual.ub_multipliers.astype(dtype)
+                mu_scale = jnp.maximum(
+                    1.0,
+                    jnp.maximum(
+                        vmax(jnp.where(drop_lb, mh_lb, 0.0)),
+                        vmax(jnp.where(drop_ub, mh_ub, 0.0)),
+                    ),
+                )
+                neg_f_lb = drop_lb & (mh_lb < -tau * mu_scale)
+                neg_f_ub = drop_ub & (mh_ub < -tau * mu_scale)
+                full = ok & ~jnp.any(neg_f_lb | neg_f_ub)
+                partial = ok & ~full
+
+                # Full step: violated bounds of d_hat (batch add).
+                free = ~a_lb & ~a_ub
+                viol_lb = jnp.where(free & jnp.isfinite(lo), lo - d_hat, -inf)
+                viol_ub = jnp.where(free & jnp.isfinite(hi), d_hat - hi, -inf)
+                v_lb = viol_lb > tau * jnp.maximum(1.0, jnp.abs(lo))
+                v_ub = (viol_ub > tau * jnp.maximum(1.0, jnp.abs(hi))) & ~v_lb
+                any_v = jnp.any(v_lb | v_ub)
+                converged = full & ~any_v
+                batch = full & any_v
+                max_lb = jnp.max(jnp.where(v_lb, viol_lb, -inf), initial=-jnp.inf)
+                max_ub = jnp.max(jnp.where(v_ub, viol_ub, -inf), initial=-jnp.inf)
+                p_ub_new = max_ub > max_lb
+                p_new = jnp.where(
+                    p_ub_new,
+                    jnp.argmax(jnp.where(v_ub, viol_ub, -inf)),
+                    jnp.argmax(jnp.where(v_lb, viol_lb, -inf)),
+                ).astype(jnp.int32)
+
+                # (R) the pinned problem is infeasible: ray of the certificate.
+                r_lb = res.ray_lb.astype(dtype)
+                r_ub = res.ray_ub.astype(dtype)
+                r_scale = jnp.maximum(
+                    vmax(jnp.where(drop_lb, r_lb, 0.0)),
+                    vmax(jnp.where(drop_ub, r_ub, 0.0)),
+                )
+                neg_r_lb = drop_lb & (r_lb < -tau * r_scale)
+                neg_r_ub = drop_ub & (r_ub < -tau * r_scale)
+                infeasible = ray & ~jnp.any(neg_r_lb | neg_r_ub)
+                oracle_failure = ~ok & ~res.has_ray
+                ray_step = ray & ~infeasible
+
+                # Dual step (partial towards mu_hat, or along the ray).
+                step = partial | ray_step
+                dir_lb = jnp.where(ray, r_lb, mh_lb - mu_lb)
+                dir_ub = jnp.where(ray, r_ub, mh_ub - mu_ub)
+                neg_lb = jnp.where(ray, neg_r_lb, neg_f_lb) & step
+                neg_ub = jnp.where(ray, neg_r_ub, neg_f_ub) & step
+                safe_lb = jnp.where(neg_lb, -dir_lb, 1.0)
+                safe_ub = jnp.where(neg_ub, -dir_ub, 1.0)
+                ratio_lb = jnp.where(neg_lb, mu_lb / safe_lb, inf)
+                ratio_ub = jnp.where(neg_ub, mu_ub / safe_ub, inf)
+                t = jnp.minimum(
+                    jnp.min(ratio_lb, initial=jnp.inf),
+                    jnp.min(ratio_ub, initial=jnp.inf),
+                )
+                blk_lb = neg_lb & (ratio_lb <= t * (1.0 + tau))
+                blk_ub = neg_ub & (ratio_ub <= t * (1.0 + tau))
+                positive = t > 0.0
+
+                # Degenerate step (t = 0): keep the most violated pin of the last
+                # addition; release the other fresh pins instead.
+                p_safe = jnp.maximum(p, 0)
+                p_in_blk = (p >= 0) & jnp.where(p_ub, blk_ub[p_safe], blk_lb[p_safe])
+                is_p = iota == p
+                deg_lb = fresh_lb & ~(is_p & ~p_ub)
+                deg_ub = fresh_ub & ~(is_p & p_ub)
+                use_deg = ~positive & p_in_blk
+                blk_lb = jnp.where(use_deg, deg_lb, blk_lb)
+                blk_ub = jnp.where(use_deg, deg_ub, blk_ub)
+                stalled = step & ~positive & ~jnp.any(blk_lb | blk_ub)
+                release = step & ~stalled
+
+                # Next working set and multipliers.
+                a_lb_next = jnp.where(
+                    batch, a_lb | v_lb, jnp.where(release, a_lb & ~blk_lb, a_lb)
+                )
+                a_ub_next = jnp.where(
+                    batch, a_ub | v_ub, jnp.where(release, a_ub & ~blk_ub, a_ub)
+                )
+                mu_lb_full = jnp.where(a_lb, mh_lb, 0.0)
+                mu_ub_full = jnp.where(a_ub, mh_ub, 0.0)
+                move = release & positive
+                mu_lb_step = jnp.where(
+                    a_lb, mu_lb + jnp.where(move, t, 0.0) * dir_lb, 0.0
+                )
+                mu_ub_step = jnp.where(
+                    a_ub, mu_ub + jnp.where(move, t, 0.0) * dir_ub, 0.0
+                )
+                mu_lb_new = jnp.where(
+                    full, mu_lb_full, jnp.where(step, mu_lb_step, mu_lb)
+                )
+                mu_ub_new = jnp.where(
+                    full, mu_ub_full, jnp.where(step, mu_ub_step, mu_ub)
+                )
+                mu_lb_next, mu_ub_next = clip_mu(
+                    mu_lb_new, mu_ub_new, a_lb_next, a_ub_next
+                )
+
+                fresh_lb_next = (
+                    jnp.where(batch, v_lb, jnp.where(move, False, fresh_lb)) & a_lb_next
+                )
+                fresh_ub_next = (
+                    jnp.where(batch, v_ub, jnp.where(move, False, fresh_ub)) & a_ub_next
+                )
+                p_next = jnp.where(batch, p_new, jnp.where(move, -1, p)).astype(
+                    jnp.int32
+                )
+                p_ub_next = jnp.where(batch, p_ub_new, p_ub)
+
+                d_full_next = jnp.where(full, d_hat, d_full)
+                dual_full_next = jax.tree.map(
+                    lambda new, old: jnp.where(full, new.astype(dtype), old),
+                    res.dual,
+                    dual_full,
+                )
+                delta_full_next = jnp.where(full, res.delta.astype(dtype), delta_full)
+                reject = jnp.asarray(False)
+                if self.warm_start:
+                    # First iteration = warm trial: unless it is a dual-feasible
+                    # full step, discard it and restart from the cold carry (the
+                    # iteration and NNLS counts below still include the trial).
+                    # Only the resets of ``A``, ``infeasible`` and
+                    # ``oracle_failure`` are live. Equivalent mutants: the resets
+                    # of ``mu`` (it is 0 throughout a rejected trial, so every
+                    # ratio is 0 and nothing moves), ``fresh`` and ``p`` (still
+                    # at their cold values, since only a batch or a positive step
+                    # changes them), ``converged`` (``converged`` implies
+                    # ``full``) and ``stalled`` (with ``p = -1`` a negative
+                    # multiplier always has a blocker, so no stall).
+                    reject = (n_it == 0) & ~full
+                    a_lb_next = jnp.where(reject, fixed, a_lb_next)
+                    a_ub_next = jnp.where(reject, false_n, a_ub_next)
+                    mu_lb_next = jnp.where(reject, 0.0, mu_lb_next)
+                    mu_ub_next = jnp.where(reject, 0.0, mu_ub_next)
+                    fresh_lb_next = fresh_lb_next & ~reject
+                    fresh_ub_next = fresh_ub_next & ~reject
+                    p_next = jnp.where(reject, -1, p_next).astype(jnp.int32)
+                    p_ub_next = p_ub_next & ~reject
+                    converged = converged & ~reject
+                    infeasible = infeasible & ~reject
+                    oracle_failure = oracle_failure & ~reject
+                    stalled = stalled & ~reject
+                # Monitoring counters (outside the numerics above).
+                n_ray_next = n_ray + (ray_step & ~stalled & ~reject).astype(jnp.int32)
+                n_safeguard_next = n_safeguard + (use_deg & ~stalled & ~reject).astype(
+                    jnp.int32
+                )
+                n_reject_next = n_reject + reject.astype(jnp.int32)
+                outcome = jnp.where(
+                    converged,
+                    _CONVERGED,
+                    jnp.where(
+                        infeasible,
+                        _INFEASIBLE,
+                        jnp.where(
+                            oracle_failure,
+                            _ORACLE_FAILURE,
+                            jnp.where(stalled, _STALLED, _RUNNING),
+                        ),
+                    ),
+                ).astype(jnp.int32)
+                return (
+                    a_lb_next,
+                    a_ub_next,
+                    mu_lb_next,
+                    mu_ub_next,
+                    fresh_lb_next,
+                    fresh_ub_next,
+                    p_next,
+                    p_ub_next,
+                    d_full_next,
+                    dual_full_next,
+                    delta_full_next,
+                    n_ray_next,
+                    n_safeguard_next,
+                    n_reject_next,
+                    res.ldp_status,
+                    n_nnls + res.n_nnls_iter.astype(jnp.int32),
+                    n_it + 1,
+                    outcome,
+                )
+
+            return jax.lax.while_loop(cond_fn, body_fn, init)
+
+        carry_p = run(None)
+
+        # Elastic mode (plan 2.5, rev 11): entered only when the plain loop
+        # certifies the QP infeasible or the oracle fails without a
+        # certificate; the WHOLE bound loop is then re-run, from the same start
+        # (warm trial included), on the elastic QP, which is one fixed QP for
+        # every working set (unshifted relaxation, rho_e frozen). The two loops
+        # have separate iteration budgets; the counters are cumulative, the
+        # trial-rejected flag is that of the final loop.
+        use_elastic = self.elastic and lag.meq + lag.mineq > 0
+        if use_elastic:
+            out_p = carry_p[-1]
+            entered = (out_p == _INFEASIBLE) | (out_p == _ORACLE_FAILURE)
+
+            def enter(c_p):
+                rho = elastic_penalty(
+                    lag, factors, self.elastic_weight, rank_tol=self.rank_tol
+                ).astype(dtype)
+                c_e = run(rho)
+                return (
+                    *c_e[:11],
+                    c_p[11] + c_e[11],  # ray steps
+                    c_p[12] + c_e[12],  # safeguard firings
+                    c_e[13],  # warm trial rejected (final loop)
+                    c_e[14],  # last oracle status
+                    c_p[15] + c_e[15],  # NNLS iterations
+                    c_p[16] + c_e[16],  # oracle calls
+                    c_e[17],  # outcome
+                )
+
+            carry_f = jax.lax.cond(entered, enter, lambda c: c, carry_p)
+        else:
+            entered = jnp.asarray(False)
+            carry_f = carry_p
         (
             a_lb_f,
             a_ub_f,
@@ -695,6 +837,7 @@ class LRHDirectQPSolver(
             _p_ub_f,
             d_full_f,
             dual_full_f,
+            delta_full_f,
             n_ray_f,
             n_safeguard_f,
             n_reject_f,
@@ -702,7 +845,8 @@ class LRHDirectQPSolver(
             n_nnls_f,
             n_it_f,
             outcome_f,
-        ) = jax.lax.while_loop(cond_fn, body_fn, init)
+        ) = carry_f
+
         dual_full_f = cast(Dual, dual_full_f)
 
         converged = outcome_f == _CONVERGED
@@ -766,6 +910,9 @@ class LRHDirectQPSolver(
         dual_out = jax.tree.map(
             lambda a: jnp.where(failed, jnp.zeros_like(a), a), dual_out
         )
+        # δ of the last full step (0 unless that step solved an elastic QP; also
+        # 0 when the solve failed, like the dual).
+        delta_out = jnp.where(failed, 0.0, delta_full_f).astype(dtype)
 
         # Residual of the general constraints at the returned step.
         resid_eq = ev.eq_fn_jac_val.astype(dtype) @ step_f + ev.eq_fn_val.astype(dtype)
@@ -805,6 +952,8 @@ class LRHDirectQPSolver(
                 s.last_kkt_reason,
                 s.n_nnls_iter,
                 s.last_ldp_status,
+                s.last_elastic_delta,
+                s.n_elastic,
             ),
             initial_state,
             (
@@ -825,6 +974,9 @@ class LRHDirectQPSolver(
                 kkt_reason,
                 jnp.asarray(initial_state.n_nnls_iter, jnp.int32) + n_nnls_f,
                 ldp_f,
+                delta_out,
+                jnp.asarray(initial_state.n_elastic, jnp.int32)
+                + entered.astype(jnp.int32),
             ),
         )
         step = cast(Primal, Primal(x=step_f))
@@ -838,6 +990,7 @@ class LRHDirectQPSolver(
             n_safeguard=jnp.asarray(n_safeguard_f, jnp.int32),
             n_nnls=n_nnls_f,
             trial_rejected=jnp.asarray(n_reject_f, jnp.int32) > 0,
+            elastic_entered=entered,
         )
         return (step, dual_out), new_state
 
@@ -852,6 +1005,7 @@ class LRHDirectQPSolver(
         n_safeguard: Int[Array, ""],
         n_nnls: Int[Array, ""],
         trial_rejected: Bool[Array, ""],
+        elastic_entered: Bool[Array, ""],
     ) -> None:
         """Logger lines and ``"qp"`` diagnostic record of one solve.
 
@@ -868,7 +1022,9 @@ class LRHDirectQPSolver(
         ray; neither counter includes the iteration that stalls (it takes no
         step), the terminal certified-infeasible iteration, or a discarded
         (rejected) warm trial. ``warm_trial_accepted`` is ``False`` when no
-        trial ran (``max_iter = 0``).
+        trial ran (``max_iter = 0``). The elastic fields are ``elastic``
+        (elastic mode was entered in this solve), ``last_elastic_delta`` and
+        ``n_elastic`` (cumulative).
         """
         converged = state.success
         stalled = state.qp_result == ACTIVE_SET_QP_RESULTS.anti_cycling
@@ -899,6 +1055,12 @@ class LRHDirectQPSolver(
             iters=state.last_n_iter,
             n_pinned=n_pinned,
         )
+        self.logger.info(
+            "qp elastic mode: delta={delta} solved={solved}",
+            when=elastic_entered,
+            delta=state.last_elastic_delta,
+            solved=converged,
+        )
         warm = jnp.asarray(self.warm_start)
         self.logger.diagnostic(
             "qp",
@@ -925,5 +1087,8 @@ class LRHDirectQPSolver(
                 "n_safeguard": n_safeguard,
                 "stalled": stalled,
                 "n_pinned": n_pinned,
+                "elastic": elastic_entered,
+                "last_elastic_delta": state.last_elastic_delta,
+                "n_elastic": state.n_elastic,
             },
         )

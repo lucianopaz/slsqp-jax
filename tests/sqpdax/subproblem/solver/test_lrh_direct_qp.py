@@ -34,10 +34,17 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     LRHDirectQPSolver,
     LRHQPSolverState,
     lrh_direct_qp,
+    lrh_fixed_bounds,
 )
-from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import solve_fixed_bounds_qp
+from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
+    elastic_penalty,
+    solve_fixed_bounds_qp,
+)
 from tests.sqpdax.subproblem.solver.conftest import (
     RandomQP,
+    assert_elastic_kkt,
+    delta_min_lp,
+    elastic_column_np,
     index_mask,
     make_empty_active_set,
     make_random_lrh_qp,
@@ -65,6 +72,10 @@ CONVERGED = ACTIVE_SET_QP_RESULTS.working_set_converged
 FAILURE = ACTIVE_SET_QP_RESULTS.kkt_solver_failure
 BUDGET = ACTIVE_SET_QP_RESULTS.max_iter_reached
 STALL = ACTIVE_SET_QP_RESULTS.anti_cycling
+
+# The C12-C14 tests pin the plain loop: an infeasible QP is a failure, not an
+# elastic solve (the elastic mode has its own tests at the end of the file).
+PLAIN = LRHDirectQPSolver(elastic=False)
 
 _oracle = jax.jit(solve_fixed_bounds_qp)
 _unbounded = _oracle
@@ -346,14 +357,26 @@ class RefLoop(NamedTuple):
     n_safeguard: int  # degenerate steps resolved by the safeguard (not stalls)
 
 
-def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefLoop:
+def reference_loop(
+    qp: RandomQP,
+    max_iter: int = 100,
+    tol: float = 1e-8,
+    oracle=None,
+    value=None,
+) -> RefLoop:
     """The dual bound loop of PLAN 3.5 rev 11 in NumPy, one oracle call per pass.
 
     Asserts its own invariants: ``μ ≥ 0`` off the ``lb == ub`` pins after every
     dual step, and the values ``q(d̂)`` of the full steps never decrease. It also
     counts the ray steps and the safeguard firings, neither of them including the
     stalling iteration (nor the terminal certified-infeasible one).
+
+    ``oracle`` (default the plain jitted kernel) and ``value`` (default the plain
+    objective ``q(d̂)``, called as ``value(qp, result)``) let the same loop run
+    on another fixed-bounds oracle, e.g. the elastic one.
     """
+    oracle = _oracle if oracle is None else oracle
+    value = (lambda q, r: objective(q, np.asarray(r.step))) if value is None else value
     lag, factors = qp.lagrangian, qp.factors
     n = qp.x.shape[0]
     tau = max(tol, 100.0 * float(np.finfo(qp.x.dtype).eps))
@@ -373,7 +396,7 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
         )
 
     for it in range(1, max_iter + 1):
-        res = _oracle(lag, factors, jnp.asarray(a_lb), jnp.asarray(a_ub))
+        res = oracle(lag, factors, jnp.asarray(a_lb), jnp.asarray(a_ub))
         drop_lb, drop_ub = a_lb & ~fixed, a_ub.copy()
         is_ray = False
         if bool(res.ldp_status == LDP_RESULTS.feasible):
@@ -387,7 +410,7 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
             if not (neg_lb.any() or neg_ub.any()):  # full step
                 d = np.asarray(res.step)
                 d_full = d
-                q = objective(qp, d)
+                q = value(qp, res)
                 assert q >= last_q - 1e-9 * max(1.0, abs(q)), "full-step value fell"
                 last_q = q
                 mu_lb = np.where(
@@ -457,7 +480,7 @@ def reference_loop(qp: RandomQP, max_iter: int = 100, tol: float = 1e-8) -> RefL
 @functools.cache
 def _shared_logged_solver() -> tuple[LRHDirectQPSolver, LogView]:
     """One logged solver for the batteries (one compilation per shape)."""
-    return with_logger(LRHDirectQPSolver())
+    return with_logger(PLAIN)
 
 
 def assert_matches_reference(qp: RandomQP) -> None:
@@ -699,7 +722,7 @@ class TestBatteries:
         """The LP says infeasible: a certified ``kkt_solver_failure``."""
         qp = near_infeasible_case(n, seed, False)
         assert not lp_feasible(qp)
-        res = run(qp)
+        res = run(qp, PLAIN)
         state = res.state
         assert bool(state.qp_result == FAILURE) and not bool(state.success)
         assert bool(state.status == RESULTS.singular)
@@ -966,21 +989,21 @@ EXIT_PATHS: dict[
     ),
     "contradictory-inequalities": (
         _contradictory_inequalities,
-        LRHDirectQPSolver(),
+        PLAIN,
         FAILURE,
         RESULTS.singular,
     ),
     "contradictory-equalities": (
         _contradictory_equalities,
-        LRHDirectQPSolver(),
+        PLAIN,
         FAILURE,
         RESULTS.singular,
     ),
-    "box-too-tight": (_box_too_tight, LRHDirectQPSolver(), FAILURE, RESULTS.singular),
-    "nonfinite": (_nonfinite_gradient, LRHDirectQPSolver(), FAILURE, RESULTS.singular),
+    "box-too-tight": (_box_too_tight, PLAIN, FAILURE, RESULTS.singular),
+    "nonfinite": (_nonfinite_gradient, PLAIN, FAILURE, RESULTS.singular),
     "nnls-budget": (
         lambda: make_case(8, 0.0, False, (0, 3), seed=5, tight=3),
-        LRHDirectQPSolver(nnls_max_iter=1),
+        LRHDirectQPSolver(nnls_max_iter=1, elastic=False),
         FAILURE,
         RESULTS.max_steps_reached,
     ),
@@ -1024,7 +1047,7 @@ class TestExitPaths:
         assert not np.any(np.asarray(state.active_set.active_inequalities))
 
     def test_non_finite_data_is_reported(self):
-        res = run(_nonfinite_gradient())
+        res = run(_nonfinite_gradient(), PLAIN)
         assert bool(res.state.last_ldp_status == LDP_RESULTS.nonfinite)
         assert bool(res.state.last_kkt_reason == KKT_SOLVER_RESULTS.nonfinite)
 
@@ -1126,6 +1149,7 @@ class TestStall:
 # ---------------------------------------------------------------------------
 
 WARM = LRHDirectQPSolver(warm_start=True)
+WARM_PLAIN = LRHDirectQPSolver(warm_start=True, elastic=False)
 
 
 def with_warm_set(state: LRHQPSolverState, lb_mask, ub_mask) -> LRHQPSolverState:
@@ -1318,14 +1342,14 @@ class TestWarmStart:
     def test_infeasible_qp_gives_the_cold_certified_outcome(self, n, seed, perturb):
         """The base set is the cold run's final (certifying) working set."""
         qp = near_infeasible_case(n, seed, False)
-        cold = run(qp)
+        cold = run(qp, PLAIN)
         assert bool(cold.state.qp_result == FAILURE)
         lb, ub = perturb(
             np.asarray(cold.state.active_set.active_lb),
             np.asarray(cold.state.active_set.active_ub),
             np.random.default_rng(seed),
         )
-        res = run(qp, WARM, with_warm_set(cold_state(qp), lb, ub))
+        res = run(qp, WARM_PLAIN, with_warm_set(cold_state(qp), lb, ub))
         state = res.state
         assert bool(state.qp_result == FAILURE) and not bool(state.success)
         assert bool(state.status == cold.state.status)
@@ -1513,6 +1537,9 @@ RECORD_KEYS = {
     "n_safeguard",
     "stalled",
     "n_pinned",
+    "elastic",
+    "last_elastic_delta",
+    "n_elastic",
 }
 
 
@@ -1624,7 +1651,7 @@ class TestLogging:
         """Near-infeasible QPs take ray steps and degenerate (safeguard) steps."""
         qp = near_infeasible_case(8, seed, False)
         ref = reference_loop(qp)
-        solver, logged = with_logger(LRHDirectQPSolver())
+        solver, logged = with_logger(PLAIN)
         run(qp, solver)
         (rec,) = logged.records
         assert rec.values["n_ray_steps"] == ref.n_ray > 0
@@ -1644,11 +1671,11 @@ class TestLogging:
         on these QPs, so the trial would be a ray step if it were counted.
         """
         qp = near_infeasible_case(20, seed, feasible)
-        cold_solver, cold_logged = with_logger(LRHDirectQPSolver())
+        cold_solver, cold_logged = with_logger(PLAIN)
         cold = run(qp, cold_solver)
         n = qp.x.shape[0]
         state = with_warm_set(cold_state(qp), np.ones(n, bool), np.zeros(n, bool))
-        warm_solver, warm_logged = with_logger(WARM)
+        warm_solver, warm_logged = with_logger(WARM_PLAIN)
         warm = run(qp, warm_solver, state)
         cold_values = cold_logged.records[-1].values
         warm_values = warm_logged.records[-1].values
@@ -1849,7 +1876,8 @@ class TestJit:
 
 
 class TestMemoryBudget:
-    def test_no_n_by_n_or_bound_stacked_intermediate(self):
+    @pytest.mark.parametrize("elastic", [False, True])
+    def test_no_n_by_n_or_bound_stacked_intermediate(self, elastic):
         """No array of the jaxpr has two axes as large as ``n``.
 
         ``n`` is distinct from every other dimension (memory 4, ``m_c = 5``)
@@ -1861,10 +1889,545 @@ class TestMemoryBudget:
         sub = make_subproblem(qp)
         state = cold_state(qp)
         x0 = (Primal(jnp.zeros(n)), qp.lagrangian.dual)
-        solver = LRHDirectQPSolver()
+        solver = LRHDirectQPSolver(elastic=elastic)
         jaxpr = jax.make_jaxpr(lambda: solver.solve(sub, x0, state))()
         shapes = set(walk_avals(jaxpr.jaxpr))
         offenders = [s for s in shapes if sum(1 for d in s if d >= n) >= 2]
         assert not offenders, offenders
         largest = max(int(np.prod(s)) for s in shapes)
-        assert largest <= n * max(m_c, MEMORY + 1) + n
+        # The elastic QP adds one coordinate and two general rows: the
+        # ``(n + 1) × (m_c + 2)`` matrix of the augmented least-distance problem.
+        e = int(elastic)
+        assert largest <= (n + e) * (max(m_c, MEMORY + 1) + 2 * e) + n
+
+
+# ---------------------------------------------------------------------------
+# Elastic mode (plan 2.5 rev 11/12, T09): inconsistent linearisations
+# ---------------------------------------------------------------------------
+
+
+def contradictory_margin(n: int, seed: int, mix: tuple[int, int]) -> RandomQP:
+    """``aᵀd ≤ -1`` (violated at 0) and ``-aᵀd ≤ 0.9``: ``δ_min = 0.1``."""
+    qp = make_case(n, 0.3, False, mix, seed=seed)
+    a = np.random.default_rng(seed).standard_normal((1, n))
+    return with_rows(
+        qp, qp.a_eq, qp.b_eq, np.concatenate([a, -a]), np.array([-1.0, 0.9])
+    )
+
+
+def equality_vs_inequality(n: int, seed: int) -> RandomQP:
+    """``aᵀd = 1`` against ``aᵀd ≤ 0.5``: ``δ_min = 0.5``."""
+    qp = make_case(n, 0.3, False, (0, 0), seed=seed)
+    a = np.random.default_rng(seed).standard_normal((1, n))
+    return with_rows(qp, a, np.array([1.0]), a.copy(), np.array([0.5]))
+
+
+def over_fixed_bounds(n: int, seed: int, mix: tuple[int, int]) -> RandomQP:
+    """``d_0 + d_{n-1}/2 = 1`` with ``d_0`` fixed (``lb == ub = x``) and ``d_{n-1} ≤ 0.4``.
+
+    The fixed variable cannot move and the other one cannot reach: ``δ_min = 0.8``.
+    """
+    qp = make_case(n, 0.3, False, mix, seed=seed)
+    lb, ub = qp.lb.copy(), qp.ub.copy()
+    lb[0] = ub[0] = qp.x[0]
+    ub[n - 1] = qp.x[n - 1] + 0.4
+    row = np.zeros((1, n))
+    row[0, 0], row[0, n - 1] = 1.0, 0.5
+    qp = with_rows(qp, row, np.array([1.0]), qp.a_ineq, qp.b_ineq)
+    return with_bounds_and_secant(qp, lb, ub)
+
+
+def clashing_equalities(n: int, seed: int) -> RandomQP:
+    """``aᵀd = 1`` and ``aᵀd = 2``: every relaxed row scales with ``1 - δ``, so ``δ = 1``."""
+    qp = make_case(n, 0.3, False, (2, 0), seed=seed)
+    a = np.random.default_rng(seed).standard_normal((1, n))
+    return with_rows(
+        qp, np.concatenate([a, a]), np.array([1.0, 2.0]), qp.a_ineq, qp.b_ineq
+    )
+
+
+# name -> QP factory. Every QP has ``x`` inside its box and an infeasible
+# linearisation (the LP of ``delta_min_lp`` gives the smallest relaxation).
+INCONSISTENT: dict[str, Callable[[], RandomQP]] = {
+    **{
+        f"near-infeasible-{n}-{seed}": functools.partial(
+            near_infeasible_case, n, seed, False
+        )
+        for n, seed in [(8, 0), (8, 2), (8, 5), (20, 0), (20, 4), (20, 5)]
+    },
+    **{
+        f"margin-{n}-{mix[0]}{mix[1]}": functools.partial(
+            contradictory_margin, n, 1, mix
+        )
+        for n, mix in [(8, (0, 2)), (20, (0, 2)), (8, (2, 3)), (20, (2, 3))]
+    },
+    "equality-vs-inequality-8": functools.partial(equality_vs_inequality, 8, 0),
+    "equality-vs-inequality-20": functools.partial(equality_vs_inequality, 20, 0),
+    "over-fixed-8-03": functools.partial(over_fixed_bounds, 8, 0, (0, 3)),
+    "over-fixed-20-23": functools.partial(over_fixed_bounds, 20, 1, (2, 3)),
+    "box-too-tight": _box_too_tight,
+    "clashing-equalities-8": functools.partial(clashing_equalities, 8, 0),
+    "clashing-equalities-20": functools.partial(clashing_equalities, 20, 1),
+}
+# Data of the C15 kind (the relaxation trade-off ``κ`` is small): the excess
+# of ``δ`` over ``δ_min`` stays within the plan's ``2 / elastic_weight``.
+WELL_SCALED = [name for name in INCONSISTENT if not name.startswith("near-infeasible")]
+
+
+def merit_directional_derivative(qp: RandomQP, d: np.ndarray, rho_m: float) -> float:
+    """One-sided derivative at ``t = 0`` of the L1 merit along ``d``.
+
+    ``φ(x + t d) = f + ρ_m (‖c_E‖₁ + ‖max(c_I, 0)‖₁)`` with the constraints
+    linearised (``c_E = -b_E``, ``c_I = -b_I``, Jacobians ``A``).
+    """
+    c_e, c_i = -qp.b_eq, -qp.b_ineq
+    j_e, j_i = qp.a_eq @ d, qp.a_ineq @ d
+    d_eq = np.where(c_e != 0, np.sign(c_e) * j_e, np.abs(j_e)).sum()
+    d_in = np.where(c_i > 0, j_i, np.where(c_i == 0, np.maximum(j_i, 0.0), 0.0)).sum()
+    return float(qp.g @ d + rho_m * (d_eq + d_in))
+
+
+class Elastic(NamedTuple):
+    """An elastic solve with the quantities the tests read."""
+
+    qp: RandomQP
+    run: Run
+    delta: float
+    rho: float
+    weight: float
+    lam: np.ndarray  # [λ_E, λ_I]
+    column: np.ndarray  # the column c of δ
+
+
+def elastic_rho_of(qp: RandomQP, weight: float = 1e3) -> float:
+    return float(elastic_penalty(qp.lagrangian, qp.factors, weight))
+
+
+def solve_elastic(qp: RandomQP, **kwargs) -> Elastic:
+    solver = LRHDirectQPSolver(**kwargs)
+    res = run(qp, solver)
+    return Elastic(
+        qp,
+        res,
+        float(res.state.last_elastic_delta),
+        float(elastic_penalty(qp.lagrangian, qp.factors, solver.elastic_weight)),
+        solver.elastic_weight,
+        np.concatenate(
+            [np.asarray(res.dual.eq_multipliers), np.asarray(res.dual.ineq_multipliers)]
+        ),
+        elastic_column_np(qp),
+    )
+
+
+@pytest.fixture(params=list(INCONSISTENT))
+def inconsistent(request) -> Elastic:
+    """The default solver (elastic mode on) run on each inconsistent QP."""
+    return solve_elastic(INCONSISTENT[request.param]())
+
+
+class TestElasticMode:
+    def test_inconsistent_linearisation_gives_a_relaxed_step(self, inconsistent):
+        el = inconsistent
+        qp, res = el.qp, el.run
+        state = res.state
+        assert_converged(res)
+        assert bool(state.qp_result == CONVERGED) and bool(state.success)
+        assert bool(state.status == RESULTS.successful)
+        assert int(state.n_elastic) == 1
+        # Both loops ran: at least the plain loop's certifying iteration plus one
+        # elastic oracle call (the counters are cumulative over the two).
+        plain_state = run(el.qp, PLAIN).state
+        assert int(state.last_n_iter) > int(plain_state.last_n_iter)
+        assert int(state.last_n_cg_iter) >= int(plain_state.last_n_cg_iter)
+        assert int(state.n_nnls_iter) == int(state.last_n_cg_iter)
+        delta_min = delta_min_lp(qp)
+        assert delta_min is not None and 0.0 < delta_min <= 1.0
+        # A finite step inside the box, 0 < δ ≤ 1, and δ_min ≤ δ.
+        assert np.all(np.isfinite(res.step))
+        assert_in_box(qp, res.step)
+        assert 0.0 < el.delta <= 1.0 + 1e-12
+        assert el.delta >= delta_min - 1e-8
+        # The relaxed QP is solved to its KKT point (convex: the minimiser), and
+        # δ never appears in the returned dual.
+        assert_elastic_kkt(qp, el.rho, res.step, el.delta, res.dual)
+        assert res.dual.eq_multipliers.shape == (qp.a_eq.shape[0],)
+        assert res.dual.ineq_multipliers.shape == (qp.a_ineq.shape[0],)
+        assert res.dual.lb_multipliers.shape == res.dual.ub_multipliers.shape
+        assert np.all(np.isfinite(el.lam)) and bool(
+            state.last_ldp_status == LDP_RESULTS.feasible
+        )
+        assert bool(state.last_kkt_reason == KKT_SOLVER_RESULTS.converged)
+
+    def test_excess_of_delta_is_the_tradeoff_over_the_weight(self, inconsistent):
+        """``δ = max(δ_min, κ/w)`` with ``κ = -cᵀλ/τ²`` and ``ρ_e = w τ²``.
+
+        At an interior ``δ`` the stationarity in ``δ`` is ``ρ_e δ = -cᵀλ``, so
+        the excess over ``δ_min`` is at most ``κ/w``: the plan's
+        ``2 / elastic_weight`` bound is the case ``κ ≤ 2``.
+        """
+        el = inconsistent
+        delta_min = delta_min_lp(el.qp)
+        tau2 = el.rho / el.weight
+        kappa = -(el.column @ el.lam) / tau2
+        assert el.delta - delta_min <= max(kappa, 0.0) / el.weight + 1e-8
+
+    def test_step_is_a_merit_descent_direction(self, inconsistent):
+        """``Dφ ≤ -dᵀBd - (1-δ)(ρ_m - ‖λ‖∞)‖viol‖₁ < 0`` for ``ρ_m > ‖λ‖∞``."""
+        el = inconsistent
+        qp, d = el.qp, el.run.step
+        lam_max = np.abs(el.lam).max(initial=0.0)
+        rho_m = 1.1 * lam_max + 1e-6
+        dphi = merit_directional_derivative(qp, d, rho_m)
+        viol = np.abs(qp.b_eq).sum() + np.maximum(-qp.b_ineq, 0.0).sum()
+        bound = -d @ qp.dense_b @ d - (1.0 - el.delta) * (rho_m - lam_max) * viol
+        assert dphi < 0.0
+        assert dphi <= bound + 1e-8 * max(1.0, abs(bound))
+
+    @pytest.mark.parametrize("name", WELL_SCALED)
+    def test_default_weight_bound_on_delta(self, name):
+        """At the default weight: ``δ_min ≤ δ ≤ δ_min + 2/elastic_weight``."""
+        el = solve_elastic(INCONSISTENT[name]())
+        delta_min = delta_min_lp(el.qp)
+        assert el.weight == 1e3
+        assert delta_min - 1e-8 <= el.delta <= delta_min + 2.0 / el.weight
+
+    @pytest.mark.parametrize("name", ["near-infeasible-20-5", "near-infeasible-8-5"])
+    def test_excess_shrinks_with_the_weight(self, name):
+        """The excess of ``δ`` over ``δ_min`` is ``O(1/w)``: monotone in the weight."""
+        qp = INCONSISTENT[name]()
+        delta_min = delta_min_lp(qp)
+        excess = []
+        for weight in (1e1, 1e2, 1e3):
+            el = solve_elastic(qp, elastic_weight=weight)
+            assert bool(el.run.state.success)
+            assert_elastic_kkt(qp, el.rho, el.run.step, el.delta, el.run.dual)
+            excess.append(el.delta - delta_min)
+        assert excess[0] >= excess[1] >= excess[2] >= -1e-8
+        assert excess[0] > 10 * max(excess[2], 1e-12)
+
+    @pytest.mark.parametrize("name", list(INCONSISTENT)[:6] + ["box-too-tight"])
+    def test_elastic_false_reproduces_the_failure(self, name):
+        qp = INCONSISTENT[name]()
+        plain = run(qp, PLAIN)
+        state = plain.state
+        assert bool(state.qp_result == FAILURE) and not bool(state.success)
+        assert bool(state.status == RESULTS.singular)
+        assert int(state.n_elastic) == 0 and float(state.last_elastic_delta) == 0.0
+        for leaf in jax.tree.leaves(plain.dual):
+            assert np.all(np.asarray(leaf) == 0.0)
+        # ... and the same QP is solved with elastic mode on.
+        assert bool(run(qp).state.success)
+
+    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
+    @pytest.mark.parametrize(
+        "mix", [(0, 0), (2, 3), (0, 3), (3, 2)], ids=["0-0", "2-3", "0-3", "3dup-2"]
+    )
+    @pytest.mark.parametrize("n", [8, 20])
+    @pytest.mark.parametrize("seed", range(2))
+    def test_consistent_qps_never_enter_elastic_mode(self, n, mix, x_on_bound, seed):
+        """Heavy-cut QPs: ``n_elastic`` unchanged, bit-identical to ``elastic=False``."""
+        qp = make_case(n, 0.8, x_on_bound, mix, seed=seed)
+        on, off = run(qp), run(qp, PLAIN)
+        assert bool(on.state.success)
+        assert int(on.state.n_elastic) == 0 and float(on.state.last_elastic_delta) == 0
+        assert leaves_equal(on.step, off.step)
+        assert leaves_equal(on.dual, off.dual)
+        assert leaves_equal(on.state, off.state)
+
+    @pytest.mark.parametrize("seed", range(4))
+    @pytest.mark.parametrize("n", [8, 20])
+    def test_near_infeasible_feasible_side_is_not_relaxed(self, n, seed):
+        qp = near_infeasible_case(n, seed, True)
+        on, off = run(qp), run(qp, PLAIN)
+        assert int(on.state.n_elastic) == 0
+        assert leaves_equal(on.step, off.step) and leaves_equal(on.state, off.state)
+
+    def test_counters_accumulate_and_delta_resets(self):
+        """``n_elastic`` is cumulative; ``last_elastic_delta`` is that of the last solve."""
+        bad = near_infeasible_case(8, 0, False)
+        good = near_infeasible_case(8, 0, True)
+        first = run(bad)
+        second = run(bad, state=first.state)
+        assert int(first.state.n_elastic) == 1 and int(second.state.n_elastic) == 2
+        np.testing.assert_array_equal(
+            np.asarray(second.state.last_elastic_delta),
+            np.asarray(first.state.last_elastic_delta),
+        )
+        assert int(second.state.n_iter) == 2 * int(first.state.last_n_iter)
+        third = run(good, state=second.state)
+        assert int(third.state.n_elastic) == 2
+        assert float(third.state.last_elastic_delta) == 0.0
+        assert bool(third.state.success)
+
+    def test_cold_state_has_zero_elastic_fields(self):
+        state = LRHQPSolverState.cold(5, 2, 3, jnp.float64)
+        assert float(state.last_elastic_delta) == 0.0
+        assert state.last_elastic_delta.dtype == jnp.float64
+        assert int(state.n_elastic) == 0 and state.n_elastic.dtype == jnp.int32
+
+    def test_elastic_loop_that_fails_reports_failure(self):
+        """No relaxation helps: ``x`` below every lower bound (``d ≥ 0.2``), ``Σ d = 1``.
+
+        The relaxed row is ``Σ d = 1 - δ ≤ 1 < 1.2`` for every ``δ ∈ [0, 1]``, so
+        the elastic QP is infeasible too (its unpinned relaxation is not, so the
+        elastic loop takes a full step with ``δ > 0`` first): the exit is the
+        elastic loop's certified-infeasible row, with ``success`` false, zero
+        dual and ``δ`` reported as 0 (the earlier full step is not a QP
+        solution), and elastic mode entered.
+        """
+        n = 6
+        qp = make_case(n, 0.0, False, (1, 0), seed=1)
+        qp = with_rows(qp, np.ones((1, n)), np.ones(1), qp.a_ineq, qp.b_ineq)
+        qp = with_bounds_and_secant(qp, qp.x + 0.2, qp.x + 1.0)
+        assert not lp_feasible(qp) and delta_min_lp(qp) is None
+        # The first elastic full step (nothing pinned) already has δ > 0.
+        none = jnp.zeros(n, bool)
+        first = solve_fixed_bounds_qp(
+            qp.lagrangian, qp.factors, none, none, elastic_rho=elastic_rho_of(qp)
+        )
+        assert float(first.delta) > 0.0
+        state = run(qp).state
+        assert bool(state.qp_result == FAILURE) and not bool(state.success)
+        assert bool(state.status == RESULTS.singular)
+        assert int(state.n_elastic) == 1 and float(state.last_elastic_delta) == 0.0
+        assert bool(
+            (state.last_ldp_status == LDP_RESULTS.infeasible)
+            | (state.last_ldp_status == LDP_RESULTS.inconsistent_equalities)
+        )
+
+    def test_without_general_constraints_elastic_mode_is_not_entered(self):
+        """A failing solve with no rows (non-finite gradient): nothing to relax."""
+        qp = make_case(6, 0.3, False, (0, 0), seed=0)
+        lag = eqx.tree_at(
+            lambda lg: lg.evaluated.grad_val,
+            qp.lagrangian,
+            qp.lagrangian.evaluated.grad_val.at[0].set(jnp.nan),
+        )
+        qp = qp._replace(lagrangian=lag)
+        state = run(qp).state
+        assert bool(state.qp_result == FAILURE) and not bool(state.success)
+        assert int(state.n_elastic) == 0 and float(state.last_elastic_delta) == 0.0
+        assert leaves_equal(state, run(qp, PLAIN).state)
+
+    def test_non_finite_data_enters_and_fails(self):
+        state = run(_nonfinite_gradient()).state
+        assert bool(state.qp_result == FAILURE) and not bool(state.success)
+        assert int(state.n_elastic) == 1 and float(state.last_elastic_delta) == 0.0
+        assert bool(state.last_ldp_status == LDP_RESULTS.nonfinite)
+
+    @pytest.mark.parametrize("n, seed", [(8, 2), (20, 4)])
+    def test_certificate_retry_is_needed_and_recovers_the_ray(
+        self, monkeypatch, n, seed
+    ):
+        """The augmented LDP can be infeasible without a certificate.
+
+        At the default weight the pinned elastic problem of these QPs is
+        reported ``infeasible`` with no certificate, which would end the
+        elastic loop as an oracle failure; the retry at a smaller weight takes
+        the certificate of the same (``ρ_e``-independent) infeasible problem.
+        """
+        qp = near_infeasible_case(n, seed, False)
+        _, state = _solve_unjitted(qp)
+        assert bool(state.success) and int(state.n_elastic) == 1
+        monkeypatch.setattr(lrh_fixed_bounds, "_CERT_RETRY_SCALE", 1.0)
+        _, no_retry = _solve_unjitted(qp)
+        assert not bool(no_retry.success)
+        assert bool(no_retry.qp_result == FAILURE)
+        assert bool(no_retry.last_ldp_status == LDP_RESULTS.infeasible)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "near-infeasible-8-0",
+            "near-infeasible-8-2",
+            "near-infeasible-20-4",
+            "margin-8-23",
+            "over-fixed-8-03",
+            "equality-vs-inequality-8",
+        ],
+    )
+    def test_path_is_the_plain_loop_then_the_elastic_loop(self, name):
+        """Counters are cumulative over the two loops, the step is the second's.
+
+        The NumPy reference runs the loop of the plan on the plain oracle, then
+        on the elastic oracle with the frozen ``ρ_e`` (separate budgets). The
+        solver must take the same iterations, ray steps, safeguard firings and
+        NNLS steps in total and end on the elastic loop's working set and step.
+        """
+        qp = INCONSISTENT[name]()
+        rho = elastic_rho_of(qp)
+        elastic_kernel = jax.jit(
+            functools.partial(solve_fixed_bounds_qp, elastic_rho=rho)
+        )
+        nnls = {"plain": 0, "elastic": 0}
+
+        def counted(kind, kernel):
+            def oracle(*args):
+                res = kernel(*args)
+                nnls[kind] += int(res.n_nnls_iter)
+                return res
+
+            return oracle
+
+        def elastic_value(q, res):
+            return (
+                objective(q, np.asarray(res.step)) + 0.5 * rho * float(res.delta) ** 2
+            )
+
+        plain = reference_loop(qp, oracle=counted("plain", _oracle))
+        elastic = reference_loop(
+            qp, oracle=counted("elastic", elastic_kernel), value=elastic_value
+        )
+        assert bool(plain.qp_result == FAILURE) and bool(elastic.qp_result == CONVERGED)
+        solver, logged = with_logger(LRHDirectQPSolver())
+        res = run(qp, solver)
+        state = res.state
+        v = logged.records[-1].values
+        assert int(state.last_n_iter) == plain.n_iter + elastic.n_iter
+        assert int(state.last_n_cg_iter) == nnls["plain"] + nnls["elastic"]
+        assert v["n_ray_steps"] == plain.n_ray + elastic.n_ray
+        assert v["n_safeguard"] == plain.n_safeguard + elastic.n_safeguard
+        np.testing.assert_array_equal(
+            np.asarray(state.active_set.active_lb), elastic.active_lb
+        )
+        np.testing.assert_array_equal(
+            np.asarray(state.active_set.active_ub), elastic.active_ub
+        )
+        np.testing.assert_allclose(res.step, elastic.step, atol=1e-12, rtol=0)
+
+    @pytest.mark.parametrize(
+        "name", ["near-infeasible-8-0", "margin-8-23", "over-fixed-8-03"]
+    )
+    def test_warm_start_reaches_the_same_elastic_solution(self, name):
+        """The elastic loop restarts from the warm trial, like the plain one."""
+        qp = INCONSISTENT[name]()
+        cold = run(qp)
+        assert bool(cold.state.success) and int(cold.state.n_elastic) == 1
+        state = with_warm_set(
+            cold_state(qp),
+            np.asarray(cold.state.active_set.active_lb),
+            np.asarray(cold.state.active_set.active_ub),
+        )
+        warm = run(qp, LRHDirectQPSolver(warm_start=True), state)
+        assert bool(warm.state.success) and int(warm.state.n_elastic) == 1
+        np.testing.assert_allclose(warm.step, cold.step, atol=1e-8)
+        np.testing.assert_allclose(
+            float(warm.state.last_elastic_delta),
+            float(cold.state.last_elastic_delta),
+            atol=1e-10,
+        )
+
+
+class TestElasticJit:
+    def test_single_compilation_whether_or_not_elastic_mode_is_entered(self):
+        traces = []
+
+        @jax.jit
+        def solve(sub, state):
+            traces.append(1)
+            lag = sub.lagrangian
+            x0 = (Primal(jnp.zeros_like(lag.x_ref)), lag.dual)
+            return LRHDirectQPSolver().solve(sub, x0, state)
+
+        entered = []
+        for seed, feasible in [(0, False), (1, True), (2, False), (3, True)]:
+            qp = near_infeasible_case(8, seed, feasible)
+            _, state = solve(make_subproblem(qp), cold_state(qp))
+            entered.append(int(state.n_elastic))
+            assert bool(state.success)
+        assert entered == [1, 0, 1, 0]
+        assert len(traces) == 1
+
+    @pytest.mark.parametrize(
+        "x64, dtype",
+        [(True, jnp.float64), (False, jnp.float32)],
+        ids=["float64", "float32"],
+    )
+    def test_inside_while_loop_and_dtype_stable(self, x64, dtype):
+        """An elastic solve inside a ``lax.while_loop`` whose carry is the state."""
+        with jax.enable_x64(x64):
+            qp = near_infeasible_case(8, 0, False)
+            sub = make_subproblem(qp)
+            state0 = cold_state(qp)
+            solver = LRHDirectQPSolver()
+            assert qp.lagrangian.x_ref.dtype == dtype
+
+            @jax.jit
+            def looped(sub, state):
+                lag = sub.lagrangian
+                x0 = (
+                    Primal(jnp.zeros_like(lag.x_ref)),
+                    jax.tree.map(jnp.zeros_like, lag.dual),
+                )
+
+                def body(carry):
+                    i, st, _ = carry
+                    (step, _dual), st = solver.solve(sub, x0, st)
+                    return i + 1, st, step.x
+
+                return jax.lax.while_loop(
+                    lambda c: c[0] < 2,
+                    body,
+                    (jnp.asarray(0), state, jnp.zeros_like(lag.x_ref)),
+                )
+
+            _, state_out, step_out = looped(sub, state0)
+            assert _state_dtypes(state_out) == _state_dtypes(state0)
+            assert step_out.dtype == dtype
+            assert int(state_out.n_elastic) == 2
+            assert np.all(np.isfinite(np.asarray(step_out)))
+
+    def test_vmapped_over_data(self):
+        """``vmap`` of the solve: the elastic ``cond`` becomes a select."""
+        qps = [near_infeasible_case(8, s, f) for s, f in [(0, False), (1, True)]]
+        subs = jax.tree.map(
+            lambda *xs: jnp.stack(xs), *[make_subproblem(q) for q in qps]
+        )
+        states = jax.tree.map(lambda *xs: jnp.stack(xs), *[cold_state(q) for q in qps])
+
+        def solve(sub, state):
+            lag = sub.lagrangian
+            x0 = (Primal(jnp.zeros_like(lag.x_ref)), lag.dual)
+            (step, _), new = LRHDirectQPSolver().solve(sub, x0, state)
+            return step.x, new
+
+        _, new = jax.jit(jax.vmap(solve))(subs, states)
+        assert np.asarray(new.n_elastic).tolist() == [1, 0]
+        assert bool(np.all(np.asarray(new.success)))
+
+
+class TestElasticLogging:
+    @pytest.mark.parametrize("feasible", [False, True], ids=["elastic", "plain"])
+    def test_record_and_line(self, feasible):
+        qp = near_infeasible_case(8, 0, feasible)
+        solver, logged = with_logger(LRHDirectQPSolver())
+        res = run(qp, solver)
+        (rec,) = logged.records
+        v = rec.values
+        assert set(v) == RECORD_KEYS
+        assert v["elastic"] == (not feasible)
+        assert v["n_elastic"] == int(res.state.n_elastic) == (0 if feasible else 1)
+        np.testing.assert_allclose(
+            v["last_elastic_delta"], float(res.state.last_elastic_delta), rtol=1e-6
+        )
+        assert (v["last_elastic_delta"] > 0.0) == (not feasible)
+        msgs = [m for _, m in logged.lines]
+        assert any(m.startswith("qp elastic mode") for m in msgs) == (not feasible)
+        assert any(m.startswith("qp solved") for m in msgs)
+        assert not any(m.startswith("qp failed") for m in msgs)
+
+    def test_elastic_record_counts_the_cumulative_solves(self):
+        qp = near_infeasible_case(8, 0, False)
+        solver, logged = with_logger(LRHDirectQPSolver())
+        first = run(qp, solver)
+        run(qp, solver, first.state)
+        assert [r.values["n_elastic"] for r in logged.records] == [1, 2]
+
+    def test_logging_does_not_change_the_elastic_result(self):
+        qp = near_infeasible_case(8, 0, False)
+        plain = run(qp)
+        logged_solver, _ = with_logger(LRHDirectQPSolver())
+        logged = run(qp, logged_solver)
+        assert leaves_equal(plain.step, logged.step)
+        assert leaves_equal(plain.dual, logged.dual)
+        assert leaves_equal(plain.state, logged.state)

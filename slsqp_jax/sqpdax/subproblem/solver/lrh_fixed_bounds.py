@@ -25,11 +25,22 @@ multipliers are mapped back. The bound multipliers on ``W`` follow from
 stationarity. Bounds are never stacked into the constraint matrix: ``W`` is a
 pair of boolean masks, and every dense object is ``n × m`` (LRH memory),
 ``n × m_c``, ``m_c × n`` or smaller.
+
+**Elastic variant.** With ``elastic_rho`` the same QP is relaxed by one scalar
+``δ ∈ [0, 1]`` (Kraft's device for inconsistent linearisations, see
+:func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_least_distance_lsei`):
+``A_E d + δ b_E = b_E``, ``A_I,j d + δ b_I,j ≤ b_I,j`` on the rows violated at
+``d = 0``, objective ``+ ½ ρ_e δ²``. The column of ``δ`` is the **unshifted**
+``b``, so the elastic QP is the same for every working set (only the
+right-hand side carries ``d_fix``); ``ρ_e`` is an absolute weight computed
+once per QP by :func:`elastic_penalty` and frozen across the working-set loop.
+``δ`` is a general variable: it never enters the returned multipliers.
 """
 
 from __future__ import annotations
 
 import equinox as eqx
+import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
@@ -37,12 +48,21 @@ from ...dual import Dual
 from ...lagrangian.evaluated import EvaluatedLagrangian
 from ...linalg.free_set_factor import FreeSetFactor
 from ...linalg.lawson_hanson import LDP_RESULTS
-from ...linalg.lsei import least_distance_lsei
+from ...linalg.lsei import (
+    elastic_delta_column,
+    elastic_least_distance_lsei,
+    elastic_weight_scale,
+    least_distance_lsei,
+)
 from ...primal import Primal
 from ...secant.reduced_hessian import ReducedHessianFactors
 from ...types import Scalar, Vector_n
 
-__all__ = ["FixedBoundsQPResult", "solve_fixed_bounds_qp"]
+# Weight factor of the certificate retry of the elastic variant (see the
+# comment at its use).
+_CERT_RETRY_SCALE = 1e-2
+
+__all__ = ["FixedBoundsQPResult", "elastic_penalty", "solve_fixed_bounds_qp"]
 
 
 class FixedBoundsQPResult(eqx.Module):
@@ -83,7 +103,11 @@ class FixedBoundsQPResult(eqx.Module):
         Inequality part ``y_I ≥ 0`` of the certificate, shape ``(m_I,)``.
         Zero unless ``has_ray``. With ``y = [y_E; y_I]``, ``A_Fᵀ y ≈ 0`` on
         the free variables and ``b̃ᵀ y < 0`` (``b̃ = b - A d_fix``), scaled to
-        ``‖y‖_∞ = 1``: it proves the pinned QP infeasible.
+        ``‖y‖_∞ = 1``: it proves the pinned QP infeasible. For the elastic
+        variant the unit sup-norm is that of the augmented certificate
+        ``[y; y_lo; y_hi]`` (the entries of the rows ``δ ≥ 0``, ``δ ≤ 1``), so
+        ``‖y‖_∞ ≤ 1`` there, and the proof is ``b̃ᵀ y + max(-cᵀy, 0) < 0``
+        (``c`` the column of ``δ``) instead of ``b̃ᵀ y < 0``.
     ray_lb, ray_ub
         Ray of the bound multipliers of the pinned QP, shape ``(n,)``.
         With ``ρ_y = A_Eᵀ y_E + A_Iᵀ y_I``, ``ray_lb = ρ_y`` on the lower
@@ -101,6 +125,15 @@ class FixedBoundsQPResult(eqx.Module):
         False, with all four fields above zero, when the status is
         ``feasible``, ``max_iter_reached`` or ``nonfinite``, and on the
         primal-check ``infeasible`` of the least-distance solver.
+    ray_rate
+        Growth rate of the dual objective along the ray, ``-b̃ᵀ y > 0`` (for
+        the elastic variant ``-(b̃ᵀ y_gen + y_hi)``, with ``y_gen`` the
+        certificate of the general rows and ``y_hi`` the certificate entry of
+        the row ``δ ≤ 1``: the ``δ`` rows of the certificate satisfy
+        ``cᵀ y_gen - y_lo + y_hi = 0``). Zero unless ``has_ray``.
+    delta
+        The relaxation ``δ ∈ [0, 1]`` of the elastic variant (``0`` for the
+        plain variant, and whenever ``ldp_status`` is not ``feasible``).
     """
 
     step: Vector_n
@@ -113,6 +146,64 @@ class FixedBoundsQPResult(eqx.Module):
     ray_lb: Vector_n
     ray_ub: Vector_n
     has_ray: Bool[Array, ""]
+    ray_rate: Scalar
+    delta: Scalar
+
+
+def _general_rows(ev, dtype):
+    """General constraint rows ``A d = / ≤ b`` (``[E, I]``) of the SQP-view QP."""
+    a_mat = jnp.concatenate([ev.eq_fn_jac_val, ev.ineq_fn_jac_val], axis=0).astype(
+        dtype
+    )
+    b_vec = -jnp.concatenate([ev.eq_fn_val, ev.ineq_fn_val], axis=0).astype(dtype)
+    return a_mat, b_vec
+
+
+def elastic_penalty(
+    lagrangian: EvaluatedLagrangian[Primal],
+    factors: ReducedHessianFactors,
+    elastic_weight: float,
+    *,
+    rank_tol: float | None = None,
+) -> Scalar:
+    """Absolute elastic weight ``ρ_e = elastic_weight · τ²`` of one QP.
+
+    ``τ²`` is :func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_weight_scale` of the
+    **unpinned** least-distance data ``G₀ = A C⁻¹``, ``h₀ = b + A B⁻¹ g`` (no
+    variable pinned, ``C`` the factor of the full model ``B``) and the column
+    ``c = b`` of ``δ``. The elastic QP must be one fixed QP for every bound
+    working set, so this scale is computed once per QP and the same ``ρ_e`` is
+    passed (as ``elastic_rho``) to every call of
+    :func:`solve_fixed_bounds_qp`. Cost ``O(n r m_c)``.
+
+    Parameters
+    ----------
+    lagrangian
+        Evaluated Lagrangian at the reference point (as for
+        :func:`solve_fixed_bounds_qp`).
+    factors
+        Reduced-Hessian factors of the model ``B``.
+    elastic_weight
+        Dimensionless weight (default of the solver ``1e3``).
+    rank_tol
+        As in :func:`solve_fixed_bounds_qp`.
+
+    Returns
+    -------
+    Array
+        The scalar ``ρ_e`` (``nan`` on non-finite data).
+    """
+    ev = lagrangian.evaluated
+    dtype = jnp.result_type(ev.grad_val, factors.basis, jnp.float32)
+    g = jnp.asarray(ev.grad_val, dtype=dtype)
+    m_e = ev.meq
+    a_mat, b_vec = _general_rows(ev, dtype)
+    free = jnp.ones(g.shape, dtype=bool)
+    factor = FreeSetFactor.build(factors, free, rank_tol=rank_tol)
+    g_t0 = factor.apply_c_inv_t_matrix(a_mat.T)
+    h0 = b_vec + a_mat @ factor.solve(g)
+    delta_col = elastic_delta_column(b_vec, m_e)
+    return elastic_weight * elastic_weight_scale(g_t0, h0, delta_col, m_e)
 
 
 def solve_fixed_bounds_qp(
@@ -124,6 +215,7 @@ def solve_fixed_bounds_qp(
     rank_tol: float | None = None,
     eq_tol: float | None = None,
     nnls_max_iter: int | None = None,
+    elastic_rho: float | Float[Array, ""] | None = None,
 ) -> FixedBoundsQPResult:
     """Solve the LRH QP with the variables of a working set pinned at a bound.
 
@@ -156,7 +248,34 @@ def solve_fixed_bounds_qp(
     dual is zero: consumers (the working-set loop) must branch on it, never
     read those outputs as a QP solution (a zero ``w`` would silently be the
     unconstrained step ``-B_FF⁻¹ g̃``, which is why it is not returned). No
-    elastic relaxation is attempted here.
+    elastic relaxation is attempted unless ``elastic_rho`` is given.
+
+    **Elastic variant** (``elastic_rho`` not ``None``, a static choice; the
+    value may be traced). The least-distance problem is replaced by
+    :func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_least_distance_lsei` with the
+    column ``c = b`` of ``δ`` (the **unshifted** right-hand side, built by
+    :func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_delta_column`; it is not
+    transformed by ``C_F``) and the absolute weight ``ρ_e = elastic_rho``
+    (use :func:`elastic_penalty`). The relaxation reads
+    ``A_F,E d_F = b̃_E - δ b_E`` and ``A_F,I d_F ≤ b̃_I - δ b_I,j`` on the rows
+    with ``b_I,j < 0``. The result carries ``delta``; ``dual`` holds the
+    multipliers of the general rows only (the rows of ``δ`` never enter it).
+    The step, the bound multipliers (stationarity, ``δ`` does not enter
+    ``B d + g + Aᵀλ``) and the certificate are formed as in the plain variant;
+    the growth rate of the dual objective along the ray is
+    ``-(b̃ᵀ y_gen + y_hi)`` (``ray_rate``). With no pinned variable the
+    elastic problem is feasible whenever ``d = 0`` meets the relaxed rows at
+    ``δ = 1``, and an infeasible *pinned* elastic problem is a ray step. The
+    augmented least-distance
+    problem is ill conditioned at the default weight (the ``δ`` coordinate is
+    scaled by ``√ρ_e``), and on an infeasible pinned problem its NNLS residual
+    can land just above the noise threshold of the infeasibility test, which
+    gives ``ldp_status = infeasible`` *without* a certificate (about 6 % of the
+    infeasible pinned solves of the near-infeasible battery at weight ``1e3``).
+    The infeasibility of the pinned problem in ``(w, δ)`` and its Farkas
+    certificate (a statement about the rows) do not depend on ``ρ_e``, so in
+    that case the certificate is taken from a re-solve at ``ρ_e / 100``; the
+    step, multipliers and status are not changed.
 
     **Farkas certificate.** When the pinned QP is infeasible (``ldp_status``
     ``infeasible`` or ``inconsistent_equalities``) and the least-distance
@@ -192,14 +311,17 @@ def solve_fixed_bounds_qp(
     nnls_max_iter
         Iteration budget of the NNLS inside the least-distance solver
         (``None``: its default).
+    elastic_rho
+        Absolute elastic weight ``ρ_e > 0`` (see :func:`elastic_penalty`);
+        ``None`` (default) solves the plain QP.
 
     Returns
     -------
     FixedBoundsQPResult
         ``step``, ``dual``, ``ldp_status``, ``n_nnls_iter``,
-        ``feasibility_residual`` and the certificate fields
-        (``certificate_eq``, ``certificate_ineq``, ``ray_lb``, ``ray_ub``,
-        ``has_ray``).
+        ``feasibility_residual``, the certificate fields (``certificate_eq``,
+        ``certificate_ineq``, ``ray_lb``, ``ray_ub``, ``has_ray``,
+        ``ray_rate``) and ``delta``.
 
     Examples
     --------
@@ -269,10 +391,7 @@ def solve_fixed_bounds_qp(
     d_fix = target - x
 
     # General constraints (m_c x n at most): A d = / <= b.
-    a_mat = jnp.concatenate([ev.eq_fn_jac_val, ev.ineq_fn_jac_val], axis=0).astype(
-        dtype
-    )
-    b_vec = -jnp.concatenate([ev.eq_fn_val, ev.ineq_fn_val], axis=0).astype(dtype)
+    a_mat, b_vec = _general_rows(ev, dtype)
 
     # Eliminate the pinned block (full B applied to the full d_fix, then masked).
     factor = FreeSetFactor.build(factors, free, rank_tol=rank_tol)
@@ -284,10 +403,67 @@ def solve_fixed_bounds_qp(
     g_t = factor.apply_c_inv_t_matrix(a_free.T)  # (n, m_c): G^T = C_F^{-T} A_F^T
     b_inv_g = factor.solve(g_tilde)
     h = b_tilde + a_free @ b_inv_g
-    lsei = least_distance_lsei(g_t, h, m_e, eq_tol=eq_tol, max_iter=nnls_max_iter)
+    if elastic_rho is None:
+        lsei = least_distance_lsei(g_t, h, m_e, eq_tol=eq_tol, max_iter=nnls_max_iter)
+        w, delta_raw, y_hi = lsei.w, jnp.zeros((), dtype), jnp.zeros((), dtype)
+    else:
+        # Relaxation A_F d_F + δ b = b~: the column of δ is the UNSHIFTED b,
+        # untransformed by C_F, and ρ_e is the frozen absolute weight.
+        delta_col = elastic_delta_column(b_vec, m_e)
+        rho_e = jnp.asarray(elastic_rho, dtype)
+
+        def elastic_solve(rho):
+            return elastic_least_distance_lsei(
+                g_t,
+                h,
+                m_e,
+                delta_col,
+                rho,
+                eq_tol=eq_tol,
+                max_iter=nnls_max_iter,
+            )
+
+        lsei = elastic_solve(rho_e)
+        # Certificate retry. The pinned elastic problem is often infeasible (a
+        # ray step of the loop), and the least-distance solver must then hand
+        # back a Farkas certificate. At the default weight the augmented
+        # problem is ill conditioned (the δ coordinate is scaled by √ρ_e) and
+        # the NNLS residual of an infeasible problem can land just above the
+        # noise threshold of the infeasibility test: the status is then
+        # ``infeasible`` (by the primal check) but there is no certificate.
+        # Infeasibility of the pinned problem in (w, δ) does not depend on
+        # ρ_e (it only rescales the δ coordinate) and a certificate is a
+        # statement about the rows, so re-solving with a smaller weight, which
+        # is well conditioned, yields a valid certificate of the same problem.
+        # The retry replaces only the certificate and only when it forms one.
+        need_cert = (lsei.status == LDP_RESULTS.infeasible) & ~lsei.has_certificate
+        alt = jax.lax.cond(
+            need_cert,
+            lambda: elastic_solve(rho_e * _CERT_RETRY_SCALE),
+            lambda: lsei,
+        )
+        take = need_cert & alt.has_certificate & (alt.status == LDP_RESULTS.infeasible)
+        lsei = eqx.tree_at(
+            lambda r: (
+                r.cert_eq,
+                r.cert_ineq,
+                r.cert_delta,
+                r.has_certificate,
+                r.n_iter,
+            ),
+            lsei,
+            (
+                jnp.where(take, alt.cert_eq, lsei.cert_eq),
+                jnp.where(take, alt.cert_ineq, lsei.cert_ineq),
+                jnp.where(take, alt.cert_delta, lsei.cert_delta),
+                take | lsei.has_certificate,
+                lsei.n_iter + jnp.where(need_cert, alt.n_iter, 0),
+            ),
+        )
+        w, delta_raw, y_hi = lsei.w, lsei.delta.astype(dtype), lsei.cert_delta[1]
 
     # Step and bound multipliers (garbage unless ``ok``; selected below).
-    d_free = factor.apply_c_inv(lsei.w) - b_inv_g
+    d_free = factor.apply_c_inv(w) - b_inv_g
     step_ok = d_free + d_fix
     lam_eq, lam_ineq = lsei.lam_eq, lsei.lam_ineq
     rho_s = (
@@ -343,6 +519,12 @@ def solve_fixed_bounds_qp(
     )
     ray_lb = jnp.where(has_ray & pin_lb, rho_ray, 0.0)
     ray_ub = jnp.where(has_ray & pin_ub, -rho_ray, 0.0)
+    # Growth rate of the dual objective along the ray: -(b~'y_gen + y_hi); the
+    # general rows of the elastic certificate satisfy G'y_gen = 0, so
+    # h'y_gen = b~'y_gen, and y_hi = 0 for the plain variant.
+    ray_rate = jnp.where(
+        has_ray, -(b_tilde @ jnp.concatenate([cert_eq, cert_ineq]) + y_hi), 0.0
+    )
 
     return FixedBoundsQPResult(  # ty: ignore[invalid-return-type]
         step=step,
@@ -355,4 +537,6 @@ def solve_fixed_bounds_qp(
         ray_lb=ray_lb,
         ray_ub=ray_ub,
         has_ray=has_ray,
+        ray_rate=ray_rate,
+        delta=jnp.where(ok, delta_raw, 0.0),
     )

@@ -23,10 +23,14 @@ import scipy.linalg
 from slsqp_jax.sqpdax.linalg import LDP_RESULTS
 from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
     FixedBoundsQPResult,
+    elastic_penalty,
     solve_fixed_bounds_qp,
 )
 from tests.sqpdax.subproblem.solver.conftest import (
     RandomQP,
+    assert_elastic_kkt,
+    delta_min_lp,
+    elastic_column_np,
     index_mask,
     make_random_lrh_qp,
     walk_avals,
@@ -345,13 +349,17 @@ def _opposite_halfspaces(qp: RandomQP) -> RandomQP:
     )
 
 
-def _nonfinite_gradient(qp: RandomQP) -> RandomQP:
+def _nonfinite_gradient_at(qp: RandomQP, index: int) -> RandomQP:
     lag = eqx.tree_at(
         lambda lg: lg.evaluated.grad_val,
         qp.lagrangian,
-        qp.lagrangian.evaluated.grad_val.at[0].set(jnp.nan),
+        qp.lagrangian.evaluated.grad_val.at[index].set(jnp.nan),
     )
     return qp._replace(lagrangian=lag)
+
+
+def _nonfinite_gradient(qp: RandomQP) -> RandomQP:
+    return _nonfinite_gradient_at(qp, 0)
 
 
 def _status_qp(mix, mutate, lower, upper) -> RandomQP:
@@ -397,12 +405,15 @@ class TestStatusPropagation:
 
 
 class TestMemoryBudget:
-    def test_no_n_by_n_intermediate(self):
+    @pytest.mark.parametrize("elastic", [False, True])
+    def test_no_n_by_n_intermediate(self, elastic):
         """No array of the jaxpr has two axes as large as ``n``."""
         n, m_c = 30, 5  # n is distinct from every other dimension (m=4, m_c=5)
         lower, upper = working_set("random", n, 0)
         qp = make_random_lrh_qp(n, 3, 2, 3, seed=1, lower=lower, upper=upper)
-        jaxpr = jax.make_jaxpr(solve_fixed_bounds_qp)(
+        jaxpr = jax.make_jaxpr(
+            lambda *a: solve_fixed_bounds_qp(*a, elastic_rho=1.0 if elastic else None)
+        )(
             qp.lagrangian,
             qp.factors,
             jnp.asarray(lower),
@@ -411,7 +422,12 @@ class TestMemoryBudget:
         shapes = set(walk_avals(jaxpr.jaxpr))
         offenders = [s for s in shapes if sum(1 for d in s if d >= n) >= 2]
         assert not offenders, offenders
-        assert max(int(np.prod(s)) for s in shapes) <= n * max(m_c, 4) + n
+        # The elastic QP adds one coordinate and two general rows: the
+        # ``(n + 1) × (m_c + 2)`` matrix of the augmented least-distance problem.
+        e = int(elastic)
+        assert (
+            max(int(np.prod(s)) for s in shapes) <= (n + e) * (max(m_c, 4) + 2 * e) + n
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +642,9 @@ def assert_ray_certificate(case: Case, res: FixedBoundsQPResult) -> None:
     assert np.linalg.norm(a_all[:, free].T @ y) <= 1e-8 * a_norm
     assert b_tilde @ y < 0.0
     assert b_tilde @ y <= -1e-6 * (np.abs(b_tilde) @ np.abs(y))
+    # Growth rate of the dual objective along the ray, and no relaxation.
+    np.testing.assert_allclose(float(res.ray_rate), -(b_tilde @ y), rtol=1e-12)
+    assert float(res.delta) == 0.0
 
     ray_lb, ray_ub = np.asarray(res.ray_lb), np.asarray(res.ray_ub)
     rho = a_all.T @ y
@@ -638,6 +657,7 @@ def assert_ray_certificate(case: Case, res: FixedBoundsQPResult) -> None:
 def assert_no_ray(qp: RandomQP, res: FixedBoundsQPResult) -> None:
     m_e, m_i = qp.a_eq.shape[0], qp.a_ineq.shape[0]
     assert not bool(res.has_ray)
+    assert float(res.ray_rate) == 0.0 and float(res.delta) == 0.0
     assert res.certificate_eq.shape == (m_e,)
     assert res.certificate_ineq.shape == (m_i,)
     assert res.ray_lb.shape == res.ray_ub.shape == qp.x.shape
@@ -732,3 +752,311 @@ class TestFarkasCertificates:
         assert_ray_certificate(both_case, res)
         assert np.any(np.asarray(res.ray_lb) != 0.0)
         np.testing.assert_array_equal(np.asarray(res.ray_ub), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Elastic variant (T09, C16): ``elastic_rho`` relaxes the QP by one scalar
+# δ ∈ [0, 1] with the UNSHIFTED column ``c = [b_E, min(b_I, 0)]`` and the
+# frozen absolute weight ρ_e (plan 2.5 rev 11/12).
+# ---------------------------------------------------------------------------
+
+WEIGHT = 1e3
+
+
+def scaled_qp(qp: RandomQP, kappa: float) -> RandomQP:
+    """``qp`` with ``g`` and ``b`` multiplied by ``kappa`` (``w`` scales by ``kappa``)."""
+    scaled = with_rows(qp, qp.a_eq, kappa * qp.b_eq, qp.a_ineq, kappa * qp.b_ineq)
+    lag = eqx.tree_at(
+        lambda lg: lg.evaluated.grad_val,
+        scaled.lagrangian,
+        kappa * scaled.lagrangian.evaluated.grad_val,
+    )
+    return scaled._replace(lagrangian=lag, g=kappa * qp.g)
+
+
+def tau_squared_reference(qp: RandomQP) -> float:
+    """Dense ``τ²`` of the unpinned data (plan 2.5 rev 12), reference formula.
+
+    ``‖G₀_j‖² = a_jᵀ B⁻¹ a_j``, ``h₀ = b + A B⁻¹ g``, column ``c = b`` on the
+    equalities and ``min(b, 0)`` on the inequalities.
+    """
+    m_e = qp.a_eq.shape[0]
+    a_all = np.concatenate([qp.a_eq, qp.a_ineq])
+    b_all = np.concatenate([qp.b_eq, qp.b_ineq])
+    if a_all.shape[0] == 0:
+        return 1.0
+    b_inv_a = np.linalg.solve(qp.dense_b, a_all.T)
+    norm = np.sqrt(np.einsum("ij,ji->i", a_all, b_inv_a))
+    h0 = b_all + a_all @ np.linalg.solve(qp.dense_b, qp.g)
+    h_term = np.concatenate([np.abs(h0[:m_e]), np.maximum(-h0[m_e:], 0.0)])
+    dist = np.maximum(h_term, np.abs(elastic_column_np(qp))) / norm
+    tau = dist.max()
+    return float(tau**2 if tau > 0 else 1.0)
+
+
+class TestElasticPenalty:
+    @pytest.mark.parametrize("kappa", [1e-6, 1.0, 1e3])
+    @pytest.mark.parametrize("weight", [1e-2, 1e3])
+    @pytest.mark.parametrize("mix", MIXES[1:], ids=MIX_IDS[1:])
+    @pytest.mark.parametrize("seed", range(2))
+    def test_matches_the_dense_formula(self, mix, weight, kappa, seed):
+        qp = scaled_qp(
+            make_random_lrh_qp(8, 3, *mix, seed=seed, dup=mix[0] == 3), kappa
+        )
+        rho = float(elastic_penalty(qp.lagrangian, qp.factors, weight))
+        np.testing.assert_allclose(rho, weight * tau_squared_reference(qp), rtol=1e-8)
+
+    @pytest.mark.parametrize("kappa", [1e-6, 1e3])
+    @pytest.mark.parametrize(
+        "mix", [(2, 0), (2, 3), (3, 2)], ids=["2-0", "2-3", "3dup-2"]
+    )
+    def test_scales_with_the_square_of_the_data(self, mix, kappa):
+        """Scaling ``g`` and ``b`` by ``κ`` scales ``w`` by ``κ``, ``τ²`` by ``κ²``.
+
+        (Needs an active scale: with only slack inequalities ``τ = 1``.)
+        """
+        base = make_random_lrh_qp(8, 3, *mix, seed=0, dup=mix[0] == 3)
+        qp = scaled_qp(base, kappa)
+        ratio = elastic_rho_of(qp) / elastic_rho_of(base)
+        np.testing.assert_allclose(ratio, kappa**2, rtol=1e-8)
+
+    def test_only_slack_inequalities_give_unit_scale(self):
+        qp = make_random_lrh_qp(8, 3, 0, 3, seed=0)
+        assert float(elastic_penalty(qp.lagrangian, qp.factors, 5.0)) == 5.0
+
+    def test_no_general_constraints_gives_unit_scale(self):
+        qp = make_random_lrh_qp(6, 2, 0, 0, seed=0)
+        assert float(elastic_penalty(qp.lagrangian, qp.factors, 7.0)) == 7.0
+
+    def test_jit_and_non_finite_data(self):
+        qp = make_random_lrh_qp(6, 2, 2, 3, seed=0)
+        jitted = jax.jit(elastic_penalty, static_argnums=(2,))
+        np.testing.assert_allclose(
+            float(jitted(qp.lagrangian, qp.factors, WEIGHT)),
+            float(elastic_penalty(qp.lagrangian, qp.factors, WEIGHT)),
+        )
+        lag = eqx.tree_at(
+            lambda lg: lg.evaluated.grad_val,
+            qp.lagrangian,
+            qp.lagrangian.evaluated.grad_val.at[0].set(jnp.nan),
+        )
+        assert np.isnan(float(elastic_penalty(lag, qp.factors, WEIGHT)))
+
+
+def elastic_rho_of(qp: RandomQP, weight: float = WEIGHT) -> float:
+    return float(elastic_penalty(qp.lagrangian, qp.factors, weight))
+
+
+class TestElasticKernel:
+    def test_solves_the_relaxed_qp_on_every_working_set(self, case: Case):
+        """KKT of the relaxed QP (so the minimiser), ``d_W = d_fix``, ``δ`` bound.
+
+        The plain QP of these cases is feasible; with ``λ`` its multipliers,
+        ``0 ≤ δ ≤ max(-cᵀλ, 0)/ρ_e`` (plan rev 12), and ``δ`` is not in the dual.
+        """
+        qp = case.qp
+        rho = elastic_rho_of(qp)
+        res = run(case, elastic_rho=rho)
+        plain = run(case)
+        pinned = case.lower | case.upper
+        assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        assert not bool(res.has_ray)
+        delta = float(res.delta)
+        assert 0.0 <= delta <= 1.0
+        d = np.asarray(res.step)
+        np.testing.assert_allclose(
+            d[pinned], d_fix_of(qp, case.lower, case.upper)[pinned], atol=1e-12
+        )
+        assert_elastic_kkt(qp, rho, d, delta, res.dual, pinned=pinned)
+        lam = np.concatenate(
+            [
+                np.asarray(plain.dual.eq_multipliers),
+                np.asarray(plain.dual.ineq_multipliers),
+            ]
+        )
+        bound = max(-(elastic_column_np(qp) @ lam), 0.0) / rho
+        assert delta <= bound + 1e-9
+        assert res.dual.eq_multipliers.shape == plain.dual.eq_multipliers.shape
+        assert res.dual.ineq_multipliers.shape == plain.dual.ineq_multipliers.shape
+
+    @pytest.mark.parametrize("kind", WORKING_SETS)
+    def test_nonfinite_data_gives_the_fallback_outputs(self, kind):
+        """A non-finite gradient: ``nonfinite``, ``d_fix`` step, zero dual and ``δ``."""
+        mix, mutate, expected = STATUS_CASES["nonfinite"]
+        lower, upper = working_set(kind, 6, 0)
+        qp = _status_qp(mix, mutate, lower, upper)
+        res = run(Case(qp, lower, upper), elastic_rho=1.0)
+        assert bool(res.ldp_status == expected)
+        np.testing.assert_array_equal(np.asarray(res.step), d_fix_of(qp, lower, upper))
+        for leaf in jax.tree.leaves(res.dual):
+            assert np.all(np.asarray(leaf) == 0.0)
+        assert float(res.delta) == 0.0
+        assert not bool(res.has_ray) and float(res.ray_rate) == 0.0
+
+    @pytest.mark.parametrize("weight", [1e-1, 1e2, 1e5])
+    def test_relaxation_shrinks_towards_the_plain_step_with_the_weight(self, weight):
+        """A larger ``ρ_e`` pulls ``δ`` and the step towards the plain solution."""
+        case = build_case(8, 3, (2, 3), "random")
+        plain = np.asarray(run(case).step)
+        errs = []
+        for w in (weight, 10 * weight):
+            res = run(case, elastic_rho=elastic_rho_of(case.qp, w))
+            errs.append(np.abs(np.asarray(res.step) - plain).max())
+        assert errs[1] <= errs[0] + 1e-9
+
+    def test_traced_weight_compiles_once(self):
+        traces = []
+
+        def counted(lagrangian, factors, active_lb, active_ub, rho):
+            traces.append(1)
+            return solve_fixed_bounds_qp(
+                lagrangian, factors, active_lb, active_ub, elastic_rho=rho
+            )
+
+        solve = jax.jit(counted)
+        case = build_case(6, 2, (2, 3), "random")
+        for weight in (1e1, 1e3, 1e5):
+            res = solve(
+                case.qp.lagrangian,
+                case.qp.factors,
+                jnp.asarray(case.lower),
+                jnp.asarray(case.upper),
+                jnp.asarray(elastic_rho_of(case.qp, weight)),
+            )
+            assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        assert len(traces) == 1
+
+
+def pinned_elastic_data(make, kind, mix, seed):
+    """``(case, δ_min)``: the LP gives the smallest ``δ`` of the pinned elastic QP."""
+    case = make(mix, kind, seed)
+    qp = case.qp
+    d_fix = d_fix_of(qp, case.lower, case.upper)
+    pin = (case.lower & np.isfinite(qp.lb)) | (case.upper & np.isfinite(qp.ub))
+    lo = np.where(pin, d_fix, qp.lb - qp.x)
+    hi = np.where(pin, d_fix, qp.ub - qp.x)
+    return case, delta_min_lp(qp, lo, hi)
+
+
+PINNED_ELASTIC = [(params, seed) for params in CERTIFICATE_PARAMS for seed in range(4)]
+PINNED_ELASTIC_IDS = [f"{cid}-s{seed}" for cid in CERTIFICATE_IDS for seed in range(4)]
+_PINNED_DELTA_MIN = {
+    key: pinned_elastic_data(*params, seed)[1]
+    for key, (params, seed) in zip(PINNED_ELASTIC_IDS, PINNED_ELASTIC)
+}
+PINNED_FEASIBLE = [
+    pytest.param(*p[0], p[1], id=i)
+    for p, i in zip(PINNED_ELASTIC, PINNED_ELASTIC_IDS)
+    if _PINNED_DELTA_MIN[i] is not None
+]
+PINNED_INFEASIBLE = [
+    pytest.param(*p[0], p[1], id=i)
+    for p, i in zip(PINNED_ELASTIC, PINNED_ELASTIC_IDS)
+    if _PINNED_DELTA_MIN[i] is None
+]
+
+
+def assert_elastic_ray(case: Case, res: FixedBoundsQPResult, rho: float) -> None:
+    """Certificate of an infeasible pinned elastic problem (rev 12 ray rule).
+
+    ``y`` (rows of ``A``) has ``y_I ≥ 0``, ``A_Fᵀ y ≈ 0`` and, with the rows of
+    ``δ ∈ [0, 1]`` priced in, ``b̃ᵀy + max(-cᵀy, 0) < 0``: no ``(d_F, δ)`` meets
+    ``A_F d_F + δ c = b̃`` / ``≤ b̃``. The growth rate along the ray is
+    ``-(b̃ᵀy_gen + y_hi)`` with ``y_hi ≥ max(-cᵀy, 0)``.
+    """
+    qp = case.qp
+    pin_lb = case.lower & np.isfinite(qp.lb)
+    pin_ub = case.upper & ~case.lower & np.isfinite(qp.ub)
+    free = ~(pin_lb | pin_ub)
+    assert bool(res.has_ray)
+    assert any(bool(res.ldp_status == s) for s in NOT_FEASIBLE)
+    a_all = np.concatenate([qp.a_eq, qp.a_ineq])
+    b_all = np.concatenate([qp.b_eq, qp.b_ineq])
+    y_e, y_i = np.asarray(res.certificate_eq), np.asarray(res.certificate_ineq)
+    y = np.concatenate([y_e, y_i])
+    assert np.all(np.isfinite(y)) and np.all(y_i >= 0.0)
+    # The augmented certificate [y; y_lo; y_hi] has unit sup-norm, so ‖y‖ ≤ 1.
+    assert 0.0 < np.max(np.abs(y)) <= 1.0 + 1e-12
+    d_fix = np.where(pin_lb, qp.lb - qp.x, np.where(pin_ub, qp.ub - qp.x, 0.0))
+    b_tilde = b_all - a_all @ d_fix
+    a_norm = np.linalg.norm(a_all)
+    assert np.linalg.norm(a_all[:, free].T @ y) <= 1e-8 * a_norm * np.max(np.abs(y))
+    c = elastic_column_np(qp)
+    margin = b_tilde @ y + max(-(c @ y), 0.0)
+    assert margin < 0.0
+    assert margin <= -1e-6 * (np.abs(b_tilde) @ np.abs(y) + np.abs(c) @ np.abs(y))
+    rate = float(res.ray_rate)
+    assert rate > 0.0 and rate <= -margin + 1e-9 * max(1.0, abs(margin))
+    # The ray identity on all coordinates, and the outputs of a failed solve.
+    rho_y = a_all.T @ y
+    ray_lb, ray_ub = np.asarray(res.ray_lb), np.asarray(res.ray_ub)
+    np.testing.assert_allclose(
+        ray_lb, np.where(pin_lb, rho_y, 0.0), atol=1e-12 * a_norm
+    )
+    np.testing.assert_allclose(
+        ray_ub, np.where(pin_ub, -rho_y, 0.0), atol=1e-12 * a_norm
+    )
+    assert np.linalg.norm(rho_y - ray_lb + ray_ub) <= 1e-8 * a_norm
+    assert float(res.delta) == 0.0
+    np.testing.assert_array_equal(np.asarray(res.step), np.where(free, 0.0, d_fix))
+    for leaf in jax.tree.leaves(res.dual):
+        assert np.all(np.asarray(leaf) == 0.0)
+
+
+class TestElasticOverPinned:
+    """Over-pinned and tight-box QPs, solved or certified by the elastic variant.
+
+    The LP of ``delta_min_lp`` (pins as ``lo == hi``) decides which of the two
+    outcomes a pin set has; both occur in the scenarios below.
+    """
+
+    def test_both_outcomes_occur(self):
+        assert PINNED_FEASIBLE and PINNED_INFEASIBLE
+
+    @pytest.mark.parametrize("make, kind, mix, seed", PINNED_FEASIBLE)
+    def test_feasible_pinned_elastic_problem_is_solved(self, make, kind, mix, seed):
+        case, delta_min = pinned_elastic_data(make, kind, mix, seed)
+        qp = case.qp
+        rho = elastic_rho_of(qp)
+        res = run(case, elastic_rho=rho)
+        assert bool(res.ldp_status == LDP_RESULTS.feasible) and not bool(res.has_ray)
+        delta = float(res.delta)
+        assert delta_min is not None and delta >= delta_min - 1e-7
+        pinned = (case.lower & np.isfinite(qp.lb)) | (
+            case.upper & ~case.lower & np.isfinite(qp.ub)
+        )
+        assert_elastic_kkt(
+            qp, rho, np.asarray(res.step), delta, res.dual, pinned=pinned
+        )
+
+    @pytest.mark.parametrize("make, kind, mix, seed", PINNED_FEASIBLE)
+    def test_nonfinite_gradient_on_a_pinned_variable_zeroes_delta(
+        self, make, kind, mix, seed
+    ):
+        """The reduction does not see a pinned coordinate of ``g``: the solve
+        succeeds with ``δ > 0`` until the finiteness check flips the status, which
+        must zero ``δ`` as well as the step and dual."""
+        case, _ = pinned_elastic_data(make, kind, mix, seed)
+        rho = elastic_rho_of(case.qp)
+        assert float(run(case, elastic_rho=rho).delta) > 0.0
+        pinned = (case.lower & np.isfinite(case.qp.lb)) | (
+            case.upper & np.isfinite(case.qp.ub)
+        )
+        bad = _nonfinite_gradient_at(case.qp, int(np.flatnonzero(pinned)[0]))
+        res = run(Case(bad, case.lower, case.upper), elastic_rho=rho)
+        assert bool(res.ldp_status == LDP_RESULTS.nonfinite)
+        assert float(res.delta) == 0.0 and not bool(res.has_ray)
+        np.testing.assert_array_equal(
+            np.asarray(res.step), d_fix_of(bad, case.lower, case.upper)
+        )
+        for leaf in jax.tree.leaves(res.dual):
+            assert np.all(np.asarray(leaf) == 0.0)
+
+    @pytest.mark.parametrize("make, kind, mix, seed", PINNED_INFEASIBLE)
+    def test_infeasible_pinned_elastic_problem_has_a_certificate(
+        self, make, kind, mix, seed
+    ):
+        case, delta_min = pinned_elastic_data(make, kind, mix, seed)
+        assert delta_min is None
+        rho = elastic_rho_of(case.qp)
+        assert_elastic_ray(case, run(case, elastic_rho=rho), rho)

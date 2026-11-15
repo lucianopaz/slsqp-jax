@@ -433,3 +433,116 @@ def walk_avals(jaxpr: Any):
                 inner = getattr(sub, "jaxpr", sub)
                 if hasattr(inner, "eqns"):
                     yield from walk_avals(inner)
+
+
+# ---------------------------------------------------------------------------
+# Dense references of the elastic (relaxed) QP (tiny ``n``, reference use only)
+# ---------------------------------------------------------------------------
+
+
+def elastic_column_np(qp: RandomQP) -> np.ndarray:
+    """Column ``c`` of ``δ``: ``b_E`` on the equalities, ``min(b_I, 0)`` on the rest.
+
+    The relaxed rows are ``A_E d + δ b_E = b_E`` and ``A_I d + δ c_I ≤ b_I``.
+    """
+    return np.concatenate([qp.b_eq, np.minimum(qp.b_ineq, 0.0)])
+
+
+def _relaxed_rows(qp: RandomQP):
+    a_all = np.concatenate([qp.a_eq, qp.a_ineq])
+    b_all = np.concatenate([qp.b_eq, qp.b_ineq])
+    return a_all, b_all, qp.a_eq.shape[0]
+
+
+def delta_min_lp(
+    qp: RandomQP, lo: np.ndarray | None = None, hi: np.ndarray | None = None
+) -> float | None:
+    """Smallest ``δ ∈ [0, 1]`` with a step ``lo ≤ d ≤ hi`` meeting the relaxed rows.
+
+    Solved as a small LP over ``(d, δ)``. ``lo`` / ``hi`` default to the box of
+    ``qp`` (``lb - x``, ``ub - x``); pinned variables are expressed as
+    ``lo == hi``. Returns ``None`` when no ``δ ∈ [0, 1]`` makes the relaxed
+    rows feasible.
+    """
+    from scipy.optimize import linprog
+
+    lo = qp.lb - qp.x if lo is None else lo
+    hi = qp.ub - qp.x if hi is None else hi
+    n = qp.x.shape[0]
+    m_e, m_i = qp.a_eq.shape[0], qp.a_ineq.shape[0]
+    c_i = np.minimum(qp.b_ineq, 0.0)
+    bounds = [
+        (None if np.isneginf(a) else a, None if np.isposinf(b) else b)
+        for a, b in zip(lo, hi)
+    ] + [(0.0, 1.0)]
+    cost = np.zeros(n + 1)
+    cost[-1] = 1.0
+    out = linprog(
+        cost,
+        A_ub=np.hstack([qp.a_ineq, c_i[:, None]]) if m_i else None,
+        b_ub=qp.b_ineq if m_i else None,
+        A_eq=np.hstack([qp.a_eq, qp.b_eq[:, None]]) if m_e else None,
+        b_eq=qp.b_eq if m_e else None,
+        bounds=bounds,
+        method="highs",
+    )
+    return float(out.fun) if out.status == 0 else None
+
+
+def assert_elastic_kkt(
+    qp: RandomQP,
+    rho: float,
+    d: np.ndarray,
+    delta: float,
+    dual,
+    *,
+    pinned: np.ndarray | None = None,
+    tol: float = 1e-7,
+) -> None:
+    """KKT conditions of the elastic QP (convex, so they certify the minimiser).
+
+    ``min gᵀd + ½dᵀBd + ½ρδ²`` s.t. ``A_E d + δ b_E = b_E``,
+    ``A_I d + δ c_I ≤ b_I``, ``0 ≤ δ ≤ 1`` (``c`` = :func:`elastic_column_np`)
+    and, unless ``pinned`` is given, the box ``lb ≤ x + d ≤ ub``. With
+    ``pinned`` (a boolean mask of variables held at ``d``), stationarity is
+    required on the other coordinates only and the box is not checked. The
+    multipliers of ``δ``'s rows are not returned by the code under test; the
+    sign pattern of ``ρδ + cᵀλ`` (``= μ_lo - μ_hi``) stands in for them.
+    """
+    lam_e = np.asarray(dual.eq_multipliers)
+    lam_i = np.asarray(dual.ineq_multipliers)
+    lam_lb, lam_ub = np.asarray(dual.lb_multipliers), np.asarray(dual.ub_multipliers)
+    n = qp.x.shape[0]
+    free = np.ones(n, bool) if pinned is None else ~pinned
+    c = elastic_column_np(qp)
+    c_e, c_i = c[: qp.a_eq.shape[0]], c[qp.a_eq.shape[0] :]
+    scale = max(1.0, np.linalg.norm(qp.g), np.linalg.norm(qp.dense_b @ d))
+    # Primal feasibility of the relaxed rows and of the box.
+    assert -tol <= delta <= 1.0 + tol
+    np.testing.assert_allclose(
+        qp.a_eq @ d + delta * c_e - qp.b_eq,
+        0.0,
+        atol=tol * max(1.0, abs(qp.b_eq).max(initial=0.0)),
+    )
+    slack = qp.b_ineq - qp.a_ineq @ d - delta * c_i
+    assert np.all(slack >= -tol * max(1.0, np.abs(qp.b_ineq).max(initial=0.0)))
+    gap_lo, gap_hi = qp.x + d - qp.lb, qp.ub - qp.x - d
+    if pinned is None:
+        assert np.all(gap_lo >= -1e-9) and np.all(gap_hi >= -1e-9)
+    # Stationarity in d (free coordinates) and the multiplier signs.
+    resid = qp.dense_b @ d + qp.g + qp.a_eq.T @ lam_e + qp.a_ineq.T @ lam_i
+    resid = resid - lam_lb + lam_ub
+    assert np.max(np.abs(resid[free]), initial=0.0) <= tol * scale * 10
+    assert np.all(lam_i >= -tol * scale)
+    assert np.all(np.abs(lam_i * slack) <= tol * scale * 10)
+    if pinned is None:
+        assert np.all(lam_lb >= -tol * scale) and np.all(lam_ub >= -tol * scale)
+        lo_fin, hi_fin = np.isfinite(gap_lo), np.isfinite(gap_hi)
+        assert np.all(np.abs(lam_lb[lo_fin] * gap_lo[lo_fin]) <= tol * scale * 10)
+        assert np.all(np.abs(lam_ub[hi_fin] * gap_hi[hi_fin]) <= tol * scale * 10)
+    # Stationarity in δ: ρδ + cᵀλ = μ_lo - μ_hi with μ ≥ 0, complementary to δ.
+    r_delta = rho * delta + c_e @ lam_e + c_i @ lam_i
+    r_tol = tol * max(1.0, abs(rho * delta), abs(c) @ np.abs(np.r_[lam_e, lam_i])) * 10
+    assert (r_delta >= -r_tol) | (delta > 1e-9)  # δ = 0: μ_lo ≥ 0
+    assert (r_delta <= r_tol) | (delta < 1.0 - 1e-9)  # δ = 1: μ_hi ≥ 0
+    assert (abs(r_delta) <= r_tol) | (delta < 1e-9) | (delta > 1.0 - 1e-9)
