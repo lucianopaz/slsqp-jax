@@ -20,7 +20,12 @@ import numpy as np
 import pytest
 import scipy.linalg
 
+from slsqp_jax.sqpdax.dual import Dual
+from slsqp_jax.sqpdax.lagrangian.evaluated import EvaluatedLagrangian
 from slsqp_jax.sqpdax.linalg import LDP_RESULTS
+from slsqp_jax.sqpdax.primal import Primal
+from slsqp_jax.sqpdax.problem.basic import EvaluatedProblem
+from slsqp_jax.sqpdax.secant import ReducedHessianFactors
 from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
     FixedBoundsQPResult,
     elastic_penalty,
@@ -402,6 +407,78 @@ class TestStatusPropagation:
         np.testing.assert_allclose(
             float(res.feasibility_residual), expected_resid, atol=1e-12
         )
+
+
+# ---------------------------------------------------------------------------
+# Redundant linear equality under a stiff model (C24).
+#
+# LSEI sees ``Gᵀ = C_F⁻ᵀ A_Fᵀ``: a redundant equality (``a₃ = a₁ + a₂``) is
+# exactly dependent in ``A`` but its rounding is amplified by the metric
+# (about ``eps · κ`` for rows in the stiff part of ``range(Z)``). The default
+# rank cut must still classify the row as dependent and return the step of the
+# two independent rows; too small a cut returns ``feasible`` with a wrong step
+# and multipliers of order 1e16 and above. ``B = (I - ZZᵀ) σ + ZRᵀRZᵀ`` is
+# only ever applied through ``Z``: the reference is an O(n r) Woodbury solve.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n, kappa", [(100, 1e2), (1000, 1e3)])
+def test_redundant_equality_under_stiff_model_matches_woodbury(n, kappa):
+    r = 10
+    rng = np.random.default_rng(0)
+    z = np.linalg.qr(rng.standard_normal((n, r)))[0]
+    a_ind = rng.standard_normal((2, r)) @ z.T  # rows in range(Z)
+    a_eq = np.vstack([a_ind, a_ind.sum(axis=0, keepdims=True)])
+    b_eq = a_eq @ rng.standard_normal(n)
+    g = rng.standard_normal(n)
+
+    # Reference: B⁻¹ v = v - Z Zᵀ v + κ⁻² Z Zᵀ v (σ = 1, R = κ I), the two
+    # independent rows, and their 2 x 2 Schur system.
+    def b_inv(v):
+        zv = z.T @ v
+        return v - z @ zv + z @ zv / kappa**2
+
+    binv_rows = np.stack([b_inv(row) for row in a_ind], axis=1)
+    lam_ref = np.linalg.solve(a_ind @ binv_rows, -(b_eq[:2] + a_ind @ b_inv(g)))
+    step_ref = -b_inv(g + a_ind.T @ lam_ref)
+
+    evaluated = EvaluatedProblem(
+        ref=Primal(x=jnp.zeros(n)),
+        fn_val=jnp.zeros(()),
+        grad_val=jnp.asarray(g),
+        fn_qvp=None,
+        eq_fn_val=jnp.asarray(-b_eq),
+        eq_fn_jac_val=jnp.asarray(a_eq),
+        eq_fn_qvp=None,
+        ineq_fn_val=jnp.zeros((0,)),
+        ineq_fn_jac_val=jnp.zeros((0, n)),
+        ineq_fn_qvp=None,
+        lb=jnp.full(n, -jnp.inf),
+        ub=jnp.full(n, jnp.inf),
+        null_lb=jnp.ones(n, dtype=bool),
+        null_ub=jnp.ones(n, dtype=bool),
+        aux_val=None,
+    )
+    lagrangian = EvaluatedLagrangian(
+        evaluated=evaluated,
+        secant=None,
+        dual=Dual(jnp.zeros(3), jnp.zeros(0), jnp.zeros(n), jnp.zeros(n)),
+    )
+    factors = ReducedHessianFactors(
+        basis=jnp.asarray(z),
+        cholesky=jnp.asarray(kappa * np.eye(r)),
+        sigma=jnp.asarray(1.0),
+        rank=jnp.asarray(r, dtype=jnp.int32),
+    )
+    res = _solve(lagrangian, factors, jnp.zeros(n, bool), jnp.zeros(n, bool))
+
+    assert bool(res.ldp_status == LDP_RESULTS.feasible)
+    step = np.asarray(res.step)
+    np.testing.assert_allclose(
+        np.linalg.norm(step - step_ref) / np.linalg.norm(step_ref), 0.0, atol=1e-8
+    )
+    lam = np.asarray(res.dual.eq_multipliers)
+    assert np.max(np.abs(lam)) <= 10.0 * np.max(np.abs(lam_ref))
 
 
 class TestMemoryBudget:

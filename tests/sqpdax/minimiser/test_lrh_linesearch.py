@@ -7,6 +7,7 @@ import warnings
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optimistix as optx
 import pytest
 
@@ -27,6 +28,7 @@ from tests.sqpdax.lagrangian.conftest import make_problem
 
 from .conftest import (
     CONVERGENCE_CASES,
+    _hs_problem,
     make_bound_only_quadratic,
     make_equality_quadratic,
     make_infeasible_problem,
@@ -559,3 +561,48 @@ def test_logged_model_is_the_one_after_the_secant_update():
         sigmas.append(float(factors.sigma))
     # The check is only meaningful if the model actually moves between steps.
     assert len(set(sigmas)) > 1
+
+
+@pytest.mark.parametrize(
+    "n, theta", [(10_000, 0.1), (10_000, 0.01)], ids=["theta0.1", "theta0.01"]
+)
+def test_float32_equalities_at_large_n_converge_without_elastic_mode(n, theta):
+    """Two unit equalities at angle ``theta`` are not read as dependent in float32.
+
+    ``0.5 ‖x − c‖²`` on ``[−1, 1]ⁿ`` with two equalities at angle ``theta``
+    (condition ``≈ 2/theta``). The LSEI default rank cut used to grow like
+    ``10·eps·n`` (``1.2e-2`` in float32 at ``n = 1e4``), declared the rows
+    dependent and inconsistent, and the solve ended in elastic mode and
+    failed; float64 converges in one step. The float32 solve must converge
+    too, with no elastic entry. Only ``2 × n`` dense data.
+    """
+    with jax.enable_x64(False):
+        rng = np.random.default_rng(0)
+        a1 = rng.standard_normal(n)
+        a1 /= np.linalg.norm(a1)
+        u = rng.standard_normal(n)
+        u -= (u @ a1) * a1
+        u /= np.linalg.norm(u)
+        a2 = np.cos(theta) * a1 + np.sin(theta) * u
+        a_mat = jnp.asarray(np.stack([a1, a2]), jnp.float32)
+        c = jnp.asarray(0.5 * np.cos(np.arange(n)), jnp.float32)
+        b = jnp.asarray([0.1, 0.2], jnp.float32)
+        problem = _hs_problem(
+            fn=lambda x: 0.5 * jnp.sum((x - c) ** 2),
+            grad=lambda x: x - c,
+            eq=(lambda x: a_mat @ x - b, lambda x: a_mat),
+            lb=[-1.0] * n,
+            ub=[1.0] * n,
+        )
+        sol = minimise(
+            problem,
+            LRHLineSearchMinimiser(rtol=1e-4, atol=1e-4, secant_memory=10),
+            jnp.zeros(n, jnp.float32),
+            max_steps=200,
+            throw=False,
+            options={"minimiser": {"secant": {"kind": "lrh"}}},
+        )
+        assert sol.value.dtype == jnp.float32
+        assert bool(sol.state.result_adapter.is_successful(sol.result))
+        assert int(sol.stats["n_elastic"]) == 0
+        assert float(jnp.max(jnp.abs(problem.eq_fn(sol.value)))) <= 1e-4

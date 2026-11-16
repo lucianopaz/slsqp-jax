@@ -204,7 +204,20 @@ def least_distance_lsei(
         kept by the rank cut; plain ``rank_tol`` without equalities), a
         threshold raised further to ``eps^(2/3) σ_max(c)`` of the projected
         system ``c`` (see the module docstring). ``None`` selects
-        ``10 · eps · max(n, m)``.
+        ``min(10 · eps · max(n, m), max(10 · eps · m, √eps))``: the cut grows
+        linearly in ``n`` and is capped at ``√eps``, the cap of the noise
+        threshold. The rows of ``Gᵀ = C_F⁻ᵀ A_Fᵀ`` that are dependent in ``A``
+        carry the rounding of the constraint data amplified by the metric
+        (about ``eps · κ_j`` per column, ``κ_j`` growing with the stiffness of
+        the model along the row), not just the few ``eps`` of the QR, so the
+        cut must keep the linear ``n`` growth that covers that amplification.
+        The cap stops it from reaching ``O(1)`` in float32 at large ``n``
+        (``0.12`` at ``n = 1e5`` without it), where it would reject
+        well-conditioned equalities as dependent. It equals the plain
+        ``10 · eps · max(n, m)`` in float64 for ``n`` below about ``6.7e6`` and
+        in float32 below about ``2900``; equality sets whose conditioning
+        exceeds about ``1/√eps`` count as dependent and go to the ``eq_tol``
+        consistency test.
 
     Returns
     -------
@@ -250,7 +263,16 @@ def least_distance_lsei(
         )
 
     eps = float(jnp.finfo(dtype).eps)
-    rank_tol = 10.0 * eps * max(n, m) if rank_tol is None else rank_tol
+    # Default rank cut min(10·eps·max(n, m), max(10·eps·m, √eps)). The noise
+    # it must cover on the dependent part of R_EE is the rounding of the
+    # constraint data amplified by the metric C_F⁻ᵀ (≈ eps·κ_j per column of
+    # Gᵀ = C_F⁻ᵀ A_Fᵀ), not the QR's own few eps; the linear n growth covers
+    # metric amplification up to κ ≈ n. The √eps cap (the cap of ``noise_tol``)
+    # keeps float32 at large n from rejecting well-conditioned rows (the
+    # uncapped cut is 0.12 at n = 1e5), and ``10·eps·m`` keeps the cut above
+    # the QR noise of very wide systems.
+    if rank_tol is None:
+        rank_tol = min(10.0 * eps * max(n, m), max(10.0 * eps * m, eps**0.5))
 
     # Equilibrate (O(n m)): unit columns of Gᵀ, h scaled along. w is
     # unchanged and λ_j = λ̂_j / ‖g_j‖. Without it the rank cut and the

@@ -1631,3 +1631,105 @@ def test_elastic_with_two_equalities_and_few_free_variables(
     eager = run_elastic(g_t, h, 2, rho, delta_col=c)
     assert bool(eager.status == res.status)
     assert bool(eager.has_certificate == res.has_certificate)
+
+
+# --- default rank_tol does not grow linearly in n (C24) ----------------------
+#
+# The default cut is ``min(10·eps·max(n, m), max(10·eps·m, √eps))``. The
+# uncapped ``10·eps·max(n, m)`` was 0.12 in float32 at n = 1e5 and declared two
+# well-conditioned unit equality rows (angle 0.1, cond ≈ 20) dependent, then
+# inconsistent. Only ``m × n`` data are formed, so n = 1e5 is O(n).
+
+LARGE_N = [1_000, 10_000, 100_000]
+RESIDUAL_FACTOR = 10.0  # equality residual ≤ RESIDUAL_FACTOR · eps · cond(rows)
+# (dtype, angle between the two unit equality rows). θ = 1e-3 (cond 2e3) is
+# float64 only: in float32 the cut is capped at √eps ≈ 3.4e-4, close to
+# tan(θ/2) = 5e-4, so the pair is not a well-posed float32 problem.
+PAIR_CASES = [
+    (dtype, theta)
+    for dtype, thetas in [
+        (np.float32, [0.3, 0.1, 0.01]),
+        (np.float64, [0.3, 0.1, 0.01, 1e-3]),
+    ]
+    for theta in thetas
+]
+PAIR_IDS = [f"{dtype.__name__}-theta{theta:g}" for dtype, theta in PAIR_CASES]
+
+
+def unit_pair_problem(n, theta, dtype, *, seed=0):
+    """Two unit equality rows at angle ``theta`` and one random inequality.
+
+    Returns ``(g_t, h, cond)`` with ``g_t`` of shape ``(n, 3)`` (columns
+    ``[E, E, I]``) cast to ``dtype`` and ``cond = 1/tan(θ/2)`` the condition
+    number of the equality rows. Only ``n × 3`` data.
+    """
+    rng = np.random.default_rng(seed)
+    a1 = rng.standard_normal(n)
+    a1 /= np.linalg.norm(a1)
+    u = rng.standard_normal(n)
+    u -= (u @ a1) * a1
+    u /= np.linalg.norm(u)
+    a2 = np.cos(theta) * a1 + np.sin(theta) * u
+    a3 = rng.standard_normal(n)
+    a3 /= np.linalg.norm(a3)
+    g_t = np.stack([a1, a2, a3], axis=1).astype(dtype)
+    h = np.array([1.0, 2.0, 5.0], dtype=dtype)
+    return g_t, h, 1.0 / np.tan(0.5 * theta)
+
+
+@pytest.mark.parametrize("n", LARGE_N)
+@pytest.mark.parametrize("dtype, theta", PAIR_CASES, ids=PAIR_IDS)
+def test_well_conditioned_equalities_are_feasible_at_large_n(dtype, theta, n):
+    """The equalities are solved to ``O(eps · cond)`` whatever ``n`` is."""
+    eps = float(np.finfo(dtype).eps)
+    g_t, h, cond = unit_pair_problem(n, theta, dtype)
+    res = least_distance_lsei(jnp.asarray(g_t), jnp.asarray(h), 2, eps**0.5)
+    assert res.w.dtype == dtype
+    assert bool(res.status == LDP_RESULTS.feasible)
+    resid = g_t[:, :2].astype(np.float64).T @ np.asarray(res.w, np.float64)
+    resid -= h[:2].astype(np.float64)
+    assert np.max(np.abs(resid)) <= RESIDUAL_FACTOR * eps * cond
+
+
+# (row perturbation in units of eps, rhs gap in units of eq_tol, expected
+# status). The rows are the first equality row and a copy perturbed by
+# ``row_perturb · eps`` (a random direction); ``gap`` is added to the copy's
+# right-hand side. A gap far below ``eq_tol`` is consistent (dependent rows
+# solved exactly), far above it is not.
+DUPLICATE_CASES = [
+    (0.0, 0.0, LDP_RESULTS.feasible),
+    (4.0, 0.0, LDP_RESULTS.feasible),
+    (0.0, 0.1, LDP_RESULTS.feasible),
+    (4.0, 0.1, LDP_RESULTS.feasible),
+    (0.0, 100.0, LDP_RESULTS.inconsistent_equalities),
+    (4.0, 100.0, LDP_RESULTS.inconsistent_equalities),
+]
+DUPLICATE_IDS = [f"pert{p:g}-gap{g:g}" for p, g, _ in DUPLICATE_CASES]
+
+
+@pytest.mark.parametrize("n", LARGE_N)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["f32", "f64"])
+@pytest.mark.parametrize(
+    "row_perturb, gap, expected", DUPLICATE_CASES, ids=DUPLICATE_IDS
+)
+def test_duplicate_rows_keep_their_verdict_at_large_n(
+    dtype, n, row_perturb, gap, expected
+):
+    """Exact and eps-perturbed duplicate rows are still dependent.
+
+    Capping the default cut at ``√eps`` must not make the rounding noise of
+    the QR count as a genuine direction: the copy stays a dependent row,
+    consistent or not according to its right-hand side.
+    """
+    eps = float(np.finfo(dtype).eps)
+    eq_tol = eps**0.5
+    g_t, h, _ = unit_pair_problem(n, 0.3, dtype)
+    rng = np.random.default_rng(1)
+    noise = rng.standard_normal(n)
+    noise /= np.linalg.norm(noise)
+    copy = g_t[:, 0].astype(np.float64) + row_perturb * eps * noise
+    g_dup = np.stack([g_t[:, 0], g_t[:, 1], copy.astype(dtype), g_t[:, 2]], axis=1)
+    h_dup = np.array([h[0], h[1], h[0] + gap * eq_tol, h[2]], dtype=dtype)
+    res = least_distance_lsei(jnp.asarray(g_dup), jnp.asarray(h_dup), 3, eq_tol)
+    assert bool(res.status == expected)
+    assert bool(res.has_certificate) == (expected != LDP_RESULTS.feasible)
