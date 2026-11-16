@@ -1578,11 +1578,22 @@ def _elastic_two_equalities(g_t, h, c, rho):
 # ``(spread, n_free, weight, seed)``: the grid at the default spread of 2
 # decades, and three wide-spread reproducers that only the ``eps^(2/3)`` floor
 # of the SVD truncation of the reduction rows resolves (a floor of ``rank_tol ·
-# σ_max`` returns ``feasible`` with ``‖w‖ ≈ 1e16`` on each of them).
-ELASTIC_FEW_FREE_CASES = [
-    (2.0, n_free, weight, seed)
-    for n_free, weight, seed in itertools.product([1, 2], [1e3, 1e4], range(25))
-] + [(2.0, 2, 1e4, 185), (4.0, 2, 1e3, 271), (4.0, 2, 1e4, 36)]
+# σ_max`` returns ``feasible`` with ``‖w‖ ≈ 1e16`` on each of them). The six
+# ``spread = 6`` reproducers (seeds 41, 69, 290) put a tiny-norm slack row of
+# the reduced LDP far from the solution: only the scale of the ``ldp``
+# normalisation (rows violated at the origin) with unit-column NNLS resolves
+# them (before C16d: a wrong ``feasible`` on 41 and 290, an LP mismatch on 69).
+ELASTIC_FEW_FREE_CASES = (
+    [
+        (2.0, n_free, weight, seed)
+        for n_free, weight, seed in itertools.product([1, 2], [1e3, 1e4], range(25))
+    ]
+    + [(2.0, 2, 1e4, 185), (4.0, 2, 1e3, 271), (4.0, 2, 1e4, 36)]
+    + [
+        (6.0, 2, weight, seed)
+        for weight, seed in itertools.product([1e3, 1e4], [41, 69, 290])
+    ]
+)
 ELASTIC_FEW_FREE_IDS = [
     f"spread{spread:g}-{'one' if n_free == 1 else 'two'}-free-{weight:g}-{seed}"
     for spread, n_free, weight, seed in ELASTIC_FEW_FREE_CASES

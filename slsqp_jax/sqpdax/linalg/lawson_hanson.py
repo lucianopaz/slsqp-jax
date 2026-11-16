@@ -354,13 +354,23 @@ def ldp(
       of ``r_{n+1}`` does not enter even for ``‖x‖ ~ 1e12``.
 
     ``ldp`` normalises the data internally, in ``O(k n)``: rows of ``g`` to
-    unit norm, then ``h`` to unit sup-norm (``y = x / s`` with
-    ``s = max_i |h_i| / ‖g_i‖``; zero rows and a zero ``h`` keep scale 1),
-    and rescales ``x = s y`` and ``μ_i = s μ̂_i / ‖g_i‖`` afterwards.
-    Without it the NNLS dual tolerance, which grows with ``‖h‖``, would
-    exceed the true duals (``∝ 1/‖x‖``) and stop NNLS early. Callers must
-    not normalise themselves, and ``tol`` and ``ldp_tol`` apply to the
-    normalised problem. Non-finite checks use the original data.
+    unit norm, then ``h`` by the largest violation of a row at the origin
+    (``y = x / s`` with ``s = max_i max(h_i, 0) / ‖g_i‖``; zero rows keep
+    scale 1, and so does the case where no row is violated at the origin,
+    where ``x = 0``), and rescales ``x = s y`` and ``μ_i = s μ̂_i / ‖g_i‖``
+    afterwards. Without it the NNLS dual tolerance, which grows with ``‖h‖``,
+    would exceed the true duals (``∝ 1/‖x‖``) and stop NNLS early. Only the
+    rows violated at the origin set ``s``: ``x`` lies in every half-space, so
+    ``‖x‖ ≥ s`` and the normalised solution has ``‖y‖ ≥ 1``, whereas a row
+    that holds at the origin (``h_i ≤ 0``) can lie arbitrarily far away and
+    would make the post-check and the NNLS tolerances too coarse for the near
+    rows (a wrong ``feasible``). The NNLS then runs on ``E`` with unit-norm
+    columns (zero columns keep 1), and ``u = u_unit / ‖E_j‖`` is rescaled
+    afterwards; since ``E u`` is invariant under positive column scaling the
+    residual, ``x``, the status and the certificate are those of the
+    unscaled problem. Callers must not normalise themselves, and ``tol`` and
+    ``ldp_tol`` apply to the normalised problem. Non-finite checks use the
+    original data.
 
     **Degenerate polytopes.** If the feasible set has an empty interior (some
     ``c ≥ 0`` with ``gᵀc = 0`` and ``hᵀc = 0``: e.g. a singleton vertex where
@@ -414,15 +424,17 @@ def ldp(
         NNLS step budget (see :func:`nnls`); ``None`` selects ``3 k``.
     tol
         NNLS dual tolerance (see :func:`nnls`), applied to the normalised
-        problem; ``None`` selects its default.
+        problem with unit-norm columns of ``E``; ``None`` selects its
+        default.
     ldp_tol
         Infeasibility threshold on ``‖r‖`` of the *normalised* problem (see
         above). The right-hand side ``f`` has unit norm, so this is a
         relative quantity. ``None`` selects the
         rounding-error level of the residual,
-        ``10 · eps · max(n + 1, k) · (‖E‖_F ‖u‖ + 1)``: data that is
-        infeasible by less than that is reported feasible, with a (very)
-        large ``x``.
+        ``10 · eps · max(n + 1, k) · (‖E_unit‖_F ‖u_unit‖ + 1)``, with
+        ``E_unit`` the unit-column matrix the NNLS runs on and ``u_unit`` its
+        solution: data that is infeasible by less than that is reported
+        feasible, with a (very) large ``x``.
     dep_tol
         Linear-dependence threshold of the NNLS (see :func:`nnls`); ``None``
         selects ``√eps`` of the working dtype, ``0.0`` disables the test.
@@ -465,15 +477,20 @@ def ldp(
             certificate=jnp.zeros((0,), dtype),
         )
 
-    # Normalise before the NNLS (O(k n)): unit rows, then h of unit sup-norm.
-    # The NNLS dual tolerance scales with ‖E‖_F (hence with ‖h‖) whereas the
-    # true duals shrink like 1/‖x‖, so without this NNLS stops early for
-    # ‖h‖ ≳ 1e6 and a wrong ``feasible`` results. With y = x / s the problem
-    # is ĝ y ≥ ĥ / s, and x = s y, μ_i = s μ̂_i / ‖g_i‖.
+    # Normalise before the NNLS (O(k n)): unit rows, then ĥ scaled by the
+    # largest violation of a row at the origin. The NNLS dual tolerance scales
+    # with ‖E‖_F (hence with ‖h‖) whereas the true duals shrink like 1/‖x‖,
+    # so without this NNLS stops early for ‖h‖ ≳ 1e6 and a wrong ``feasible``
+    # results. With y = x / s the problem is ĝ y ≥ ĥ / s, and x = s y,
+    # μ_i = s μ̂_i / ‖g_i‖. Only rows violated at the origin (ĥ_i > 0) set s:
+    # x* lies in every half-space, so ‖x*‖ ≥ s and ‖y*‖ ≥ 1, whereas a row
+    # that holds at the origin can be arbitrarily far away (|ĥ_i| ≫ ‖x*‖) and
+    # would make the post-check and the NNLS tolerances far too coarse for the
+    # near rows.
     row_norm = jnp.linalg.norm(g, axis=1)
     row_norm = jnp.where(row_norm > 0.0, row_norm, 1.0)
     h_hat = h / row_norm
-    h_scale = jnp.max(jnp.abs(h_hat))
+    h_scale = jnp.max(jnp.maximum(h_hat, 0.0))
     h_scale = jnp.where(h_scale > 0.0, h_scale, 1.0)
     g_n = g / row_norm[:, None]
     h_n = h_hat / h_scale
@@ -483,12 +500,24 @@ def ldp(
     eps = float(jnp.finfo(dtype).eps)
     dep_tol = eps**0.5 if dep_tol is None else dep_tol
     check_tol = 100.0 * eps**0.5 if check_tol is None else check_tol
-    res = nnls(e, f, max_iter=max_iter, tol=tol, dep_tol=dep_tol)
-    u, r = res.x, res.residual
+    # The far slack rows now carry ĥ_i/s ≪ -1, which inflates ‖E‖_F (the NNLS
+    # tolerance, the default ``ldp_tol``). Solve the NNLS on E with unit
+    # columns instead: E u is invariant under positive column scaling, so the
+    # residual, x, the status and the certificate are those of the original
+    # problem; only u (and its tolerance scale) is rescaled.
+    e_col = jnp.linalg.norm(e, axis=0)
+    e_col = jnp.where(e_col > 0.0, e_col, 1.0)
+    e_unit = e / e_col
+    res = nnls(e_unit, f, max_iter=max_iter, tol=tol, dep_tol=dep_tol)
+    u_unit, r = res.x, res.residual
+    u = u_unit / e_col
 
     if ldp_tol is None:
         infeasible_tol = (
-            10.0 * eps * max(n + 1, k) * (jnp.linalg.norm(e) * jnp.linalg.norm(u) + 1.0)
+            10.0
+            * eps
+            * max(n + 1, k)
+            * (jnp.linalg.norm(e_unit) * jnp.linalg.norm(u_unit) + 1.0)
         )
     else:
         infeasible_tol = jnp.asarray(ldp_tol, dtype)

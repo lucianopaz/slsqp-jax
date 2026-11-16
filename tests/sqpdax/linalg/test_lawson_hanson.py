@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.optimize import linprog
 from scipy.optimize import minimize as scipy_minimize
 from scipy.optimize import nnls as scipy_nnls
 
@@ -909,16 +910,19 @@ def test_ldp_certificate_proves_infeasibility(make, k, n, seed):
 def ldp_nnls_residual_norm(g, h) -> float:
     """``‖r‖`` of the NNLS that :func:`ldp` solves (NumPy copy of its normalisation).
 
-    Rows of unit norm, then ``h`` of unit sup-norm; the NNLS data are
-    ``E = [ĝᵀ; (ĥ/s)ᵀ]`` and ``f = e_{n+1}``. Reference only: it lets a test place
-    ``ldp_tol`` relative to the residual that the code under test sees.
+    Rows of unit norm, then ``h`` scaled by the largest violation at the origin
+    (``s = max_i max(ĥ_i, 0)``, 1 if zero); the NNLS data are ``E = [ĝᵀ; (ĥ/s)ᵀ]``
+    with unit-norm columns, and ``f = e_{n+1}``. Reference only: it lets a test
+    place ``ldp_tol`` relative to the residual that the code under test sees.
     """
     k, n = g.shape
     row_norm = np.linalg.norm(g, axis=1)
     g_n = g / row_norm[:, None]
     h_hat = h / row_norm
-    h_n = h_hat / np.max(np.abs(h_hat))
+    h_scale = np.max(np.maximum(h_hat, 0.0))
+    h_n = h_hat / (h_scale if h_scale > 0.0 else 1.0)
     e = np.concatenate([g_n.T, h_n[None, :]], axis=0)
+    e = e / np.linalg.norm(e, axis=0)
     f = np.zeros(n + 1)
     f[n] = 1.0
     return float(jnp.linalg.norm(nnls(jnp.asarray(e), jnp.asarray(f)).residual))
@@ -1011,3 +1015,175 @@ def test_ldp_certificate_jit_matches_eager():
     np.testing.assert_allclose(
         np.asarray(jitted.certificate), np.asarray(eager.certificate), atol=1e-12
     )
+
+
+# --------------------------------------------------------------------------
+# ldp: far slack rows (C16d)
+# --------------------------------------------------------------------------
+#
+# A row that holds at the origin (``h_i <= 0`` in ``g x >= h``) can lie
+# arbitrarily far away. If such a slack row set the scale of the
+# normalisation (``s = max_i |h_i| / ‖g_i‖``), the normalised solution would
+# be tiny, ``‖y‖ = ‖x‖ / s << 1``, and the post-check and the NNLS dual
+# tolerance would be far too coarse for the near rows: ``ldp`` returned
+# ``feasible`` with violated rows. The scale is now set by the rows violated at
+# the origin only, and the NNLS runs on unit-norm columns of ``E``.
+
+
+def assert_farkas_certificate(res: LDPResult, g, h):
+    """``c ≥ 0``, ``‖c‖_∞ = 1``, ``gᵀc ≈ 0`` and ``hᵀc > 0`` (no relative size).
+
+    Weaker than :func:`assert_ldp_certificate`, which also requires ``hᵀc`` to
+    be a sizeable part of ``|h|ᵀc``: with a near-infeasibility of relative size
+    ``1e-6`` the cancellation of ``hᵀc`` is inherent to the problem.
+    """
+    c = np.asarray(res.certificate)
+    assert c.shape == (g.shape[0],)
+    assert np.all(c >= 0.0)
+    np.testing.assert_allclose(np.max(c), 1.0, rtol=1e-12)
+    assert np.linalg.norm(g.T @ c) <= 1e-8 * np.linalg.norm(g)
+    assert h @ c > 0.0
+
+
+def row_violation(g, h, x):
+    """Largest violation of ``g x ≥ h`` in units of the rows' own norms."""
+    return float(np.max(np.maximum(h - g @ x, 0.0) / np.linalg.norm(g, axis=1)))
+
+
+FAR_SLACK_1D_GAPS = [1e-2, 1e-4, 1e-6]
+FAR_SLACK_1D_DISTANCES = [1e2, 1e6, 1e10]
+FAR_SLACK_1D_ROW_NORMS = [1.0, 1e-6]
+
+
+@pytest.mark.parametrize("t", FAR_SLACK_1D_ROW_NORMS)
+@pytest.mark.parametrize("far", FAR_SLACK_1D_DISTANCES)
+@pytest.mark.parametrize("gap", FAR_SLACK_1D_GAPS)
+def test_ldp_far_slack_row_does_not_hide_infeasibility(gap, far, t):
+    """``x ≥ 1`` and ``x ≤ 1 - gap`` with a far slack row ``-t x ≥ -far·t``.
+
+    The problem is infeasible by ``gap``, whatever the distance ``far`` of the
+    slack row (``x ≤ far``) and its norm ``t``. Before C16d ``ldp`` returned
+    ``feasible`` with the near rows violated by ``gap`` (``gap = 1e-2`` for
+    ``far ≥ 1e6``, ``gap = 1e-4`` for ``far ≥ 1e4``, ``gap = 1e-6`` already at
+    ``far = 1e2``) or an uncertified ``infeasible``.
+    """
+    g = np.array([[1.0], [-1.0], [-t]])
+    h = np.array([1.0, -(1.0 - gap), -far * t])
+    res = ldp(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+    assert_farkas_certificate(res, g, h)
+    # The certificate is the pair of near rows: the slack row is not needed.
+    c = np.asarray(res.certificate)
+    np.testing.assert_allclose(c[:2], 1.0, atol=1e-6)
+    assert h @ c == pytest.approx(gap, rel=1e-4)
+
+
+FAR_SLACK_DISTANCES = [1e2, 1e5, 1e8, 1e11]
+FAR_SLACK_GAPS = [1e-1, 1e-3, 1e-5]
+FAR_SLACK_SEEDS = range(6)
+
+
+def far_slack_problem(far, gap, sign, seed, n=4, k_near=5, k_far=2):
+    """Near rows with a slab of signed relative width ``sign · gap``, plus far rows.
+
+    The near rows ``g x ≥ h`` are satisfied by ``x0`` (some of them with zero
+    slack). Rows 0 and ``k_near - 1`` bound a slab around ``x0``: row 0 is
+    tight at ``x0`` and the last row is ``g_0·x ≤ g_0·x0 + sign · gap ·
+    ‖g_0‖ max(1, ‖x0‖)``, so the near problem is feasible for ``sign = +1`` and
+    infeasible (``y = (1, ..., 1)`` is a Farkas certificate) for ``sign = -1``.
+    The ``k_far`` slack rows have norms in ``1e-8 .. 1`` and lie at distance
+    ``far`` (``h_i = -far · ‖g_i‖ · (1 + u)``, ``u ∈ [0, 1)``): they hold at
+    ``x0``, at the origin and at the minimum-norm point of the near rows.
+    Returns ``(g_near, h_near, g_far, h_far)``.
+    """
+    rng = np.random.default_rng(seed)
+    g = rng.standard_normal((k_near, n))
+    x0 = rng.standard_normal(n)
+    h = g @ x0 - np.abs(rng.standard_normal(k_near)) * (rng.random(k_near) < 0.5)
+    h[0] = g[0] @ x0
+    g[-1] = -g[0]
+    h[-1] = -h[0] - sign * gap * np.linalg.norm(g[0]) * max(1.0, np.linalg.norm(x0))
+    g_far = rng.standard_normal((k_far, n)) * 10.0 ** rng.uniform(-8, 0, (k_far, 1))
+    h_far = -far * np.linalg.norm(g_far, axis=1) * (1.0 + rng.random(k_far))
+    return g, h, g_far, h_far
+
+
+def lp_is_feasible(g, h):
+    """Reference: HiGHS feasibility of ``g x ≥ h`` (zero objective)."""
+    n = g.shape[1]
+    lp = linprog(
+        np.zeros(n), A_ub=-g, b_ub=-h, bounds=[(None, None)] * n, method="highs"
+    )
+    return lp.status == 0
+
+
+@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
+@pytest.mark.parametrize("gap", FAR_SLACK_GAPS)
+@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
+def test_ldp_far_slack_battery_feasible(far, gap, seed):
+    """Feasible near rows plus far slack rows: a correct ``feasible`` exit.
+
+    The rows are met to ``1e-6 · max(1, ‖x‖)`` (in the rows' own units), the
+    solution matches the SciPy reference of the near rows to ``1e-5``, the far
+    rows stay inactive (zero multipliers) and the LP agrees on feasibility.
+    """
+    g_near, h_near, g_far, h_far = far_slack_problem(far, gap, +1, seed)
+    g, h = np.vstack([g_near, g_far]), np.concatenate([h_near, h_far])
+    assert lp_is_feasible(g, h)
+    res = jax.jit(ldp)(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.feasible)
+    x = np.asarray(res.x)
+    assert row_violation(g, h, x) <= 1e-6 * max(1.0, np.linalg.norm(x))
+    ref = scipy_ldp(g_near, h_near)
+    np.testing.assert_allclose(x, ref, atol=1e-5 * max(1.0, np.linalg.norm(ref)))
+    np.testing.assert_array_equal(np.asarray(res.multipliers)[len(h_near) :], 0.0)
+    np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
+
+
+@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
+@pytest.mark.parametrize("gap", FAR_SLACK_GAPS)
+@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
+def test_ldp_far_slack_battery_infeasible(far, gap, seed):
+    """Near rows infeasible by a relative gap, plus far slack rows: certified.
+
+    Before C16d ``ldp`` returned a wrong ``feasible`` on every such seed for
+    ``far ≥ 1e8`` and on most of them for ``gap ≤ 1e-3`` at ``far = 1e5``.
+    """
+    g_near, h_near, g_far, h_far = far_slack_problem(far, gap, -1, seed)
+    g, h = np.vstack([g_near, g_far]), np.concatenate([h_near, h_far])
+    assert not lp_is_feasible(g, h)
+    res = jax.jit(ldp)(jnp.asarray(g), jnp.asarray(h))
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+    assert_farkas_certificate(res, g, h)
+
+
+@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
+@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
+@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
+def test_ldp_far_slack_row_leaves_feasible_solution_unchanged(make, far, seed):
+    """Appending far slack rows changes neither ``x`` nor the near multipliers."""
+    k, n = 8, 5
+    g, h = make(k, n, seed)
+    rng = np.random.default_rng(seed)
+    g_far = rng.standard_normal((2, n)) * 10.0 ** rng.uniform(-8, 0, (2, 1))
+    h_far = -far * np.linalg.norm(g_far, axis=1) * (1.0 + rng.random(2))
+    base = ldp(jnp.asarray(g), jnp.asarray(h))
+    res = ldp(
+        jnp.asarray(np.vstack([g, g_far])), jnp.asarray(np.concatenate([h, h_far]))
+    )
+    assert bool(base.status == LDP_RESULTS.feasible)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    x_ref = np.asarray(base.x)
+    scale = max(1.0, np.linalg.norm(x_ref))
+    np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=1e-8 * scale, rtol=0.0)
+    np.testing.assert_allclose(
+        np.asarray(res.multipliers)[:k],
+        np.asarray(base.multipliers),
+        atol=1e-8 * max(1.0, np.max(np.asarray(base.multipliers))),
+        rtol=0.0,
+    )
+    np.testing.assert_array_equal(np.asarray(res.multipliers)[k:], 0.0)
