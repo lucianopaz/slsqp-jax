@@ -1,0 +1,202 @@
+"""LRH line-search minimiser on the Hock-Schittkowski problems (HS21/35/71/76)."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from scipy.optimize import minimize as scipy_minimize
+
+from slsqp_jax.sqpdax.minimiser import LRHLineSearchMinimiser, minimise
+from slsqp_jax.sqpdax.minimiser.active_set_linesearch import (
+    ACTIVE_SET_LINE_SEARCH_RESULTS,
+)
+from slsqp_jax.sqpdax.problem import Problem
+
+from .conftest import HS_CASES
+
+TOL = 1e-6
+
+
+@pytest.fixture(autouse=True)
+def x64():
+    """Run every test in float64 (the tolerances below assume it)."""
+    with jax.enable_x64(True):
+        yield
+
+
+def _solve(problem: Problem, x0, *, max_steps: int = 200, **kwargs):
+    kwargs.setdefault("rtol", TOL)
+    kwargs.setdefault("atol", TOL)
+    sol = minimise(
+        problem,
+        LRHLineSearchMinimiser(**kwargs),
+        jnp.asarray(x0),
+        max_steps=max_steps,
+        throw=False,
+    )
+    return sol, sol.state._postprocess_stats(problem, sol.result)
+
+
+def _scipy_slsqp(problem: Problem, x0) -> tuple[float, np.ndarray]:
+    """Reference SLSQP solve (tiny n, so dense NumPy callables are fine)."""
+
+    def np_fn(fn):
+        return lambda x: np.asarray(fn(jnp.asarray(x)))
+
+    constraints = []
+    if problem.meq:
+        constraints.append(
+            {
+                "type": "eq",
+                "fun": np_fn(problem.eq_fn),
+                "jac": np_fn(problem.eq_fn_jac),
+            }
+        )
+    if problem.mineq:
+        # sqpdax uses ``h(x) <= 0``; scipy uses ``g(x) >= 0``.
+        constraints.append(
+            {
+                "type": "ineq",
+                "fun": lambda x: -np_fn(problem.ineq_fn)(x),
+                "jac": lambda x: -np_fn(problem.ineq_fn_jac)(x),
+            }
+        )
+    lb, ub = np.asarray(problem.lb), np.asarray(problem.ub)
+    bounds = [
+        (None if np.isinf(lo) else lo, None if np.isinf(hi) else hi)
+        for lo, hi in zip(lb, ub)
+    ]
+    res = scipy_minimize(
+        lambda x: float(problem.fn(jnp.asarray(x))[0]),
+        np.clip(np.asarray(x0, dtype=float), lb, ub),
+        jac=np_fn(problem.grad),
+        bounds=bounds,
+        constraints=constraints,
+        method="SLSQP",
+        options={"ftol": 1e-10, "maxiter": 500},
+    )
+    return float(res.fun), res.x
+
+
+@pytest.fixture(scope="module")
+def scipy_reference() -> Callable[[str], tuple[float, np.ndarray]]:
+    """Module-cached ``scipy_reference(case) -> (f, x)`` of SLSQP."""
+    cache: dict[str, tuple[float, np.ndarray]] = {}
+
+    def get(case: str) -> tuple[float, np.ndarray]:
+        if case not in cache:
+            with jax.enable_x64(True):
+                factory, x0, _, _ = HS_CASES[case]
+                cache[case] = _scipy_slsqp(factory(), x0)
+        return cache[case]
+
+    return get
+
+
+@pytest.mark.parametrize("case", list(HS_CASES))
+def test_known_optimum_matches_scipy(case, scipy_reference):
+    """The literature optimum used below agrees with scipy SLSQP (builder check)."""
+    _, _, x_star, f_star = HS_CASES[case]
+    f_scipy, x_scipy = scipy_reference(case)
+    assert f_scipy == pytest.approx(f_star, rel=1e-6)
+    assert np.allclose(x_scipy, x_star, atol=1e-4)
+
+
+@pytest.mark.parametrize("secant_memory", [2, 5, 10], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("case", list(HS_CASES))
+def test_hs_problems_solve_and_match_references(
+    case, qp_warm_start, secant_memory, scipy_reference
+):
+    """Success status, KKT <= tol, feasibility, and the optimum of SLSQP / literature."""
+    factory, x0, x_star, f_star = HS_CASES[case]
+    problem = factory()
+    sol, stats = _solve(
+        problem, x0, qp_warm_start=qp_warm_start, secant_memory=secant_memory
+    )
+    assert bool(sol.state.result_adapter.is_successful(sol.result)), sol.result
+    assert bool(jnp.all(jnp.isfinite(sol.value)))
+    assert float(stats["kkt_ratio"]) <= TOL
+
+    x = sol.value
+    assert bool(jnp.all(x >= problem.lb - 1e-6))
+    assert bool(jnp.all(x <= problem.ub + 1e-6))
+    assert float(jnp.max(problem.ineq_fn(x), initial=-jnp.inf)) <= 1e-6
+    assert float(jnp.max(jnp.abs(problem.eq_fn(x)), initial=0.0)) <= 1e-6
+
+    f = float(stats["final_objective"])
+    f_scipy, _ = scipy_reference(case)
+    assert f == pytest.approx(f_scipy, rel=1e-6)
+    assert f == pytest.approx(f_star, rel=1e-6)
+    assert np.allclose(np.asarray(x), x_star, atol=1e-3)
+
+
+SANE_RESULTS = (
+    ACTIVE_SET_LINE_SEARCH_RESULTS.successful,
+    ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
+    ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure,
+    ACTIVE_SET_LINE_SEARCH_RESULTS.merit_stagnation,
+)
+
+
+@pytest.mark.parametrize("secant_memory", [2, 5, 10], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("case", list(HS_CASES))
+def test_tiny_line_search_budget_terminates_sanely(case, qp_warm_start, secant_memory):
+    """With a one-trial line-search budget the run still ends cleanly.
+
+    Whatever the outcome, the iterate is finite and inside the box, the status
+    is a recognised one, and a run that did not converge was preceded by
+    recorded secant resets (the failure is never silent).
+    """
+    factory, x0, _, _ = HS_CASES[case]
+    problem = factory()
+    sol, stats = _solve(
+        problem,
+        x0,
+        max_steps=60,
+        line_search_max_steps=1,
+        qp_warm_start=qp_warm_start,
+        secant_memory=secant_memory,
+    )
+    assert bool(jnp.all(jnp.isfinite(sol.value)))
+    assert bool(jnp.isfinite(stats["final_objective"]))
+    assert bool(jnp.all(sol.value >= problem.lb - 1e-8))
+    assert bool(jnp.all(sol.value <= problem.ub + 1e-8))
+    assert any(bool(sol.result == r) for r in SANE_RESULTS), sol.result
+    assert int(sol.stats["num_steps"]) <= 60
+    n_resets = int(jnp.sum(sol.state.secant_stats.n_resets))
+    converged = bool(sol.state.result_adapter.is_successful(sol.result))
+    assert converged or n_resets > 0
+
+
+@pytest.mark.parametrize("secant_memory", [2, 5, 10], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
+def test_forced_line_search_failures_trigger_secant_resets(
+    qp_warm_start, secant_memory
+):
+    """HS21's first step needs a backtrack; with one trial every step fails.
+
+    The failures walk the recovery schedule (one reset per channel, then the
+    identity model) and end with the recovery-failure status, never NaN, and
+    without moving off the projected start (``f = -98.96``).
+    """
+    factory, x0, _, _ = HS_CASES["hs21"]
+    problem = factory()
+    sol, stats = _solve(
+        problem,
+        x0,
+        max_steps=60,
+        line_search_max_steps=1,
+        qp_warm_start=qp_warm_start,
+        secant_memory=secant_memory,
+    )
+    assert bool(sol.result == ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure)
+    assert bool(jnp.all(sol.state.secant_stats.n_resets >= 1))
+    assert int(sol.state.consecutive_ls_failures) >= 1
+    assert float(stats["final_objective"]) == pytest.approx(-98.96, rel=1e-9)
+    assert bool(jnp.all(jnp.isfinite(sol.value)))
