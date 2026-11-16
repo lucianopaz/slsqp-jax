@@ -809,8 +809,9 @@ def _nonfinite():
     "make", [_post_check_infeasible, _budget_exhausted, _nonfinite]
 )
 def test_no_certificate_without_a_certified_exit(make):
-    """The LDP's primal-check ``infeasible``, ``max_iter_reached`` and
-    ``nonfinite`` carry no certificate."""
+    """The coarse-``tol`` primal-check ``infeasible`` (whose NNLS solution does
+    not verify as a certificate), ``max_iter_reached`` and ``nonfinite`` carry
+    no certificate."""
     g_t, h, m_eq, kwargs, expected = make()
     res = run(g_t, h, m_eq, **kwargs)
     assert bool(res.status == expected)

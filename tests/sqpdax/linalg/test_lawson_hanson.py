@@ -906,6 +906,55 @@ def test_ldp_certificate_proves_infeasibility(make, k, n, seed):
     assert_ldp_certificate(res, g, h)
 
 
+def ldp_nnls_residual_norm(g, h) -> float:
+    """``‖r‖`` of the NNLS that :func:`ldp` solves (NumPy copy of its normalisation).
+
+    Rows of unit norm, then ``h`` of unit sup-norm; the NNLS data are
+    ``E = [ĝᵀ; (ĥ/s)ᵀ]`` and ``f = e_{n+1}``. Reference only: it lets a test place
+    ``ldp_tol`` relative to the residual that the code under test sees.
+    """
+    k, n = g.shape
+    row_norm = np.linalg.norm(g, axis=1)
+    g_n = g / row_norm[:, None]
+    h_hat = h / row_norm
+    h_n = h_hat / np.max(np.abs(h_hat))
+    e = np.concatenate([g_n.T, h_n[None, :]], axis=0)
+    f = np.zeros(n + 1)
+    f[n] = 1.0
+    return float(jnp.linalg.norm(nnls(jnp.asarray(e), jnp.asarray(f)).residual))
+
+
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
+@pytest.mark.parametrize(
+    "make", INFEASIBLE_GENERATORS.values(), ids=INFEASIBLE_GENERATORS.keys()
+)
+def test_ldp_post_check_exit_keeps_a_verified_certificate(make, k, n, seed):
+    """A residual just above the noise threshold still certifies infeasibility.
+
+    ``ldp_tol`` is set to half of the NNLS residual, i.e. the residual test
+    fails by a factor of two (the situation of a rounding-level residual that
+    lands a little above ``10·eps·…``), so the ``infeasible`` status comes from
+    the primal check. (The ``-1e-300`` keeps the residual test failing for an
+    NNLS residual of exactly zero.) The NNLS solution verifies as a Farkas certificate
+    (``gᵀc ≈ 0``, ``hᵀc > 0``) and is the very one of the residual-test exit;
+    status, ``x`` and ``multipliers`` are those of a certificate-less exit.
+    """
+    g, h = make(k, n, seed)
+    g_j, h_j = jnp.asarray(g), jnp.asarray(h)
+    by_residual = ldp(g_j, h_j)
+    r_norm = ldp_nnls_residual_norm(g, h)
+    res = ldp(g_j, h_j, ldp_tol=0.5 * r_norm - 1e-300)
+    assert bool(by_residual.status == LDP_RESULTS.infeasible)
+    assert bool(res.status == LDP_RESULTS.infeasible)
+    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
+    assert_ldp_certificate(res, g, h)
+    np.testing.assert_array_equal(
+        np.asarray(res.certificate), np.asarray(by_residual.certificate)
+    )
+
+
 @pytest.mark.parametrize("seed", LDP_SEEDS)
 @pytest.mark.parametrize("k, n", LDP_SHAPES)
 @pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
@@ -938,8 +987,10 @@ def _nonfinite():
     "make", [_post_check_infeasible, _budget_exhausted, _nonfinite]
 )
 def test_ldp_certificate_is_zero_without_a_residual_infeasible_exit(make):
-    """Only the residual test certifies: the primal-check ``infeasible``,
-    ``max_iter_reached`` and ``nonfinite`` carry no certificate."""
+    """No certificate without a verified one: the coarse-``tol`` primal-check
+    ``infeasible`` (its NNLS solution is garbage, not a certificate; see
+    ``test_ldp_post_check_exit_keeps_a_verified_certificate`` for the one
+    that verifies), ``max_iter_reached`` and ``nonfinite`` carry none."""
     g, h, kwargs, expected = make()
     res = ldp(jnp.asarray(g), jnp.asarray(h), **kwargs)
     assert bool(res.status == expected)

@@ -313,8 +313,9 @@ class LDPResult(eqx.Module):
         Farkas certificate of infeasibility, shape ``(k,)``: ``c ≥ 0`` with
         ``‖c‖_∞ = 1``, ``gᵀc ≈ 0`` and ``hᵀc > 0``, which proves
         ``g x ≥ h`` has no solution. Nonzero only when ``status`` is
-        ``infeasible`` because of the residual test ``‖r‖ ≤ ldp_tol``; zero
-        for every other status, the primal-check ``infeasible`` included.
+        ``infeasible``: because of the residual test ``‖r‖ ≤ ldp_tol``, or
+        because of the primal check when the NNLS solution verifies as a
+        certificate (see :func:`ldp`). Zero for every other status.
     """
 
     x: Float[Array, " n"]
@@ -392,8 +393,16 @@ def ldp(
     scaled to ``‖c‖_∞ = 1``, is returned as ``certificate``: ``c ≥ 0``,
     ``gᵀc ≈ 0`` and ``hᵀc > 0``, which proves ``g x ≥ h`` infeasible. It is
     ``û`` itself (not recomputed), so the tolerance that decides
-    ``infeasible`` also decides when it is a certificate. For every other
-    status, including the primal-check ``infeasible``, it is zero.
+    ``infeasible`` also decides when it is a certificate. At an
+    ``infeasible`` exit by the primal check, ``û`` is kept, with the same
+    normalisation, only when it verifies: ``‖ĝᵀû‖ ≤ check_tol · ‖û‖`` and
+    ``(ĥ/s)ᵀû ≥ ½``. That proves that no ``x`` of normalised norm
+    ``≲ 1 / check_tol`` meets the rows (the same infeasible-means-huge-``x``
+    notion as the residual test). The NNLS residual of an infeasible problem
+    can land just above the rounding threshold of the residual test, so this
+    exit may carry a certificate; the status, ``x`` and ``multipliers``
+    do not depend on it. If it does not verify (e.g. a coarse ``tol``), or
+    for every other status, the certificate is zero.
 
     Parameters
     ----------
@@ -512,6 +521,16 @@ def ldp(
     # ``dep_tol`` level, far below ``check_tol``.
     violation = jnp.max(jnp.maximum(h_n - g_n @ x, 0.0))
     violated = usable & (violation > check_tol * jnp.maximum(1.0, jnp.linalg.norm(x)))
+    # A post-check ``infeasible`` exit keeps the NNLS solution as its Farkas
+    # certificate when it verifies: ‖ĝᵀû‖ = ‖r_{:n}‖ ≤ check_tol ‖û‖ and
+    # (ĥ/s)ᵀû = 1 + r_n ≥ ½. Its residual can sit just above the rounding
+    # threshold of the residual test (so the status comes from the check)
+    # while û is still a perfectly good certificate. Status, x and
+    # multipliers are unchanged.
+    cert_verified = (jnp.linalg.norm(r[:n]) <= check_tol * jnp.linalg.norm(u)) & (
+        h_n @ u >= 0.5
+    )
+    cert_ok = cert_ok | (violated & cert_verified)
     infeasible = infeasible | violated
     usable = usable & ~violated
     x = jnp.where(violated, 0.0, x)

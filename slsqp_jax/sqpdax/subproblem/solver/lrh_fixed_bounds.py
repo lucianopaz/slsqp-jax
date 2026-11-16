@@ -40,7 +40,6 @@ once per QP by :func:`elastic_penalty` and frozen across the working-set loop.
 from __future__ import annotations
 
 import equinox as eqx
-import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
@@ -57,10 +56,6 @@ from ...linalg.lsei import (
 from ...primal import Primal
 from ...secant.reduced_hessian import ReducedHessianFactors
 from ...types import Scalar, Vector_n
-
-# Weight factor of the certificate retry of the elastic variant (see the
-# comment at its use).
-_CERT_RETRY_SCALE = 1e-2
 
 __all__ = ["FixedBoundsQPResult", "elastic_penalty", "solve_fixed_bounds_qp"]
 
@@ -412,53 +407,14 @@ def solve_fixed_bounds_qp(
         delta_col = elastic_delta_column(b_vec, m_e)
         rho_e = jnp.asarray(elastic_rho, dtype)
 
-        def elastic_solve(rho):
-            return elastic_least_distance_lsei(
-                g_t,
-                h,
-                m_e,
-                delta_col,
-                rho,
-                eq_tol=eq_tol,
-                max_iter=nnls_max_iter,
-            )
-
-        lsei = elastic_solve(rho_e)
-        # Certificate retry. The pinned elastic problem is often infeasible (a
-        # ray step of the loop), and the least-distance solver must then hand
-        # back a Farkas certificate. At the default weight the augmented
-        # problem is ill conditioned (the δ coordinate is scaled by √ρ_e) and
-        # the NNLS residual of an infeasible problem can land just above the
-        # noise threshold of the infeasibility test: the status is then
-        # ``infeasible`` (by the primal check) but there is no certificate.
-        # Infeasibility of the pinned problem in (w, δ) does not depend on
-        # ρ_e (it only rescales the δ coordinate) and a certificate is a
-        # statement about the rows, so re-solving with a smaller weight, which
-        # is well conditioned, yields a valid certificate of the same problem.
-        # The retry replaces only the certificate and only when it forms one.
-        need_cert = (lsei.status == LDP_RESULTS.infeasible) & ~lsei.has_certificate
-        alt = jax.lax.cond(
-            need_cert,
-            lambda: elastic_solve(rho_e * _CERT_RETRY_SCALE),
-            lambda: lsei,
-        )
-        take = need_cert & alt.has_certificate & (alt.status == LDP_RESULTS.infeasible)
-        lsei = eqx.tree_at(
-            lambda r: (
-                r.cert_eq,
-                r.cert_ineq,
-                r.cert_delta,
-                r.has_certificate,
-                r.n_iter,
-            ),
-            lsei,
-            (
-                jnp.where(take, alt.cert_eq, lsei.cert_eq),
-                jnp.where(take, alt.cert_ineq, lsei.cert_ineq),
-                jnp.where(take, alt.cert_delta, lsei.cert_delta),
-                take | lsei.has_certificate,
-                lsei.n_iter + jnp.where(need_cert, alt.n_iter, 0),
-            ),
+        lsei = elastic_least_distance_lsei(
+            g_t,
+            h,
+            m_e,
+            delta_col,
+            rho_e,
+            eq_tol=eq_tol,
+            max_iter=nnls_max_iter,
         )
         w, delta_raw, y_hi = lsei.w, lsei.delta.astype(dtype), lsei.cert_delta[1]
 

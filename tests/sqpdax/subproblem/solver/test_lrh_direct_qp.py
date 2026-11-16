@@ -34,7 +34,6 @@ from slsqp_jax.sqpdax.subproblem.solver import (
     LRHDirectQPSolver,
     LRHQPSolverState,
     lrh_direct_qp,
-    lrh_fixed_bounds,
 )
 from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
     elastic_penalty,
@@ -670,6 +669,46 @@ def near_infeasible_case(n: int, seed: int, feasible: bool) -> RandomQP:
         np.vstack([qp.a_ineq, -c[None]]),
         np.concatenate([qp.b_ineq, [-target]]),
     )
+
+
+def near_infeasible_pinned_battery(
+    size: int = 80, min_free: int | None = None
+) -> list[tuple[RandomQP, np.ndarray, np.ndarray]]:
+    """``size`` pinned problems whose elastic relaxation is itself infeasible.
+
+    Each is ``(qp, lower, upper)`` from :func:`near_infeasible_case` (infeasible
+    side) with a random pin set of fraction 0.3 to 0.9 of the variables (each
+    on a random finite face). It is kept when the LP (:func:`delta_min_lp`,
+    pins as ``lo == hi``, free variables unbounded) declares the relaxed rows
+    infeasible for every ``δ ∈ [0, 1]``, so that the kernel must answer with a
+    Farkas ray, and when at least ``min_free`` variables stay free (default
+    ``m_E + 1``: with fewer, the pins nearly determine the equality rows and a
+    solve may report ``feasible`` with a huge step, a regime that is not the
+    subject of the batteries that use the default). Deterministic.
+    """
+    battery = []
+    for seed in range(1000):
+        for n in (8, 20):
+            qp = near_infeasible_case(n, seed, False)
+            n_free_min = qp.a_eq.shape[0] + 1 if min_free is None else min_free
+            for frac in (0.3, 0.5, 0.7, 0.9):
+                rng = np.random.default_rng(1000 * n + 10 * seed + int(10 * frac))
+                pin = rng.random(n) < frac
+                lower = pin & (rng.random(n) < 0.5) & np.isfinite(qp.lb)
+                upper = pin & ~lower & np.isfinite(qp.ub)
+                pinned = lower | upper
+                if int((~pinned).sum()) < n_free_min:
+                    continue
+                d_fix = np.where(
+                    lower, qp.lb - qp.x, np.where(upper, qp.ub - qp.x, 0.0)
+                )
+                lo = np.where(pinned, d_fix, -np.inf)
+                hi = np.where(pinned, d_fix, np.inf)
+                if delta_min_lp(qp, lo, hi) is None:
+                    battery.append((qp, lower, upper))
+                    if len(battery) == size:
+                        return battery
+    raise AssertionError("not enough pinned infeasible problems")
 
 
 def x_outside_case(n: int, mix: tuple[int, int], seed: int) -> RandomQP:
@@ -2216,24 +2255,83 @@ class TestElasticMode:
         assert bool(state.last_ldp_status == LDP_RESULTS.nonfinite)
 
     @pytest.mark.parametrize("n, seed", [(8, 2), (20, 4)])
-    def test_certificate_retry_is_needed_and_recovers_the_ray(
-        self, monkeypatch, n, seed
-    ):
-        """The augmented LDP can be infeasible without a certificate.
+    def test_default_weight_certifies_without_a_retry(self, n, seed):
+        """The augmented LDP's infeasible exit carries a certificate by itself.
 
-        At the default weight the pinned elastic problem of these QPs is
-        reported ``infeasible`` with no certificate, which would end the
-        elastic loop as an oracle failure; the retry at a smaller weight takes
-        the certificate of the same (``ρ_e``-independent) infeasible problem.
+        At the default weight the pinned elastic problem of these QPs has an
+        NNLS residual just above the noise threshold of the infeasibility
+        test, so the LDP status is ``infeasible`` by its primal check. That
+        exit keeps the verified Farkas certificate (C16b), so the elastic loop
+        takes its ray step and the solve succeeds with no second solve of the
+        pinned problem at a smaller weight (the C16 kernel retry, removed).
         """
         qp = near_infeasible_case(n, seed, False)
         _, state = _solve_unjitted(qp)
-        assert bool(state.success) and int(state.n_elastic) == 1
-        monkeypatch.setattr(lrh_fixed_bounds, "_CERT_RETRY_SCALE", 1.0)
-        _, no_retry = _solve_unjitted(qp)
-        assert not bool(no_retry.success)
-        assert bool(no_retry.qp_result == FAILURE)
-        assert bool(no_retry.last_ldp_status == LDP_RESULTS.infeasible)
+        assert bool(state.success) and bool(state.qp_result == CONVERGED)
+        assert int(state.n_elastic) == 1
+
+    @pytest.mark.parametrize("weight", [1e3, 1e4])
+    def test_pinned_infeasible_elastic_solves_are_certified_jit_and_eager(self, weight):
+        """Every infeasible pinned elastic solve carries a ray, jitted or not.
+
+        The NNLS residual of an infeasible augmented problem can land a little
+        above the noise threshold of the LDP's infeasibility test, so that the
+        ``infeasible`` status comes from its primal check; which side of the
+        threshold it lands on can differ between a compiled and an op-by-op
+        run. Such an exit must keep its certificate (``has_ray``) in both.
+        """
+        battery = near_infeasible_pinned_battery()
+        assert len(battery) == 80
+        jitted = jax.jit(solve_fixed_bounds_qp)
+        outcomes = []
+        for qp, lower, upper in battery:
+            args = (qp.lagrangian, qp.factors, jnp.asarray(lower), jnp.asarray(upper))
+            rho = elastic_rho_of(qp, weight)
+            outcomes.append(
+                tuple(
+                    (
+                        bool(res.has_ray),
+                        bool(res.ldp_status == LDP_RESULTS.infeasible),
+                    )
+                    for res in (
+                        jitted(*args, elastic_rho=rho),
+                        solve_fixed_bounds_qp(*args, elastic_rho=rho),
+                    )
+                )
+            )
+        jit_out, eager_out = zip(*outcomes)
+        # Jit and eager agree on every problem, ...
+        assert jit_out == eager_out
+        # ... the pinned problems exercise the infeasible exit, ...
+        assert sum(infeasible for _, infeasible in jit_out) >= 60
+        # ... and each of them carries a certificate.
+        assert all(has_ray for has_ray, _ in jit_out)
+
+    @pytest.mark.parametrize("weight", [1e3, 1e4])
+    def test_every_infeasible_exit_of_a_pinned_elastic_solve_has_a_ray(self, weight):
+        """The contract at any number of free variables, jitted or not.
+
+        With as few free variables as equality rows the pinned augmented
+        problem is infeasible by a margin that is small in the normalised
+        units of the LDP, and its NNLS residual often sits just above the noise
+        threshold: the ``infeasible`` status then comes from the primal check.
+        Whatever else such a solve reports, an ``infeasible`` exit must keep
+        its certificate.
+        """
+        battery = near_infeasible_pinned_battery(min_free=1)
+        jitted = jax.jit(solve_fixed_bounds_qp)
+        n_infeasible = 0
+        for qp, lower, upper in battery:
+            args = (qp.lagrangian, qp.factors, jnp.asarray(lower), jnp.asarray(upper))
+            rho = elastic_rho_of(qp, weight)
+            for res in (
+                jitted(*args, elastic_rho=rho),
+                solve_fixed_bounds_qp(*args, elastic_rho=rho),
+            ):
+                if bool(res.ldp_status == LDP_RESULTS.infeasible):
+                    n_infeasible += 1
+                    assert bool(res.has_ray)
+        assert n_infeasible >= 100
 
     @pytest.mark.parametrize(
         "name",

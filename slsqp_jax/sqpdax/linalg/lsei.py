@@ -161,7 +161,8 @@ def least_distance_lsei(
     zero, and callers must branch on the status and never use them.
 
     **Farkas certificate.** When the status is ``infeasible`` (by the LDP's
-    residual test) or ``inconsistent_equalities``, ``cert_eq`` and
+    residual test, or by its primal check with a verified certificate) or
+    ``inconsistent_equalities``, ``cert_eq`` and
     ``cert_ineq`` hold a vector ``y`` with ``y_I ≥ 0``, ``Gᵀ y ≈ 0`` and
     ``hᵀ y < 0``, scaled to ``‖y‖_∞ = 1`` (``has_certificate`` is then true).
     For inconsistent equalities ``ŷ_E = -U_⊥ U_⊥ᵀ ĥ_E`` and ``ŷ_I = 0``.
@@ -169,8 +170,9 @@ def least_distance_lsei(
     ``ŷ_E = -R_EE⁺ R_EI u`` (the multiplier formula with ``z = 0``). It is
     computed in the equilibrated units and divided by the column norms, as
     the multipliers are. The ``infeasible`` outcome of the LDP's primal
-    check carries no certificate (``has_certificate`` false, both parts
-    zero).
+    check carries a certificate only when the LDP's NNLS solution verifies
+    as one (see :func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.ldp`);
+    otherwise ``has_certificate`` is false and both parts are zero.
 
     Parameters
     ----------
