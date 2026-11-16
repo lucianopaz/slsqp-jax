@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import optimistix as optx
 import pytest
 
-from slsqp_jax.sqpdax.logging import MemoryHandler
+from slsqp_jax.sqpdax.logging import MemoryDiagnosticsHandler, MemoryHandler
 from slsqp_jax.sqpdax.minimiser import (
     ActiveSetLineSearchMinimiser,
     LRHLineSearchMinimiser,
@@ -30,6 +30,7 @@ from .conftest import (
     make_bound_only_quadratic,
     make_equality_quadratic,
     make_infeasible_problem,
+    make_scaled_quartic,
     make_unconstrained_quadratic,
 )
 
@@ -396,3 +397,165 @@ def test_locally_infeasible_problem_ends_infeasible_with_a_bounded_penalty(x0):
     assert all(b <= a * (1.0 + 1e-12) for a, b in zip(penalties[1:], penalties[2:]))
     assert bool(jnp.all(jnp.isfinite(solver.iterate.x)))
     assert bool(jnp.all(jnp.isfinite(solver.dual.ineq_multipliers)))
+
+
+# --- LRH stats / log fields (C18) -----------------------------------------------
+
+PARENT_STAT_KEYS = (
+    "final_objective",
+    "kkt_ratio",
+    "qp_iterations",
+    "total_qp_iterations",
+    "last_qp_converged",
+)
+LRH_STAT_KEYS = (
+    "total_nnls_iters",
+    "lrh_rank",
+    "lrh_sigma",
+    "nnls_iters",
+    "ldp_status",
+    "elastic_delta",
+    "n_elastic",
+)
+STEP_KEYS = tuple(k for k in LRH_STAT_KEYS if not k.startswith("total_"))
+
+
+def _run_logged(problem, x0, **kwargs):
+    """Solve with both log channels attached; return solution, lines, records."""
+    text = MemoryHandler()
+    diagnostics = MemoryDiagnosticsHandler()
+    solver = LRHLineSearchMinimiser(**kwargs).init(
+        problem,
+        jnp.asarray(x0),
+        {"logging": {"level": "INFO", "handler": text, "diagnostics": diagnostics}},
+    )
+    while not bool(solver.terminate(problem)[0]) and int(solver.step_count) < 30:
+        solver = solver.step(problem)
+    jax.effects_barrier()
+    lines = [r.message for r in text.records if r.message.startswith("step=")]
+    return solver, lines, diagnostics.select(name="minimiser", kind="step")
+
+
+def _line_values(lines, key):
+    return [int(line.split(f"{key}=")[1].split()[0]) for line in lines]
+
+
+@pytest.mark.parametrize("memory", [2, 5], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize(
+    ("problem_factory", "x0", "_x_star"),
+    list(CONVERGENCE_CASES.values()),
+    ids=list(CONVERGENCE_CASES),
+)
+def test_stats_report_lrh_fields_read_from_state(problem_factory, x0, _x_star, memory):
+    """Final stats carry the LRH keys, the parent keys, and the state's own values."""
+    problem = problem_factory()
+    sol = _solve(problem, x0, max_steps=100, secant_memory=memory)
+    stats = sol.state._postprocess_stats(problem, sol.result)
+    for key in PARENT_STAT_KEYS + LRH_STAT_KEYS:
+        assert key in stats, key
+    factors = sol.state.secant.factors()
+    state = sol.state.solver_state
+    assert 0 <= int(stats["lrh_rank"]) <= memory
+    assert int(stats["lrh_rank"]) == int(factors.rank)
+    assert float(stats["lrh_sigma"]) > 0
+    assert float(stats["lrh_sigma"]) == float(factors.sigma)
+    assert int(stats["total_nnls_iters"]) == int(state.n_nnls_iter) >= 0
+    assert int(stats["nnls_iters"]) == int(state.last_n_cg_iter)
+    assert int(stats["total_nnls_iters"]) == int(stats["total_qp_cg_iterations"])
+    assert int(stats["n_elastic"]) == int(state.n_elastic) >= 0
+    assert stats["ldp_status"] == state.last_ldp_status
+    assert float(stats["elastic_delta"]) == float(state.last_elastic_delta)
+
+
+def test_elastic_case_reports_elastic_fields():
+    """On the C17 infeasible case the stats show elastic solves with ``δ ≈ 1``."""
+    problem = make_infeasible_problem()
+    solver = LRHLineSearchMinimiser(rtol=1e-6, atol=1e-6, min_steps=5).init(
+        problem, jnp.array([2.0, 0.0])
+    )
+    for _ in range(6):
+        solver = solver.step(problem)
+    stats = solver._postprocess_stats(
+        problem, ACTIVE_SET_LINE_SEARCH_RESULTS.successful
+    )
+    assert int(stats["n_elastic"]) >= 1
+    assert float(stats["elastic_delta"]) == pytest.approx(1.0, abs=1e-2)
+    assert int(stats["n_elastic"]) == int(solver.solver_state.n_elastic)
+
+
+def test_step_log_line_and_diagnostic_record_include_lrh_fields():
+    """Both the text line and the diagnostic record carry the new fields."""
+    text = MemoryHandler()
+    diagnostics = MemoryDiagnosticsHandler()
+    sol = _solve(
+        make_equality_quadratic(),
+        [0.25, 0.25],
+        options={
+            "logging": {
+                "level": "INFO",
+                "handler": text,
+                "diagnostics": diagnostics,
+            }
+        },
+    )
+    assert bool(sol.state.result_adapter.is_successful(sol.result))
+    lines = [r.message for r in text.records if r.message.startswith("step=")]
+    assert lines
+    for key in STEP_KEYS:
+        assert all(f"{key}=" in line for line in lines), key
+    records = diagnostics.select(name="minimiser", kind="step")
+    assert len(records) == len(lines)
+    for record in records:
+        for key in STEP_KEYS:
+            assert key in record.values, key
+        # Parent payload is still there.
+        assert "merit_penalty" in record.values
+        assert "qp_result" in record.values
+        assert float(record.values["lrh_sigma"]) > 0
+        assert float(record.values["n_elastic"]) >= 0
+
+
+def test_per_step_values_match_the_state_on_the_elastic_run():
+    """Per-step records and log lines track the carried solver state, step by step."""
+    problem = make_infeasible_problem()
+    solver, lines, records = _run_logged(
+        problem, [2.0, 0.0], rtol=1e-6, atol=1e-6, min_steps=5
+    )
+    state = solver.solver_state
+    assert len(records) == len(lines) >= 5
+    nnls = [int(r.values["nnls_iters"]) for r in records]
+    n_elastic = [int(r.values["n_elastic"]) for r in records]
+    # Per-step NNLS counts add up to the cumulative counter.
+    assert sum(nnls) == int(state.n_nnls_iter) > 0
+    assert all(b > a for a, b in zip(n_elastic, n_elastic[1:]))
+    assert n_elastic[-1] == int(state.n_elastic)
+    delta = float(records[-1].values["elastic_delta"])
+    assert delta == float(state.last_elastic_delta)
+    assert delta == pytest.approx(1.0, abs=1e-2)
+    # The text channel reports the very same numbers.
+    assert _line_values(lines, "nnls_iters") == nnls
+    assert _line_values(lines, "n_elastic") == n_elastic
+
+
+def test_logged_model_is_the_one_after_the_secant_update():
+    """After every step the newest record's rank and sigma equal the live secant's."""
+    problem = make_scaled_quartic()
+    text = MemoryHandler()
+    diagnostics = MemoryDiagnosticsHandler()
+    solver = LRHLineSearchMinimiser(rtol=1e-6, atol=1e-6).init(
+        problem,
+        jnp.array([0.5, 0.3, 0.2]),
+        {"logging": {"level": "INFO", "handler": text, "diagnostics": diagnostics}},
+    )
+    sigmas = []
+    for k in range(1, 7):
+        solver = solver.step(problem)
+        jax.effects_barrier()
+        records = diagnostics.select(name="minimiser", kind="step")
+        assert len(records) == k
+        factors = solver.secant.factors()
+        assert int(records[-1].values["lrh_rank"]) == int(factors.rank)
+        assert float(records[-1].values["lrh_sigma"]) == float(factors.sigma)
+        sigmas.append(float(factors.sigma))
+    # The check is only meaningful if the model actually moves between steps.
+    assert len(set(sigmas)) > 1
