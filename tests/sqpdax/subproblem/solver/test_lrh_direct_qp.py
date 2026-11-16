@@ -671,6 +671,29 @@ def near_infeasible_case(n: int, seed: int, feasible: bool) -> RandomQP:
     )
 
 
+def pinned_box(qp: RandomQP, lower: np.ndarray, upper: np.ndarray):
+    """``(lo, hi)`` of the step with the pins as ``lo == hi`` (free: unbounded)."""
+    pinned = lower | upper
+    d_fix = np.where(lower, qp.lb - qp.x, np.where(upper, qp.ub - qp.x, 0.0))
+    return np.where(pinned, d_fix, -np.inf), np.where(pinned, d_fix, np.inf)
+
+
+def relaxed_row_violation(qp: RandomQP, step: np.ndarray, delta: float) -> float:
+    """Largest violation of the relaxed rows at ``(step, δ)`` in unit-row units.
+
+    ``|A_E d + δ b_E - b_E|`` and ``max(A_I d + δ c_I - b_I, 0)``, each row
+    divided by its norm, then compared with ``max(1, ‖b‖∞)`` by the caller.
+    """
+    c = elastic_column_np(qp)
+    a = np.concatenate([qp.a_eq, qp.a_ineq])
+    b = np.concatenate([qp.b_eq, qp.b_ineq])
+    m_e = qp.a_eq.shape[0]
+    r = (a @ step + delta * c - b) / np.linalg.norm(a, axis=1)
+    return float(
+        max(np.abs(r[:m_e]).max(initial=0.0), np.maximum(r[m_e:], 0.0).max(initial=0.0))
+    )
+
+
 def near_infeasible_pinned_battery(
     size: int = 80, min_free: int | None = None
 ) -> list[tuple[RandomQP, np.ndarray, np.ndarray]]:
@@ -682,9 +705,9 @@ def near_infeasible_pinned_battery(
     pins as ``lo == hi``, free variables unbounded) declares the relaxed rows
     infeasible for every ``δ ∈ [0, 1]``, so that the kernel must answer with a
     Farkas ray, and when at least ``min_free`` variables stay free (default
-    ``m_E + 1``: with fewer, the pins nearly determine the equality rows and a
-    solve may report ``feasible`` with a huge step, a regime that is not the
-    subject of the batteries that use the default). Deterministic.
+    ``m_E + 1``; with fewer, the pins nearly determine the equality rows, the
+    regime of the rounding-noise rows of the LSEI reduction, exercised by
+    ``min_free=1``). Deterministic.
     """
     battery = []
     for seed in range(1000):
@@ -699,11 +722,7 @@ def near_infeasible_pinned_battery(
                 pinned = lower | upper
                 if int((~pinned).sum()) < n_free_min:
                     continue
-                d_fix = np.where(
-                    lower, qp.lb - qp.x, np.where(upper, qp.ub - qp.x, 0.0)
-                )
-                lo = np.where(pinned, d_fix, -np.inf)
-                hi = np.where(pinned, d_fix, np.inf)
+                lo, hi = pinned_box(qp, lower, upper)
                 if delta_min_lp(qp, lo, hi) is None:
                     battery.append((qp, lower, upper))
                     if len(battery) == size:
@@ -2141,7 +2160,11 @@ class TestElasticMode:
             assert bool(el.run.state.success)
             assert_elastic_kkt(qp, el.rho, el.run.step, el.delta, el.run.dual)
             excess.append(el.delta - delta_min)
-        assert excess[0] >= excess[1] >= excess[2] >= -1e-8
+        # Monotone up to rounding: past a weight the excess is ``O(1/w)`` below
+        # the 1e-12 of floating point and consecutive values tie.
+        assert excess[0] >= excess[1] - 1e-12
+        assert excess[1] >= excess[2] - 1e-12
+        assert excess[2] >= -1e-8
         assert excess[0] > 10 * max(excess[2], 1e-12)
 
     @pytest.mark.parametrize("name", list(INCONSISTENT)[:6] + ["box-too-tight"])
@@ -2317,6 +2340,15 @@ class TestElasticMode:
         threshold: the ``infeasible`` status then comes from the primal check.
         Whatever else such a solve reports, an ``infeasible`` exit must keep
         its certificate.
+
+        The converse holds too (C16c): a ``feasible`` exit must meet the
+        relaxed rows within ``1e-6 · max(1, ‖b‖∞)`` and the LP reference must
+        agree that some ``δ ∈ [0, 1]`` relaxes them. With few free variables
+        the equalities determine the space of the inequality rows, whose
+        projections are then rounding noise; it must not be read as rows. The
+        battery is infeasible for every ``δ`` (by the LP), so here the LP
+        reference admits no ``feasible`` exit at all. Jit and eager agree on
+        the status and on the ray.
         """
         battery = near_infeasible_pinned_battery(min_free=1)
         jitted = jax.jit(solve_fixed_bounds_qp)
@@ -2324,13 +2356,26 @@ class TestElasticMode:
         for qp, lower, upper in battery:
             args = (qp.lagrangian, qp.factors, jnp.asarray(lower), jnp.asarray(upper))
             rho = elastic_rho_of(qp, weight)
-            for res in (
+            lo, hi = pinned_box(qp, lower, upper)
+            lp_feasible = delta_min_lp(qp, lo, hi) is not None
+            scale = max(1.0, np.abs(qp.b_eq).max(), np.abs(qp.b_ineq).max())
+            results = (
                 jitted(*args, elastic_rho=rho),
                 solve_fixed_bounds_qp(*args, elastic_rho=rho),
-            ):
+            )
+            for res in results:
                 if bool(res.ldp_status == LDP_RESULTS.infeasible):
                     n_infeasible += 1
                     assert bool(res.has_ray)
+                if bool(res.ldp_status == LDP_RESULTS.feasible):
+                    violation = relaxed_row_violation(
+                        qp, np.asarray(res.step), float(res.delta)
+                    )
+                    assert lp_feasible
+                    assert violation <= 1e-6 * scale
+            jit_res, eager_res = results
+            assert bool(jit_res.ldp_status == eager_res.ldp_status)
+            assert bool(jit_res.has_ray == eager_res.has_ray)
         assert n_infeasible >= 100
 
     @pytest.mark.parametrize(

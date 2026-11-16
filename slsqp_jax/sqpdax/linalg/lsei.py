@@ -33,7 +33,11 @@ The reduction follows the SLSQP chain, with direct linear algebra:
    column of ``Gᵀ``) has a zero row in this system (``O(eps)`` noise in
    floating point, which ``ldp`` would normalise into a random constraint):
    such rows are zeroed, and their right-hand side is clamped to ``≥ 0``
-   unless it is a genuine violation;
+   unless it is a genuine violation. The rows are first rank-revealed (thin SVD,
+   singular values below ``eps^(2/3) σ_max`` dropped: the unpivoted QR leaves
+   rounding noise as *directions* too) and the noise threshold of a row grows
+   with the condition number of ``R_EE`` (a projection onto the equality span
+   rounds like ``eps · cond(R_EE)``);
 4. the multipliers follow by back-substitution.
 
 :func:`elastic_least_distance_lsei` solves the same problem relaxed by one extra
@@ -194,8 +198,13 @@ def least_distance_lsei(
     rank_tol
         Singular values of the equilibrated ``R_EE`` below
         ``rank_tol · σ_max`` count as zero (dependent equality rows), and
-        projected inequality rows of norm at most ``rank_tol`` count as noise.
-        ``None`` selects ``10 · eps · max(n, m)``.
+        projected inequality rows of norm at most
+        ``min(rank_tol · max(1, σ_max / σ_min,kept), max(rank_tol, √eps))``
+        count as noise (``σ_min,kept`` the smallest singular value of ``R_EE``
+        kept by the rank cut; plain ``rank_tol`` without equalities), a
+        threshold raised further to ``eps^(2/3) σ_max(c)`` of the projected
+        system ``c`` (see the module docstring). ``None`` selects
+        ``10 · eps · max(n, m)``.
 
     Returns
     -------
@@ -283,9 +292,22 @@ def least_distance_lsei(
         # Certificate of inconsistent equalities: ŷ_E = -U_⊥ U_⊥ᵀ ĥ_E has
         # R_EE ŷ_E = 0 and ĥ_Eᵀ ŷ_E = -‖U_⊥ᵀ ĥ_E‖² < 0.
         cert_inc_e = -(u @ jnp.where(keep, 0.0, u_h))
+        # Row-noise tolerance. Projecting a row onto range(G_Eᵀ) rounds like
+        # eps·cond(R_EE) (the unpivoted QR and the solve with R_EE), so a row
+        # lying in that span survives a fixed ``rank_tol`` as noise once R_EE
+        # is ill-conditioned. Scale the tolerance with the condition of the
+        # kept part of R_EE, capped at max(rank_tol, √eps) so that genuine
+        # (if small) rows are never discarded wholesale.
+        s_min_kept = jnp.min(jnp.where(keep, s, jnp.inf), initial=jnp.inf)
+        has_kept = jnp.isfinite(s_min_kept)
+        cond_e = jnp.where(has_kept, s[0] / jnp.where(has_kept, s_min_kept, 1.0), 1.0)
+        noise_tol = jnp.minimum(
+            rank_tol * jnp.maximum(1.0, cond_e), max(rank_tol, eps**0.5)
+        )
     else:
         z_e0 = jnp.zeros((0,), dtype)
         inconsistent = jnp.zeros((), bool)
+        noise_tol = rank_tol
 
     # Inequalities: R_EIᵀ z_E + R_IIᵀ z_I ≤ h_I in ζ = [t; z_I]. ldp wants
     # "≥", hence the sign flips.
@@ -306,7 +328,19 @@ def least_distance_lsei(
         # constraint. Zero such rows; a slack >= -eq_tol (floor 1, units of
         # w) counts as satisfied (rhs -> max(rhs, 0)), a larger violation
         # stays negative so that ldp reports ``infeasible``.
-        noise = jnp.linalg.norm(c, axis=1) <= rank_tol
+        #
+        # Rank-reveal the rows first. The unpivoted QR leaves rounding noise
+        # (eps/pivot) as *directions* inside genuine rows too, and ldp would
+        # exploit them (a huge ``feasible`` step that violates the rows by
+        # O(1)). Drop the singular directions of c below eps^(2/3)·σ_max,
+        # rebuild c, and raise the row tolerance to that floor so rows lying
+        # wholly in the dropped directions are zeroed by the rule below. ζ's
+        # coordinates are unchanged; the cost is O(m_I² m_c).
+        u_c, s_c, vt_c = jnp.linalg.svd(c, full_matrices=False)
+        s_floor = eps ** (2.0 / 3.0) * jnp.max(s_c, initial=0.0)
+        c = (u_c * jnp.where(s_c > s_floor, s_c, 0.0)) @ vt_c
+        noise_tol = jnp.maximum(noise_tol, s_floor)
+        noise = jnp.linalg.norm(c, axis=1) <= noise_tol
         near_ok = rhs >= -eq_tol * jnp.maximum(1.0, jnp.abs(h_i) + z_e0_norm)
         c = jnp.where(noise[:, None], 0.0, c)
         rhs = jnp.where(noise & near_ok, jnp.maximum(rhs, 0.0), rhs)

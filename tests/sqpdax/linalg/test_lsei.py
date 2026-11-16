@@ -1419,3 +1419,204 @@ def test_elastic_certificate_with_delta_rows(sign, y_expected, delta_dual, n, rh
     assert h @ y_gen + y_hi < -1.0
     np.testing.assert_array_equal(np.asarray(res.w), 0.0)
     assert float(res.delta) == 0.0
+
+
+# --- rounding noise in the reduction rows (C16c) --------------------------------
+#
+# When the equalities determine, or nearly determine, the space the inequality
+# rows live in, the projected inequality rows are rounding noise (the unpivoted
+# QR, ``eps·cond(R_EE)``), and the least-distance solver must not read them as
+# constraints: a wrong ``feasible`` answer violates rows by O(1) at a huge ``w``.
+# The contract checked here: no ``feasible`` exit violates a row by more than
+# ``1e-6·max(1, ‖ĥ‖∞)`` (hat: unit rows), and every ``infeasible`` exit is
+# certified.
+
+
+def assert_exit_contract(res, g_t, h, m_eq, c=None):
+    """``feasible`` ⇒ rows met (relaxed by ``δ c`` if ``c``); else a certificate."""
+    g_t, h = np.asarray(g_t), np.asarray(h)
+    row_norm = np.linalg.norm(g_t, axis=0)
+    row_norm = np.where(row_norm > 0, row_norm, 1.0)
+    if bool(res.status == LDP_RESULTS.feasible):
+        delta = 0.0 if c is None else float(res.delta)
+        shift = 0.0 if c is None else delta * np.asarray(c)
+        resid = (g_t.T @ np.asarray(res.w) + shift - h) / row_norm
+        viol = np.concatenate([np.abs(resid[:m_eq]), np.maximum(resid[m_eq:], 0.0)])
+        assert np.all(viol <= 1e-6 * max(1.0, np.max(np.abs(h) / row_norm)))
+    else:
+        assert bool(res.has_certificate)
+
+
+def determined_equalities_problem(theta, violated, seed, n=6, k=3, m_i=3):
+    """``k`` equalities that determine a ``k``-dim span of condition ``~1/θ``.
+
+    The inequalities lie in the same span (so they are determined too: their
+    projected rows are noise) and are all slack (feasible) or all violated at
+    the point ``w0`` the equalities fix, by at least ``0.1``.
+    """
+    rng = np.random.default_rng(seed)
+    basis = np.linalg.qr(rng.standard_normal((n, k)))[0]
+    coef = rng.standard_normal((k, k))
+    coef[:, 1] = coef[:, 0] + theta * rng.standard_normal(k)
+    w0 = basis @ rng.standard_normal(k)
+    g_e = basis @ coef
+    g_i = basis @ rng.standard_normal((k, m_i))
+    slack = (0.1 + np.abs(rng.standard_normal(m_i))) * (-1.0 if violated else 1.0)
+    g_t = np.hstack([g_e, g_i])
+    return g_t, np.concatenate([g_e.T @ w0, g_i.T @ w0 + slack]), k, w0
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("violated", [False, True], ids=["satisfied", "violated"])
+@pytest.mark.parametrize("theta", [1e-1, 1e-2, 1e-3, 1e-4])
+def test_determined_ill_conditioned_equalities_with_inequalities_in_the_span(
+    theta, violated, seed
+):
+    """The plain probe: noise in the rows of an in-span inequality is not a row.
+
+    The point the equalities fix is the only candidate. The solve is
+    ``feasible`` when the inequalities hold there and ``infeasible``
+    (certified) when they do not; never a ``feasible`` answer with violated
+    rows. Before C16c the wrong ``feasible`` rate grew from 1/50 at
+    ``θ = 1e-1`` to 42/50 at ``θ = 1e-4``.
+    """
+    g_t, h, m_eq, _ = determined_equalities_problem(theta, violated, seed)
+    res = run(g_t, h, m_eq)
+    assert_exit_contract(res, g_t, h, m_eq)
+    assert bool(res.status == LDP_RESULTS.feasible) == (not violated)
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("theta", [1e-1, 1e-2, 1e-3, 1e-4])
+def test_determined_point_is_returned_when_the_inequalities_hold(theta, seed):
+    """With the in-span inequalities slack, ``w`` is the point the equalities fix."""
+    g_t, h, m_eq, w0 = determined_equalities_problem(theta, False, seed)
+    res = run(g_t, h, m_eq)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    np.testing.assert_allclose(np.asarray(res.w), w0, atol=1e-6)
+
+
+@pytest.mark.parametrize("m_e", [0, 1])
+@pytest.mark.parametrize("e", [1e-6, 1e-8])
+def test_wedge_of_near_parallel_rows_is_not_truncated(e, m_e):
+    """Rows ``(±1, e)·w ≥ 1`` meet at ``w = (0, 1/e)``, ``‖w‖ = 1/e``.
+
+    The two rows differ only by ``2e`` in the first coordinate, so ``σ_min /
+    σ_max = e`` in the projected system: a genuine direction that the
+    rank-revealing truncation of the reduction rows (floor ``eps^(2/3)``) must
+    keep. An over-aggressive floor (e.g. ``√eps``) drops it and the problem
+    turns ``infeasible`` or returns a wrong point. An optional equality on a
+    third coordinate (``w_3 = 1/2``) must leave the wedge solution untouched.
+    """
+    n = 3
+    g_t = np.zeros((n, m_e + 2))
+    g_t[2, :m_e] = 1.0  # equality w_3 = 1/2 (columns are ordered [E, I])
+    g_t[:2, m_e] = [-1.0, -e]  # -(w_1 + e w_2) <= -1
+    g_t[:2, m_e + 1] = [1.0, -e]  # -(-w_1 + e w_2) <= -1
+    h = np.concatenate([0.5 * np.ones(m_e), -np.ones(2)])
+    res = run(g_t, h, m_e)
+    assert bool(res.status == LDP_RESULTS.feasible)
+    expected = np.array([0.0, 1.0 / e, 0.5 * m_e])
+    # ``w`` is accurate relative to its own norm ``1/e``.
+    np.testing.assert_allclose(
+        np.asarray(res.w), expected, rtol=0, atol=1e-6 * np.linalg.norm(expected)
+    )
+
+
+def pinned_elastic_problem(n_free, seed, weight, n=8, m_e=2, m_i=4, spread=2.0):
+    """The elastic LSEI data of a pinned QP whose relaxation is infeasible.
+
+    ``a`` is the constraint matrix in the variables of ``w`` (``B = I``), rows
+    scaled over ``spread`` decades; every variable but ``n_free`` of them is
+    pinned at ``d_fix``, which shifts the right-hand side (``h = b - A d_fix``)
+    but not the column of ``δ`` (``c = elastic_delta_column(b)``). The pinned
+    columns of ``Gᵀ`` are zero rows. With ``n_free ≤ m_E`` the two equalities
+    fix ``(w_free, δ)`` and the relaxed rows (``δ`` is then ``> 1`` for most
+    seeds) are infeasible. Returns ``(g_t, h, c, rho)``.
+    """
+    rng = np.random.default_rng(seed)
+    m = m_e + m_i
+    free = rng.choice(n, n_free, replace=False)
+    a = rng.standard_normal((m, n)) * 10.0 ** rng.uniform(-spread, 0, size=(m, 1))
+    b = 3.0 * rng.standard_normal(m)
+    b[m_e:] -= 1.0
+    d_fix = 3.0 * rng.standard_normal(n)
+    d_fix[free] = 0.0
+    h = b - a @ d_fix
+    g_t = np.zeros((n, m))
+    g_t[free] = a[:, free].T
+    c = np.asarray(elastic_delta_column(jnp.asarray(b), m_e))
+    tau2 = float(
+        elastic_weight_scale(jnp.asarray(g_t), jnp.asarray(h), jnp.asarray(c), m_e)
+    )
+    return g_t, h, c, weight * tau2
+
+
+def delta_lp_is_feasible(g_t, h, c, m_eq):
+    """LP reference: do the relaxed rows hold for some ``w`` and ``δ ∈ [0, 1]``?"""
+    from scipy.optimize import linprog
+
+    n, m = g_t.shape
+    a = g_t.T
+    out = linprog(
+        np.zeros(n + 1),
+        A_ub=np.hstack([a[m_eq:], c[m_eq:, None]]),
+        b_ub=h[m_eq:],
+        A_eq=np.hstack([a[:m_eq], c[:m_eq, None]]),
+        b_eq=h[:m_eq],
+        bounds=[(None, None)] * n + [(0.0, 1.0)],
+        method="highs",
+    )
+    return out.status == 0
+
+
+@jax.jit
+def _elastic_two_equalities(g_t, h, c, rho):
+    return elastic_least_distance_lsei(g_t, h, 2, c, rho, EQ_TOL)
+
+
+# ``(spread, n_free, weight, seed)``: the grid at the default spread of 2
+# decades, and three wide-spread reproducers that only the ``eps^(2/3)`` floor
+# of the SVD truncation of the reduction rows resolves (a floor of ``rank_tol ·
+# σ_max`` returns ``feasible`` with ``‖w‖ ≈ 1e16`` on each of them).
+ELASTIC_FEW_FREE_CASES = [
+    (2.0, n_free, weight, seed)
+    for n_free, weight, seed in itertools.product([1, 2], [1e3, 1e4], range(25))
+] + [(2.0, 2, 1e4, 185), (4.0, 2, 1e3, 271), (4.0, 2, 1e4, 36)]
+ELASTIC_FEW_FREE_IDS = [
+    f"spread{spread:g}-{'one' if n_free == 1 else 'two'}-free-{weight:g}-{seed}"
+    for spread, n_free, weight, seed in ELASTIC_FEW_FREE_CASES
+]
+
+
+@pytest.mark.parametrize(
+    "spread, n_free, weight, seed",
+    ELASTIC_FEW_FREE_CASES,
+    ids=ELASTIC_FEW_FREE_IDS,
+)
+def test_elastic_with_two_equalities_and_few_free_variables(
+    spread, n_free, weight, seed
+):
+    """The two defect reproducers at the LSEI level (``m_E = 2``).
+
+    With one free variable the two equality columns span the whole augmented
+    space ``(w_free, δ)`` and the rows of ``δ`` lie in it: their projections
+    are noise just above ``rank_tol`` (growing like ``eps·cond(R_EE)``). With
+    two free variables the augmented data have rank 3 and the rows carry
+    ``eps/pivot`` noise in the rank-deficient directions of a genuinely 1-D,
+    infeasible, problem. Before C16c both gave a ``feasible`` exit with
+    ``‖w‖ ≈ 1e15`` that violated the relaxed rows by O(1). The exit must now
+    agree with the LP reference (``feasible`` iff some ``δ ∈ [0, 1]`` relaxes
+    the rows), meet the rows, and be certified when infeasible; the jitted and
+    eager solves agree.
+    """
+    g_t, h, c, rho = pinned_elastic_problem(n_free, seed, weight, spread=spread)
+    args = (jnp.asarray(g_t), jnp.asarray(h), jnp.asarray(c), rho)
+    res = _elastic_two_equalities(*args)
+    assert_exit_contract(res, g_t, h, 2, c=c)
+    assert bool(res.status == LDP_RESULTS.feasible) == delta_lp_is_feasible(
+        g_t, h, c, 2
+    )
+    eager = run_elastic(g_t, h, 2, rho, delta_col=c)
+    assert bool(eager.status == res.status)
+    assert bool(eager.has_certificate == res.has_certificate)
