@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
@@ -19,8 +20,10 @@ from slsqp_jax.sqpdax.minimiser import (
     TrustFunnelTerminationMetrics,
     minimise,
 )
-from slsqp_jax.sqpdax.primal import InteriorPointPrimal
+from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal
 from slsqp_jax.sqpdax.problem import Problem
+from slsqp_jax.sqpdax.step_controller import StepResult
+from slsqp_jax.sqpdax.subproblem.solver import ACTIVE_SET_QP_RESULTS, RESULTS
 from slsqp_jax.sqpdax.types import Aux
 from tests.sqpdax.conftest import make_shifted_box_quadratic
 from tests.sqpdax.lagrangian.conftest import make_problem
@@ -563,3 +566,72 @@ def infeasible_funnel_run() -> InfeasibleFunnelRun:
             sol.state._optimisation_context(problem)
         )
     return InfeasibleFunnelRun(problem, sol, handler, metrics)
+
+
+def _execute_synthetic_step(
+    solver,
+    problem,
+    *,
+    accepted: bool,
+    qp_success: bool,
+    qp_status,
+    x,
+    merit: float,
+    step_size: float | None = None,
+    proposed_step_norm: float = 1.0,
+    accepted_by_fallback: bool = False,
+    rounding_level: bool = False,
+):
+    """Exercise phase four with a controlled line-search/QP outcome."""
+    ctx = solver._init_subproblem(problem)
+    qp_result = ACTIVE_SET_QP_RESULTS.where(
+        jnp.asarray(qp_success),
+        ACTIVE_SET_QP_RESULTS.working_set_converged,
+        ACTIVE_SET_QP_RESULTS.where(
+            qp_status == RESULTS.max_steps_reached,
+            ACTIVE_SET_QP_RESULTS.max_iter_reached,
+            ACTIVE_SET_QP_RESULTS.kkt_solver_failure,
+        ),
+    )
+    state = eqx.tree_at(
+        lambda s: (s.success, s.status, s.qp_result),
+        solver.solver_state,
+        (jnp.asarray(qp_success), qp_status, qp_result),
+    )
+    result = StepResult(
+        x=Primal(jnp.asarray(x)),
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(merit),
+        solver_state=state,
+        step_size=jnp.asarray(
+            (1.0 if accepted else 0.0) if step_size is None else step_size
+        ),
+        proposed_step_norm=jnp.asarray(proposed_step_norm),
+        accepted_by_fallback=jnp.asarray(accepted_by_fallback),
+        rounding_level=jnp.asarray(rounding_level),
+    )
+    return solver._execute_step(ctx, solver.dual, result)
+
+
+def _indefinite_quadratic():
+    """``f(x) = 1/2 (x0^2 - 4 x1^2)`` with exact curvature, unconstrained."""
+    w = jnp.array([1.0, -4.0])
+    lb, ub = unbounded_box(2)
+    return Problem(
+        fn=lambda x: (0.5 * jnp.sum(w * x**2), None),
+        grad=lambda x: w * x,
+        hvp=lambda x, v: w * v,
+        eq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        ineq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        eq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        eq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        lb=lb,
+        ub=ub,
+        null_lb=jnp.ones(2, dtype=bool),
+        null_ub=jnp.ones(2, dtype=bool),
+        n=2,
+        meq=0,
+        mineq=0,
+    )

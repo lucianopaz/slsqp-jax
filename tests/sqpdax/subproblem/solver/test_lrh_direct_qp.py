@@ -2324,11 +2324,16 @@ class TestElasticMode:
             )
         jit_out, eager_out = zip(*outcomes)
         # Jit and eager agree on every problem, ...
-        assert jit_out == eager_out
+        for i, (jit_i, eager_i) in enumerate(zip(jit_out, eager_out)):
+            assert jit_i == eager_i, (
+                f"battery[{i}] weight={weight:g}: jit (has_ray, infeasible) "
+                f"{jit_i} != eager {eager_i}"
+            )
         # ... the pinned problems exercise the infeasible exit, ...
         assert sum(infeasible for _, infeasible in jit_out) >= 60
         # ... and each of them carries a certificate.
-        assert all(has_ray for has_ray, _ in jit_out)
+        for i, (has_ray, _) in enumerate(jit_out):
+            assert has_ray, f"battery[{i}] weight={weight:g}: no ray"
 
     @pytest.mark.parametrize("weight", [1e3, 1e4])
     def test_every_infeasible_exit_of_a_pinned_elastic_solve_has_a_ray(self, weight):
@@ -2353,7 +2358,8 @@ class TestElasticMode:
         battery = near_infeasible_pinned_battery(min_free=1)
         jitted = jax.jit(solve_fixed_bounds_qp)
         n_infeasible = 0
-        for qp, lower, upper in battery:
+        for i, (qp, lower, upper) in enumerate(battery):
+            case = f"battery[{i}] weight={weight:g}"
             args = (qp.lagrangian, qp.factors, jnp.asarray(lower), jnp.asarray(upper))
             rho = elastic_rho_of(qp, weight)
             lo, hi = pinned_box(qp, lower, upper)
@@ -2363,19 +2369,26 @@ class TestElasticMode:
                 jitted(*args, elastic_rho=rho),
                 solve_fixed_bounds_qp(*args, elastic_rho=rho),
             )
-            for res in results:
+            for kind, res in zip(("jit", "eager"), results):
                 if bool(res.ldp_status == LDP_RESULTS.infeasible):
                     n_infeasible += 1
-                    assert bool(res.has_ray)
+                    assert bool(res.has_ray), f"{case} {kind}: infeasible, no ray"
                 if bool(res.ldp_status == LDP_RESULTS.feasible):
                     violation = relaxed_row_violation(
                         qp, np.asarray(res.step), float(res.delta)
                     )
-                    assert lp_feasible
-                    assert violation <= 1e-6 * scale
+                    assert lp_feasible, f"{case} {kind}: feasible but the LP is not"
+                    assert violation <= 1e-6 * scale, (
+                        f"{case} {kind}: row violation {violation:.3e} "
+                        f"> {1e-6 * scale:.3e}"
+                    )
             jit_res, eager_res = results
-            assert bool(jit_res.ldp_status == eager_res.ldp_status)
-            assert bool(jit_res.has_ray == eager_res.has_ray)
+            assert bool(jit_res.ldp_status == eager_res.ldp_status), (
+                f"{case}: jit and eager disagree on the LDP status"
+            )
+            assert bool(jit_res.has_ray == eager_res.has_ray), (
+                f"{case}: jit and eager disagree on has_ray"
+            )
         assert n_infeasible >= 100
 
     @pytest.mark.parametrize(

@@ -27,6 +27,8 @@ from slsqp_jax.sqpdax.subproblem.active_set import ActiveSetSubProblem
 from slsqp_jax.sqpdax.subproblem.solver import RESULTS
 
 from .conftest import (
+    _execute_synthetic_step,
+    _indefinite_quadratic,
     make_equality_quadratic,
     make_hs71,
     make_infeasible_problem,
@@ -34,10 +36,6 @@ from .conftest import (
     make_shifted_equality_problem,
     make_unconstrained_quadratic,
     make_zero_jacobian_infeasible_problem,
-)
-from .test_active_set_linesearch import (
-    _execute_synthetic_step,
-    _indefinite_quadratic,
 )
 
 
@@ -305,6 +303,35 @@ def test_infeasible_stationary_requires_a_stationary_violation_measure():
     assert float(sol.stats["violation_stationarity"]) <= 1e-3
 
 
+@pytest.mark.parametrize(
+    ("last_ls_success", "certifies"),
+    [(True, False), (False, True)],
+    ids=["progressing", "stuck"],
+)
+def test_infeasible_stationary_needs_a_stuck_iterate(last_ls_success, certifies):
+    """At a violation-stationary point the certificate also needs ``stuck``.
+
+    ``stuck`` is ``stationary | ~last_ls_success``: with the Lagrangian not
+    stationary, a point where the last step was accepted is still progressing
+    and must not certify; one where it was rejected must.
+    """
+    problem = make_infeasible_problem()
+    solver = _at(
+        LRHLineSearchMinimiser(min_steps=0, zero_step_patience=0).init(
+            problem, jnp.zeros(2)
+        ),
+        [0.5, 0.0],
+    )
+    solver = eqx.tree_at(
+        lambda m: m.last_ls_success, solver, jnp.asarray(last_ls_success)
+    )
+    metrics = solver.termination_metrics(solver._optimisation_context(problem))
+    verdict = solver._infeasible_stationary(
+        metrics, jnp.asarray(False), jnp.asarray(False)
+    )
+    assert bool(verdict) == certifies
+
+
 # --- staged secant reset of a model that already holds pairs (C19 review O2) ------
 
 
@@ -391,8 +418,12 @@ def test_penalty_blowup_on_the_zero_jacobian_problem_is_pinned(minimiser_cls):
     the first four steps and constant afterwards (13 steps, final
     ``x₀ ≈ -7e-9``); the parent reaches ``ρ ≈ 4e166``. Both end with the
     ``infeasible`` status and finite iterates, never NaN. This is inherited
-    parent design (no cap on ``ρ``); changing it is outside the LRH plan, so
-    the test only pins termination, status and finiteness.
+    parent design (no cap on ``ρ``); changing it is outside the LRH plan.
+
+    The termination, status and finiteness asserts are the lasting
+    requirements. The ``merit_penalty > 1e10`` assert is a deliberate
+    tripwire on the current, undesirable magnitude: a fix that bounds ``ρ``
+    is meant to replace it with an upper bound, not to be blocked by it.
     """
     problem = make_zero_jacobian_infeasible_problem()
     sol = minimise(

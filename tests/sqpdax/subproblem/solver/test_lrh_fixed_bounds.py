@@ -536,6 +536,16 @@ def with_stiff_model(qp: RandomQP, factor: float) -> RandomQP:
     return qp._replace(factors=fac, dense_b=dense_b)
 
 
+def _enumerated_reference(qp: RandomQP, lower, upper):
+    """Reference step by dense KKT enumeration."""
+    return dense_reference(qp, lower, upper)[0]
+
+
+def _singleton_reference(qp: RandomQP, lower, upper):
+    """Reference step when ``d0`` is the only feasible step."""
+    return qp.d0
+
+
 def _scenario_row_on_pinned_variable(seed: int, scale: float):
     """One inequality supported only on a pinned variable, others general."""
     n = 6
@@ -546,7 +556,7 @@ def _scenario_row_on_pinned_variable(seed: int, scale: float):
     a_in[0, 0] = scale
     b_in[0] = scale * qp.d0[0]  # active at the pinned step
     qp = with_rows(qp, qp.a_eq, qp.b_eq, a_in, b_in)
-    return qp, index_mask(n, []), upper, None
+    return qp, index_mask(n, []), upper, _enumerated_reference
 
 
 def _scenario_all_rows_on_pinned_variables(seed: int, scale: float):
@@ -558,7 +568,7 @@ def _scenario_all_rows_on_pinned_variables(seed: int, scale: float):
     a_in = np.zeros((2, n))
     a_in[:, :2] = rng.standard_normal((2, 2)) * scale
     qp = with_rows(qp, np.zeros((0, n)), np.zeros(0), a_in, a_in @ qp.d0)
-    return qp, index_mask(n, []), upper, None
+    return qp, index_mask(n, []), upper, _enumerated_reference
 
 
 def _scenario_two_opposite_inequalities(seed: int, scale: float):
@@ -580,7 +590,7 @@ def _scenario_two_opposite_inequalities(seed: int, scale: float):
         with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0),
         lower,
         index_mask(n, []),
-        "d0",
+        _singleton_reference,
     )
 
 
@@ -603,7 +613,7 @@ def _scenario_vertex_in_a_null_space(seed: int, scale: float):
         with_rows(qp, a_e, a_e @ qp.d0, a_i, a_i @ qp.d0),
         lower,
         index_mask(n, []),
-        "d0",
+        _singleton_reference,
     )
 
 
@@ -626,10 +636,10 @@ class TestDegenerateFeasibleSets:
         the others the dense KKT enumeration gives the reference.
         """
         scale = 10 ** np.random.default_rng(100 + seed).uniform(-2, 4)
-        qp, lower, upper, expected = DEGENERATE_SCENARIOS[name](seed, scale)
+        qp, lower, upper, reference = DEGENERATE_SCENARIOS[name](seed, scale)
         qp = with_stiff_model(qp, np.sqrt(curvature))
         case = Case(qp, lower, upper)
-        d_ref = qp.d0 if expected == "d0" else dense_reference(qp, lower, upper)[0]
+        d_ref = reference(qp, lower, upper)
         res = run(case)
         assert bool(res.ldp_status == LDP_RESULTS.feasible)
         np.testing.assert_allclose(

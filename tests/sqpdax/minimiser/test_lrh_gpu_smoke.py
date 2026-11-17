@@ -18,6 +18,7 @@ budget is more than two orders of magnitude below it.
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Mapping
 
 import jax
@@ -155,6 +156,9 @@ def test_gpu_smoke_n1e5_solves_within_the_memory_budget(smoke, rule):
     problem, x0 = smoke
     solver = LRHLineSearchMinimiser(secant_memory=MEMORY)
     device = next(iter(x0.devices()))
+    # Free cyclic garbage of earlier parametrisations now, so it is not released
+    # during the solve (which would understate the solve's own peak).
+    gc.collect()
     before = device.memory_stats()
     sol = minimise(
         problem, solver, x0, max_steps=500, throw=False, options=lrh_options(rule)

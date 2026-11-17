@@ -135,25 +135,46 @@ def test_hs_problems_solve_and_match_references(
     assert np.allclose(np.asarray(x), x_star, atol=1e-3)
 
 
-SANE_RESULTS = (
-    ACTIVE_SET_LINE_SEARCH_RESULTS.successful,
-    ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure,
-    ACTIVE_SET_LINE_SEARCH_RESULTS.line_search_failure,
-    ACTIVE_SET_LINE_SEARCH_RESULTS.merit_stagnation,
-)
+# Outcome ``(status, secant resets recorded)`` of each ``(case, secant_memory)``
+# with a one-trial line-search budget. A run fails loudly (resets, then the
+# recovery-failure status) exactly when some step needs a backtrack: HS21 always
+# does, and HS35 does with the shortest memory (m = 2). Otherwise every step is
+# accepted at ``alpha = 1``, no backtrack is needed and the run converges with
+# no reset at all (HS71, HS76, HS35 with m >= 5).
+_FAILS = (ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure, True)
+_CONVERGES = (ACTIVE_SET_LINE_SEARCH_RESULTS.successful, False)
+TINY_BUDGET_OUTCOMES = {
+    ("hs21", 2): _FAILS,
+    ("hs21", 5): _FAILS,
+    ("hs21", 10): _FAILS,
+    ("hs35", 2): _FAILS,
+    ("hs35", 5): _CONVERGES,
+    ("hs35", 10): _CONVERGES,
+    ("hs71", 2): _CONVERGES,
+    ("hs71", 5): _CONVERGES,
+    ("hs71", 10): _CONVERGES,
+    ("hs76", 2): _CONVERGES,
+    ("hs76", 5): _CONVERGES,
+    ("hs76", 10): _CONVERGES,
+}
 
 
-@pytest.mark.parametrize("secant_memory", [2, 5, 10], ids=lambda m: f"m{m}")
 @pytest.mark.parametrize("qp_warm_start", [False, True], ids=["cold", "warm"])
-@pytest.mark.parametrize("case", list(HS_CASES))
-def test_tiny_line_search_budget_terminates_sanely(case, qp_warm_start, secant_memory):
-    """With a one-trial line-search budget the run still ends cleanly.
+@pytest.mark.parametrize(
+    "case, secant_memory",
+    list(TINY_BUDGET_OUTCOMES),
+    ids=[f"{c}-m{m}" for c, m in TINY_BUDGET_OUTCOMES],
+)
+def test_tiny_line_search_budget_outcome(case, secant_memory, qp_warm_start):
+    """With a one-trial line-search budget each case ends as recorded.
 
-    Whatever the outcome, the iterate is finite and inside the box, the status
-    is a recognised one, and a run that did not converge was preceded by
-    recorded secant resets (the failure is never silent).
+    The iterate is always finite and inside the box and the run takes at most
+    60 steps. The status and whether secant resets were recorded are the
+    outcome of ``TINY_BUDGET_OUTCOMES``: a run that needs no backtrack still
+    converges without a reset, one that does fails loudly, never silently.
     """
     factory, x0, _, _ = HS_CASES[case]
+    expected_result, expect_resets = TINY_BUDGET_OUTCOMES[case, secant_memory]
     problem = factory()
     sol, stats = _solve(
         problem,
@@ -167,11 +188,10 @@ def test_tiny_line_search_budget_terminates_sanely(case, qp_warm_start, secant_m
     assert bool(jnp.isfinite(stats["final_objective"]))
     assert bool(jnp.all(sol.value >= problem.lb - 1e-8))
     assert bool(jnp.all(sol.value <= problem.ub + 1e-8))
-    assert any(bool(sol.result == r) for r in SANE_RESULTS), sol.result
     assert int(sol.stats["num_steps"]) <= 60
+    assert bool(sol.result == expected_result), sol.result
     n_resets = int(jnp.sum(sol.state.secant_stats.n_resets))
-    converged = bool(sol.state.result_adapter.is_successful(sol.result))
-    assert converged or n_resets > 0
+    assert (n_resets > 0) == expect_resets, n_resets
 
 
 @pytest.mark.parametrize("secant_memory", [2, 5, 10], ids=lambda m: f"m{m}")
@@ -183,7 +203,9 @@ def test_forced_line_search_failures_trigger_secant_resets(
 
     The failures walk the recovery schedule (one reset per channel, then the
     identity model) and end with the recovery-failure status, never NaN, and
-    without moving off the projected start (``f = -98.96``).
+    without moving off the projected start (``f = -98.96``). The resets cannot
+    help: the identity-reset target equals the initial identity model, and the
+    rejected steps add no secant pairs, so the next trial fails the same way.
     """
     factory, x0, _, _ = HS_CASES["hs21"]
     problem = factory()

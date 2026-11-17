@@ -965,16 +965,22 @@ def test_elastic_leaves_consistent_problems_unchanged(n, m_e, m_i, dup, relax, s
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("rho", [1e2, 1e4, 1e10])
+@pytest.mark.parametrize(
+    "rho, w_gap",
+    [(1e2, np.inf), (1e4, np.inf), (1e10, 1e-3)],
+    ids=["rho1e2", "rho1e4", "rho1e10"],
+)
 @pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
 @pytest.mark.parametrize("n", DIMS)
 def test_elastic_on_consistent_problems_is_a_small_perturbation(
-    n, m_e, m_i, dup, rho, seed
+    n, m_e, m_i, dup, rho, w_gap, seed
 ):
     """When a relaxed row is active the first-order gain makes ``δ`` positive
     on a consistent problem, but ``δ ≤ max(0, -cᵀλ)/ρ`` (convexity of the value in
     ``δ``, at the plain multipliers), the relaxed objective is no worse than the plain
-    one, and ``w`` approaches the plain solution as ``ρ`` grows."""
+    one, and ``w`` approaches the plain solution as ``ρ`` grows: ``w_gap`` is the
+    relative distance to the plain ``w`` that must hold (infinite when ``ρ`` is too
+    small for the claim)."""
     g_t, h = make_problem(n, m_e, m_i, dup, seed)
     plain = run(g_t, h, m_e)
     c = np.asarray(elastic_delta_column(jnp.asarray(h), m_e))
@@ -987,8 +993,7 @@ def test_elastic_on_consistent_problems_is_a_small_perturbation(
     w, w0 = np.asarray(res.w), np.asarray(plain.w)
     assert 0.5 * w @ w + 0.5 * rho * delta**2 <= 0.5 * w0 @ w0 * (1 + 1e-9) + 1e-12
     assert_elastic_kkt(res, g_t, h, c, m_e, rho)
-    if rho >= 1e10:
-        assert np.linalg.norm(w - w0) <= 1e-3 * max(1.0, np.linalg.norm(w0))
+    assert np.linalg.norm(w - w0) <= w_gap * max(1.0, np.linalg.norm(w0))
 
 
 @pytest.mark.parametrize("global_factor", [1e-4, 1.0, 1e4])
@@ -1072,27 +1077,38 @@ def test_elastic_jit_matches_eager(make, expected):
         )
 
 
+ELASTIC_NONFEASIBLE_STATUS_CASES = {
+    "budget": (
+        np.eye(6),
+        -np.ones(6),
+        0,
+        {"max_iter": 0},
+        LDP_RESULTS.max_iter_reached,
+    ),
+    "nonfinite": (
+        np.where(
+            np.arange(5)[:, None] == 0, np.nan, make_problem(5, 2, 3, False, 0)[0]
+        ),
+        make_problem(5, 2, 3, False, seed=0)[1],
+        2,
+        {},
+        LDP_RESULTS.nonfinite,
+    ),
+}
+ELASTIC_STATUS_CASES = {
+    "feasible": (*make_problem(5, 2, 3, False, seed=0), 2, {}, LDP_RESULTS.feasible),
+    **ELASTIC_NONFEASIBLE_STATUS_CASES,
+}
+
+
 @pytest.mark.parametrize(
     "g_t, h, m_eq, kwargs, expected",
-    [
-        (*make_problem(5, 2, 3, False, seed=0), 2, {}, LDP_RESULTS.feasible),
-        (np.eye(6), -np.ones(6), 0, {"max_iter": 0}, LDP_RESULTS.max_iter_reached),
-        (
-            np.where(
-                np.arange(5)[:, None] == 0, np.nan, make_problem(5, 2, 3, False, 0)[0]
-            ),
-            make_problem(5, 2, 3, False, seed=0)[1],
-            2,
-            {},
-            LDP_RESULTS.nonfinite,
-        ),
-    ],
-    ids=["feasible", "budget", "nonfinite"],
+    ELASTIC_STATUS_CASES.values(),
+    ids=ELASTIC_STATUS_CASES.keys(),
 )
-def test_elastic_statuses_zero_outputs_and_shapes(g_t, h, m_eq, kwargs, expected):
-    """Statuses are those of the augmented LSEI; unless feasible every output
-    is zero; shapes are those of the general rows (the extra variable and its
-    two rows are reported separately)."""
+def test_elastic_statuses_and_shapes(g_t, h, m_eq, kwargs, expected):
+    """Statuses are those of the augmented LSEI; shapes are those of the
+    general rows (the extra variable and its two rows are reported separately)."""
     n, m = g_t.shape
     res = run_elastic(g_t, h, m_eq, 10.0, **kwargs)
     assert bool(res.status == expected)
@@ -1101,9 +1117,19 @@ def test_elastic_statuses_zero_outputs_and_shapes(g_t, h, m_eq, kwargs, expected
     assert res.lam_delta.shape == (2,)
     assert res.cert_eq.shape == (m_eq,) and res.cert_ineq.shape == (m - m_eq,)
     assert res.cert_delta.shape == (2,)
-    if expected != LDP_RESULTS.feasible:
-        for name in ["w", "delta", "lam_eq", "lam_ineq", "lam_delta"]:
-            np.testing.assert_array_equal(np.asarray(getattr(res, name)), 0.0)
+
+
+@pytest.mark.parametrize(
+    "g_t, h, m_eq, kwargs, expected",
+    ELASTIC_NONFEASIBLE_STATUS_CASES.values(),
+    ids=ELASTIC_NONFEASIBLE_STATUS_CASES.keys(),
+)
+def test_elastic_nonfeasible_outputs_are_zero(g_t, h, m_eq, kwargs, expected):
+    """Unless feasible every output is zero."""
+    res = run_elastic(g_t, h, m_eq, 10.0, **kwargs)
+    assert bool(res.status == expected)
+    for name in ["w", "delta", "lam_eq", "lam_ineq", "lam_delta"]:
+        np.testing.assert_array_equal(np.asarray(getattr(res, name)), 0.0, err_msg=name)
 
 
 @pytest.mark.parametrize("n, m_e, m_i", [(1, 0, 0), (4, 0, 0), (3, 0, 2), (3, 2, 0)])

@@ -374,21 +374,24 @@ def test_lrh_solves_what_the_references_solve(case, rule, case_runs):
     name = f"lrh_{rule}"
     r = runs[name]
     refs = {k: v for k, v in runs.items() if not k.startswith("lrh_") and v.ok}
-    if refs:
-        assert r.ok, f"{name} failed ({r.status}, feas={r.feas}, kkt={r.kkt_ratio})"
+    # Only the references that solved the case count; no reference, no gate.
+    assert r.ok or not refs, (
+        f"{name} failed ({r.status}, feas={r.feas}, kkt={r.kkt_ratio})"
+    )
 
     tight_lrh = tight[name]
-    obj_refs = {}
-    if "scipy_slsqp" in refs:
-        obj_refs["scipy_slsqp"] = refs["scipy_slsqp"].f
-    if tight["active_set_lbfgs_cg"].ok:
-        obj_refs["active_set_tight"] = tight["active_set_lbfgs_cg"].f
-    if f_star is not None:
-        obj_refs["known_optimum"] = f_star
-    if obj_refs:
-        assert tight_lrh.ok, (
-            f"{name} did not converge at rtol={TIGHT_TOL:g} "
-            f"({tight_lrh.status}, feas={tight_lrh.feas}, kkt={tight_lrh.kkt_ratio})"
-        )
+    tight_parent = tight["active_set_lbfgs_cg"]
+    candidates = {
+        "scipy_slsqp": refs.get("scipy_slsqp"),
+        "active_set_tight": tight_parent if tight_parent.ok else None,
+    }
+    obj_refs = {k: v.f for k, v in candidates.items() if v is not None}
+    obj_refs.update(
+        {k: v for k, v in {"known_optimum": f_star}.items() if v is not None}
+    )
+    assert tight_lrh.ok or not obj_refs, (
+        f"{name} did not converge at rtol={TIGHT_TOL:g} "
+        f"({tight_lrh.status}, feas={tight_lrh.feas}, kkt={tight_lrh.kkt_ratio})"
+    )
     for ref_name, f_ref in obj_refs.items():
         assert tight_lrh.f == pytest.approx(f_ref, rel=1e-6, abs=1e-8), ref_name
