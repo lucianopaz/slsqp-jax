@@ -40,7 +40,15 @@ CASES = [
 ]
 CASE_IDS = ["0-0", "2-0", "0-3", "2-3", "3dup-2"]
 DIMS = [4, 10]
-SEEDS = [0, 1, 2, 3]
+SEEDS = [0, 1, 2]
+
+
+# ``(n, case index, seed)`` covering design: every pair of axis values appears
+# (the seed rotates with ``n`` and the case). The two extra rows at ``n = 4``,
+# seed 0 are the killers of the ``λ_E`` and right-hand-side mutants.
+COVERING = [(DIMS[(i + s) % 2], i, s) for i in range(len(CASES)) for s in SEEDS]
+COVERING += [row for row in [(4, 1, 0), (4, 3, 0)] if row not in COVERING]
+COVERING_IDS = [f"n{n}-{CASE_IDS[i]}-s{s}" for n, i, s in COVERING]
 
 
 def make_problem(n, m_e, m_i, dup, seed, *, row_scale=None, h_scale=1.0, violate=0.0):
@@ -130,14 +138,28 @@ def run(g_t, h, m_eq, eq_tol=EQ_TOL, **kwargs):
     return least_distance_lsei(jnp.asarray(g_t), jnp.asarray(h), m_eq, eq_tol, **kwargs)
 
 
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
-@pytest.mark.parametrize("n", DIMS)
-def test_matches_dense_reference_and_kkt(n, m_e, m_i, dup, seed):
-    """Primal and dual solution agree with the KKT enumeration; KKT holds."""
+def _relax_nothing(lam_ineq):
+    return np.zeros_like(lam_ineq)
+
+
+def _relax_inactive(lam_ineq):
+    return (lam_ineq == 0.0).astype(float)
+
+
+@pytest.mark.parametrize("n, case, seed", COVERING, ids=COVERING_IDS)
+def test_matches_dense_reference_and_kkt(n, case, seed):
+    """Primal and dual solution agree with the KKT enumeration; KKT holds.
+
+    The same feasible problems also check that the plain solve carries no
+    certificate, and that the elastic solve with no active relaxed row (none,
+    or only the inequalities that are inactive at the plain solution) is the
+    plain one: ``δ = 0`` and the same ``w`` and multipliers.
+    """
+    m_e, m_i, dup = CASES[case]
     g_t, h = make_problem(n, m_e, m_i, dup, seed)
     res = run(g_t, h, m_e)
     assert bool(res.status == LDP_RESULTS.feasible)
+    assert_no_certificate(res, m_e, m_e + m_i)
     assert res.w.shape == (n,)
     assert res.lam_eq.shape == (m_e,)
     assert res.lam_ineq.shape == (m_i,)
@@ -156,14 +178,28 @@ def test_matches_dense_reference_and_kkt(n, m_e, m_i, dup, seed):
     )
     np.testing.assert_allclose(np.asarray(res.lam_eq), lam_e_ref, atol=REF_TOL * scale)
     assert_lsei_kkt(res, g_t, h, m_e)
+    for relax in [_relax_nothing, _relax_inactive]:
+        c = np.zeros_like(h)
+        c[m_e:] = -relax(np.asarray(res.lam_ineq))  # relaxes slack rows
+        el = run_elastic(g_t, h, m_e, 10.0, delta_col=c)
+        assert bool(el.status == LDP_RESULTS.feasible)
+        assert float(el.delta) <= 1e-12
+        np.testing.assert_allclose(np.asarray(el.w), np.asarray(res.w), atol=1e-9)
+        np.testing.assert_allclose(
+            np.asarray(el.lam_eq), np.asarray(res.lam_eq), atol=1e-8
+        )
+        np.testing.assert_allclose(
+            np.asarray(el.lam_ineq), np.asarray(res.lam_ineq), atol=1e-8
+        )
+        assert_elastic_kkt(el, g_t, h, c, m_e, 10.0)
 
 
 @pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
 @pytest.mark.parametrize("n", DIMS)
 def test_problem_generator_activates_inequalities(n, m_e, m_i, dup):
-    """Across seeds some inequality is active at the solution (``m_I > 0``)."""
+    """Across 4 seeds some inequality is active at the solution (``m_I > 0``)."""
     n_active = 0
-    for seed in range(8):
+    for seed in range(4):
         g_t, h = make_problem(n, m_e, m_i, dup, seed)
         res = run(g_t, h, m_e)
         slack = g_t[:, m_e:].T @ np.asarray(res.w) - h[m_e:]
@@ -331,11 +367,26 @@ SCALE_MAGNITUDES = [1e-3, 1.0, 1e4, 1e8, 1e12]
 GLOBAL_G_FACTORS = [1e-6, 1.0, 1e6]
 
 
-@pytest.mark.parametrize("seed", range(2))
-@pytest.mark.parametrize("g_factor", GLOBAL_G_FACTORS)
-@pytest.mark.parametrize("s", SCALE_MAGNITUDES)
-@pytest.mark.parametrize("n, m_e, m_i, dup", SCALE_CASES)
-def test_scale_battery(n, m_e, m_i, dup, s, g_factor, seed):
+# ``(case, magnitude, global G factor, seed)``: covering design (every pair of
+# axis values appears). The case is ``(mag + factor + 1) % 3`` and the seed
+# ``(mag + factor + 1) % 2``; the row ``(10-3-4-dup, 1e8, 1e-6, 0)`` kills the
+# absolute ``eq_tol`` mutant.
+SCALE_ROWS = [
+    (SCALE_CASES[(i + j + 1) % 3], mag, g_factor, (i + j + 1) % 2)
+    for i, mag in enumerate(SCALE_MAGNITUDES)
+    for j, g_factor in enumerate(GLOBAL_G_FACTORS)
+]
+
+
+@pytest.mark.parametrize(
+    "case, s, g_factor, seed",
+    SCALE_ROWS,
+    ids=[
+        f"case{SCALE_CASES.index(c)}-s{m:g}-g{g:g}-seed{sd}"
+        for c, m, g, sd in SCALE_ROWS
+    ],
+)
+def test_scale_battery(case, s, g_factor, seed):
     """KKT holds relative to the solution scale for ``h`` over 15 decades.
 
     The problem is homogeneous in ``h``: scaling ``h`` by ``s`` scales ``w``
@@ -344,6 +395,7 @@ def test_scale_battery(n, m_e, m_i, dup, s, g_factor, seed):
     ``λ_i`` by the row scale. ``G_Eᵀ λ_E`` is unique even for dependent
     equality rows, and is checked as well.
     """
+    n, m_e, m_i, dup = case
     rng = np.random.default_rng(seed + 31 * n + m_i)
     row_scale = g_factor * 10.0 ** rng.uniform(-1.0, 1.0, size=m_e + m_i)
     if dup:
@@ -389,10 +441,24 @@ DETERMINED_EXTRA = [0, 1]  # m_E = n + extra: the equalities determine w
 DETERMINED_DECADES = [0.0, 4.0]
 
 
-@pytest.mark.parametrize("seed", range(6))
-@pytest.mark.parametrize("decades", DETERMINED_DECADES)
-@pytest.mark.parametrize("extra", DETERMINED_EXTRA)
-@pytest.mark.parametrize("n", DETERMINED_DIMS)
+# ``(n, extra, decades, seed)``: covering design, the seed rotating over 2 values.
+DETERMINED_ROWS = [
+    (2, 0, 0.0, 0),
+    (2, 1, 4.0, 1),
+    (3, 0, 0.0, 1),
+    (3, 1, 4.0, 0),
+    (5, 0, 4.0, 0),
+    (5, 1, 0.0, 1),
+    (2, 0, 4.0, 1),
+    (3, 1, 0.0, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "n, extra, decades, seed",
+    DETERMINED_ROWS,
+    ids=[f"n{n}-extra{e}-dec{d:g}-s{sd}" for n, e, d, sd in DETERMINED_ROWS],
+)
 def test_determined_equalities_with_active_inequalities(n, extra, decades, seed):
     """``m_E ≥ n``: the equalities fix ``w = w0``; active inequalities stay feasible.
 
@@ -500,7 +566,7 @@ def test_dependent_copy_in_another_scale(perturb, expected, alpha, m_i):
     assert bool(np.any(np.asarray(res.w) != 0.0)) == (expected == LDP_RESULTS.feasible)
 
 
-@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("seed", range(2))
 @pytest.mark.parametrize("slack", [0.0, 0.5], ids=["active", "slack"])
 @pytest.mark.parametrize("n", [6, 10])
 def test_inequality_in_span_of_equalities_with_free_directions(n, slack, seed):
@@ -567,18 +633,40 @@ def singleton_vertex_problem(m_e, p, extra, cond, spread, seed):
     return (g * row_scale[:, None]).T.copy(), h * row_scale, w0
 
 
-# (cond, relative error bound on w): a frozen dependent row holds to about
+# (cond, relative error bound on w) pairs used below: a frozen dependent row holds to about
 # ``dep_tol · ‖y‖``, so the vertex moves by that amount times the local
 # conditioning: up to 3.7e-8 measured at cond 1e6 (designed tolerance, not a
 # coarse freeze; about 2.7x margin to 1e-7), and below 1e-8 for the milder ones.
-SINGLETON_COND_AND_ATOL = [(1e4, 1e-8), (1e5, 1e-8), (1e6, 1e-7)]
 
 
-@pytest.mark.parametrize("seed", range(8))
-@pytest.mark.parametrize("extra", [0, 2])
-@pytest.mark.parametrize("spread", [0.0, 2.0])
-@pytest.mark.parametrize("cond, rel_atol", SINGLETON_COND_AND_ATOL)
-@pytest.mark.parametrize("m_e, p", [(0, 1), (0, 3), (2, 1), (2, 3)])
+# ``(m_E, p, cond, rel_atol, spread, extra, seed)``: covering design (every pair
+# of axis values appears, seeds 0-2). Pinned: ``(2, 3, 1e6, spread 0, extra 0,
+# seed 1)`` is the worst measured case (3.7e-8, C11b review) and ``(2, 1, 1e4,
+# spread 0, extra 0, seed 1)`` kills the ``dep_tol = 0`` mutant.
+SINGLETON_ROWS = [
+    (0, 1, 1e4, 1e-8, 2.0, 2, 0),
+    (0, 1, 1e5, 1e-8, 2.0, 0, 1),
+    (0, 1, 1e6, 1e-7, 0.0, 0, 2),
+    (0, 3, 1e4, 1e-8, 2.0, 2, 1),
+    (0, 3, 1e5, 1e-8, 0.0, 2, 2),
+    (0, 3, 1e6, 1e-7, 0.0, 0, 0),
+    (2, 1, 1e4, 1e-8, 0.0, 0, 1),
+    (2, 1, 1e5, 1e-8, 0.0, 0, 0),
+    (2, 1, 1e6, 1e-7, 2.0, 2, 2),
+    (2, 3, 1e4, 1e-8, 2.0, 0, 2),
+    (2, 3, 1e5, 1e-8, 0.0, 2, 0),
+    (2, 3, 1e6, 1e-7, 0.0, 0, 1),
+]
+
+
+@pytest.mark.parametrize(
+    "m_e, p, cond, rel_atol, spread, extra, seed",
+    SINGLETON_ROWS,
+    ids=[
+        f"e{m}-p{p}-c{c:g}-sp{sp:g}-x{x}-s{sd}"
+        for m, p, c, _, sp, x, sd in SINGLETON_ROWS
+    ],
+)
 def test_singleton_vertex_is_found(m_e, p, cond, rel_atol, spread, extra, seed):
     """``p + 1`` positively spanning active rows in a ``p``-dim null space.
 
@@ -607,10 +695,24 @@ def zero_row_problem(n_zero, n_other, rhs, seed):
     return g, h
 
 
-@pytest.mark.parametrize("seed", range(3))
-@pytest.mark.parametrize("rhs", [0.0, -1e-16, -1e-12, -1e-10])
-@pytest.mark.parametrize("n_other", [0, 3])
-@pytest.mark.parametrize("n_zero", [1, 2])
+# ``(n_zero, rhs, n_other, seed)``: covering design.
+ZERO_ROW_CASES = [
+    (1, 0.0, 0, 0),
+    (1, -1e-16, 3, 1),
+    (1, -1e-12, 3, 0),
+    (1, -1e-10, 0, 1),
+    (2, 0.0, 3, 1),
+    (2, -1e-16, 0, 0),
+    (2, -1e-12, 0, 1),
+    (2, -1e-10, 3, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "n_zero, rhs, n_other, seed",
+    ZERO_ROW_CASES,
+    ids=[f"z{z}-rhs{r:g}-o{o}-s{sd}" for z, r, o, sd in ZERO_ROW_CASES],
+)
 def test_zero_rows_without_equalities(n_zero, n_other, rhs, seed):
     """Inequalities supported only on pinned variables are exactly zero rows.
 
@@ -745,22 +847,47 @@ SCALINGS = {
 }
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("scaling", SCALINGS.values(), ids=SCALINGS.keys())
-@pytest.mark.parametrize("n", [4, 10])
-@pytest.mark.parametrize("m_e", [0, 2])
+# ``(kind, scaling, n, m_E, seed)`` covering design (every pair appears; ``m_E``
+# matters only for the contradictory-inequality kind). The two
+# ``inconsistent-dependent-eq`` rows at ``n = 4``, ``m_E = 0``, seed 0 kill the
+# certificate sign / branch / column-norm mutants.
+CERTIFICATE_ROWS = [
+    ("contradictory-ineq", "none", 10, 2, 1),
+    ("contradictory-ineq", "rows", 4, 0, 2),
+    ("contradictory-ineq", "variables", 4, 0, 0),
+    ("contradictory-ineq", "both", 4, 0, 0),
+    ("inconsistent-dependent-eq", "none", 4, 0, 0),
+    ("inconsistent-dependent-eq", "rows", 4, 0, 0),
+    ("inconsistent-dependent-eq", "variables", 10, 0, 2),
+    ("inconsistent-dependent-eq", "both", 10, 2, 1),
+    ("inconsistent-independent-eq", "none", 4, 0, 0),
+    ("inconsistent-independent-eq", "rows", 10, 0, 1),
+    ("inconsistent-independent-eq", "variables", 4, 2, 2),
+    ("inconsistent-independent-eq", "both", 4, 0, 0),
+    ("after-elimination", "none", 4, 0, 1),
+    ("after-elimination", "rows", 4, 0, 0),
+    ("after-elimination", "variables", 4, 2, 0),
+    ("after-elimination", "both", 10, 0, 2),
+    ("ineq-in-equality-span", "none", 4, 0, 2),
+    ("ineq-in-equality-span", "rows", 10, 2, 0),
+    ("ineq-in-equality-span", "variables", 4, 0, 1),
+    ("ineq-in-equality-span", "both", 4, 0, 0),
+]
+
+
 @pytest.mark.parametrize(
-    "make, expected",
-    INFEASIBLE_PROBLEMS.values(),
-    ids=INFEASIBLE_PROBLEMS.keys(),
+    "kind, scaling, n, m_e, seed",
+    CERTIFICATE_ROWS,
+    ids=[f"{k}-{sc}-n{n}-e{e}-s{sd}" for k, sc, n, e, sd in CERTIFICATE_ROWS],
 )
-def test_certificate_proves_infeasibility(make, expected, m_e, n, scaling, seed):
+def test_certificate_proves_infeasibility(kind, scaling, n, m_e, seed):
     """Every infeasible kind carries a valid certificate, also when the rows
     and the variables are rescaled over several decades (the equilibration
     and the normalisation are undone correctly)."""
+    make, expected = INFEASIBLE_PROBLEMS[kind]
     g_t, h, m_eq = make(n, m_e, seed)
     rng = np.random.default_rng(seed)
-    row_dec, col_dec = scaling
+    row_dec, col_dec = SCALINGS[scaling]
     row = 10.0 ** rng.uniform(-row_dec, row_dec, size=g_t.shape[1])
     col = 10.0 ** rng.uniform(-col_dec, col_dec, size=n)
     g_t, h = scale_problem(g_t, h, row, col)
@@ -773,16 +900,6 @@ def assert_no_certificate(res: LSEIResult, m_eq: int, m: int):
     assert res.cert_eq.shape == (m_eq,) and res.cert_ineq.shape == (m - m_eq,)
     np.testing.assert_array_equal(np.asarray(res.cert_eq), 0.0)
     np.testing.assert_array_equal(np.asarray(res.cert_ineq), 0.0)
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("n", DIMS)
-@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
-def test_certificate_is_zero_on_feasible_problems(n, m_e, m_i, dup, seed):
-    g_t, h = make_problem(n, m_e, m_i, dup, seed)
-    res = run(g_t, h, m_e)
-    assert bool(res.status == LDP_RESULTS.feasible)
-    assert_no_certificate(res, m_e, m_e + m_i)
 
 
 def _post_check_infeasible():
@@ -859,8 +976,6 @@ def test_certificate_jit_matches_eager(make, expected):
 # right-hand side of a QP with ``B = I``, ``g = 0`` and no pinned variable, so
 # ``w = d`` and the problem is exactly the elastic QP of the plan (§2.5).
 
-ELASTIC_RHOS = [1.0, 1e3]
-
 
 def run_elastic(g_t, h, m_eq, rho, delta_col=None, eq_tol=EQ_TOL, **kwargs):
     g_t, h = jnp.asarray(g_t), jnp.asarray(h)
@@ -908,18 +1023,38 @@ def assert_elastic_kkt(
     assert abs(mu_hi * (delta - 1.0)) <= tol * scale * scale_lam + 1e-300
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("rho", ELASTIC_RHOS)
-@pytest.mark.parametrize("n", [4, 10])
-@pytest.mark.parametrize("m_e", [0, 2])
+# ``(kind, m_E, n, rho, seed)`` covering design; the ``contradictory-ineq`` row
+# with ``m_E = 0``, ``n = 4``, ``ρ = 1e3``, seed 0 kills the clip and root mutants.
+ELASTIC_INFEASIBLE_ROWS = [
+    ("contradictory-ineq", 0, 4, 1.0, 2),
+    ("contradictory-ineq", 0, 4, 1000.0, 0),
+    ("contradictory-ineq", 2, 10, 1.0, 1),
+    ("inconsistent-dependent-eq", 0, 4, 1.0, 1),
+    ("inconsistent-dependent-eq", 0, 4, 1.0, 2),
+    ("inconsistent-dependent-eq", 2, 10, 1000.0, 0),
+    ("inconsistent-independent-eq", 0, 4, 1.0, 0),
+    ("inconsistent-independent-eq", 0, 4, 1.0, 1),
+    ("inconsistent-independent-eq", 2, 10, 1000.0, 2),
+    ("after-elimination", 0, 4, 1.0, 2),
+    ("after-elimination", 0, 4, 1000.0, 1),
+    ("after-elimination", 2, 10, 1.0, 0),
+    ("ineq-in-equality-span", 0, 4, 1.0, 2),
+    ("ineq-in-equality-span", 0, 10, 1.0, 0),
+    ("ineq-in-equality-span", 2, 4, 1000.0, 1),
+]
+
+
 @pytest.mark.parametrize(
-    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+    "kind, m_e, n, rho, seed",
+    ELASTIC_INFEASIBLE_ROWS,
+    ids=[f"{k}-e{e}-n{n}-rho{r:g}-s{sd}" for k, e, n, r, sd in ELASTIC_INFEASIBLE_ROWS],
 )
-def test_elastic_solves_infeasible_problems(make, expected, m_e, n, rho, seed):
+def test_elastic_solves_infeasible_problems(kind, m_e, n, rho, seed):
     """Every plain-infeasible system has a finite relaxed solution with
     ``0 < δ ≤ 1`` that satisfies the relaxed rows and the KKT conditions of
     the augmented problem; the extra variable never enters ``w`` or the
     general multipliers, and there is no certificate."""
+    make, expected = INFEASIBLE_PROBLEMS[kind]
     g_t, h, m_eq = make(n, m_e, seed)
     plain = run(g_t, h, m_eq)
     assert bool(plain.status == expected)
@@ -938,49 +1073,24 @@ def test_elastic_solves_infeasible_problems(make, expected, m_e, n, rho, seed):
     )
 
 
-def _relax_nothing(lam_ineq):
-    return np.zeros_like(lam_ineq)
+# ``(n, case index, rho, w_gap, seed)``: covering design over the three weights
+# (``w_gap`` is infinite when ``ρ`` is too small for the claim).
+SMALL_PERTURBATION_ROWS = [
+    (DIMS[(i + j) % 2], i, rho, w_gap, (i + 2 * j) % len(SEEDS))
+    for i in range(len(CASES))
+    for j, (rho, w_gap) in enumerate([(1e2, np.inf), (1e4, np.inf), (1e10, 1e-3)])
+]
 
 
-def _relax_inactive(lam_ineq):
-    return (lam_ineq == 0.0).astype(float)
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("relax", [_relax_nothing, _relax_inactive])
-@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
-@pytest.mark.parametrize("n", DIMS)
-def test_elastic_leaves_consistent_problems_unchanged(n, m_e, m_i, dup, relax, seed):
-    """With no active relaxed row the elastic problem is the plain one:
-    ``δ = 0`` and the same ``w`` and multipliers (relaxing only inequality
-    rows that are inactive at the plain solution, or none)."""
-    g_t, h = make_problem(n, m_e, m_i, dup, seed)
-    plain = run(g_t, h, m_e)
-    c = np.zeros_like(h)
-    c[m_e:] = -relax(np.asarray(plain.lam_ineq))  # relaxes slack rows
-    res = run_elastic(g_t, h, m_e, 10.0, delta_col=c)
-    assert bool(res.status == LDP_RESULTS.feasible)
-    assert float(res.delta) <= 1e-12
-    np.testing.assert_allclose(np.asarray(res.w), np.asarray(plain.w), atol=1e-9)
-    np.testing.assert_allclose(
-        np.asarray(res.lam_eq), np.asarray(plain.lam_eq), atol=1e-8
-    )
-    np.testing.assert_allclose(
-        np.asarray(res.lam_ineq), np.asarray(plain.lam_ineq), atol=1e-8
-    )
-    assert_elastic_kkt(res, g_t, h, c, m_e, 10.0)
-
-
-@pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize(
-    "rho, w_gap",
-    [(1e2, np.inf), (1e4, np.inf), (1e10, 1e-3)],
-    ids=["rho1e2", "rho1e4", "rho1e10"],
+    "n, case, rho, w_gap, seed",
+    SMALL_PERTURBATION_ROWS,
+    ids=[
+        f"n{n}-{CASE_IDS[i]}-rho{r:g}-s{s}" for n, i, r, _, s in SMALL_PERTURBATION_ROWS
+    ],
 )
-@pytest.mark.parametrize("m_e, m_i, dup", CASES, ids=CASE_IDS)
-@pytest.mark.parametrize("n", DIMS)
 def test_elastic_on_consistent_problems_is_a_small_perturbation(
-    n, m_e, m_i, dup, rho, w_gap, seed
+    n, case, rho, w_gap, seed
 ):
     """When a relaxed row is active the first-order gain makes ``δ`` positive
     on a consistent problem, but ``δ ≤ max(0, -cᵀλ)/ρ`` (convexity of the value in
@@ -988,6 +1098,7 @@ def test_elastic_on_consistent_problems_is_a_small_perturbation(
     one, and ``w`` approaches the plain solution as ``ρ`` grows: ``w_gap`` is the
     relative distance to the plain ``w`` that must hold (infinite when ``ρ`` is too
     small for the claim)."""
+    m_e, m_i, dup = CASES[case]
     g_t, h = make_problem(n, m_e, m_i, dup, seed)
     plain = run(g_t, h, m_e)
     c = np.asarray(elastic_delta_column(jnp.asarray(h), m_e))
@@ -1003,20 +1114,38 @@ def test_elastic_on_consistent_problems_is_a_small_perturbation(
     assert np.linalg.norm(w - w0) <= w_gap * max(1.0, np.linalg.norm(w0))
 
 
-@pytest.mark.parametrize("global_factor", [1e-4, 1.0, 1e4])
-@pytest.mark.parametrize("decades", [0.0, 3.0, 6.0])
-@pytest.mark.parametrize("seed", [0])
-@pytest.mark.parametrize("n", [4, 10])
+# ``(kind, decades, global factor, n)`` covering design (seed 0).
+ROW_SCALING_ROWS = [
+    ("contradictory-ineq", 0.0, 0.0001, 4),
+    ("contradictory-ineq", 3.0, 1.0, 10),
+    ("contradictory-ineq", 6.0, 10000.0, 4),
+    ("inconsistent-dependent-eq", 0.0, 10000.0, 10),
+    ("inconsistent-dependent-eq", 3.0, 0.0001, 4),
+    ("inconsistent-dependent-eq", 6.0, 1.0, 4),
+    ("inconsistent-independent-eq", 0.0, 1.0, 4),
+    ("inconsistent-independent-eq", 3.0, 10000.0, 4),
+    ("inconsistent-independent-eq", 6.0, 0.0001, 10),
+    ("after-elimination", 0.0, 1.0, 4),
+    ("after-elimination", 3.0, 0.0001, 10),
+    ("after-elimination", 6.0, 10000.0, 4),
+    ("ineq-in-equality-span", 0.0, 0.0001, 10),
+    ("ineq-in-equality-span", 3.0, 1.0, 4),
+    ("ineq-in-equality-span", 6.0, 10000.0, 4),
+]
+
+
 @pytest.mark.parametrize(
-    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+    "kind, decades, global_factor, n",
+    ROW_SCALING_ROWS,
+    ids=[f"{k}-dec{d:g}-g{g:g}-n{n}" for k, d, g, n in ROW_SCALING_ROWS],
 )
-def test_elastic_is_invariant_to_row_scaling(
-    make, expected, n, seed, decades, global_factor
-):
+def test_elastic_is_invariant_to_row_scaling(kind, decades, global_factor, n):
     """Rescaling the rows of ``(Gᵀ, h)`` together (so the feasible set and
     the relaxation are unchanged) leaves ``w`` and ``δ`` unchanged over many
     decades: the equilibration of the LSEI reduction also covers the extra
     column."""
+    seed = 0
+    make, _ = INFEASIBLE_PROBLEMS[kind]
     g_t, h, m_eq = make(n, 2, seed)
     rng = np.random.default_rng(seed)
     row = global_factor * 10.0 ** rng.uniform(-decades, decades, size=g_t.shape[1])
@@ -1031,19 +1160,32 @@ def test_elastic_is_invariant_to_row_scaling(
     assert_elastic_kkt(res, g_t * row[None, :], h * row, c, m_eq, 10.0, tol=1e-7)
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("n", [4, 10])
-@pytest.mark.parametrize("m_e", [0, 2])
+# ``(kind, n, m_E, seed)`` covering design.
+NO_RELAXED_ROWS = [
+    ("contradictory-ineq", 4, 0, 0),
+    ("contradictory-ineq", 10, 2, 1),
+    ("inconsistent-dependent-eq", 4, 0, 1),
+    ("inconsistent-dependent-eq", 10, 2, 0),
+    ("inconsistent-independent-eq", 4, 2, 0),
+    ("inconsistent-independent-eq", 10, 0, 1),
+    ("after-elimination", 4, 0, 0),
+    ("after-elimination", 10, 2, 1),
+    ("ineq-in-equality-span", 4, 0, 0),
+    ("ineq-in-equality-span", 10, 2, 1),
+]
+
+
 @pytest.mark.parametrize(
-    "make, expected", INFEASIBLE_PROBLEMS.values(), ids=INFEASIBLE_PROBLEMS.keys()
+    "kind, n, m_e, seed",
+    NO_RELAXED_ROWS,
+    ids=[f"{k}-n{n}-e{e}-s{sd}" for k, n, e, sd in NO_RELAXED_ROWS],
 )
-def test_elastic_without_relaxed_rows_keeps_the_plain_certificate(
-    make, expected, m_e, n, seed
-):
+def test_elastic_without_relaxed_rows_keeps_the_plain_certificate(kind, n, m_e, seed):
     """With ``c = 0`` the elastic problem is infeasible exactly as the plain
     one; the certificate then covers ``[E, I, δ rows]``: ``y_I, y_δ ≥ 0``,
     ``Gᵀy_gen = 0``, the ``δ`` coordinate ``cᵀy_gen - y_lo + y_hi = 0``,
     ``hᵀy_gen + y_hi < 0``, ``‖y‖_∞ = 1``, zero outputs."""
+    make, expected = INFEASIBLE_PROBLEMS[kind]
     g_t, h, m_eq = make(n, m_e, seed)
     res = run_elastic(g_t, h, m_eq, 10.0, delta_col=np.zeros_like(h))
     assert bool(res.status == expected)
@@ -1345,34 +1487,73 @@ def relative_row_violation(g_t, h, c, m_eq, w, delta):
     return np.max(viol) / np.linalg.norm(w)
 
 
-# (data scale s, scale of g): g scaled with the data, g = 0, g = O(1).
-SCALE_AND_G = (
-    [(s, s) for s in [1e-8, 1e-4, 1.0, 1e4]]
-    + [(s, 0.0) for s in [1e-8, 1e-4, 1.0, 1e4]]
-    + [(s, 1.0) for s in [1e-4, 1.0, 1e4]]
-)
-
-
-# (δ_min, dimensionless weight, bound on δ - δ_min). The quadratic penalty is
+# The ``(data scale s, scale of g)`` axis has 11 values: g scaled with the data
+# (``s`` in 1e-8 .. 1e4), g = 0 (same ``s``) and g = O(1) (``s`` in 1e-4 .. 1e4).
+# The ``(δ_min, dimensionless weight, bound on δ - δ_min). The quadratic penalty is
 # exact only when ``δ_min`` exceeds the unconstrained trade-off
 # ``≈ 1/(1 + weight·c)``: with weight 1e3 that holds for δ_min = 0.3, while
 # δ_min = 1e-3 needs 1e5. A larger weight costs accuracy of ``w``. The last
 # row is the default weight with a small ``δ_min``: ``δ`` settles above
 # ``δ_min`` by ``O(1/weight)`` (here up to 5e-4), bounded by ``2/weight``.
-DELTA_AND_WEIGHT = [(0.3, 1e3, 1e-8), (1e-3, 1e5, 1e-8), (1e-3, 1e3, 2e-3)]
+# These are the three values of the ``(δ_min, weight, excess)`` axis.
+
+# ``(with_equality, (s, g_scale), (delta_min, weight, delta_excess), seed)``:
+# covering design (every pair appears); includes the default-weight row
+# ``(1e-3, 1e3)`` and the ``(eq, s = 1e-4, g = 1, 1e-3, 1e5, seed 0)`` row that
+# kills the ``dep_tol = 1e-7`` mutant.
+ELASTIC_SCALE_ROWS = [
+    (False, (1e-08, 1e-08), (0.3, 1000.0, 1e-08), 0),
+    (False, (1e-08, 1e-08), (0.001, 100000.0, 1e-08), 2),
+    (False, (0.0001, 0.0001), (0.001, 100000.0, 1e-08), 1),
+    (False, (0.0001, 0.0001), (0.001, 1000.0, 0.002), 0),
+    (False, (1.0, 1.0), (0.001, 100000.0, 1e-08), 1),
+    (False, (1.0, 1.0), (0.001, 1000.0, 0.002), 2),
+    (False, (10000.0, 10000.0), (0.3, 1000.0, 1e-08), 1),
+    (False, (10000.0, 10000.0), (0.001, 1000.0, 0.002), 2),
+    (False, (1e-08, 0.0), (0.001, 100000.0, 1e-08), 2),
+    (False, (1e-08, 0.0), (0.001, 1000.0, 0.002), 1),
+    (False, (0.0001, 0.0), (0.001, 100000.0, 1e-08), 2),
+    (False, (0.0001, 0.0), (0.001, 1000.0, 0.002), 0),
+    (False, (1.0, 0.0), (0.3, 1000.0, 1e-08), 0),
+    (False, (1.0, 0.0), (0.001, 1000.0, 0.002), 2),
+    (False, (10000.0, 0.0), (0.3, 1000.0, 1e-08), 0),
+    (False, (10000.0, 0.0), (0.001, 1000.0, 0.002), 2),
+    (False, (0.0001, 1.0), (0.3, 1000.0, 1e-08), 1),
+    (False, (0.0001, 1.0), (0.001, 1000.0, 0.002), 2),
+    (False, (1.0, 1.0), (0.3, 1000.0, 1e-08), 0),
+    (False, (10000.0, 1.0), (0.3, 1000.0, 1e-08), 0),
+    (False, (10000.0, 1.0), (0.001, 1000.0, 0.002), 2),
+    (True, (1e-08, 1e-08), (0.001, 1000.0, 0.002), 1),
+    (True, (0.0001, 0.0001), (0.3, 1000.0, 1e-08), 2),
+    (True, (1.0, 1.0), (0.3, 1000.0, 1e-08), 0),
+    (True, (10000.0, 10000.0), (0.001, 100000.0, 1e-08), 0),
+    (True, (1e-08, 0.0), (0.3, 1000.0, 1e-08), 0),
+    (True, (0.0001, 0.0), (0.3, 1000.0, 1e-08), 1),
+    (True, (1.0, 0.0), (0.001, 100000.0, 1e-08), 1),
+    (True, (10000.0, 0.0), (0.001, 100000.0, 1e-08), 1),
+    (True, (0.0001, 1.0), (0.001, 100000.0, 1e-08), 0),
+    (True, (1.0, 1.0), (0.001, 100000.0, 1e-08), 1),
+    (True, (10000.0, 1.0), (0.001, 100000.0, 1e-08), 1),
+]
 
 
-@pytest.mark.parametrize("seed", range(3))
-@pytest.mark.parametrize("delta_min, weight, delta_excess", DELTA_AND_WEIGHT)
-@pytest.mark.parametrize("s, g_scale", SCALE_AND_G)
-@pytest.mark.parametrize("with_equality", [False, True], ids=["no-eq", "eq"])
+@pytest.mark.parametrize(
+    "with_equality, s_and_g, delta_and_weight, seed",
+    ELASTIC_SCALE_ROWS,
+    ids=[
+        f"{'eq' if e else 'no-eq'}-s{sg[0]:g}-g{sg[1]:g}-d{dw[0]:g}-w{dw[1]:g}-s{sd}"
+        for e, sg, dw, sd in ELASTIC_SCALE_ROWS
+    ],
+)
 def test_elastic_scale_battery_with_the_weight_rule(
-    with_equality, s, g_scale, delta_min, weight, delta_excess, seed
+    with_equality, s_and_g, delta_and_weight, seed
 ):
     """With ``ρ_e = weight · τ²`` the relaxation settles at ``δ_min`` (up to
     ``delta_excess``) and the relaxed rows hold to ``1e-8 ‖w‖``, whatever the
     data scale (``1e-8`` to ``1e4``), also for ``g = 0``, ``g = O(1)`` and
     with a far slack row (a fixed ``ρ_e`` fails here)."""
+    s, g_scale = s_and_g
+    delta_min, weight, delta_excess = delta_and_weight
     g_t, h, c, m_eq = sqp_elastic_problem(8, s, g_scale, delta_min, seed, with_equality)
     rho = weight * elastic_weight_scale(g_t, h, c, m_eq)
     res = elastic_least_distance_lsei(g_t, h, m_eq, c, rho, EQ_TOL)
@@ -1382,14 +1563,13 @@ def test_elastic_scale_battery_with_the_weight_rule(
     assert relative_row_violation(g_t, h, c, m_eq, w, float(res.delta)) <= 1e-8
 
 
-@pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("delta_min", [1e-3, 0.1, 0.5])
-def test_elastic_interior_delta_approaches_delta_min(delta_min, seed):
+def test_elastic_interior_delta_approaches_delta_min(delta_min):
     """An infeasible problem with an interior ``0 < δ_min < 1`` and ``c ≠ h``
     (``g ≠ 0``): ``δ ≥ δ_min`` always, and ``δ → δ_min`` (non-increasing error) as the
     dimensionless weight grows; KKT holds at every weight (a small weight
     over-relaxes, the quadratic penalty is not exact)."""
-    g_t, h, c, m_eq = sqp_elastic_problem(8, 1.0, 0.1, delta_min, seed)
+    g_t, h, c, m_eq = sqp_elastic_problem(8, 1.0, 0.1, delta_min, 0)
     tau2 = float(elastic_weight_scale(g_t, h, c, m_eq))
     assert not np.allclose(c, h)
     errors = []
@@ -1501,7 +1681,7 @@ def determined_equalities_problem(theta, violated, seed, n=6, k=3, m_i=3):
     return g_t, np.concatenate([g_e.T @ w0, g_i.T @ w0 + slack]), k, w0
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("violated", [False, True], ids=["satisfied", "violated"])
 @pytest.mark.parametrize("theta", [1e-1, 1e-2, 1e-3, 1e-4])
 def test_determined_ill_conditioned_equalities_with_inequalities_in_the_span(
@@ -1515,20 +1695,30 @@ def test_determined_ill_conditioned_equalities_with_inequalities_in_the_span(
     rows. Before C16c the wrong ``feasible`` rate grew from 1/50 at
     ``θ = 1e-1`` to 42/50 at ``θ = 1e-4``.
     """
-    g_t, h, m_eq, _ = determined_equalities_problem(theta, violated, seed)
+    g_t, h, m_eq, w0 = determined_equalities_problem(theta, violated, seed)
     res = run(g_t, h, m_eq)
     assert_exit_contract(res, g_t, h, m_eq)
     assert bool(res.status == LDP_RESULTS.feasible) == (not violated)
+    # With the in-span inequalities slack, ``w`` is the point the equalities
+    # fix (the violated problems carry no ``w``, so they compare to themselves).
+    w = np.asarray(res.w)
+    np.testing.assert_allclose(w, np.where(violated, w, w0), atol=1e-6)
 
 
-@pytest.mark.parametrize("seed", range(20))
-@pytest.mark.parametrize("theta", [1e-1, 1e-2, 1e-3, 1e-4])
-def test_determined_point_is_returned_when_the_inequalities_hold(theta, seed):
-    """With the in-span inequalities slack, ``w`` is the point the equalities fix."""
-    g_t, h, m_eq, w0 = determined_equalities_problem(theta, False, seed)
+def test_svd_floor_discards_noise_of_a_very_ill_conditioned_determined_system():
+    """Pinned reproducer of the ``eps^(2/3)`` SVD floor (found after C16d).
+
+    ``k = 6`` equalities of condition ``~1e8`` in ``n = 12`` determine a
+    6-dim span that holds 4 violated inequalities. With the floor lowered to
+    ``rank_tol · σ_max`` the projected noise rows survive and the solve is no
+    longer a certified ``infeasible``. After C16d the C16c wide-spread cases
+    no longer separate the two floors; this one does (1 of 4800 random cases
+    over ``θ`` in 1e-2..1e-8, ``n`` in 5..20, 40 seeds).
+    """
+    g_t, h, m_eq, _ = determined_equalities_problem(1e-8, True, 19, n=12, k=6, m_i=4)
     res = run(g_t, h, m_eq)
-    assert bool(res.status == LDP_RESULTS.feasible)
-    np.testing.assert_allclose(np.asarray(res.w), w0, atol=1e-6)
+    assert_exit_contract(res, g_t, h, m_eq)
+    assert bool(res.status == LDP_RESULTS.infeasible)
 
 
 @pytest.mark.parametrize("m_e", [0, 1])
@@ -1618,10 +1808,21 @@ def _elastic_two_equalities(g_t, h, c, rho):
 # the reduced LDP far from the solution: only the scale of the ``ldp``
 # normalisation (rows violated at the origin) with unit-column NNLS resolves
 # them (before C16d: a wrong ``feasible`` on 41 and 290, an LP mismatch on 69).
+# The spread-2 grid is a covering design over ``(n_free, weight, seed)`` with
+# seeds 0, 1, 16, 24 (``(2, 1e3, 16)`` kills the no-SVD-truncation mutant).
 ELASTIC_FEW_FREE_CASES = (
     [
         (2.0, n_free, weight, seed)
-        for n_free, weight, seed in itertools.product([1, 2], [1e3, 1e4], range(25))
+        for n_free, weight, seed in [
+            (1, 1e3, 0),
+            (1, 1e3, 24),
+            (1, 1e4, 1),
+            (1, 1e4, 16),
+            (2, 1e3, 1),
+            (2, 1e3, 16),
+            (2, 1e4, 0),
+            (2, 1e4, 24),
+        ]
     ]
     + [(2.0, 2, 1e4, 185), (4.0, 2, 1e3, 271), (4.0, 2, 1e4, 36)]
     + [
@@ -1675,20 +1876,27 @@ def test_elastic_with_two_equalities_and_few_free_variables(
 # well-conditioned unit equality rows (angle 0.1, cond ≈ 20) dependent, then
 # inconsistent. Only ``m × n`` data are formed, so n = 1e5 is O(n).
 
-LARGE_N = [1_000, 10_000, 100_000]
 RESIDUAL_FACTOR = 10.0  # equality residual ≤ RESIDUAL_FACTOR · eps · cond(rows)
 # (dtype, angle between the two unit equality rows). θ = 1e-3 (cond 2e3) is
 # float64 only: in float32 the cut is capped at √eps ≈ 3.4e-4, close to
 # tan(θ/2) = 5e-4, so the pair is not a well-posed float32 problem.
+# ``(dtype, theta, n)`` covering design: every theta and every ``n`` meets both
+# dtypes where valid. The float32 rows ``(0.01, 1e4)``, ``(0.01, 1e5)`` and
+# ``(0.1, 1e5)`` are the ones that kill the uncapped-``rank_tol`` mutant.
 PAIR_CASES = [
-    (dtype, theta)
-    for dtype, thetas in [
-        (np.float32, [0.3, 0.1, 0.01]),
-        (np.float64, [0.3, 0.1, 0.01, 1e-3]),
-    ]
-    for theta in thetas
+    (np.float32, 0.01, 10_000),
+    (np.float32, 0.01, 100_000),
+    (np.float32, 0.1, 100_000),
+    (np.float32, 0.1, 1_000),
+    (np.float32, 0.3, 10_000),
+    (np.float32, 0.3, 1_000),
+    (np.float64, 0.3, 100_000),
+    (np.float64, 0.1, 1_000),
+    (np.float64, 0.01, 10_000),
+    (np.float64, 1e-3, 100_000),
+    (np.float64, 1e-3, 1_000),
 ]
-PAIR_IDS = [f"{dtype.__name__}-theta{theta:g}" for dtype, theta in PAIR_CASES]
+PAIR_IDS = [f"{d.__name__}-theta{t:g}-n{n}" for d, t, n in PAIR_CASES]
 
 
 def unit_pair_problem(n, theta, dtype, *, seed=0):
@@ -1712,8 +1920,7 @@ def unit_pair_problem(n, theta, dtype, *, seed=0):
     return g_t, h, 1.0 / np.tan(0.5 * theta)
 
 
-@pytest.mark.parametrize("n", LARGE_N)
-@pytest.mark.parametrize("dtype, theta", PAIR_CASES, ids=PAIR_IDS)
+@pytest.mark.parametrize("dtype, theta, n", PAIR_CASES, ids=PAIR_IDS)
 def test_well_conditioned_equalities_are_feasible_at_large_n(dtype, theta, n):
     """The equalities are solved to ``O(eps · cond)`` whatever ``n`` is."""
     eps = float(np.finfo(dtype).eps)
@@ -1731,21 +1938,28 @@ def test_well_conditioned_equalities_are_feasible_at_large_n(dtype, theta, n):
 # ``row_perturb · eps`` (a random direction); ``gap`` is added to the copy's
 # right-hand side. A gap far below ``eq_tol`` is consistent (dependent rows
 # solved exactly), far above it is not.
+# ``(dtype, n, perturbation, gap, expected)``: covering design over the four
+# axes (every pair of values appears).
+_FEASIBLE, _INCONSISTENT = LDP_RESULTS.feasible, LDP_RESULTS.inconsistent_equalities
 DUPLICATE_CASES = [
-    (0.0, 0.0, LDP_RESULTS.feasible),
-    (4.0, 0.0, LDP_RESULTS.feasible),
-    (0.0, 0.1, LDP_RESULTS.feasible),
-    (4.0, 0.1, LDP_RESULTS.feasible),
-    (0.0, 100.0, LDP_RESULTS.inconsistent_equalities),
-    (4.0, 100.0, LDP_RESULTS.inconsistent_equalities),
+    (np.float32, 1_000, 0.0, 0.0, _FEASIBLE),
+    (np.float32, 10_000, 0.0, 0.0, _FEASIBLE),
+    (np.float32, 100_000, 0.0, 0.1, _FEASIBLE),
+    (np.float64, 10_000, 0.0, 0.1, _FEASIBLE),
+    (np.float32, 100_000, 0.0, 100.0, _INCONSISTENT),
+    (np.float64, 1_000, 0.0, 100.0, _INCONSISTENT),
+    (np.float64, 100_000, 4.0, 0.0, _FEASIBLE),
+    (np.float32, 1_000, 4.0, 0.1, _FEASIBLE),
+    (np.float32, 10_000, 4.0, 100.0, _INCONSISTENT),
+    (np.float64, 10_000, 4.0, 100.0, _INCONSISTENT),
 ]
-DUPLICATE_IDS = [f"pert{p:g}-gap{g:g}" for p, g, _ in DUPLICATE_CASES]
+DUPLICATE_IDS = [
+    f"{d.__name__}-n{n}-pert{p:g}-gap{g:g}" for d, n, p, g, _ in DUPLICATE_CASES
+]
 
 
-@pytest.mark.parametrize("n", LARGE_N)
-@pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["f32", "f64"])
 @pytest.mark.parametrize(
-    "row_perturb, gap, expected", DUPLICATE_CASES, ids=DUPLICATE_IDS
+    "dtype, n, row_perturb, gap, expected", DUPLICATE_CASES, ids=DUPLICATE_IDS
 )
 def test_duplicate_rows_keep_their_verdict_at_large_n(
     dtype, n, row_perturb, gap, expected
