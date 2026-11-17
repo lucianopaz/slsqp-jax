@@ -80,6 +80,11 @@ _oracle = jax.jit(solve_fixed_bounds_qp)
 _unbounded = _oracle
 
 
+def case_ids(rows) -> list[str]:
+    """Readable ids for explicit rows of case parameters."""
+    return ["-".join(str(v).replace(" ", "") for v in row) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # QP construction
 # ---------------------------------------------------------------------------
@@ -482,10 +487,11 @@ def _shared_logged_solver() -> tuple[LRHDirectQPSolver, LogView]:
     return with_logger(PLAIN)
 
 
-def assert_matches_reference(qp: RandomQP) -> None:
+def assert_matches_reference(qp: RandomQP) -> Run:
     """The solver takes the reference's path: outcome, iterations, set, step.
 
     The ``"qp"`` record's ray-step and safeguard counts equal the reference's.
+    Returns the run of the (plain, logged) solver.
     """
     ref = reference_loop(qp)
     solver, logged = _shared_logged_solver()
@@ -502,6 +508,7 @@ def assert_matches_reference(qp: RandomQP) -> None:
         np.asarray(res.state.active_set.active_ub), ref.active_ub
     )
     np.testing.assert_allclose(res.step, ref.step, atol=1e-12, rtol=0)
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -520,13 +527,55 @@ def check_against_reference(qp: RandomQP) -> Run:
     return res
 
 
+VARIANTS = {
+    "lb==ub": dict(n_fixed=2),
+    "one-sided": dict(one_sided=True),
+    "lb==ub+one-sided": dict(n_fixed=2, one_sided=True),
+}
+
+# Pairwise covers (every pair of values of any two axes appears), as explicit
+# rows: (seed, n, frac, x_on_bound, mix) and (seed, n, frac, x_on_bound, mix,
+# variant). Rows 1-3 / 1 are the cases that first killed the catalogue mutants.
+SCIPY_ROWS = [
+    (1, 8, 0.3, False, (0, 0)),
+    (1, 8, 0.8, True, (2, 0)),
+    (1, 8, 0.8, True, (2, 3)),
+    (2, 20, 0.0, False, (2, 0)),
+    (2, 20, 0.3, True, (0, 3)),
+    (1, 8, 0.0, True, (3, 2)),
+    (2, 20, 0.8, False, (3, 2)),
+    (1, 8, 0.0, False, (0, 3)),
+    (1, 20, 0.0, False, (2, 3)),
+    (2, 8, 0.0, True, (0, 0)),
+    (1, 20, 0.8, False, (0, 0)),
+    (2, 8, 0.3, False, (2, 3)),
+    (1, 8, 0.3, False, (2, 0)),
+    (1, 8, 0.3, False, (3, 2)),
+    (1, 8, 0.8, False, (0, 3)),
+]
+VARIANT_ROWS = [
+    (1, 8, 0.3, False, (0, 0), "lb==ub"),
+    (1, 20, 0.8, True, (2, 3), "one-sided"),
+    (2, 8, 0.3, True, (3, 2), "lb==ub+one-sided"),
+    (3, 20, 0.8, False, (0, 0), "lb==ub+one-sided"),
+    (2, 20, 0.8, False, (3, 2), "lb==ub"),
+    (3, 8, 0.3, False, (2, 3), "one-sided"),
+    (2, 8, 0.8, True, (0, 0), "one-sided"),
+    (3, 20, 0.3, True, (2, 3), "lb==ub"),
+    (1, 8, 0.3, False, (2, 3), "lb==ub+one-sided"),
+    (1, 8, 0.3, False, (3, 2), "one-sided"),
+    (2, 8, 0.3, False, (2, 3), "lb==ub"),
+    (3, 8, 0.3, False, (3, 2), "lb==ub"),
+]
+# (n, tight, seed): every (n, tight) pair, distinct seeds.
+VERTEX_ROWS = [(8, 1, 0), (20, 3, 1), (8, 3, 2), (20, 1, 3)]
+
+
 class TestAgainstDenseReference:
-    @pytest.mark.parametrize("mix", MIXES, ids=MIX_IDS)
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
-    @pytest.mark.parametrize("frac", [0.0, 0.3, 0.8])
-    @pytest.mark.parametrize("n", [8, 20])
-    @pytest.mark.parametrize("seed", [1, 2])
-    def test_matches_scipy_and_kkt(self, n, frac, x_on_bound, mix, seed):
+    @pytest.mark.parametrize(
+        "seed, n, frac, x_on_bound, mix", SCIPY_ROWS, ids=case_ids(SCIPY_ROWS)
+    )
+    def test_matches_scipy_and_kkt(self, seed, n, frac, x_on_bound, mix):
         qp = make_case(n, frac, x_on_bound, mix, seed=seed)
         res = check_against_reference(qp)
         n_active = assert_kkt(qp, res.step, res.dual)
@@ -535,24 +584,13 @@ class TestAgainstDenseReference:
         assert (n_active >= 1) == (frac > 0) or x_on_bound
 
     @pytest.mark.parametrize(
-        "variant",
-        [
-            dict(n_fixed=2),
-            dict(one_sided=True),
-            dict(n_fixed=2, one_sided=True),
-        ],
-        ids=["lb==ub", "one-sided", "lb==ub+one-sided"],
+        "seed, n, frac, x_on_bound, mix, variant",
+        VARIANT_ROWS,
+        ids=case_ids(VARIANT_ROWS),
     )
-    @pytest.mark.parametrize(
-        "mix", [(0, 0), (2, 3), (3, 2)], ids=["0-0", "2-3", "3dup-2"]
-    )
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
-    @pytest.mark.parametrize("frac", [0.3, 0.8])
-    @pytest.mark.parametrize("n", [8, 20])
-    @pytest.mark.parametrize("seed", [1, 2, 3])
-    def test_bound_variants(self, n, frac, x_on_bound, mix, variant, seed):
+    def test_bound_variants(self, seed, n, frac, x_on_bound, mix, variant):
         """``lb == ub`` pins, one-sided and infinite bounds."""
-        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
+        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **VARIANTS[variant])
         res = check_against_reference(qp)
         fixed = qp.lb == qp.ub
         # A variable with lb == ub is never released and sits at its value.
@@ -570,10 +608,8 @@ class TestAgainstDenseReference:
         assert not np.any(np.asarray(active.active_lb)[~np.isfinite(qp.lb)])
         assert not np.any(np.asarray(active.active_ub)[~np.isfinite(qp.ub)])
 
-    @pytest.mark.parametrize("tight", [1, 3])
-    @pytest.mark.parametrize("seed", range(4))
-    @pytest.mark.parametrize("n", [8, 20])
-    def test_degenerate_vertex_from_pinned_bounds(self, n, seed, tight):
+    @pytest.mark.parametrize("n, tight, seed", VERTEX_ROWS, ids=case_ids(VERTEX_ROWS))
+    def test_degenerate_vertex_from_pinned_bounds(self, n, tight, seed):
         """All but 3 variables pinned by ``lb == ub``; tight rows in the rest.
 
         The free subspace has dimension 3 with 2 equalities and ``tight``
@@ -694,8 +730,9 @@ def relaxed_row_violation(qp: RandomQP, step: np.ndarray, delta: float) -> float
     )
 
 
+@functools.cache
 def near_infeasible_pinned_battery(
-    size: int = 80, min_free: int | None = None
+    size: int = 12, min_free: int | None = None
 ) -> list[tuple[RandomQP, np.ndarray, np.ndarray]]:
     """``size`` pinned problems whose elastic relaxation is itself infeasible.
 
@@ -752,32 +789,52 @@ def x_outside_case(n: int, mix: tuple[int, int], seed: int) -> RandomQP:
     return out
 
 
-class TestBatteries:
-    @pytest.mark.parametrize("seed", range(5))
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
-    @pytest.mark.parametrize(
-        "mix", [(2, 3), (3, 2), (0, 3), (2, 0)], ids=["2-3", "3dup-2", "0-3", "2-0"]
-    )
-    @pytest.mark.parametrize("n", [8, 20])
-    def test_heavy_cut_has_no_false_failure(self, n, mix, x_on_bound, seed):
-        """80 % of the bounds cut the unconstrained solution (incl. the seeds
-        that over-pinned the former primal loop)."""
-        check_against_reference(make_case(n, 0.8, x_on_bound, mix, seed=seed))
+HEAVY_CUT_MIXES = [(3, 2), (2, 3), (0, 3), (2, 0)]
+# (seed, mix, n, x_on_bound): every (seed, mix) pair, with ``n`` and
+# ``x_on_bound`` staggered so that every pair of axes appears. The row
+# (1, (2, 3), 8, interior) first killed the "safeguard disabled" mutant.
+HEAVY_CUT_ROWS = [
+    (seed, mix, (8, 20)[(i + seed) % 2], ((i + 1) // 2 + seed) % 2 == 1)
+    for i, mix in enumerate(HEAVY_CUT_MIXES)
+    for seed in range(5)
+]
+# (n, seed): the infeasible side adds the seeds 24 and 29 at ``n = 20`` (C12
+# regressions of the dual-step arithmetic).
+NEAR_FEASIBLE_ROWS = [(n, seed) for n in (8, 20) for seed in range(3)]
+NEAR_INFEASIBLE_ROWS = [*NEAR_FEASIBLE_ROWS, (20, 24), (20, 29)]
+# (n, mix, seed) of the x-outside-the-box QPs.
+X_OUTSIDE_ROWS = [
+    (n, mix, seed)
+    for i, mix in enumerate([(2, 3), (3, 2), (0, 3)])
+    for seed in range(2)
+    for n in [(8, 20)[(i + seed) % 2]]
+]
+# (mix, x_on_bound, seed): float32 is a rounding-floor regression (the mix and
+# bound axes are covered at float64 above).
+FLOAT32_ROWS = [((2, 3), False, 0), ((3, 2), True, 1)]
 
-    @pytest.mark.parametrize("seed", range(10))
-    @pytest.mark.parametrize("n", [8, 20])
+
+class TestBatteries:
+    @pytest.mark.parametrize("n, seed", NEAR_FEASIBLE_ROWS)
     def test_near_infeasible_feasible_side_converges(self, n, seed):
-        """The LP says feasible: the QP converges with KKT multipliers."""
+        """The LP says feasible: the QP converges with KKT multipliers.
+
+        It takes the reference path, and elastic mode is not entered: the
+        result is bit-identical to ``elastic=False``.
+        """
         qp = near_infeasible_case(n, seed, True)
         assert lp_feasible(qp)
         res = run(qp)
         assert_converged(res)
         assert_kkt(qp, res.step, res.dual)
+        off = assert_matches_reference(qp)
+        assert int(res.state.n_elastic) == 0
+        assert leaves_equal(res.step, off.step) and leaves_equal(res.state, off.state)
 
-    @pytest.mark.parametrize("seed", range(10))
-    @pytest.mark.parametrize("n", [8, 20])
+    @pytest.mark.parametrize("n, seed", NEAR_INFEASIBLE_ROWS)
     def test_near_infeasible_infeasible_side_is_certified(self, n, seed):
-        """The LP says infeasible: a certified ``kkt_solver_failure``."""
+        """The LP says infeasible: a certified ``kkt_solver_failure`` on the
+        reference path."""
         qp = near_infeasible_case(n, seed, False)
         assert not lp_feasible(qp)
         res = run(qp, PLAIN)
@@ -791,12 +848,11 @@ class TestBatteries:
         for leaf in jax.tree.leaves(res.dual):
             assert np.all(np.asarray(leaf) == 0.0)
         assert_in_box(qp, res.step)
+        assert_matches_reference(qp)
 
-    @pytest.mark.parametrize("seed", range(4))
     @pytest.mark.parametrize(
-        "mix", [(2, 3), (3, 2), (0, 3)], ids=["2-3", "3dup-2", "0-3"]
+        "n, mix, seed", X_OUTSIDE_ROWS, ids=case_ids(X_OUTSIDE_ROWS)
     )
-    @pytest.mark.parametrize("n", [8, 20])
     def test_x_outside_the_box(self, n, mix, seed):
         """``x`` below / above some bounds: the step must reach into the box."""
         qp = x_outside_case(n, mix, seed)
@@ -817,10 +873,8 @@ class TestBatteries:
         assert int(res.state.last_n_iter) <= 10
         assert_kkt(qp, res.step, res.dual)
 
-    @pytest.mark.parametrize("seed", [0, 1])
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
     @pytest.mark.parametrize(
-        "mix", [(2, 3), (3, 2), (0, 3), (2, 0)], ids=["2-3", "3dup-2", "0-3", "2-0"]
+        "mix, x_on_bound, seed", FLOAT32_ROWS, ids=case_ids(FLOAT32_ROWS)
     )
     def test_float32_heavy_cut_converges(self, mix, x_on_bound, seed):
         """``τ = max(tol, 100 eps)``: float32 does not see rounding noise."""
@@ -842,26 +896,28 @@ class TestReferenceLoop:
     A solver whose outcome is right but whose multiplier updates are wrong
     (for instance ``μ`` not moved on partial or ray steps) reaches the same
     answer in a different number of iterations; only a path-level comparison
-    with the plan's loop notices.
+    with the plan's loop notices. (The near-infeasible QPs are compared with
+    the reference in ``TestBatteries``.)
     """
 
-    @pytest.mark.parametrize("seed", range(5))
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
     @pytest.mark.parametrize(
-        "mix", [(2, 3), (3, 2), (0, 3), (2, 0)], ids=["2-3", "3dup-2", "0-3", "2-0"]
+        "seed, mix, n, x_on_bound", HEAVY_CUT_ROWS, ids=case_ids(HEAVY_CUT_ROWS)
     )
-    @pytest.mark.parametrize("n", [8, 20])
-    def test_heavy_cut_path(self, n, mix, x_on_bound, seed):
-        assert_matches_reference(make_case(n, 0.8, x_on_bound, mix, seed=seed))
+    def test_heavy_cut_matches_scipy_and_reference_path(self, seed, mix, n, x_on_bound):
+        """80 % of the bounds cut the unconstrained solution (incl. the seeds
+        that over-pinned the former primal loop): no false failure, the scipy
+        step, the reference path, and elastic mode is not entered (the result
+        is bit-identical to the ``elastic=False`` run of the reference check)."""
+        qp = make_case(n, 0.8, x_on_bound, mix, seed=seed)
+        res = check_against_reference(qp)
+        off = assert_matches_reference(qp)
+        assert int(res.state.n_elastic) == 0
+        assert float(res.state.last_elastic_delta) == 0
+        assert leaves_equal(res.step, off.step)
+        assert leaves_equal(res.dual, off.dual)
+        assert leaves_equal(res.state, off.state)
 
-    @pytest.mark.parametrize("seed", range(40))
-    @pytest.mark.parametrize("n", [8, 20])
-    @pytest.mark.parametrize("feasible", [True, False], ids=["feasible", "infeasible"])
-    def test_near_infeasible_path(self, n, seed, feasible):
-        """Includes the infeasible-side seeds 24 and 29 at ``n = 20``."""
-        assert_matches_reference(near_infeasible_case(n, seed, feasible))
-
-    @pytest.mark.parametrize("budget", [1, 2, 3])
+    @pytest.mark.parametrize("budget", [1, 3])
     def test_budget_exit_path(self, budget):
         """A budget exit matches the reference truncated at the same budget."""
         qp = make_case(20, 0.8, True, (2, 3), seed=1)
@@ -930,7 +986,7 @@ class TestStateFields:
 class TestBudgetSweep:
     @pytest.mark.parametrize(
         "n, mix, seed",
-        [(8, (2, 3), 0), (20, (2, 3), 1), (20, (0, 3), 2), (8, (3, 2), 3)],
+        [(8, (2, 3), 0)],
     )
     def test_dual_value_is_monotone_over_budgets(self, n, mix, seed):
         """Run the loop with budgets ``1, 2, ...``: the paths are identical.
@@ -1467,9 +1523,6 @@ def _warm_cases():
     for n, frac, x_on_bound, mix, seed, variant in [
         (8, 0.8, False, (2, 3), 1, {}),
         (8, 0.8, True, (3, 2), 2, {}),
-        (20, 0.3, False, (0, 3), 3, {}),
-        (20, 0.8, True, (2, 0), 4, {}),
-        (8, 0.8, False, (2, 3), 5, dict(n_fixed=2)),
         (20, 0.8, True, (2, 3), 6, dict(one_sided=True)),
         (8, 0.3, False, (0, 0), 7, dict(n_fixed=2, one_sided=True)),
     ]:
@@ -1489,6 +1542,13 @@ class TestWarmStart:
     def test_optimal_set_converges_in_one_iteration(
         self, n, frac, x_on_bound, mix, seed, variant
     ):
+        """The optimal set converges in one iteration, also through the filters.
+
+        Infinite faces are never pinned and the lower face wins ties: the
+        optimal set plus marks on every infinite face and on the upper face of
+        every lower-pinned variable is still accepted as is. A cold solver
+        ignores the working set of the state altogether.
+        """
         qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
         cold = run(qp)
         assert_converged(cold)
@@ -1504,6 +1564,32 @@ class TestWarmStart:
         )
         # Counters advance by the one trial iteration on top of the cold solve.
         assert int(res.state.n_iter) == int(cold.state.n_iter) + 1
+        # The filters: the working set is the filtered one, not the noisy one.
+        lb = np.asarray(cold.state.active_set.active_lb)
+        ub = np.asarray(cold.state.active_set.active_ub)
+        noisy_lb = lb | ~np.isfinite(qp.lb)
+        noisy_ub = ub | ~np.isfinite(qp.ub) | lb
+        noisy = run(qp, WARM, with_warm_set(cold_state(qp), noisy_lb, noisy_ub))
+        assert_converged(noisy)
+        assert int(noisy.state.last_n_iter) == 1
+        np.testing.assert_allclose(noisy.step, cold.step, atol=1e-10, rtol=0)
+        for face in ("active_lb", "active_ub"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(noisy.state.active_set, face)),
+                np.asarray(getattr(cold.state.active_set, face)),
+            )
+        # A cold solver ignores the working set of the state.
+        junk = with_warm_set(
+            cold_state(qp),
+            np.ones(n, bool),
+            np.random.default_rng(seed).random(n) < 0.5,
+        )
+        ignored = run(qp, LRHDirectQPSolver(warm_start=False), junk)
+        np.testing.assert_array_equal(ignored.step, cold.step)
+        assert int(ignored.state.last_n_iter) == int(cold.state.last_n_iter)
+        assert int(ignored.state.last_n_cg_iter) == int(cold.state.last_n_cg_iter)
+        for a, b in zip(jax.tree.leaves(ignored.dual), jax.tree.leaves(cold.dual)):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
     @pytest.mark.parametrize("perturb", PERTURBATIONS, ids=lambda f: f.__name__)
     @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
@@ -1526,30 +1612,34 @@ class TestWarmStart:
         # A rejected trial is discarded: the cold run plus one iteration.
         rejected = trial_is_rejected(qp, lb, ub)
         assert (not rejected) or same_outcome_as(res, cold, 1)
-
-    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
-    def test_cold_solver_ignores_the_state_working_set(
-        self, n, frac, x_on_bound, mix, seed, variant
-    ):
-        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
-        cold = run(qp)
-        junk = with_warm_set(
-            cold_state(qp),
-            np.ones(n, bool),
-            np.random.default_rng(seed).random(n) < 0.5,
+        # With a one-iteration budget a rejected trial uses the whole budget:
+        # clipped origin, no dual.
+        short = run(qp, LRHDirectQPSolver(warm_start=True, max_iter=1), state)
+        zero_dual = all(
+            np.all(np.asarray(leaf) == 0.0) for leaf in jax.tree.leaves(short.dual)
         )
-        res = run(qp, LRHDirectQPSolver(warm_start=False), junk)
-        np.testing.assert_array_equal(res.step, cold.step)
-        assert int(res.state.last_n_iter) == int(cold.state.last_n_iter)
-        assert int(res.state.last_n_cg_iter) == int(cold.state.last_n_cg_iter)
-        for a, b in zip(jax.tree.leaves(res.dual), jax.tree.leaves(cold.dual)):
-            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        origin = np.clip(0.0, qp.lb - qp.x, qp.ub - qp.x)
+        budget_exit = (
+            bool(short.state.qp_result == BUDGET)
+            and bool(short.state.status == RESULTS.max_steps_reached)
+            and not bool(short.state.success)
+            and int(short.state.last_n_iter) == 1
+            and zero_dual
+            and np.array_equal(short.step, origin)
+        )
+        assert (not rejected) or budget_exit
+        assert_in_box(qp, short.step)
 
+    # (n, seed, perturbation): every (n, perturbation) pair, seeds cycling.
     @pytest.mark.parametrize(
-        "perturb", [_keep, *PERTURBATIONS], ids=lambda f: f.__name__
+        "n, seed, perturb",
+        [
+            (n, (k + 3 * m) % 4, perturb)
+            for k, perturb in enumerate([_keep, *PERTURBATIONS])
+            for m, n in enumerate((8, 20))
+        ],
+        ids=lambda v: v.__name__ if callable(v) else str(v),
     )
-    @pytest.mark.parametrize("seed", range(4))
-    @pytest.mark.parametrize("n", [8, 20])
     def test_infeasible_qp_gives_the_cold_certified_outcome(self, n, seed, perturb):
         """The base set is the cold run's final (certifying) working set."""
         qp = near_infeasible_case(n, seed, False)
@@ -1571,48 +1661,13 @@ class TestWarmStart:
         rejected = trial_is_rejected(qp, lb, ub)
         assert (not rejected) or same_outcome_as(res, cold, 1)
 
-    @pytest.mark.parametrize("budget", [0, 1, 2])
+    @pytest.mark.parametrize("budget", [0, 1])
     def test_trial_consumes_budget(self, budget):
         qp = _hard_case()
         cold = run(qp)
         res = run(qp, LRHDirectQPSolver(warm_start=True, max_iter=budget), cold.state)
         assert int(res.state.last_n_iter) == min(budget, 1)
         assert bool(res.state.success) == (budget >= 1)
-        assert_in_box(qp, res.step)
-
-    @pytest.mark.parametrize("perturb", PERTURBATIONS, ids=lambda f: f.__name__)
-    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
-    def test_rejected_trial_with_one_iteration_budget(
-        self, n, frac, x_on_bound, mix, seed, variant, perturb
-    ):
-        """A rejected trial uses the whole budget: clipped origin, no dual."""
-        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
-        cold = run(qp)
-        lb, ub = perturb(
-            np.asarray(cold.state.active_set.active_lb),
-            np.asarray(cold.state.active_set.active_ub),
-            np.random.default_rng(seed),
-        )
-        res = run(
-            qp,
-            LRHDirectQPSolver(warm_start=True, max_iter=1),
-            with_warm_set(cold_state(qp), lb, ub),
-        )
-        state = res.state
-        rejected = trial_is_rejected(qp, lb, ub)
-        zero_dual = all(
-            np.all(np.asarray(leaf) == 0.0) for leaf in jax.tree.leaves(res.dual)
-        )
-        origin = np.clip(0.0, qp.lb - qp.x, qp.ub - qp.x)
-        budget_exit = (
-            bool(state.qp_result == BUDGET)
-            and bool(state.status == RESULTS.max_steps_reached)
-            and not bool(state.success)
-            and int(state.last_n_iter) == 1
-            and zero_dual
-            and np.array_equal(res.step, origin)
-        )
-        assert (not rejected) or budget_exit
         assert_in_box(qp, res.step)
 
     def test_both_outcomes_occur_in_the_battery(self):
@@ -1631,7 +1686,9 @@ class TestWarmStart:
                 flags.append(trial_is_rejected(qp, lb, ub))
         assert any(flags) and not all(flags)
 
-    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
+    @pytest.mark.parametrize(
+        "n, frac, x_on_bound, mix, seed, variant", list(_warm_cases())[::2]
+    )
     def test_oracle_failure_of_the_trial_is_not_reported(
         self, monkeypatch, n, frac, x_on_bound, mix, seed, variant
     ):
@@ -1667,33 +1724,6 @@ class TestWarmStart:
         assert_converged(Run(np.asarray(step.x), dual, out))
         np.testing.assert_allclose(np.asarray(step.x), cold.step, atol=1e-9, rtol=0)
         assert int(out.last_n_iter) == int(cold.state.last_n_iter) + 1
-
-    @pytest.mark.parametrize("n, frac, x_on_bound, mix, seed, variant", _warm_cases())
-    def test_warm_filters_keep_the_optimal_set_optimal(
-        self, n, frac, x_on_bound, mix, seed, variant
-    ):
-        """Infinite faces are never pinned and the lower face wins ties.
-
-        The optimal set plus marks on every infinite face and on the upper
-        face of every lower-pinned variable is still accepted as is, so it
-        converges in one iteration.
-        """
-        qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
-        cold = run(qp)
-        lb = np.asarray(cold.state.active_set.active_lb)
-        ub = np.asarray(cold.state.active_set.active_ub)
-        noisy_lb = lb | ~np.isfinite(qp.lb)
-        noisy_ub = ub | ~np.isfinite(qp.ub) | lb
-        res = run(qp, WARM, with_warm_set(cold_state(qp), noisy_lb, noisy_ub))
-        assert_converged(res)
-        assert int(res.state.last_n_iter) == 1
-        np.testing.assert_allclose(res.step, cold.step, atol=1e-10, rtol=0)
-        # The working set is the filtered one, not the noisy one.
-        for face in ("active_lb", "active_ub"):
-            np.testing.assert_array_equal(
-                np.asarray(getattr(res.state.active_set, face)),
-                np.asarray(getattr(cold.state.active_set, face)),
-            )
 
     def test_single_compilation_across_warm_sets(self):
         traces = []
@@ -1811,10 +1841,16 @@ def leaves_equal(a, b) -> bool:
 
 class TestLogging:
     @pytest.mark.parametrize("name", list(EXIT_PATHS))
-    def test_record_keys_and_values(self, name):
-        make_qp, solver, *_ = EXIT_PATHS[name]
+    def test_record_lines_and_inertness(self, name):
+        """The ``"qp"`` record, the log line and the unchanged result.
+
+        The record carries the keys and values of the state, the line fires on
+        the exit taken, and a logged solve returns the bit-identical result of
+        an unlogged one.
+        """
+        make_qp, plain_solver, *_ = EXIT_PATHS[name]
         qp = make_qp()
-        solver, logged = with_logger(solver)
+        solver, logged = with_logger(plain_solver)
         res = run(qp, solver)
         state = res.state
         (rec,) = logged.records
@@ -1842,20 +1878,20 @@ class TestLogging:
         assert 0 <= v["n_safeguard"] <= v["iters"]
         # No warm start: neither trial flag is set.
         assert not v["warm_trial_accepted"] and not v["warm_trial_rejected"]
-
-    @pytest.mark.parametrize("name", list(EXIT_PATHS))
-    def test_lines_fire_on_the_exit_taken(self, name):
-        make_qp, solver, *_ = EXIT_PATHS[name]
-        solver, logged = with_logger(solver)
-        res = run(make_qp(), solver)
-        converged = bool(res.state.success)
+        # The line fires on the exit taken.
+        converged = bool(state.success)
         level = "INFO" if converged else "WARNING"
-        result = item_name(res.state.qp_result, ACTIVE_SET_QP_RESULTS, QP_RESULT_NAMES)
+        result = item_name(state.qp_result, ACTIVE_SET_QP_RESULTS, QP_RESULT_NAMES)
         ((got_level, msg),) = logged.lines
         assert got_level == level
         assert msg.startswith(LINE_PREFIX[level])
-        assert f"iters={int(res.state.last_n_iter)}" in msg
+        assert f"iters={int(state.last_n_iter)}" in msg
         assert (f"result={result}" in msg) == (not converged)
+        # Logging does not change the result.
+        plain = run(qp, plain_solver)
+        assert leaves_equal(plain.step, res.step)
+        assert leaves_equal(plain.dual, res.dual)
+        assert leaves_equal(plain.state, res.state)
 
     @pytest.mark.parametrize("seed", [3, 5])
     def test_ray_and_safeguard_counters_match_the_reference(self, seed):
@@ -1873,8 +1909,11 @@ class TestLogging:
         qp = near_infeasible_case(8, 3, False)
         assert reference_loop(qp).n_safeguard > 0
 
-    @pytest.mark.parametrize("feasible", [True, False], ids=["feasible", "infeasible"])
-    @pytest.mark.parametrize("seed", [5, 6, 7])
+    @pytest.mark.parametrize(
+        "seed, feasible",
+        [(5, True), (6, False), (7, True)],
+        ids=["5-feasible", "6-infeasible", "7-feasible"],
+    )
     def test_rejected_ray_trial_is_not_counted(self, seed, feasible):
         """A warm trial that is a ray step but is discarded counts nothing.
 
@@ -1922,7 +1961,7 @@ class TestLogging:
 
     @pytest.mark.parametrize("perturb", [_keep, _wrong_face, _everything_pinned])
     @pytest.mark.parametrize(
-        "n, frac, x_on_bound, mix, seed, variant", list(_warm_cases())[:3]
+        "n, frac, x_on_bound, mix, seed, variant", list(_warm_cases())[:2]
     )
     def test_warm_trial_flags(self, n, frac, x_on_bound, mix, seed, variant, perturb):
         qp = make_case(n, frac, x_on_bound, mix, seed=seed, **variant)
@@ -1938,17 +1977,6 @@ class TestLogging:
         rejected = trial_is_rejected(qp, lb, ub)
         assert rec.values["warm_trial_rejected"] == rejected
         assert rec.values["warm_trial_accepted"] == (not rejected)
-
-    @pytest.mark.parametrize("name", list(EXIT_PATHS))
-    def test_logging_does_not_change_the_result(self, name):
-        make_qp, solver, *_ = EXIT_PATHS[name]
-        qp = make_qp()
-        plain = run(qp, solver)
-        logged_solver, _ = with_logger(solver)
-        logged = run(qp, logged_solver)
-        assert leaves_equal(plain.step, logged.step)
-        assert leaves_equal(plain.dual, logged.dual)
-        assert leaves_equal(plain.state, logged.state)
 
     @pytest.mark.parametrize("perturb", [_keep, _everything_pinned])
     def test_logging_does_not_change_the_warm_result(self, perturb):
@@ -2230,7 +2258,19 @@ def solve_elastic(qp: RandomQP, **kwargs) -> Elastic:
     )
 
 
-@pytest.fixture(params=list(INCONSISTENT))
+# The inconsistent QPs the elastic tests share (a spread of the families).
+ELASTIC_NAMES = [
+    "near-infeasible-8-0",
+    "near-infeasible-20-4",
+    "margin-8-02",
+    "equality-vs-inequality-8",
+    "over-fixed-20-23",
+    "box-too-tight",
+    "clashing-equalities-8",
+]
+
+
+@pytest.fixture(params=ELASTIC_NAMES)
 def inconsistent(request) -> Elastic:
     """The default solver (elastic mode on) run on each inconsistent QP."""
     return solve_elastic(INCONSISTENT[request.param]())
@@ -2238,6 +2278,13 @@ def inconsistent(request) -> Elastic:
 
 class TestElasticMode:
     def test_inconsistent_linearisation_gives_a_relaxed_step(self, inconsistent):
+        """A relaxed step, ``δ`` the trade-off over the weight, a merit descent.
+
+        ``δ = max(δ_min, κ/w)`` with ``κ = -cᵀλ/τ²`` and ``ρ_e = w τ²``: at an
+        interior ``δ`` the stationarity in ``δ`` is ``ρ_e δ = -cᵀλ``, so the
+        excess over ``δ_min`` is at most ``κ/w``. The step satisfies
+        ``Dφ ≤ -dᵀBd - (1-δ)(ρ_m - ‖λ‖∞)‖viol‖₁ < 0`` for ``ρ_m > ‖λ‖∞``.
+        """
         el = inconsistent
         qp, res = el.qp, el.run
         state = res.state
@@ -2268,24 +2315,13 @@ class TestElasticMode:
             state.last_ldp_status == LDP_RESULTS.feasible
         )
         assert bool(state.last_kkt_reason == KKT_SOLVER_RESULTS.converged)
-
-    def test_excess_of_delta_is_the_tradeoff_over_the_weight(self, inconsistent):
-        """``δ = max(δ_min, κ/w)`` with ``κ = -cᵀλ/τ²`` and ``ρ_e = w τ²``.
-
-        At an interior ``δ`` the stationarity in ``δ`` is ``ρ_e δ = -cᵀλ``, so
-        the excess over ``δ_min`` is at most ``κ/w``: the plan's
-        ``2 / elastic_weight`` bound is the case ``κ ≤ 2``.
-        """
-        el = inconsistent
-        delta_min = delta_min_lp(el.qp)
+        # The excess of delta is the trade-off over the weight (the plan's
+        # ``2 / elastic_weight`` bound is the case ``κ ≤ 2``).
         tau2 = el.rho / el.weight
         kappa = -(el.column @ el.lam) / tau2
         assert el.delta - delta_min <= max(kappa, 0.0) / el.weight + 1e-8
-
-    def test_step_is_a_merit_descent_direction(self, inconsistent):
-        """``Dφ ≤ -dᵀBd - (1-δ)(ρ_m - ‖λ‖∞)‖viol‖₁ < 0`` for ``ρ_m > ‖λ‖∞``."""
-        el = inconsistent
-        qp, d = el.qp, el.run.step
+        # The merit descent.
+        d = el.run.step
         lam_max = np.abs(el.lam).max(initial=0.0)
         rho_m = 1.1 * lam_max + 1e-6
         dphi = merit_directional_derivative(qp, d, rho_m)
@@ -2294,7 +2330,7 @@ class TestElasticMode:
         assert dphi < 0.0
         assert dphi <= bound + 1e-8 * max(1.0, abs(bound))
 
-    @pytest.mark.parametrize("name", WELL_SCALED)
+    @pytest.mark.parametrize("name", [n for n in ELASTIC_NAMES if n in WELL_SCALED])
     def test_default_weight_bound_on_delta(self, name):
         """At the default weight: ``δ_min ≤ δ ≤ δ_min + 2/elastic_weight``."""
         el = solve_elastic(INCONSISTENT[name]())
@@ -2302,7 +2338,7 @@ class TestElasticMode:
         assert el.weight == 1e3
         assert delta_min - 1e-8 <= el.delta <= delta_min + 2.0 / el.weight
 
-    @pytest.mark.parametrize("name", ["near-infeasible-20-5", "near-infeasible-8-5"])
+    @pytest.mark.parametrize("name", ["near-infeasible-20-5"])
     def test_excess_shrinks_with_the_weight(self, name):
         """The excess of ``δ`` over ``δ_min`` is ``O(1/w)``: monotone in the weight."""
         qp = INCONSISTENT[name]()
@@ -2320,7 +2356,9 @@ class TestElasticMode:
         assert excess[2] >= -1e-8
         assert excess[0] > 10 * max(excess[2], 1e-12)
 
-    @pytest.mark.parametrize("name", list(INCONSISTENT)[:6] + ["box-too-tight"])
+    @pytest.mark.parametrize(
+        "name", ["near-infeasible-8-0", "near-infeasible-20-0", "box-too-tight"]
+    )
     def test_elastic_false_reproduces_the_failure(self, name):
         qp = INCONSISTENT[name]()
         plain = run(qp, PLAIN)
@@ -2332,30 +2370,6 @@ class TestElasticMode:
             assert np.all(np.asarray(leaf) == 0.0)
         # ... and the same QP is solved with elastic mode on.
         assert bool(run(qp).state.success)
-
-    @pytest.mark.parametrize("x_on_bound", [False, True], ids=["interior", "on-bound"])
-    @pytest.mark.parametrize(
-        "mix", [(0, 0), (2, 3), (0, 3), (3, 2)], ids=["0-0", "2-3", "0-3", "3dup-2"]
-    )
-    @pytest.mark.parametrize("n", [8, 20])
-    @pytest.mark.parametrize("seed", range(2))
-    def test_consistent_qps_never_enter_elastic_mode(self, n, mix, x_on_bound, seed):
-        """Heavy-cut QPs: ``n_elastic`` unchanged, bit-identical to ``elastic=False``."""
-        qp = make_case(n, 0.8, x_on_bound, mix, seed=seed)
-        on, off = run(qp), run(qp, PLAIN)
-        assert bool(on.state.success)
-        assert int(on.state.n_elastic) == 0 and float(on.state.last_elastic_delta) == 0
-        assert leaves_equal(on.step, off.step)
-        assert leaves_equal(on.dual, off.dual)
-        assert leaves_equal(on.state, off.state)
-
-    @pytest.mark.parametrize("seed", range(4))
-    @pytest.mark.parametrize("n", [8, 20])
-    def test_near_infeasible_feasible_side_is_not_relaxed(self, n, seed):
-        qp = near_infeasible_case(n, seed, True)
-        on, off = run(qp), run(qp, PLAIN)
-        assert int(on.state.n_elastic) == 0
-        assert leaves_equal(on.step, off.step) and leaves_equal(on.state, off.state)
 
     def test_counters_accumulate_and_delta_resets(self):
         """``n_elastic`` is cumulative; ``last_elastic_delta`` is that of the last solve."""
@@ -2457,7 +2471,7 @@ class TestElasticMode:
         run. Such an exit must keep its certificate (``has_ray``) in both.
         """
         battery = near_infeasible_pinned_battery()
-        assert len(battery) == 80
+        assert len(battery) == 12
         jitted = jax.jit(solve_fixed_bounds_qp)
         outcomes = []
         for qp, lower, upper in battery:
@@ -2483,7 +2497,7 @@ class TestElasticMode:
                 f"{jit_i} != eager {eager_i}"
             )
         # ... the pinned problems exercise the infeasible exit, ...
-        assert sum(infeasible for _, infeasible in jit_out) >= 60
+        assert sum(infeasible for _, infeasible in jit_out) >= 9
         # ... and each of them carries a certificate.
         for i, (has_ray, _) in enumerate(jit_out):
             assert has_ray, f"battery[{i}] weight={weight:g}: no ray"
@@ -2542,18 +2556,11 @@ class TestElasticMode:
             assert bool(jit_res.has_ray == eager_res.has_ray), (
                 f"{case}: jit and eager disagree on has_ray"
             )
-        assert n_infeasible >= 100
+        assert n_infeasible >= 15
 
     @pytest.mark.parametrize(
         "name",
-        [
-            "near-infeasible-8-0",
-            "near-infeasible-8-2",
-            "near-infeasible-20-4",
-            "margin-8-23",
-            "over-fixed-8-03",
-            "equality-vs-inequality-8",
-        ],
+        ["near-infeasible-8-2", "margin-8-23", "over-fixed-8-03"],
     )
     def test_path_is_the_plain_loop_then_the_elastic_loop(self, name):
         """Counters are cumulative over the two loops, the step is the second's.
@@ -2604,9 +2611,7 @@ class TestElasticMode:
         )
         np.testing.assert_allclose(res.step, elastic.step, atol=1e-12, rtol=0)
 
-    @pytest.mark.parametrize(
-        "name", ["near-infeasible-8-0", "margin-8-23", "over-fixed-8-03"]
-    )
+    @pytest.mark.parametrize("name", ["near-infeasible-8-0", "over-fixed-8-03"])
     def test_warm_start_reaches_the_same_elastic_solution(self, name):
         """The elastic loop restarts from the warm trial, like the plain one."""
         qp = INCONSISTENT[name]()

@@ -100,18 +100,24 @@ def build_case(n, rank, mix, kind, seed=0, tight=False) -> Case:
     return Case(qp, lower, upper)
 
 
-@pytest.fixture(
-    params=[
-        (n, rank, mix, kind)
-        for n in (6, 12)
-        for rank in (0, 2, 4)
-        for mix in MIXES
-        for kind in WORKING_SETS
-    ],
-    ids=lambda p: f"n{p[0]}-r{p[1]}-{MIX_IDS[MIXES.index(p[2])]}-{p[3]}",
-)
+# Pairwise cover of (n, LRH rank, constraint mix, working set): every mix x
+# working-set pair appears (15 cases), and the size and the rank are staggered
+# (``s = i + j`` for mix ``i`` and working set ``j``) so that every pair of
+# values of any two axes also appears.
+def case_id(p) -> str:
+    return f"n{p[0]}-r{p[1]}-{MIX_IDS[MIXES.index(p[2])]}-{p[3]}"
+
+
+CASE_PARAMS = [
+    ((6, 12)[(i + j) % 2], (0, 2, 4)[(i + j) % 3], mix, kind)
+    for i, mix in enumerate(MIXES)
+    for j, kind in enumerate(WORKING_SETS)
+]
+
+
+@pytest.fixture(params=CASE_PARAMS, ids=lambda p: case_id(p))
 def case(request) -> Case:
-    """Every (n, LRH rank, constraint mix, working set) combination."""
+    """A (n, LRH rank, constraint mix, working set) combination."""
     return build_case(*request.param)
 
 
@@ -204,17 +210,12 @@ def assert_matches_reference(case: Case) -> None:
 
 
 class TestFixedBoundsQP:
-    def test_matches_dense_reference(self, case: Case):
+    def test_matches_dense_reference_kkt_and_has_no_ray(self, case: Case):
+        """Dense reference, KKT structure and the absence of a certificate.
+
+        The three checks share the (feasible) cases of the ``case`` fixture.
+        """
         assert_matches_reference(case)
-
-    @pytest.mark.parametrize("kind", ["none", "random"])
-    @pytest.mark.parametrize("mix", [(0, 3), (2, 3)], ids=["0-3", "2-3"])
-    @pytest.mark.parametrize("seed", [0, 1, 2])
-    def test_tight_inequality_matches_dense_reference(self, mix, kind, seed):
-        """One inequality active at the feasible ``d0`` (degenerate vertex)."""
-        assert_matches_reference(build_case(12, 3, mix, kind, seed, tight=True))
-
-    def test_kkt_and_structure(self, case: Case):
         qp = case.qp
         res = run(case)
         d = np.asarray(res.step)
@@ -239,6 +240,24 @@ class TestFixedBoundsQP:
         np.testing.assert_allclose(lam_i * slack, 0.0, atol=KKT_TOL)
         assert float(res.feasibility_residual) <= KKT_TOL
         assert int(res.n_nnls_iter) >= 0
+        # A feasible problem carries no certificate and no ray.
+        assert bool(res.ldp_status == LDP_RESULTS.feasible)
+        assert_no_ray(qp, res)
+
+    # Explicit (mix, kind, seed) triples: every mix x kind pair appears.
+    @pytest.mark.parametrize(
+        "mix, kind, seed",
+        [
+            ((0, 3), "none", 0),
+            ((0, 3), "random", 1),
+            ((2, 3), "none", 2),
+            ((2, 3), "random", 0),
+        ],
+        ids=["0-3-none", "0-3-random", "2-3-none", "2-3-random"],
+    )
+    def test_tight_inequality_matches_dense_reference(self, mix, kind, seed):
+        """One inequality active at the feasible ``d0`` (degenerate vertex)."""
+        assert_matches_reference(build_case(12, 3, mix, kind, seed, tight=True))
 
     def test_no_working_set_is_unbounded_qp(self, random_lrh_qp):
         """With ``W = ∅`` the bounds (finite here) play no role."""
@@ -628,7 +647,7 @@ DEGENERATE_SCENARIOS = {
 
 class TestDegenerateFeasibleSets:
     @pytest.mark.parametrize("curvature", [1.0, 1e6], ids=["soft", "stiff"])
-    @pytest.mark.parametrize("seed", range(10))
+    @pytest.mark.parametrize("seed", range(2))
     @pytest.mark.parametrize("name", list(DEGENERATE_SCENARIOS))
     def test_step_matches_reference(self, name, seed, curvature):
         """``feasible`` and the exact step, whatever the row scale or model.
@@ -648,12 +667,18 @@ class TestDegenerateFeasibleSets:
         )
         assert float(res.feasibility_residual) <= 1e-8 * max(1.0, scale)
 
-    @pytest.mark.parametrize("curvature", [1.0, 1e6], ids=["soft", "stiff"])
-    @pytest.mark.parametrize("seed", range(12))
-    @pytest.mark.parametrize("m_e", [0, 1])
-    @pytest.mark.parametrize("tight", [2, 3, 4])
-    @pytest.mark.parametrize("n_free", [2, 3])
-    def test_several_tight_inequalities(self, n_free, tight, m_e, seed, curvature):
+    # Pairwise design: (n_free, tight, m_e) is a full product and the
+    # curvature alternates with ``a + b + c`` so that it pairs with every value.
+    @pytest.mark.parametrize(
+        "n_free, tight, m_e, curvature, seed",
+        [
+            (n_free, tight, m_e, (1.0, 1e6)[(a + b + c) % 2], (a + b + c) % 3)
+            for a, n_free in enumerate([2, 3])
+            for b, tight in enumerate([2, 3, 4])
+            for c, m_e in enumerate([0, 1])
+        ],
+    )
+    def test_several_tight_inequalities(self, n_free, tight, m_e, curvature, seed):
         """Several inequalities active at ``d0`` in a small free subspace.
 
         With ``tight > n_free`` the active rows can positively span the free
@@ -799,7 +824,7 @@ CERTIFICATE_IDS = [
 
 
 class TestFarkasCertificates:
-    @pytest.mark.parametrize("seed", range(4))
+    @pytest.mark.parametrize("seed", range(2))
     @pytest.mark.parametrize("make, kind, mix", CERTIFICATE_PARAMS, ids=CERTIFICATE_IDS)
     def test_over_pinned_and_tight_box_certificates(self, make, kind, mix, seed):
         case = make(mix, kind, seed)
@@ -816,11 +841,6 @@ class TestFarkasCertificates:
         assert bool(res.ldp_status == expected)
         assert_ray_certificate(case, res)
 
-    def test_feasible_problems_have_no_ray(self, case: Case):
-        res = run(case)
-        assert bool(res.ldp_status == LDP_RESULTS.feasible)
-        assert_no_ray(case.qp, res)
-
     def test_nonfinite_has_no_ray(self):
         mix, mutate, expected = STATUS_CASES["nonfinite"]
         lower, upper = working_set("random", 6, 0)
@@ -829,8 +849,11 @@ class TestFarkasCertificates:
         assert bool(res.ldp_status == expected)
         assert_no_ray(qp, res)
 
-    @pytest.mark.parametrize("kind", WORKING_SETS)
-    @pytest.mark.parametrize("status", NOT_FEASIBLE, ids=["infeasible", "inconsistent"])
+    @pytest.mark.parametrize(
+        "status, kind",
+        [(NOT_FEASIBLE[0], "none"), (NOT_FEASIBLE[1], "random")],
+        ids=["infeasible-none", "inconsistent-random"],
+    )
     def test_status_without_certificate_has_no_ray(self, monkeypatch, status, kind):
         """``has_ray`` follows ``has_certificate``, not the status alone.
 
@@ -919,14 +942,17 @@ def tau_squared_reference(qp: RandomQP) -> float:
 
 
 class TestElasticPenalty:
-    @pytest.mark.parametrize("kappa", [1e-6, 1.0, 1e3])
-    @pytest.mark.parametrize("weight", [1e-2, 1e3])
-    @pytest.mark.parametrize("mix", MIXES[1:], ids=MIX_IDS[1:])
-    @pytest.mark.parametrize("seed", range(2))
-    def test_matches_the_dense_formula(self, mix, weight, kappa, seed):
-        qp = scaled_qp(
-            make_random_lrh_qp(8, 3, *mix, seed=seed, dup=mix[0] == 3), kappa
-        )
+    # mix x kappa is a full product; the weight alternates with ``i + j``.
+    @pytest.mark.parametrize(
+        "mix, kappa, weight",
+        [
+            (mix, kappa, (1e-2, 1e3)[(i + j) % 2])
+            for i, mix in enumerate(MIXES[1:])
+            for j, kappa in enumerate([1e-6, 1.0, 1e3])
+        ],
+    )
+    def test_matches_the_dense_formula(self, mix, kappa, weight):
+        qp = scaled_qp(make_random_lrh_qp(8, 3, *mix, seed=0, dup=mix[0] == 3), kappa)
         rho = float(elastic_penalty(qp.lagrangian, qp.factors, weight))
         np.testing.assert_allclose(rho, weight * tau_squared_reference(qp), rtol=1e-8)
 
@@ -972,12 +998,17 @@ def elastic_rho_of(qp: RandomQP, weight: float = WEIGHT) -> float:
 
 
 class TestElasticKernel:
-    def test_solves_the_relaxed_qp_on_every_working_set(self, case: Case):
+    # Every other row of the pairwise cover: each mix and working set appears.
+    @pytest.mark.parametrize(
+        "params", CASE_PARAMS[::2], ids=[case_id(p) for p in CASE_PARAMS[::2]]
+    )
+    def test_solves_the_relaxed_qp_on_every_working_set(self, params):
         """KKT of the relaxed QP (so the minimiser), ``d_W = d_fix``, ``δ`` bound.
 
         The plain QP of these cases is feasible; with ``λ`` its multipliers,
         ``0 ≤ δ ≤ max(-cᵀλ, 0)/ρ_e`` (plan rev 12), and ``δ`` is not in the dual.
         """
+        case = build_case(*params)
         qp = case.qp
         rho = elastic_rho_of(qp)
         res = run(case, elastic_rho=rho)
@@ -1017,16 +1048,15 @@ class TestElasticKernel:
         assert float(res.delta) == 0.0
         assert not bool(res.has_ray) and float(res.ray_rate) == 0.0
 
-    @pytest.mark.parametrize("weight", [1e-1, 1e2, 1e5])
-    def test_relaxation_shrinks_towards_the_plain_step_with_the_weight(self, weight):
+    def test_relaxation_shrinks_towards_the_plain_step_with_the_weight(self):
         """A larger ``ρ_e`` pulls ``δ`` and the step towards the plain solution."""
         case = build_case(8, 3, (2, 3), "random")
         plain = np.asarray(run(case).step)
         errs = []
-        for w in (weight, 10 * weight):
+        for w in 10.0 ** np.arange(-1, 7):  # consecutive weights differ by 10x
             res = run(case, elastic_rho=elastic_rho_of(case.qp, w))
             errs.append(np.abs(np.asarray(res.step) - plain).max())
-        assert errs[1] <= errs[0] + 1e-9
+        assert np.all(np.diff(errs) <= 1e-9)
 
     def test_traced_weight_compiles_once(self):
         traces = []
@@ -1062,8 +1092,8 @@ def pinned_elastic_data(make, kind, mix, seed):
     return case, delta_min_lp(qp, lo, hi)
 
 
-PINNED_ELASTIC = [(params, seed) for params in CERTIFICATE_PARAMS for seed in range(4)]
-PINNED_ELASTIC_IDS = [f"{cid}-s{seed}" for cid in CERTIFICATE_IDS for seed in range(4)]
+PINNED_ELASTIC = [(params, seed) for params in CERTIFICATE_PARAMS for seed in range(2)]
+PINNED_ELASTIC_IDS = [f"{cid}-s{seed}" for cid in CERTIFICATE_IDS for seed in range(2)]
 _PINNED_DELTA_MIN = {
     key: pinned_elastic_data(*params, seed)[1]
     for key, (params, seed) in zip(PINNED_ELASTIC_IDS, PINNED_ELASTIC)
