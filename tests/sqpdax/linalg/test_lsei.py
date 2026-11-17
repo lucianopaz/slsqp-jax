@@ -567,12 +567,19 @@ def singleton_vertex_problem(m_e, p, extra, cond, spread, seed):
     return (g * row_scale[:, None]).T.copy(), h * row_scale, w0
 
 
+# (cond, relative error bound on w): a frozen dependent row holds to about
+# ``dep_tol · ‖y‖``, so the vertex moves by that amount times the local
+# conditioning: up to 3.7e-8 measured at cond 1e6 (designed tolerance, not a
+# coarse freeze; about 2.7x margin to 1e-7), and below 1e-8 for the milder ones.
+SINGLETON_COND_AND_ATOL = [(1e4, 1e-8), (1e5, 1e-8), (1e6, 1e-7)]
+
+
 @pytest.mark.parametrize("seed", range(8))
 @pytest.mark.parametrize("extra", [0, 2])
 @pytest.mark.parametrize("spread", [0.0, 2.0])
-@pytest.mark.parametrize("cond", [1e4, 1e5])
+@pytest.mark.parametrize("cond, rel_atol", SINGLETON_COND_AND_ATOL)
 @pytest.mark.parametrize("m_e, p", [(0, 1), (0, 3), (2, 1), (2, 3)])
-def test_singleton_vertex_is_found(m_e, p, cond, spread, extra, seed):
+def test_singleton_vertex_is_found(m_e, p, cond, rel_atol, spread, extra, seed):
     """``p + 1`` positively spanning active rows in a ``p``-dim null space.
 
     The feasible set is one point, so the minimum-norm solution is ``w0``;
@@ -584,7 +591,7 @@ def test_singleton_vertex_is_found(m_e, p, cond, spread, extra, seed):
     res = run(g_t, h, m_e, eq_tol=1.5e-8)
     assert bool(res.status == LDP_RESULTS.feasible)
     np.testing.assert_allclose(
-        np.asarray(res.w), w0, rtol=0.0, atol=1e-8 * np.linalg.norm(w0)
+        np.asarray(res.w), w0, rtol=0.0, atol=rel_atol * np.linalg.norm(w0)
     )
     assert_lsei_kkt(res, g_t, h, m_e, tol=1e-7)
 
@@ -1346,29 +1353,31 @@ SCALE_AND_G = (
 )
 
 
-# (δ_min, dimensionless weight). The quadratic penalty is exact only when
-# ``δ_min`` exceeds the unconstrained trade-off ``≈ 1/(1 + weight·c)``: with
-# weight 1e3 that holds for δ_min = 0.3, while δ_min = 1e-3 needs 1e5 (at 1e3
-# it settles up to 5e-4 above δ_min). A larger weight costs accuracy of ``w``.
-DELTA_AND_WEIGHT = [(0.3, 1e3), (1e-3, 1e5)]
+# (δ_min, dimensionless weight, bound on δ - δ_min). The quadratic penalty is
+# exact only when ``δ_min`` exceeds the unconstrained trade-off
+# ``≈ 1/(1 + weight·c)``: with weight 1e3 that holds for δ_min = 0.3, while
+# δ_min = 1e-3 needs 1e5. A larger weight costs accuracy of ``w``. The last
+# row is the default weight with a small ``δ_min``: ``δ`` settles above
+# ``δ_min`` by ``O(1/weight)`` (here up to 5e-4), bounded by ``2/weight``.
+DELTA_AND_WEIGHT = [(0.3, 1e3, 1e-8), (1e-3, 1e5, 1e-8), (1e-3, 1e3, 2e-3)]
 
 
 @pytest.mark.parametrize("seed", range(3))
-@pytest.mark.parametrize("delta_min, weight", DELTA_AND_WEIGHT)
+@pytest.mark.parametrize("delta_min, weight, delta_excess", DELTA_AND_WEIGHT)
 @pytest.mark.parametrize("s, g_scale", SCALE_AND_G)
 @pytest.mark.parametrize("with_equality", [False, True], ids=["no-eq", "eq"])
 def test_elastic_scale_battery_with_the_weight_rule(
-    with_equality, s, g_scale, delta_min, weight, seed
+    with_equality, s, g_scale, delta_min, weight, delta_excess, seed
 ):
-    """With ``ρ_e = weight · τ²`` the relaxation settles at ``δ_min`` and the
-    relaxed rows hold to ``1e-8 ‖w‖``, whatever the data scale (``1e-8`` to
-    ``1e4``), also for ``g = 0``, ``g = O(1)`` and with a far slack row (a
-    fixed ``ρ_e`` fails here)."""
+    """With ``ρ_e = weight · τ²`` the relaxation settles at ``δ_min`` (up to
+    ``delta_excess``) and the relaxed rows hold to ``1e-8 ‖w‖``, whatever the
+    data scale (``1e-8`` to ``1e4``), also for ``g = 0``, ``g = O(1)`` and
+    with a far slack row (a fixed ``ρ_e`` fails here)."""
     g_t, h, c, m_eq = sqp_elastic_problem(8, s, g_scale, delta_min, seed, with_equality)
     rho = weight * elastic_weight_scale(g_t, h, c, m_eq)
     res = elastic_least_distance_lsei(g_t, h, m_eq, c, rho, EQ_TOL)
     assert bool(res.status == LDP_RESULTS.feasible)
-    assert abs(float(res.delta) - delta_min) <= 1e-8
+    assert -1e-9 <= float(res.delta) - delta_min <= delta_excess
     w = np.asarray(res.w)
     assert relative_row_violation(g_t, h, c, m_eq, w, float(res.delta)) <= 1e-8
 

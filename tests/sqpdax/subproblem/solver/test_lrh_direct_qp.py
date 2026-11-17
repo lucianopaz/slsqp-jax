@@ -1203,6 +1203,159 @@ class TestStall:
 
 
 # ---------------------------------------------------------------------------
+# Ray-step length with two blockers (scripted oracle)
+#
+# ``n = 3``, box ``-1 <= d <= 1``. The oracle is a table indexed by the working
+# set ``(A_lb, A_ub)``; the loop runs three steps whose arithmetic is checked
+# through the working set it ends with:
+#   1. ``A = {}``: a full step violating ``lb_0`` and ``ub_1``: both pins are added.
+#   2. ``A = {lb_0, ub_1}``: a full step with multipliers ``mu_lb_0 = 2``,
+#      ``mu_ub_1 = 3`` violating ``lb_2``: it is added (``mu_lb_2 = 0``).
+#   3. ``A = {lb_0, ub_1, lb_2}``: infeasible, with the ray
+#      ``(r_lb_0, r_ub_1, r_lb_2) = (-1, r_ub, 0.5)``. The ray step has the
+#      blocking ratios ``mu_lb_0 / 1 = 2`` and ``mu_ub_1 / |r_ub|``; the pins
+#      within the tolerance of the smallest ratio are released.
+# The oracle at the working set that follows returns a converged full step.
+# ---------------------------------------------------------------------------
+
+RAY_STEP_BOX = 1.0
+RAY_STEP_CASES = {
+    # ratios 2 and 2: both blockers (opposite faces) leave the working set
+    "tied-ratios": (-1.5, ((2,), ())),
+    # ratios 2 < 3: only the lower pin leaves the working set
+    "distinct-ratios": (-1.0, ((2,), (1,))),
+}
+
+
+def _ray_step_code(lb, ub):
+    """Index of the working set ``(lb, ub)`` (bit ``i`` of ``lb``, ``8 << i`` of ``ub``)."""
+    return sum(1 << i for i in lb) + sum(8 << i for i in ub)
+
+
+def _ray_step_mask(idx):
+    return index_mask(3, list(idx))  # a tuple index would be a multi-axis index
+
+
+def _ray_step_table(r_ub, final_lb, final_ub):
+    """Scripted oracle answers (``n = 3``) keyed by the working-set code."""
+    z = np.zeros(3)
+    on_lb, on_ub = _ray_step_mask(final_lb), _ray_step_mask(final_ub)
+    final_step = np.where(on_lb, -RAY_STEP_BOX, np.where(on_ub, RAY_STEP_BOX, 0.0))
+    return {
+        _ray_step_code((), ()): dict(step=[-2.0, 2.0, 0.0], lb=z, ub=z, ray=False),
+        _ray_step_code((0,), (1,)): dict(
+            step=[-1.0, 1.0, -3.0], lb=[2.0, 0.0, 0.0], ub=[0.0, 3.0, 0.0], ray=False
+        ),
+        _ray_step_code((0, 2), (1,)): dict(
+            step=z,
+            lb=z,
+            ub=z,
+            ray=True,
+            ray_lb=[-1.0, 0.0, 0.5],
+            ray_ub=[0.0, r_ub, 0.0],
+        ),
+        _ray_step_code(final_lb, final_ub): dict(
+            step=final_step,
+            lb=on_lb.astype(float),
+            ub=on_ub.astype(float),
+            ray=False,
+        ),
+    }
+
+
+def _scripted_oracle(real, table):
+    """A stand-in for ``solve_fixed_bounds_qp`` answering from ``table``.
+
+    A working set that is not in the table is answered by an infeasible QP
+    without a certificate (an oracle failure), so the loop must reach only the
+    scripted working sets. ``real`` provides the result template.
+    """
+    codes = jnp.asarray(list(table))
+    rows = list(table.values())
+
+    def column(key):
+        return jnp.asarray(
+            np.stack([np.asarray(r.get(key, np.zeros(3)), float) for r in rows])
+        )
+
+    steps, mu_lb, mu_ub = column("step"), column("lb"), column("ub")
+    r_lb, r_ub = column("ray_lb"), column("ray_ub")
+    is_ray = jnp.asarray([r["ray"] for r in rows])
+    weights = jnp.asarray([1, 2, 4])
+
+    def oracle(lagrangian, factors, a_lb, a_ub, **kwargs):
+        res = real(lagrangian, factors, a_lb, a_ub, **kwargs)
+        code = jnp.dot(a_lb.astype(jnp.int32), weights) + 8 * jnp.dot(
+            a_ub.astype(jnp.int32), weights
+        )
+        hit = codes == code
+        i = jnp.argmax(hit)
+        known = jnp.any(hit)
+        ray = known & is_ray[i]
+        feasible = known & ~is_ray[i]
+        dtype = res.step.dtype
+        return eqx.tree_at(
+            lambda r: (
+                r.step,
+                r.dual.lb_multipliers,
+                r.dual.ub_multipliers,
+                r.ldp_status,
+                r.has_ray,
+                r.ray_lb,
+                r.ray_ub,
+            ),
+            res,
+            (
+                steps[i].astype(dtype),
+                mu_lb[i].astype(dtype),
+                mu_ub[i].astype(dtype),
+                LDP_RESULTS.where(
+                    feasible, LDP_RESULTS.feasible, LDP_RESULTS.infeasible
+                ),
+                ray,
+                jnp.where(ray, r_lb[i], 0.0).astype(dtype),
+                jnp.where(ray, r_ub[i], 0.0).astype(dtype),
+            ),
+        )
+
+    return oracle
+
+
+class TestRayStepLength:
+    @pytest.mark.parametrize(
+        "r_ub, final", RAY_STEP_CASES.values(), ids=RAY_STEP_CASES.keys()
+    )
+    def test_blockers_within_tolerance_of_the_smallest_ratio_leave(
+        self, monkeypatch, r_ub, final
+    ):
+        """The ray step length is the smallest blocking ratio, over both faces.
+
+        A wrong step length (or a face-dependent one) changes which pins are
+        blockers, hence the working set at which the next oracle call is made:
+        it then falls outside the script, an oracle failure.
+        """
+        final_lb, final_ub = final
+        n = 3
+        qp = make_random_lrh_qp(n, 0, 0, 0, seed=0, memory=MEMORY)
+        qp = with_bounds_and_secant(qp, qp.x - RAY_STEP_BOX, qp.x + RAY_STEP_BOX)
+        table = _ray_step_table(r_ub, final_lb, final_ub)
+        monkeypatch.setattr(
+            lrh_direct_qp,
+            "solve_fixed_bounds_qp",
+            _scripted_oracle(lrh_direct_qp.solve_fixed_bounds_qp, table),
+        )
+        _, state = _solve_unjitted(qp, PLAIN)
+        assert bool(state.qp_result == CONVERGED)
+        assert int(state.last_n_iter) == 4
+        np.testing.assert_array_equal(
+            np.asarray(state.active_set.active_lb), _ray_step_mask(final_lb)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(state.active_set.active_ub), _ray_step_mask(final_ub)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Warm start (C13)
 # ---------------------------------------------------------------------------
 

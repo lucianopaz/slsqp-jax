@@ -26,6 +26,7 @@ from slsqp_jax.sqpdax.linalg import LDP_RESULTS
 from slsqp_jax.sqpdax.primal import Primal
 from slsqp_jax.sqpdax.problem.basic import EvaluatedProblem
 from slsqp_jax.sqpdax.secant import ReducedHessianFactors
+from slsqp_jax.sqpdax.subproblem.solver import lrh_fixed_bounds
 from slsqp_jax.sqpdax.subproblem.solver.lrh_fixed_bounds import (
     FixedBoundsQPResult,
     elastic_penalty,
@@ -827,6 +828,42 @@ class TestFarkasCertificates:
         res = run(Case(qp, lower, upper))
         assert bool(res.ldp_status == expected)
         assert_no_ray(qp, res)
+
+    @pytest.mark.parametrize("kind", WORKING_SETS)
+    @pytest.mark.parametrize("status", NOT_FEASIBLE, ids=["infeasible", "inconsistent"])
+    def test_status_without_certificate_has_no_ray(self, monkeypatch, status, kind):
+        """``has_ray`` follows ``has_certificate``, not the status alone.
+
+        The least-distance solver is wrapped so that it reports a
+        non-feasible ``status`` (as its post-check exit does) with no
+        certificate and zero certificate parts: the kernel must then report
+        no ray and all four certificate and ray fields zero, so that the bound
+        loop classifies it as an oracle failure.
+        """
+        real = lrh_fixed_bounds.least_distance_lsei
+
+        def without_certificate(*args, **kwargs):
+            res = real(*args, **kwargs)
+            return eqx.tree_at(
+                lambda r: (r.status, r.has_certificate, r.cert_eq, r.cert_ineq),
+                res,
+                (
+                    status,
+                    jnp.zeros((), bool),
+                    jnp.zeros_like(res.cert_eq),
+                    jnp.zeros_like(res.cert_ineq),
+                ),
+            )
+
+        monkeypatch.setattr(
+            lrh_fixed_bounds, "least_distance_lsei", without_certificate
+        )
+        case = build_case(6, 2, (2, 3), kind)
+        lower, upper = jnp.asarray(case.lower), jnp.asarray(case.upper)
+        # Not jitted: a cached compilation would not see the patched solver.
+        res = solve_fixed_bounds_qp(case.qp.lagrangian, case.qp.factors, lower, upper)
+        assert bool(res.ldp_status == status)
+        assert_no_ray(case.qp, res)
 
     @pytest.mark.parametrize("mix", [(2, 0), (2, 3)])
     def test_ray_follows_the_face_of_the_pin(self, mix):

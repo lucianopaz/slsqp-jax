@@ -849,9 +849,11 @@ def test_embedded_narrow_valley_soft_curvature(angle, seed, c_rel):
     The true ``tᵀH t`` is ``0.1``. This is a measurement and regression test,
     not the L-BFGS bound of 100 (neither rule nor L-BFGS at ``memory = 2``
     meets it): it asserts positivity, no stiffening up to the stiff
-    curvature itself (``tᵀB t < 3e4 = 0.2 λ_n`` over the last ten pairs), and
-    that the Rayleigh-quotient rule is no stiffer at the end than the
-    paper's rule.
+    curvature itself (``tᵀB t < 3e4 = 0.2 λ_n`` over the last ten pairs), that
+    the Rayleigh-quotient rule (the default) stays below ``3e3`` over the last
+    ten pairs (measured maximum ``873``; the paper's rule reaches ``5.6e3`` to
+    ``1.1e4`` at ``c_rel = 0.3``), and that it is no stiffer at the end than
+    the paper's rule.
 
     Measured ``tᵀB t`` (final value / maximum over the last ten pairs), with
     L-BFGS at ``memory = 2`` and ``diag = 1e4`` on the same pairs for
@@ -888,4 +890,5 @@ def test_embedded_narrow_valley_soft_curvature(angle, seed, c_rel):
         assert np.all(np.isfinite(trace))
         assert min(trace) > 0.0
         assert max(trace[-10:]) < 3e4
+    assert max(traces["sy_over_ss"][-10:]) < 3e3
     assert traces["sy_over_ss"][-1] <= traces["yy_over_sy"][-1]

@@ -328,22 +328,40 @@ def test_removal_heavy_rank_deficient(k, seed):
     assert_kkt(res, e, f)
 
 
+# (m, k, seed) -> exact ``n_iter``: additions, skipped additions (an addition
+# plus the freeze that undoes it) and interpolation steps. The counts were
+# recorded from the solver; the data are deterministic NumPy draws.
 SKIP_CASES = {
-    f"{m}x{k}-s{seed}": (m, k, seed)
-    for m, k in [(4, 3), (9, 8), (21, 20), (30, 8)]
-    for seed in (0, 1, 3)
+    f"{m}x{k}-s{seed}": (m, k, seed, n_iter)
+    for m, k, seed, n_iter in [
+        (4, 3, 0, 4),
+        (4, 3, 1, 4),
+        (4, 3, 3, 4),
+        (9, 8, 0, 9),
+        (9, 8, 1, 11),
+        (9, 8, 3, 6),
+        (21, 20, 0, 18),
+        (21, 20, 1, 15),
+        (21, 20, 3, 14),
+        (30, 8, 0, 7),
+        (30, 8, 1, 8),
+        (30, 8, 3, 8),
+    ]
 }
 
 
-@pytest.mark.parametrize("m, k, seed", SKIP_CASES.values(), ids=SKIP_CASES.keys())
-def test_skip_rule_with_negative_tol(m, k, seed):
+@pytest.mark.parametrize(
+    "m, k, seed, n_iter", SKIP_CASES.values(), ids=SKIP_CASES.keys()
+)
+def test_skip_rule_with_negative_tol(m, k, seed, n_iter):
     """A negative ``tol`` forces additions of indices that cannot enter.
 
     With ``tol = -1.5 · min |w_j|`` over the active set at the optimum, the
     method adds the index with the least negative dual; its least-squares
     coefficient is negative, so the skipping rule has to drop it again
     (otherwise it would cycle until the budget). The result must still be the
-    SciPy solution and ``n_iter`` must count the skipped additions.
+    SciPy solution and ``n_iter`` must count the skipped additions (two steps
+    each, the addition and the freeze) and the interpolation steps exactly.
     """
     e, f = random_problem(m, k, seed)
     x_ref, _ = scipy_nnls(e, f)
@@ -354,7 +372,59 @@ def test_skip_rule_with_negative_tol(m, k, seed):
     res = nnls(jnp.asarray(e), jnp.asarray(f), tol=tol)
     assert bool(res.converged)
     np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=1e-9)
-    assert int(res.n_iter) > int(jnp.sum(res.passive))
+    assert int(res.n_iter) >= int(jnp.sum(res.passive)) + 2
+    assert int(res.n_iter) == n_iter
+
+
+# Hand-built problems (``k = 3``, one-decimal data) whose interpolation steps
+# have blocking indices with distinct step ratios. Traced by hand (Lawson-Hanson
+# with the steps counted as in ``NNLSResult.n_iter``):
+#   * "chained": adds 2, 0, 1; the solve on {0, 1, 2} blocks indices 0 and 2
+#     with ratios 0.168 < 0.278, so only index 0 is released at the step
+#     length 0.168; the solve on {1, 2} blocks index 2 (ratio 0.212) and a
+#     second, chained interpolation releases it; then x = (0, 1.76, 0) is
+#     accepted: 3 additions + 2 interpolations.
+#   * "single": adds 1, 0, 2; the solve on {0, 1, 2} blocks indices 0 and 1
+#     with ratios 0.313 > 0.028; only index 1 is released, then
+#     x = (0.25, 0, 0.87) is accepted: 3 additions + 1 interpolation.
+# A wrong step length (``α = 1``, the largest blocking ratio) or a release of
+# every blocking index sends the iterate through a different set of indices,
+# and ``n_iter`` or the optimum changes; ``n_iter`` that ignores the
+# interpolation steps is off by the number of interpolations.
+CHAINED_INTERPOLATION_CASES = {
+    "chained": (
+        [[-1.4, -0.7, -0.9], [1.9, -0.4, -0.9], [-2.9, -1.4, -3.3], [-3.1, -0.6, -0.3]],
+        [-2.3, -1.7, -1.5, -1.4],
+        5,
+        [False, True, False],
+    ),
+    "single": (
+        [[3.6, 4.4, 2.9], [2.2, 3.1, 2.5], [1.5, 1.6, 1.1], [0.9, -2.5, -1.0]],
+        [1.5, 6.2, 0.0, 0.9],
+        4,
+        [True, False, True],
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "e, f, n_iter, passive",
+    CHAINED_INTERPOLATION_CASES.values(),
+    ids=CHAINED_INTERPOLATION_CASES.keys(),
+)
+def test_chained_interpolation_steps(e, f, n_iter, passive):
+    """Hand-built interpolation paths: exact ``n_iter`` and passive set."""
+    e, f = np.asarray(e), np.asarray(f)
+    res = nnls(jnp.asarray(e), jnp.asarray(f))
+    x_ref, rnorm_ref = scipy_nnls(e, f)
+    assert bool(res.converged)
+    assert int(res.n_iter) == n_iter
+    np.testing.assert_array_equal(np.asarray(res.passive), passive)
+    np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=ATOL)
+    np.testing.assert_allclose(
+        float(jnp.linalg.norm(res.residual)), rnorm_ref, atol=ATOL
+    )
+    assert_kkt(res, e, f)
 
 
 # --------------------------------------------------------------------------
@@ -667,13 +737,16 @@ def test_ldp_nonfinite_precedes_budget_and_residual():
     assert bool(res.status == LDP_RESULTS.nonfinite)
 
 
-def ldp_scaled(k, n, seed, s):
+def ldp_scaled(k, n, seed, s, g_factor=1.0):
     """Feasible problem with uneven row scales and ``h`` of magnitude ``∝ s``.
 
-    ``h_i = s (g_i·x0 - slack_i ‖g_i‖)`` so that ``x0 · s`` is feasible.
+    ``h_i = s (g_i·x0 - slack_i ‖g_i‖)`` so that ``x0 · s`` is feasible. A
+    global factor ``g_factor`` multiplies ``g`` (and so ``h``), which leaves
+    the feasible set unchanged but changes the absolute scale of the rows.
     """
     rng = np.random.default_rng(10_000 * seed + 100 * k + n)
     g = rng.standard_normal((k, n)) * 10.0 ** rng.uniform(-1.0, 1.0, size=(k, 1))
+    g = g_factor * g
     x0 = 2.0 * rng.standard_normal(n)
     slack = rng.uniform(0.0, 1.0, size=k) * np.linalg.norm(g, axis=1)
     return g, s * (g @ x0 - slack)
@@ -684,18 +757,20 @@ SCALED_MAGNITUDES = [1e-3, 1.0, 1e4, 7e5, 1e8, 1e10]
 
 
 @pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("g_factor", [1.0, 1e-6])
 @pytest.mark.parametrize("s", SCALED_MAGNITUDES)
 @pytest.mark.parametrize("k, n", SCALED_SIZES)
-def test_ldp_scale_invariance_random(k, n, s, seed):
+def test_ldp_scale_invariance_random(k, n, s, g_factor, seed):
     """Random feasible problems keep a valid KKT certificate for any ``‖h‖``.
 
     The NNLS dual tolerance grows with ``‖E‖_F`` (hence with ``‖h‖``) while the
     true duals shrink like ``1/‖x‖``; without internal normalisation NNLS stops
     early and reports a wrong ``feasible`` for ``‖h‖ ≳ 1e6``. KKT residuals are
     measured in row-normalised units and relative to
-    ``max(‖x‖, max_i |h_i| / ‖g_i‖)``.
+    ``max(‖x‖, max_i |h_i| / ‖g_i‖)``. A global factor on ``G`` (and ``h``)
+    pins the row normalisation of ``g`` itself, not only the scaling of ``h``.
     """
-    g, h = ldp_scaled(k, n, seed, s)
+    g, h = ldp_scaled(k, n, seed, s, g_factor)
     res = ldp(jnp.asarray(g), jnp.asarray(h))
     assert bool(res.status == LDP_RESULTS.feasible)
     x, mu = np.asarray(res.x), np.asarray(res.multipliers)
