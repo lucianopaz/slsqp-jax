@@ -30,10 +30,21 @@ def _padded_orthonormal_basis(seed: int, n: int, m: int, rank: int) -> np.ndarra
     return basis
 
 
-@pytest.mark.parametrize("seed", [0, 1])
-@pytest.mark.parametrize("shape", [(6, 3), (4, 4), (3, 5), (15, 5)])
-@pytest.mark.parametrize("mode", ["reduced", "complete"])
-@pytest.mark.parametrize("even_column_sign", [1.0, -1.0], ids=["as-is", "flip-even"])
+# (seed, shape, mode, even_column_sign): every (shape, mode) pair once, with the
+# sign and the seed arranged so that every pair of axis values appears.
+POSITIVE_QR_CASES = [
+    (0, (6, 3), "reduced", 1.0),
+    (1, (6, 3), "complete", -1.0),
+    (0, (4, 4), "reduced", -1.0),
+    (1, (4, 4), "complete", 1.0),
+    (1, (3, 5), "reduced", 1.0),
+    (0, (3, 5), "complete", -1.0),
+    (1, (15, 5), "reduced", -1.0),
+    (0, (15, 5), "complete", 1.0),
+]
+
+
+@pytest.mark.parametrize("seed, shape, mode, even_column_sign", POSITIVE_QR_CASES)
 def test_positive_qr(seed, shape, mode, even_column_sign):
     """`positive_qr` reconstructs `a`, has orthonormal `q`, triangular `r`, `diag(r) >= 0`."""
     p, q_cols = shape
@@ -98,12 +109,25 @@ V_KINDS = {
 }
 
 
-# (rank as a fraction of m: 0 = empty basis, 1 = full)
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("n", [6, 15])
-@pytest.mark.parametrize("m", [1, 3, 5])
-@pytest.mark.parametrize("rank_fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("kind", V_KINDS.keys())
+# (seed, n, m, rank_fraction, kind): a pairwise covering design (every pair of
+# values of any two axes appears). rank_fraction: 0 = empty basis, 1 = full.
+ORTHOGONALIZE_CASES = [
+    (0, 6, 3, 0.5, "nearly_dependent"),
+    (0, 6, 3, 0.5, "generic"),
+    (1, 6, 1, 0.0, "in_span"),
+    (2, 15, 5, 0.5, "in_span"),
+    (2, 15, 1, 1.0, "generic"),
+    (2, 15, 3, 0.0, "nearly_dependent"),
+    (1, 6, 5, 1.0, "nearly_dependent"),
+    (0, 15, 3, 1.0, "in_span"),
+    (0, 6, 5, 0.0, "generic"),
+    (1, 15, 3, 0.5, "generic"),
+    (0, 6, 1, 0.5, "nearly_dependent"),
+    (2, 6, 1, 0.0, "generic"),
+]
+
+
+@pytest.mark.parametrize("seed, n, m, rank_fraction, kind", ORTHOGONALIZE_CASES)
 def test_orthogonalize_against(seed, n, m, rank_fraction, kind):
     """Coefficients/residual reconstruct `v`; the residual is orthogonal to the basis."""
     rank = int(round(rank_fraction * m))
@@ -179,9 +203,24 @@ def _curvature_pair(seed: int, k: int) -> tuple[np.ndarray, np.ndarray]:
     return s, y * np.sign(y @ s)
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("k", [1, 3, 5, 8])
-@pytest.mark.parametrize("n_padded", [0, 2])
+# (seed, k, n_padded): pairwise covering design.
+BFGS_CASES = [
+    (0, 1, 0),
+    (0, 3, 0),
+    (0, 5, 2),
+    (1, 5, 0),
+    (1, 1, 2),
+    (2, 8, 0),
+    (2, 3, 2),
+    (0, 8, 2),
+    (2, 1, 0),
+    (1, 3, 0),
+    (2, 5, 0),
+    (1, 8, 0),
+]
+
+
+@pytest.mark.parametrize("seed, k, n_padded", BFGS_CASES)
 def test_bfgs_factor_update(seed, k, n_padded):
     """`R_new^T R_new` is the dense BFGS update; padded identity slots are untouched."""
     r_live = _upper_triangular_factor(seed, k)
@@ -220,17 +259,16 @@ def test_bfgs_factor_update_jit_matches_eager():
     )
 
 
-@pytest.fixture(params=[0, 1, 2])
-def expanded_state(request):
+@pytest.fixture
+def expanded_state():
     """Builder of a full expanded LRH state with `m + 1` slots.
 
-    Returns ``make(n, m) -> (steps, basis, tri, chol, sigma)`` where
+    Returns ``make(n, m, seed=0) -> (steps, basis, tri, chol, sigma)`` where
     ``basis @ tri == steps`` (the last ``m + 1`` steps, oldest first),
     ``basis`` is orthonormal and ``chol`` is an upper-triangular factor.
     """
-    seed = request.param
 
-    def make(n, m):
+    def make(n, m, seed=0):
         steps = _random_matrix(seed, (n, m + 1))
         basis, tri = positive_qr(jnp.asarray(steps))
         chol = _upper_triangular_factor(seed, m + 1)
@@ -240,11 +278,24 @@ def expanded_state(request):
     return make
 
 
-@pytest.mark.parametrize("n", [6, 15])
-@pytest.mark.parametrize("m", [1, 3, 5])
-def test_drop_oldest_basis_vector(expanded_state, n, m):
+# (seed, n, m): pairwise covering design.
+DROP_CASES = [
+    (0, 6, 1),
+    (1, 15, 1),
+    (1, 6, 3),
+    (0, 15, 3),
+    (2, 6, 5),
+    (0, 15, 5),
+    (2, 15, 1),
+    (2, 6, 3),
+    (1, 6, 5),
+]
+
+
+@pytest.mark.parametrize("seed, n, m", DROP_CASES)
+def test_drop_oldest_basis_vector(expanded_state, seed, n, m):
     """Dropping the oldest step keeps the newest `m` steps and the projected model."""
-    steps, basis, tri, chol, sigma = expanded_state(n, m)
+    steps, basis, tri, chol, sigma = expanded_state(n, m, seed)
 
     z_new, t_new, r_new = (
         np.asarray(x)

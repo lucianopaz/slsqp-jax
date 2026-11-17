@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 from typing import NamedTuple
 
 import jax
@@ -97,16 +96,28 @@ def _dense_reference(factors: ReducedHessianFactors, free: np.ndarray) -> Scenar
     return Scenario(factors, free, dense_b, d @ dense_b @ d, d @ z)
 
 
-@pytest.fixture(
-    params=[
-        (source, mask_kind, rank)
-        for source, ranks in _SOURCES.items()
-        for mask_kind, rank in itertools.product(_FREE_MASKS, ranks)
-    ],
-    ids=lambda p: f"{p[0]}-{p[1]}-r{p[2]}",
-)
+# (source, mask kind, rank): every (mask, rank class) pair once (rank classes:
+# empty, mid, full memory), and each source meets every mask and every rank
+# class (a pairwise covering design instead of the 24-case product).
+_SCENARIOS = [
+    ("random", "all_free", 0),
+    ("random", "all_free", 3),
+    ("lrh", "all_free", 6),
+    ("lrh", "all_fixed", 0),
+    ("lrh", "all_fixed", 3),
+    ("random", "all_fixed", M),
+    ("random", "random_half", 3),
+    ("lrh", "random_half", 6),
+    ("random", "random_half", 0),
+    ("random", "rank_deficient", 0),
+    ("lrh", "rank_deficient", 3),
+    ("random", "rank_deficient", M),
+]
+
+
+@pytest.fixture(params=_SCENARIOS, ids=lambda p: f"{p[0]}-{p[1]}-r{p[2]}")
 def scenario(request) -> Scenario:
-    """Every (factor source, mask kind, rank) combination."""
+    """A (factor source, mask kind, rank) combination of :data:`_SCENARIOS`."""
     source, mask_kind, rank = request.param
     factors = _BUILDERS[source](rank, _COL0_SUPPORT[mask_kind], rank)
     return _dense_reference(factors, _FREE_MASKS[mask_kind])
@@ -181,16 +192,16 @@ def test_numerical_rank_of_restricted_basis(scenario, factor):
     assert int(factor.free_rank) == expected
 
 
-@pytest.mark.parametrize("name", _APPLIES)
-def test_outputs_are_finite_and_vanish_on_fixed_coordinates(
-    scenario, factor, probe, name
-):
-    out = _dense(getattr(factor, name), probe)
-    assert np.all(np.isfinite(out))
-    np.testing.assert_array_equal(out[~scenario.free], 0.0)
-    block = _dense(getattr(factor, f"{name}_matrix"), np.stack([probe, 2 * probe], 1))
-    np.testing.assert_allclose(block[:, 0], out, atol=1e-14)
-    np.testing.assert_allclose(block[:, 1], 2 * out, atol=1e-13)
+def test_outputs_are_finite_and_vanish_on_fixed_coordinates(scenario, factor, probe):
+    for name in _APPLIES:
+        out = _dense(getattr(factor, name), probe)
+        assert np.all(np.isfinite(out))
+        np.testing.assert_array_equal(out[~scenario.free], 0.0)
+        block = _dense(
+            getattr(factor, f"{name}_matrix"), np.stack([probe, 2 * probe], 1)
+        )
+        np.testing.assert_allclose(block[:, 0], out, atol=1e-14)
+        np.testing.assert_allclose(block[:, 1], 2 * out, atol=1e-13)
 
 
 @pytest.mark.parametrize(

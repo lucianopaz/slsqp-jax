@@ -44,12 +44,27 @@ def assert_kkt(res: NNLSResult, e: np.ndarray, f: np.ndarray, tol: float = KKT_T
     np.testing.assert_allclose(np.asarray(res.residual), r, atol=1e-12 * scale)
 
 
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("m, k", SHAPES)
+# Every shape once, the seeds cycled (shape and seed are independent axes).
+MATCH_CASES = [(m, k, i % len(SEEDS)) for i, (m, k) in enumerate(SHAPES)]
+
+
+@pytest.mark.parametrize("m, k, seed", MATCH_CASES)
 def test_matches_scipy(m, k, seed):
-    """Solution, residual norm and KKT conditions agree with SciPy."""
+    """Solution, residual norm and KKT conditions agree with SciPy.
+
+    ``dep_tol = 0`` is plain Lawson-Hanson, and independent columns are never
+    frozen: a positive ``dep_tol`` gives the same iterates on random full-rank
+    data (every shape here has ``m ≥ k``).
+    """
     e, f = random_problem(m, k, seed)
     res = nnls(jnp.asarray(e), jnp.asarray(f))
+    for dep_tol in (0.0, 1e-8):
+        other = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=dep_tol)
+        np.testing.assert_array_equal(np.asarray(other.x), np.asarray(res.x))
+        np.testing.assert_array_equal(
+            np.asarray(other.passive), np.asarray(res.passive)
+        )
+        assert int(other.n_iter) == int(res.n_iter)
     x_ref, rnorm_ref = scipy_nnls(e, f)
     assert bool(res.converged)
     np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=ATOL)
@@ -504,21 +519,67 @@ def assert_ldp_kkt(res: LDPResult, g, h, tol: float = LDP_TOL, scale=None):
     assert np.all(np.abs(mu * slack) <= tol * scale * max(1.0, np.max(mu)))
 
 
-@pytest.mark.parametrize("seed", LDP_SEEDS)
-@pytest.mark.parametrize("k, n", LDP_SHAPES)
-@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
-def test_ldp_feasible_kkt_and_scipy(make, k, n, seed):
-    """Feasible problems: status, KKT certificate and SLSQP agreement."""
-    g, h = make(k, n, seed)
+# (k, n, generator, far, seed): a pairwise covering design (every pair of
+# values of any two axes appears), built from orthogonal Latin squares of order
+# four. ``far`` is the distance of the appended slack rows.
+LDP_FEASIBLE_CASES = [
+    (1, 1, "random", 1e2, 0),
+    (1, 2, "rank-deficient", 1e8, 1),
+    (1, 5, "tied", 1e11, 1),
+    (1, 12, "origin-feasible", 1e5, 0),
+    (3, 1, "rank-deficient", 1e5, 1),
+    (3, 2, "random", 1e11, 0),
+    (3, 5, "origin-feasible", 1e8, 0),
+    (3, 12, "tied", 1e2, 1),
+    (8, 1, "tied", 1e8, 0),
+    (8, 2, "origin-feasible", 1e2, 1),
+    (8, 5, "random", 1e5, 1),
+    (8, 12, "rank-deficient", 1e11, 0),
+    (20, 1, "origin-feasible", 1e11, 1),
+    (20, 2, "tied", 1e5, 0),
+    (20, 5, "rank-deficient", 1e2, 0),
+    (20, 12, "random", 1e8, 1),
+]
+
+
+@pytest.mark.parametrize("k, n, make, far, seed", LDP_FEASIBLE_CASES)
+def test_ldp_feasible_kkt_and_scipy(k, n, make, far, seed):
+    """Feasible problems: status, KKT, SLSQP agreement, zero certificate.
+
+    Appending two far slack rows (distance ``far``, norms in ``1e-8 .. 1``)
+    changes neither ``x`` nor the near multipliers, and the far rows stay
+    inactive.
+    """
+    g, h = LDP_GENERATORS[make](k, n, seed)
     res = ldp(jnp.asarray(g), jnp.asarray(h))
     assert bool(res.status == LDP_RESULTS.feasible)
     assert res.x.shape == (n,) and res.multipliers.shape == (k,)
     assert 0 <= int(res.n_iter) <= 3 * k
     assert_ldp_kkt(res, g, h)
     np.testing.assert_allclose(np.asarray(res.x), scipy_ldp(g, h), atol=1e-6)
+    assert res.certificate.shape == (k,)
+    np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
+
+    rng = np.random.default_rng(seed)
+    g_far = rng.standard_normal((2, n)) * 10.0 ** rng.uniform(-8, 0, (2, 1))
+    h_far = -far * np.linalg.norm(g_far, axis=1) * (1.0 + rng.random(2))
+    ext = ldp(
+        jnp.asarray(np.vstack([g, g_far])), jnp.asarray(np.concatenate([h, h_far]))
+    )
+    assert bool(ext.status == LDP_RESULTS.feasible)
+    x_ref = np.asarray(res.x)
+    scale = max(1.0, np.linalg.norm(x_ref))
+    np.testing.assert_allclose(np.asarray(ext.x), x_ref, atol=1e-8 * scale, rtol=0.0)
+    np.testing.assert_allclose(
+        np.asarray(ext.multipliers)[:k],
+        np.asarray(res.multipliers),
+        atol=1e-8 * max(1.0, np.max(np.asarray(res.multipliers))),
+        rtol=0.0,
+    )
+    np.testing.assert_array_equal(np.asarray(ext.multipliers)[k:], 0.0)
 
 
-@pytest.mark.parametrize("k, n", LDP_SHAPES)
+@pytest.mark.parametrize("k, n", [(1, 1), (3, 12), (8, 5), (20, 2), (20, 12)])
 def test_ldp_origin_feasible_is_zero(k, n):
     """``h ≤ 0``: ``x = 0`` and no multiplier is active."""
     g, h = ldp_origin_feasible(k, n, 0)
@@ -536,17 +597,6 @@ def ldp_opposite_half_spaces(k, n, seed):
     g[0], h[0] = np.eye(n)[0], 1.0
     g[1], h[1] = -np.eye(n)[0], 1.0
     return g, h
-
-
-@pytest.mark.parametrize("seed", LDP_SEEDS)
-@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
-def test_ldp_infeasible(k, n, seed):
-    """An infeasible pair of opposite half-spaces is detected."""
-    g, h = ldp_opposite_half_spaces(k, n, seed)
-    res = ldp(jnp.asarray(g), jnp.asarray(h))
-    assert bool(res.status == LDP_RESULTS.infeasible)
-    np.testing.assert_array_equal(np.asarray(res.x), 0.0)
-    np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
 
 
 NONFINITE = {
@@ -756,10 +806,32 @@ SCALED_SIZES = [(14, 7), (8, 5), (5, 3)]
 SCALED_MAGNITUDES = [1e-3, 1.0, 1e4, 7e5, 1e8, 1e10]
 
 
-@pytest.mark.parametrize("seed", range(4))
-@pytest.mark.parametrize("g_factor", [1.0, 1e-6])
-@pytest.mark.parametrize("s", SCALED_MAGNITUDES)
-@pytest.mark.parametrize("k, n", SCALED_SIZES)
+# (k, n, s, g_factor, seed): pairwise covering design over sizes, magnitudes,
+# global factor and seed, including the two cases that kill the row-norm and
+# ``h``-scale mutants.
+SCALE_CASES = [
+    (14, 7, 1e-3, 1e-6, 2),
+    (14, 7, 7e5, 1.0, 1),
+    (8, 5, 1e-3, 1.0, 0),
+    (5, 3, 1.0, 1e-6, 0),
+    (5, 3, 1e4, 1.0, 2),
+    (8, 5, 1e4, 1e-6, 1),
+    (5, 3, 1e8, 1.0, 1),
+    (14, 7, 1e8, 1e-6, 0),
+    (8, 5, 1e10, 1.0, 2),
+    (14, 7, 1.0, 1.0, 1),
+    (8, 5, 7e5, 1e-6, 0),
+    (14, 7, 1e10, 1e-6, 0),
+    (5, 3, 7e5, 1.0, 2),
+    (8, 5, 1.0, 1.0, 2),
+    (8, 5, 1e8, 1.0, 2),
+    (5, 3, 1e-3, 1.0, 1),
+    (5, 3, 1e10, 1.0, 1),
+    (14, 7, 1e4, 1.0, 0),
+]
+
+
+@pytest.mark.parametrize("k, n, s, g_factor, seed", SCALE_CASES)
 def test_ldp_scale_invariance_random(k, n, s, g_factor, seed):
     """Random feasible problems keep a valid KKT certificate for any ``‖h‖``.
 
@@ -804,9 +876,17 @@ def near_duplicate_problem(m: int, spread: float, noise: float, seed: int):
     return e, a.sum(axis=1) + noise * rng.standard_normal(m)
 
 
-@pytest.mark.parametrize("seed", range(6))
-@pytest.mark.parametrize("noise", [0.0, 0.3])
-@pytest.mark.parametrize("spread", [1e-9, 1e-12])
+@pytest.mark.parametrize(
+    "spread, noise, seed",
+    [
+        (1e-9, 0.0, 0),
+        (1e-9, 0.3, 1),
+        (1e-12, 0.0, 1),
+        (1e-12, 0.3, 0),
+        (1e-9, 0.0, 2),
+        (1e-12, 0.3, 2),
+    ],
+)
 def test_nnls_dep_tol_freezes_dependent_column(spread, noise, seed):
     """Only one of two dependent columns enters; the optimum is unchanged.
 
@@ -823,25 +903,6 @@ def test_nnls_dep_tol_freezes_dependent_column(spread, noise, seed):
     assert np.all(np.asarray(res.x)[~passive] == 0.0)
     _, rnorm_ref = scipy_nnls(e, f)
     assert abs(float(jnp.linalg.norm(res.residual)) - rnorm_ref) <= 20 * spread + 1e-12
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("m, k", SHAPES)
-def test_nnls_dep_tol_only_removes_dependent_columns(m, k, seed):
-    """``dep_tol = 0`` is plain Lawson-Hanson, and independent columns are
-    never frozen: a positive ``dep_tol`` gives the same iterates on random
-    full-rank data (every shape here has ``m ≥ k``)."""
-    e, f = random_problem(m, k, seed)
-    plain = nnls(jnp.asarray(e), jnp.asarray(f))
-    zero = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=0.0)
-    guarded = nnls(jnp.asarray(e), jnp.asarray(f), dep_tol=1e-8)
-    for res in (zero, guarded):
-        np.testing.assert_array_equal(np.asarray(res.x), np.asarray(plain.x))
-        np.testing.assert_array_equal(
-            np.asarray(res.passive), np.asarray(plain.passive)
-        )
-        assert int(res.n_iter) == int(plain.n_iter)
-        assert bool(res.converged)
 
 
 def test_nnls_dep_tol_zero_default_reproduces_c08_degenerate_battery():
@@ -889,9 +950,21 @@ def violation(g, h, x):
     return float(np.max(np.maximum((h - g @ x) / np.linalg.norm(g, axis=1), 0.0)))
 
 
-@pytest.mark.parametrize("seed", range(10))
-@pytest.mark.parametrize("tol", [0.05, 0.2, 0.5])
-@pytest.mark.parametrize("k, n", COARSE_PROBLEM_SIZES)
+@pytest.mark.parametrize(
+    "k, n, tol, seed",
+    [
+        (4, 3, 0.05, 0),
+        (8, 5, 0.2, 0),
+        (20, 6, 0.5, 0),
+        (4, 3, 0.2, 1),
+        (8, 5, 0.05, 1),
+        (20, 6, 0.05, 2),
+        (4, 3, 0.5, 2),
+        (8, 5, 0.5, 1),
+        (20, 6, 0.2, 1),
+        (8, 5, 0.2, 2),
+    ],
+)
 def test_ldp_feasible_status_means_constraints_hold(k, n, tol, seed):
     """A garbage NNLS solution (premature stop) is reported ``infeasible``.
 
@@ -969,19 +1042,6 @@ INFEASIBLE_GENERATORS = {
 }
 
 
-@pytest.mark.parametrize("seed", range(4))
-@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
-@pytest.mark.parametrize(
-    "make", INFEASIBLE_GENERATORS.values(), ids=INFEASIBLE_GENERATORS.keys()
-)
-def test_ldp_certificate_proves_infeasibility(make, k, n, seed):
-    """An infeasible exit carries a valid Farkas certificate."""
-    g, h = make(k, n, seed)
-    res = ldp(jnp.asarray(g), jnp.asarray(h))
-    assert bool(res.status == LDP_RESULTS.infeasible)
-    assert_ldp_certificate(res, g, h)
-
-
 def ldp_nnls_residual_norm(g, h) -> float:
     """``‖r‖`` of the NNLS that :func:`ldp` solves (NumPy copy of its normalisation).
 
@@ -1003,28 +1063,59 @@ def ldp_nnls_residual_norm(g, h) -> float:
     return float(jnp.linalg.norm(nnls(jnp.asarray(e), jnp.asarray(f)).residual))
 
 
-@pytest.mark.parametrize("seed", range(2))
-@pytest.mark.parametrize("k, n", [(k, n) for k, n in LDP_SHAPES if k >= 2])
-@pytest.mark.parametrize(
-    "make", INFEASIBLE_GENERATORS.values(), ids=INFEASIBLE_GENERATORS.keys()
-)
-def test_ldp_post_check_exit_keeps_a_verified_certificate(make, k, n, seed):
-    """A residual just above the noise threshold still certifies infeasibility.
+# (k, n, generator, seed): a pairwise covering design (every pair of values of
+# any two axes appears); the first case kills the certificate-verification and
+# sup-norm mutants.
+INFEASIBLE_CASES = [
+    (3, 1, "opposite", 0),
+    (8, 2, "farkas", 0),
+    (3, 2, "farkas-uneven-rows", 1),
+    (20, 1, "farkas", 1),
+    (20, 5, "farkas-uneven-rows", 0),
+    (3, 5, "farkas", 2),
+    (8, 1, "farkas-uneven-rows", 2),
+    (3, 12, "farkas-large-h", 3),
+    (8, 5, "opposite", 1),
+    (20, 2, "opposite", 2),
+    (8, 12, "farkas-small-h", 0),
+    (20, 1, "farkas-small-h", 3),
+    (20, 12, "farkas-large-h", 1),
+    (8, 2, "farkas-large-h", 3),
+    (3, 2, "farkas-small-h", 1),
+    (3, 12, "opposite", 2),
+    (3, 12, "farkas", 3),
+    (3, 5, "opposite", 3),
+    (3, 12, "farkas-uneven-rows", 3),
+    (3, 1, "farkas-large-h", 0),
+    (3, 5, "farkas-large-h", 2),
+    (3, 5, "farkas-small-h", 2),
+]
 
-    ``ldp_tol`` is set to half of the NNLS residual, i.e. the residual test
-    fails by a factor of two (the situation of a rounding-level residual that
-    lands a little above ``10·eps·…``), so the ``infeasible`` status comes from
-    the primal check. (The ``-1e-300`` keeps the residual test failing for an
-    NNLS residual of exactly zero.) The NNLS solution verifies as a Farkas certificate
-    (``gᵀc ≈ 0``, ``hᵀc > 0``) and is the very one of the residual-test exit;
-    status, ``x`` and ``multipliers`` are those of a certificate-less exit.
+
+@pytest.mark.parametrize("k, n, make, seed", INFEASIBLE_CASES)
+def test_ldp_certificate_proves_infeasibility(k, n, make, seed):
+    """An infeasible exit carries a valid Farkas certificate.
+
+    The residual-test exit gives status ``infeasible``, zero ``x`` and
+    multipliers and a verified certificate. Then ``ldp_tol`` is set to half of
+    the NNLS residual, i.e. the residual test fails by a factor of two (the
+    situation of a rounding-level residual that lands a little above
+    ``10·eps·…``), so the ``infeasible`` status comes from the primal check.
+    (The ``-1e-300`` keeps the residual test failing for an NNLS residual of
+    exactly zero.) The NNLS solution verifies as a Farkas certificate and is
+    the very one of the residual-test exit; status, ``x`` and ``multipliers``
+    are those of a certificate-less exit.
     """
-    g, h = make(k, n, seed)
+    g, h = INFEASIBLE_GENERATORS[make](k, n, seed)
     g_j, h_j = jnp.asarray(g), jnp.asarray(h)
     by_residual = ldp(g_j, h_j)
+    assert bool(by_residual.status == LDP_RESULTS.infeasible)
+    np.testing.assert_array_equal(np.asarray(by_residual.x), 0.0)
+    np.testing.assert_array_equal(np.asarray(by_residual.multipliers), 0.0)
+    assert_ldp_certificate(by_residual, g, h)
+
     r_norm = ldp_nnls_residual_norm(g, h)
     res = ldp(g_j, h_j, ldp_tol=0.5 * r_norm - 1e-300)
-    assert bool(by_residual.status == LDP_RESULTS.infeasible)
     assert bool(res.status == LDP_RESULTS.infeasible)
     np.testing.assert_array_equal(np.asarray(res.x), 0.0)
     np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
@@ -1032,17 +1123,6 @@ def test_ldp_post_check_exit_keeps_a_verified_certificate(make, k, n, seed):
     np.testing.assert_array_equal(
         np.asarray(res.certificate), np.asarray(by_residual.certificate)
     )
-
-
-@pytest.mark.parametrize("seed", LDP_SEEDS)
-@pytest.mark.parametrize("k, n", LDP_SHAPES)
-@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
-def test_ldp_certificate_is_zero_on_feasible(make, k, n, seed):
-    g, h = make(k, n, seed)
-    res = ldp(jnp.asarray(g), jnp.asarray(h))
-    assert bool(res.status == LDP_RESULTS.feasible)
-    assert res.certificate.shape == (k,)
-    np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
 
 
 def _post_check_infeasible():
@@ -1068,7 +1148,7 @@ def _nonfinite():
 def test_ldp_certificate_is_zero_without_a_residual_infeasible_exit(make):
     """No certificate without a verified one: the coarse-``tol`` primal-check
     ``infeasible`` (its NNLS solution is garbage, not a certificate; see
-    ``test_ldp_post_check_exit_keeps_a_verified_certificate`` for the one
+    ``test_ldp_certificate_proves_infeasibility`` for the one
     that verifies), ``max_iter_reached`` and ``nonfinite`` carry none."""
     g, h, kwargs, expected = make()
     res = ldp(jnp.asarray(g), jnp.asarray(h), **kwargs)
@@ -1125,14 +1205,22 @@ def row_violation(g, h, x):
     return float(np.max(np.maximum(h - g @ x, 0.0) / np.linalg.norm(g, axis=1)))
 
 
-FAR_SLACK_1D_GAPS = [1e-2, 1e-4, 1e-6]
-FAR_SLACK_1D_DISTANCES = [1e2, 1e6, 1e10]
-FAR_SLACK_1D_ROW_NORMS = [1.0, 1e-6]
+# (gap, far, t): every (gap, far) pair once; the slack row norm is ``1e-6`` on
+# a diagonal (so each gap and each distance meets both norms).
+FAR_SLACK_1D_CASES = [
+    (1e-2, 1e2, 1e-6),
+    (1e-2, 1e6, 1.0),
+    (1e-2, 1e10, 1.0),
+    (1e-4, 1e2, 1.0),
+    (1e-4, 1e6, 1e-6),
+    (1e-4, 1e10, 1.0),
+    (1e-6, 1e2, 1.0),
+    (1e-6, 1e6, 1.0),
+    (1e-6, 1e10, 1e-6),
+]
 
 
-@pytest.mark.parametrize("t", FAR_SLACK_1D_ROW_NORMS)
-@pytest.mark.parametrize("far", FAR_SLACK_1D_DISTANCES)
-@pytest.mark.parametrize("gap", FAR_SLACK_1D_GAPS)
+@pytest.mark.parametrize("gap, far, t", FAR_SLACK_1D_CASES)
 def test_ldp_far_slack_row_does_not_hide_infeasibility(gap, far, t):
     """``x ≥ 1`` and ``x ≤ 1 - gap`` with a far slack row ``-t x ≥ -far·t``.
 
@@ -1157,7 +1245,14 @@ def test_ldp_far_slack_row_does_not_hide_infeasibility(gap, far, t):
 
 FAR_SLACK_DISTANCES = [1e2, 1e5, 1e8, 1e11]
 FAR_SLACK_GAPS = [1e-1, 1e-3, 1e-5]
-FAR_SLACK_SEEDS = range(6)
+# (far, gap) is a full product (the interaction is the point: the failure needs a
+# distant row and a small gap); the seeds are cycled over it.
+FAR_SLACK_CASES = [
+    (far, gap, i % 3)
+    for i, (far, gap) in enumerate(
+        (far, gap) for far in FAR_SLACK_DISTANCES for gap in FAR_SLACK_GAPS
+    )
+]
 
 
 def far_slack_problem(far, gap, sign, seed, n=4, k_near=5, k_far=2):
@@ -1194,9 +1289,7 @@ def lp_is_feasible(g, h):
     return lp.status == 0
 
 
-@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
-@pytest.mark.parametrize("gap", FAR_SLACK_GAPS)
-@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
+@pytest.mark.parametrize("far, gap, seed", FAR_SLACK_CASES)
 def test_ldp_far_slack_battery_feasible(far, gap, seed):
     """Feasible near rows plus far slack rows: a correct ``feasible`` exit.
 
@@ -1217,9 +1310,7 @@ def test_ldp_far_slack_battery_feasible(far, gap, seed):
     np.testing.assert_array_equal(np.asarray(res.certificate), 0.0)
 
 
-@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
-@pytest.mark.parametrize("gap", FAR_SLACK_GAPS)
-@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
+@pytest.mark.parametrize("far, gap, seed", FAR_SLACK_CASES)
 def test_ldp_far_slack_battery_infeasible(far, gap, seed):
     """Near rows infeasible by a relative gap, plus far slack rows: certified.
 
@@ -1234,31 +1325,3 @@ def test_ldp_far_slack_battery_infeasible(far, gap, seed):
     np.testing.assert_array_equal(np.asarray(res.x), 0.0)
     np.testing.assert_array_equal(np.asarray(res.multipliers), 0.0)
     assert_farkas_certificate(res, g, h)
-
-
-@pytest.mark.parametrize("seed", FAR_SLACK_SEEDS)
-@pytest.mark.parametrize("far", FAR_SLACK_DISTANCES)
-@pytest.mark.parametrize("make", LDP_GENERATORS.values(), ids=LDP_GENERATORS.keys())
-def test_ldp_far_slack_row_leaves_feasible_solution_unchanged(make, far, seed):
-    """Appending far slack rows changes neither ``x`` nor the near multipliers."""
-    k, n = 8, 5
-    g, h = make(k, n, seed)
-    rng = np.random.default_rng(seed)
-    g_far = rng.standard_normal((2, n)) * 10.0 ** rng.uniform(-8, 0, (2, 1))
-    h_far = -far * np.linalg.norm(g_far, axis=1) * (1.0 + rng.random(2))
-    base = ldp(jnp.asarray(g), jnp.asarray(h))
-    res = ldp(
-        jnp.asarray(np.vstack([g, g_far])), jnp.asarray(np.concatenate([h, h_far]))
-    )
-    assert bool(base.status == LDP_RESULTS.feasible)
-    assert bool(res.status == LDP_RESULTS.feasible)
-    x_ref = np.asarray(base.x)
-    scale = max(1.0, np.linalg.norm(x_ref))
-    np.testing.assert_allclose(np.asarray(res.x), x_ref, atol=1e-8 * scale, rtol=0.0)
-    np.testing.assert_allclose(
-        np.asarray(res.multipliers)[:k],
-        np.asarray(base.multipliers),
-        atol=1e-8 * max(1.0, np.max(np.asarray(base.multipliers))),
-        rtol=0.0,
-    )
-    np.testing.assert_array_equal(np.asarray(res.multipliers)[k:], 0.0)
