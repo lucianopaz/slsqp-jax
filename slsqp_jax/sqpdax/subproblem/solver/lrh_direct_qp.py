@@ -559,7 +559,7 @@ class LRHDirectQPSolver(
             def cond_fn(carry):
                 return (carry[-1] == _RUNNING) & (carry[-2] < self.max_iter)
 
-            # Equivalent mutants (a mutation run need not chase them): (1) the
+            # Behaviour-preserving variants (a mutation run need not chase them): (1) the
             # partial step with ``dir = mu_hat`` instead of ``mu_hat - mu`` (every
             # drop decision is invariant to a positive rescaling of ``mu``);
             # (2) ``fresh`` not cleared after a positive step (``p = -1`` then, so
@@ -730,7 +730,7 @@ class LRHDirectQPSolver(
                     # full step, discard it and restart from the cold carry (the
                     # iteration and NNLS counts below still include the trial).
                     # Only the resets of ``A``, ``infeasible`` and
-                    # ``oracle_failure`` are live. Equivalent mutants: the resets
+                    # ``oracle_failure`` are live. Behaviour-preserving variants: the resets
                     # of ``mu`` (it is 0 throughout a rejected trial, so every
                     # ratio is 0 and nothing moves), ``fresh`` and ``p`` (still
                     # at their cold values, since only a batch or a positive step

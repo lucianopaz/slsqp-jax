@@ -137,10 +137,16 @@ def test_hs_problems_solve_and_match_references(
 
 # Outcome ``(status, secant resets recorded)`` of each ``(case, secant_memory)``
 # with a one-trial line-search budget. A run fails loudly (resets, then the
-# recovery-failure status) exactly when some step needs a backtrack: HS21 always
+# recovery-failure status) here, when some step needs a backtrack: HS21 always
 # does, and HS35 does with the shortest memory (m = 2). Otherwise every step is
 # accepted at ``alpha = 1``, no backtrack is needed and the run converges with
 # no reset at all (HS71, HS76, HS35 with m >= 5).
+# The HS35 memory-2 cell is a characterisation, not a claim that failing is
+# desirable: with memory < n the complement ``sigma = s'y / s's`` underestimates
+# the tangent curvature (about 6 versus ``sigma <= 1`` for every reset target),
+# so ``alpha = 1`` is rejected and resets cannot stiffen the model. The cell may
+# flip to ``_CONVERGES`` if the ``sigma`` rule changes; it should then be
+# updated, not defended.
 _FAILS = (ACTIVE_SET_LINE_SEARCH_RESULTS.secant_recovery_failure, True)
 _CONVERGES = (ACTIVE_SET_LINE_SEARCH_RESULTS.successful, False)
 TINY_BUDGET_OUTCOMES = {

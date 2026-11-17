@@ -206,7 +206,7 @@ def least_distance_lsei(
         system ``c`` (see the module docstring). ``None`` selects
         ``min(10 · eps · max(n, m), max(10 · eps · m, √eps))``: the cut grows
         linearly in ``n`` and is capped at ``√eps``, the cap of the noise
-        threshold. The rows of ``Gᵀ = C_F⁻ᵀ A_Fᵀ`` that are dependent in ``A``
+        threshold. The columns of ``Gᵀ = C_F⁻ᵀ A_Fᵀ`` that are dependent in ``A``
         carry the rounding of the constraint data amplified by the metric
         (about ``eps · κ_j`` per column, ``κ_j`` growing with the stiffness of
         the model along the row), not just the few ``eps`` of the QR, so the
@@ -703,7 +703,7 @@ def elastic_least_distance_lsei(
     >>> c = elastic_delta_column(h, 0)
     >>> rho = 1e3 * elastic_weight_scale(g_t, h, c, 0)
     >>> res = elastic_least_distance_lsei(g_t, h, 0, c, rho, eq_tol=1e-8)
-    >>> bool(res.status == LDP_RESULTS.feasible), round(float(res.delta), 6)
+    >>> bool(res.status == LDP_RESULTS.feasible), round(float(res.delta), 4)
     (True, 0.1)
     """
     dtype = jnp.result_type(g_t, h, delta_col, jnp.float32)

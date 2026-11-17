@@ -79,7 +79,7 @@ class LimitedMemoryReducedHessian(ReducedHessianSecant):
        estimates the *largest* curvature of the pair, which then acts on
        every soft direction outside ``range(Z)``; in a narrow valley with
        steps leaving the basis it stiffened the soft curvature ``tᵀB t`` by
-       up to four orders of magnitude (3-10x stiffer than L-BFGS at equal
+       up to five orders of magnitude (3-10x stiffer than L-BFGS at equal
        memory), which is why the Rayleigh quotient is the default;
     6. a BFGS update of ``R`` by a small dense QR;
     7. removal of the oldest step when the expanded rank is ``memory + 1``.

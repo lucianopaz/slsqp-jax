@@ -12,7 +12,7 @@ bound-constrained setting):
 ```text
 Z_F   = I_F Z                        (n × m, rows of fixed variables zeroed)
 Z_Fᵀ Z_F = V Λ Vᵀ                    (m × m eigen-decomposition)
-Q     = Z_F V_k Λ_k^{-1/2}           (orthonormal, supported on F)
+Q     = Z_F V_k Λ_k^{-1/2}           (supported on F; orthonormal to O(eps/Λ_min))
 K     = σ I + Λ_k^{1/2} V_kᵀ (RᵀR - σ I) V_k Λ_k^{1/2} = L Lᵀ
 B_FF  = Q K Qᵀ + σ (I_F - Q Qᵀ)
 C_F   = Q Lᵀ Qᵀ + √σ (I_F - Q Qᵀ)     C_Fᵀ C_F = B_FF
@@ -63,8 +63,10 @@ class FreeSetFactor(eqx.Module):
     free_mask
         Boolean mask of the free variables, shape ``(n,)``.
     basis_q
-        ``Q``, shape ``(n, m)``: orthonormal columns supported on the free
-        variables, with zero columns for dropped directions.
+        ``Q``, shape ``(n, m)``: columns supported on the free variables,
+        with zero columns for dropped directions. Orthonormal only to
+        ``O(eps / Λ_min)``; use the ``apply_*`` methods rather than
+        ``basis_q`` as an exact orthonormal basis.
     k_matrix
         ``K = Qᵀ B Q``, shape ``(m, m)`` (``σ`` on the dropped block).
     k_chol

@@ -116,8 +116,9 @@ def nnls(
         ``None`` selects ``10 · eps · ‖E‖_F · max(m, k)``.
     dep_tol
         Relative linear-dependence threshold described above. The default
-        ``0.0`` disables the test (plain Lawson–Hanson). Never applied when
-        the passive set is empty.
+        ``0.0`` disables the test (plain Lawson–Hanson). Must be a static
+        Python float (it gates a Python branch, so a traced value fails with a
+        tracer-to-bool error). Never applied when the passive set is empty.
 
     Returns
     -------
@@ -437,7 +438,8 @@ def ldp(
         feasible, with a (very) large ``x``.
     dep_tol
         Linear-dependence threshold of the NNLS (see :func:`nnls`); ``None``
-        selects ``√eps`` of the working dtype, ``0.0`` disables the test.
+        selects ``√eps`` of the working dtype, ``0.0`` disables the test. Must be
+        static (a Python float or ``None``), as in :func:`nnls`.
     check_tol
         Tolerance of the primal feasibility check of the solution, relative
         to ``max(1, ‖y‖)`` in the normalised units (see above); ``None``
