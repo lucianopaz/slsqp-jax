@@ -84,7 +84,7 @@ def test_select_chunks_partition(catalog):
 
 
 def test_configs_registry():
-    assert len(CONFIGS) == 9
+    assert len(CONFIGS) == 11
     assert list(CONFIGS) == [
         "asls-pcg",
         "asls-craig",
@@ -93,6 +93,8 @@ def test_configs_registry():
         "pasls",
         "trip",
         "tfip",
+        "lrhls",
+        "lrhls-yy",
         "scipy-slsqp",
         "scipy-trust-constr",
     ]

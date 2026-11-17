@@ -107,6 +107,21 @@ def _tfip():
     return TrustFunnelInteriorPointMinimiser(curvature="secant", atol=DEFAULT_ATOL)
 
 
+def _lrhls():
+    # Limited-memory reduced-Hessian SQP: always quasi-Newton (``exact``
+    # curvature is rejected), QPs solved directly by the Householder / NNLS
+    # chain with a dual active-set loop on the bounds.
+    from slsqp_jax.sqpdax.minimiser import LRHLineSearchMinimiser
+
+    return LRHLineSearchMinimiser(rtol=DEFAULT_RTOL, atol=DEFAULT_ATOL)
+
+
+def _lrh_yy_options() -> dict[str, Any]:
+    # The alternative complement curvature rule ``sigma = yᵀy / sᵀy`` (the
+    # default is ``sᵀy / sᵀs``).
+    return {"minimiser": {"secant": {"kind": "lrh", "sigma_rule": "yy_over_sy"}}}
+
+
 def _craig_options() -> dict[str, Any]:
     from slsqp_jax.sqpdax.subproblem.solver import CraigProjector
 
@@ -167,6 +182,10 @@ CONFIGS: dict[str, BenchConfig] = {
         BenchConfig("pasls", "pasls", "proximal-active-set", "secant", _pasls),
         BenchConfig("trip", "trip", "trust-region-ip", "secant", _trip),
         BenchConfig("tfip", "tfip", "trust-funnel-ip", "secant", _tfip),
+        BenchConfig("lrhls", "lrhls", "lrh-direct-qp", "secant", _lrhls),
+        BenchConfig(
+            "lrhls-yy", "lrhls", "lrh-direct-qp", "secant", _lrhls, _lrh_yy_options
+        ),
         BenchConfig(
             "scipy-slsqp",
             "scipy",
@@ -214,7 +233,7 @@ def get_configs(names: list[str] | None = None) -> list[BenchConfig]:
     >>> from benchmarks.configs import get_configs
     >>> [c.name for c in get_configs()]  # doctest: +NORMALIZE_WHITESPACE
     ['asls-pcg', 'asls-craig', 'asls-minresqlp', 'asls-pcg-exact', 'pasls', 'trip', 'tfip',
-     'scipy-slsqp', 'scipy-trust-constr']
+     'lrhls', 'lrhls-yy', 'scipy-slsqp', 'scipy-trust-constr']
     >>> get_configs(["tfip"])[0].family
     'tfip'
     >>> get_configs(["scipy-slsqp"])[0].backend

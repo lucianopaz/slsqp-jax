@@ -8,7 +8,7 @@ the identical problems through `scipy.optimize.minimize`.
 ```bash
 uv sync --all-extras --all-groups          # installs the `benchmark` group
 
-python -m benchmarks run --tier tiny                       # all 9 configs, n <= 20
+python -m benchmarks run --tier tiny                       # all 11 configs, n <= 20
 python -m benchmarks run --tier small --jobs 4 --device cpu
 python -m benchmarks run --problems HS71,HS35 --configs pasls,tfip --repeats 5
 python -m benchmarks run --tier tiny --configs trip --chunk 0/3   # CI-style shard
@@ -29,7 +29,7 @@ python -m benchmarks validate --jobs 4                     # check signs / f* ag
 | `catalog.csv`, `catalog.py` | one row per `(problem, y0_iD)` with sizes, collection, size tier (`tiny` ≤ 20, `small` ≤ 100, `medium` ≤ 1000, `large`), reference optimum flags and the validation columns below; `select()` filters and shards (and drops `valid == False` instances unless `include_invalid=True`) |
 | `validate.py` | `python -m benchmarks validate`: solves every instance with scipy SLSQP under the candidate inequality sign conventions (documented `ineq >= 0`, the rows the reference point violates, all rows flipped) and with trust-constr on the chosen one; records `ineq_flip` (rows converted as `h = c` instead of `h = -c`), the scoring reference `fstar` with its `fstar_source` (`sif2jax` or `scipy-consensus`), `fstar_sif`, `valid` and a `validation` label (`ok`, `sign_flipped`, `fstar_from_consensus`, `fstar_mismatch`, `unverified`, `unbounded`, `infeasible`, `evaluation_error`, `error`, `timeout`); `catalog` carries these columns over |
 | `problems.py` | `to_sqpdax()` adapts a sif2jax problem (`eq == 0`, `ineq >= 0`) to `sqpdax.Problem` (`g == 0`, `h <= 0`) with exact HVPs enabled, applying the catalogue's validated `ineq_flip` / `fstar` overrides |
-| `configs.py` | the nine configurations: seven sqpdax ones (`asls-pcg`, `asls-craig`, `asls-minresqlp`, `asls-pcg-exact`, `pasls`, `trip`, `tfip`) and two SciPy baselines (`scipy-slsqp`, `scipy-trust-constr`); each carries a `backend` tag |
+| `configs.py` | the eleven configurations: nine sqpdax ones (`asls-pcg`, `asls-craig`, `asls-minresqlp`, `asls-pcg-exact`, `pasls`, `trip`, `tfip`, and the limited-memory reduced-Hessian `lrhls` / `lrhls-yy` with the two complement-curvature rules) and two SciPy baselines (`scipy-slsqp`, `scipy-trust-constr`); each carries a `backend` tag |
 | `runners.py` | backend-neutral `SolveOutcome` plus `SqpdaxRunner` (one jitted `minimise` executable with a traced step budget) |
 | `baselines.py` | `ScipyRunner`: feeds jitted JAX callbacks (objective, gradient, constraints, Jacobians, HVPs) to `scipy.optimize.minimize`; maps SciPy statuses onto the harness vocabulary and translates SciPy multipliers into the sqpdax convention so the KKT metrics are comparable |
 | `worker.py`, `_bootstrap.py` | persistent worker processes; per task: compile (untimed) → one-step warm-up (untimed) → pilot (timed) → adaptive repeats, with a 5-minute deadline |

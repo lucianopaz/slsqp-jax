@@ -50,7 +50,7 @@ def test_to_sqpdax_sign_conventions(sif2jax):
 
 
 @pytest.mark.parametrize(
-    "config", ["pasls", "tfip", "scipy-slsqp", "scipy-trust-constr"]
+    "config", ["pasls", "tfip", "lrhls", "scipy-slsqp", "scipy-trust-constr"]
 )
 def test_run_task_inprocess_solves_hs71(sif2jax, config):
     jax.config.update("jax_enable_x64", True)
