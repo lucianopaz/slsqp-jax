@@ -44,20 +44,34 @@ jax.config.update("jax_enable_x64", True)
 
 TOL = 1e-9
 
-SIZES = pytest.mark.parametrize("n", [5, 12])
-MEMORIES = pytest.mark.parametrize("memory", [1, 2, 4])
-COUNTS = pytest.mark.parametrize(
-    "count_rule",
+# Pairwise designs (every pair of axis values appears at least once). The
+# histories of shorter counts are prefixes of the longest one (``2 m + 1``
+# pairs, the scenario draws its matrix first and then the steps in order), so
+# only the longest history is replayed.
+_SIGMA_CHOICES = [
+    ("yy_over_sy", 1.0),
+    ("sy_over_ss", 1.0),
+    ("yy_over_sy", 25.0),
+    ("sy_over_ss", 0.3),
+]
+_SIZES = [5, 12]
+_MEMORIES = [1, 2, 4]
+GRID = pytest.mark.parametrize(
+    ("n", "memory", "seed"),
     [
-        lambda m: 0,
-        lambda m: 1,
-        lambda m: m,
-        lambda m: m + 1,
-        lambda m: 2 * m + 1,
+        (_SIZES[(i + j) % 2], _MEMORIES[j], (i // 2 + j) % 2)
+        for j in range(3)
+        for i in range(2)
     ],
-    ids=["none", "one", "full", "overfull", "twice"],
 )
-SEEDS = pytest.mark.parametrize("seed", [0, 1])
+SIGMA_GRID = pytest.mark.parametrize(
+    ("n", "memory", "seed", "sigma_rule", "initial_sigma"),
+    [
+        (_SIZES[(i + j) % 2], _MEMORIES[j], (i // 2 + j) % 2, *_SIGMA_CHOICES[i])
+        for j in range(3)
+        for i in range(4)
+    ],
+)
 
 diagnostics_jit = eqx.filter_jit(lambda hist, s, y: hist.diagnostics(s, y))
 reset_jit = eqx.filter_jit(lambda hist, severity: hist.reset(severity))
@@ -100,8 +114,9 @@ def _replay(
     return steps
 
 
-def _history(pair_scenario, n, memory, count_rule, seed, **options) -> list[Step]:
-    return _replay(pair_scenario, n, memory, count_rule(memory), seed, **options)
+def _history(pair_scenario, n, memory, seed, **options) -> list[Step]:
+    """Longest history (``2 m + 1`` pairs); shorter ones are its prefixes."""
+    return _replay(pair_scenario, n, memory, 2 * memory + 1, seed, **options)
 
 
 def _assert_storage_invariants(secant: LimitedMemoryReducedHessian) -> None:
@@ -238,30 +253,15 @@ def test_from_spec_warns_on_unknown_parameter():
 # ---------------------------------------------------------------------------
 
 
-SIGMA_OPTIONS = pytest.mark.parametrize(
-    ("sigma_rule", "initial_sigma"),
-    [
-        ("yy_over_sy", 1.0),
-        ("sy_over_ss", 1.0),
-        ("yy_over_sy", 25.0),
-        ("sy_over_ss", 0.3),
-    ],
-)
-
-
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-@SIGMA_OPTIONS
+@SIGMA_GRID
 def test_agrees_with_dense_reference_after_every_append(
-    pair_scenario, n, memory, count_rule, seed, sigma_rule, initial_sigma
+    pair_scenario, n, memory, seed, sigma_rule, initial_sigma
 ):
     """``B``, ``B⁻¹``, ``span Z``, ``R``, ``σ``, rank, θ and skip flag match the oracle."""
     rng = np.random.default_rng(7)
     probe = rng.normal(size=n)
     options = {"sigma_rule": sigma_rule, "initial_sigma": initial_sigma}
-    for step in _history(pair_scenario, n, memory, count_rule, seed, **options):
+    for step in _history(pair_scenario, n, memory, seed, **options):
         after, ref = step.after, step.ref
         r = int(after.rank)
         assert r == ref.rank
@@ -310,15 +310,10 @@ def test_agrees_with_dense_reference_after_every_append(
         assert (float(diag.damping_theta) == 1.0) >= step.record.skipped
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_basis_orthonormality_padding_and_step_span(
-    pair_scenario, n, memory, count_rule, seed
-):
+@GRID
+def test_basis_orthonormality_padding_and_step_span(pair_scenario, n, memory, seed):
     """Storage invariants after every append, and ``Z T`` = the newest accepted steps."""
-    for step in _history(pair_scenario, n, memory, count_rule, seed):
+    for step in _history(pair_scenario, n, memory, seed):
         after = step.after
         _assert_storage_invariants(after)
         r = int(after.rank)
@@ -327,15 +322,10 @@ def test_basis_orthonormality_padding_and_step_span(
         np.testing.assert_allclose(z_t[:, :r], steps, atol=TOL, rtol=TOL)
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_secant_condition_right_after_append(
-    pair_scenario, n, memory, count_rule, seed
-):
+@GRID
+def test_secant_condition_right_after_append(pair_scenario, n, memory, seed):
     """``B_new s̃ = Z Zᵀ ŷ`` (``Z`` the new basis), and ``s̃ᵀ B_new s̃ = s̃ᵀ y_d``."""
-    for step in _history(pair_scenario, n, memory, count_rule, seed)[1:]:
+    for step in _history(pair_scenario, n, memory, seed)[1:]:
         r = step.record
         assert r is not None and not r.skipped
         z = np.asarray(step.after.basis)[:, : int(step.after.rank)]
@@ -728,15 +718,10 @@ def test_append_does_not_warn_or_emit_nans_on_a_long_run():
 # ---------------------------------------------------------------------------
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_spectrum_bounds_match_dense_eigenvalues(
-    pair_scenario, n, memory, count_rule, seed
-):
+@GRID
+def test_spectrum_bounds_match_dense_eigenvalues(pair_scenario, n, memory, seed):
     """``spectrum_bounds`` equals the extreme eigenvalues of the dense ``B``."""
-    for step in _history(pair_scenario, n, memory, count_rule, seed):
+    for step in _history(pair_scenario, n, memory, seed):
         eigs = np.linalg.eigvalsh(np.asarray(dense_hessian(step.after)))
         lower, upper = step.after.spectrum_bounds()
         np.testing.assert_allclose(float(upper), eigs[-1], rtol=1e-8)

@@ -23,25 +23,18 @@ from .conftest import (
 
 TOL = 1e-9
 
-SIZES = pytest.mark.parametrize("n", [5, 12])
-MEMORIES = pytest.mark.parametrize("memory", [1, 2, 4])
-COUNTS = pytest.mark.parametrize(
-    "count_rule",
-    [
-        lambda m: 0,
-        lambda m: 1,
-        lambda m: m,
-        lambda m: m + 1,
-        lambda m: 2 * m + 1,
-    ],
-    ids=["none", "one", "full", "overfull", "twice"],
+# Pairwise design over (n, memory, seed). The histories of shorter counts are
+# prefixes of the longest one (``2 m + 1`` pairs), so only that one is
+# replayed. The oracle needs only a small grid.
+GRID = pytest.mark.parametrize(
+    ("n", "memory", "seed"),
+    [(5, 1, 0), (5, 2, 1), (5, 4, 0), (12, 1, 1), (12, 2, 0), (12, 4, 1)],
 )
-SEEDS = pytest.mark.parametrize("seed", [0, 1])
 
 
-def _replay(pair_scenario: PairScenario, n, memory, count_rule, seed, **kwargs):
+def _replay(pair_scenario: PairScenario, n, memory, seed, **kwargs):
     """Fresh reference replayed over scenario pairs; returns (reference, history)."""
-    pairs = pair_scenario.make(seed, n, count_rule(memory))
+    pairs = pair_scenario.make(seed, n, 2 * memory + 1)
     ref = DenseLRHReference(n, memory, **kwargs)
     return ref, replay_pairs(ref, pairs)
 
@@ -58,15 +51,10 @@ def _orthonormal_span_projector(vectors: list[np.ndarray], n: int) -> np.ndarray
 # ---------------------------------------------------------------------------
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_state_invariants_after_every_append(
-    pair_scenario, n, memory, count_rule, seed
-):
+@GRID
+def test_state_invariants_after_every_append(pair_scenario, n, memory, seed):
     """Symmetric PD ``B``, ``ZᵀZ = I``, ``span Z = span(newest steps)``, structure."""
-    ref, history = _replay(pair_scenario, n, memory, count_rule, seed)
+    ref, history = _replay(pair_scenario, n, memory, seed)
     eye = np.eye(n)
     for state, record in [(DenseLRHReference(n, memory), None), *history]:
         Z = state.Z
@@ -92,26 +80,25 @@ def test_state_invariants_after_every_append(
     assert ref.rank == min(accepted, memory)
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_scenarios_exercise_their_branches(pair_scenario, n, memory, count_rule, seed):
+@GRID
+def test_scenarios_exercise_their_branches(pair_scenario, n, memory, seed):
     """Each scenario really reaches the damping / rejection / drop branches."""
-    count = count_rule(memory)
-    _, history = _replay(pair_scenario, n, memory, count_rule, seed)
+    _, history = _replay(pair_scenario, n, memory, seed)
     records = [r for _, r in history]
     assert not any(r.skipped for r in records)
-    damped = any(r.theta < 1.0 - 1e-9 for r in records)
-    rejected = any(not r.accepted for r in records)
-    dropped = any(r.dropped for r in records)
-    damped_rejection = any(not r.accepted and r.theta < 1.0 - 1e-9 for r in records)
-    assert damped_rejection >= (count >= pair_scenario.damped_rejection_by)
-    assert damped >= (count >= pair_scenario.damps_by)
-    assert rejected >= (count >= pair_scenario.rejects_by)
-    assert dropped >= (pair_scenario.independent and count > memory)
-    # a rank-full rejected step never drops
-    assert not any(r.dropped and not r.accepted for r in records)
+    # the thresholds hold for every prefix of the longest history
+    for count in range(len(records) + 1):
+        prefix = records[:count]
+        damped = any(r.theta < 1.0 - 1e-9 for r in prefix)
+        rejected = any(not r.accepted for r in prefix)
+        dropped = any(r.dropped for r in prefix)
+        damped_rejection = any(not r.accepted and r.theta < 1.0 - 1e-9 for r in prefix)
+        assert damped_rejection >= (count >= pair_scenario.damped_rejection_by)
+        assert damped >= (count >= pair_scenario.damps_by)
+        assert rejected >= (count >= pair_scenario.rejects_by)
+        assert dropped >= (pair_scenario.independent and count > memory)
+        # a rank-full rejected step never drops
+        assert not any(r.dropped and not r.accepted for r in prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +106,10 @@ def test_scenarios_exercise_their_branches(pair_scenario, n, memory, count_rule,
 # ---------------------------------------------------------------------------
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_secant_condition_and_bfgs_formula(pair_scenario, n, memory, count_rule, seed):
+@GRID
+def test_secant_condition_and_bfgs_formula(pair_scenario, n, memory, seed):
     """``B'' s̃ = ŷ`` and ``B''`` is the plain BFGS update of the expanded ``B'``."""
-    _, history = _replay(pair_scenario, n, memory, count_rule, seed)
+    _, history = _replay(pair_scenario, n, memory, seed)
     previous = [DenseLRHReference(n, memory)] + [state for state, _ in history[:-1]]
     eye = np.eye(n)
     for before, (_, r) in zip(previous, history):
@@ -147,19 +131,14 @@ def test_secant_condition_and_bfgs_formula(pair_scenario, n, memory, count_rule,
         )
 
 
-@SIZES
-@MEMORIES
-@COUNTS
-@SEEDS
-def test_drop_identity_and_secant_after_drop(
-    pair_scenario, n, memory, count_rule, seed
-):
+@GRID
+def test_drop_identity_and_secant_after_drop(pair_scenario, n, memory, seed):
     """``B_new = P̄ B'' P̄ + σ_new (I - P̄)`` and ``B_new s̃ = P̄ ŷ``.
 
     ``P̄`` is the projector onto the span of the retained steps; it equals the
     expanded projector when nothing is dropped, so the identity is generic.
     """
-    _, history = _replay(pair_scenario, n, memory, count_rule, seed)
+    _, history = _replay(pair_scenario, n, memory, seed)
     eye = np.eye(n)
     for state, r in history:
         P = state.projector()
@@ -364,10 +343,17 @@ def _sigma_preserving_pairs(
     return pairs
 
 
-@SIZES
-@MEMORIES
-@pytest.mark.parametrize("sigma", [0.7, 3.0])
-@SEEDS
+@pytest.mark.parametrize(
+    ("n", "memory", "sigma", "seed"),
+    [
+        (5, 1, 0.7, 0),
+        (5, 2, 3.0, 1),
+        (5, 4, 0.7, 1),
+        (12, 1, 3.0, 0),
+        (12, 2, 0.7, 0),
+        (12, 4, 3.0, 1),
+    ],
+)
 def test_matches_plain_dense_bfgs_when_nothing_is_dropped_or_damped(
     n, memory, sigma, seed
 ):
