@@ -51,6 +51,7 @@ to ``‖(w, √ρ_e δ)‖``): :func:`elastic_weight_scale` gives that scale.
 from __future__ import annotations
 
 import equinox as eqx
+import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
@@ -116,6 +117,21 @@ class LSEIResult(eqx.Module):
     has_certificate: Bool[Array, ""]
 
 
+def _primal_point(q, z_e0, v_null, zeta, m_e, n):
+    """``w = Q [z_E0 + V_null t; z_I]`` (first ``n`` entries) from ``ζ = [t; z_I]``."""
+    z_e = z_e0 + v_null @ zeta[:m_e]
+    return (q @ jnp.concatenate([z_e, zeta[m_e:]]))[:n]
+
+
+def _row_violation(g_hat, h_hat, w, m_e):
+    """Largest violation of the equilibrated rows ``[E, I]`` at ``w`` (∞-norm)."""
+    resid = g_hat.T @ w - h_hat
+    return jnp.maximum(
+        jnp.max(jnp.abs(resid[:m_e]), initial=0.0),
+        jnp.max(jnp.maximum(resid[m_e:], 0.0), initial=0.0),
+    )
+
+
 def least_distance_lsei(
     g_t: Float[Array, "n m"],
     h: Float[Array, " m"],
@@ -163,6 +179,21 @@ def least_distance_lsei(
     into a spurious constraint; a genuine violation stays ``infeasible``.
     Unless the status is ``feasible``, ``w`` and both multiplier vectors are
     zero, and callers must branch on the status and never use them.
+
+    **Verification.** The projection noise of an inequality row lying in the
+    span of the equalities is ``eps · cond(R_EE)``, above the ``√eps`` cap of
+    the noise threshold once ``cond(R_EE) ≳ 1e8``; the LDP can then exploit
+    it with a ``‖w‖ ~ 1/eps`` step that violates the rows. Whenever the cap
+    binds (``rank_tol · cond(R_EE) > max(rank_tol, √eps)``), ``feasible`` is
+    only reported for a point that meets the equilibrated rows to
+    ``max(10 √eps, 2 eq_tol) · max(1, ‖ĥ‖ + ‖z_E0‖)`` (``z_E0`` the point the
+    equalities fix in the reduced coordinates): an absolute test in the data
+    scale, never relative to ``‖w‖``. When the check fails, the inequality
+    part is solved once more with the uncapped threshold
+    ``rank_tol · cond(R_EE)`` (only on that path); an answer that still fails
+    it is ``infeasible``, without a certificate unless the LDP produced one.
+    Where the cap does not bind, the answer is accurate relative to ``‖w‖``,
+    like any LDP solution (a far-away vertex of near-parallel rows included).
 
     **Farkas certificate.** When the status is ``infeasible`` (by the LDP's
     residual test, or by its primal check with a verified certificate) or
@@ -331,6 +362,22 @@ def least_distance_lsei(
         inconsistent = jnp.zeros((), bool)
         noise_tol = rank_tol
 
+    # Verification of a ``feasible`` answer when the √eps cap of ``noise_tol``
+    # binds (ill-conditioned R_EE): the projection noise of a row in the span
+    # of the equalities is eps·cond(R_EE), above the cap once cond(R_EE) ≳
+    # 1e8, and ldp exploits such noise rows with a ‖w‖ ~ 1/eps step whose
+    # violations sit at the rounding level of that ‖w‖. The check is therefore
+    # absolute in the data scale, never relative to ‖w‖, on the equilibrated
+    # (unit) rows, covering the reduction's own acceptance rules (the
+    # ``eq_tol`` consistency test and the ``near_ok`` slack of noise rows) with
+    # a √eps floor. It is not applied where the cap does not bind: a genuine
+    # far-away vertex (‖w‖ ~ 1e8 for near-parallel rows) is only accurate
+    # relative to ‖w‖, like any ldp solution.
+    check_tol = jnp.maximum(10.0 * eps**0.5, 2.0 * eq_tol) * jnp.maximum(
+        1.0, jnp.linalg.norm(h_hat) + jnp.linalg.norm(z_e0)
+    )
+    cap_binds = jnp.zeros((), bool)
+
     # Inequalities: R_EIᵀ z_E + R_IIᵀ z_I ≤ h_I in ζ = [t; z_I]. ldp wants
     # "≥", hence the sign flips.
     if m_i > 0:
@@ -361,12 +408,36 @@ def least_distance_lsei(
         u_c, s_c, vt_c = jnp.linalg.svd(c, full_matrices=False)
         s_floor = eps ** (2.0 / 3.0) * jnp.max(s_c, initial=0.0)
         c = (u_c * jnp.where(s_c > s_floor, s_c, 0.0)) @ vt_c
-        noise_tol = jnp.maximum(noise_tol, s_floor)
-        noise = jnp.linalg.norm(c, axis=1) <= noise_tol
+        c_norm = jnp.linalg.norm(c, axis=1)
         near_ok = rhs >= -eq_tol * jnp.maximum(1.0, jnp.abs(h_i) + z_e0_norm)
-        c = jnp.where(noise[:, None], 0.0, c)
-        rhs = jnp.where(noise & near_ok, jnp.maximum(rhs, 0.0), rhs)
-        res = ldp(-c, -rhs, max_iter=max_iter, tol=tol, ldp_tol=ldp_tol)
+
+        def solve_ineq(row_tol):
+            noise = c_norm <= jnp.maximum(row_tol, s_floor)
+            c_kept = jnp.where(noise[:, None], 0.0, c)
+            rhs_kept = jnp.where(noise & near_ok, jnp.maximum(rhs, 0.0), rhs)
+            return ldp(-c_kept, -rhs_kept, max_iter=max_iter, tol=tol, ldp_tol=ldp_tol)
+
+        res = solve_ineq(noise_tol)
+        if m_e > 0:
+            # Where the cap binds, verify the answer on the original rows; a
+            # ``feasible`` point that violates them let noise through.
+            # Re-solve once with the uncapped tolerance rank_tol·cond(R_EE)
+            # (only on that path: lax.cond).
+            noise_hi = jnp.minimum(rank_tol * jnp.maximum(1.0, cond_e), 1.0)
+            cap_binds = noise_hi > noise_tol
+            w_first = _primal_point(q, z_e0, v_null, res.x, m_e, n)
+            retry = (
+                cap_binds
+                & (res.status == LDP_RESULTS.feasible)
+                & (_row_violation(g_hat, h_hat, w_first, m_e) > check_tol)
+            )
+            first_iter = res.n_iter
+            res = jax.lax.cond(retry, lambda: solve_ineq(noise_hi), lambda: res)
+            res = eqx.tree_at(
+                lambda r: r.n_iter,
+                res,
+                jnp.where(retry, first_iter + res.n_iter, res.n_iter),
+            )
         zeta = res.x
         lam_i = res.multipliers
         ldp_status = res.status
@@ -393,6 +464,16 @@ def least_distance_lsei(
     w = (q @ jnp.concatenate([z_e, z_i]))[:n]
     lam_e = lam_e / col_norm[:m_e]
     lam_i = lam_i / col_norm[m_e:]
+    # Where the cap binds, ``feasible`` is only reported for a verified point:
+    # a ``w`` that still violates the rows after the retry is ``infeasible``,
+    # with a certificate only if the LDP produced one (here it did not: its
+    # status was ``feasible``), as at the primal check of ``ldp``.
+    unverified = (
+        cap_binds
+        & (ldp_status == LDP_RESULTS.feasible)
+        & (_row_violation(g_hat, h_hat, w, m_e) > check_tol)
+    )
+    ldp_status = LDP_RESULTS.where(unverified, LDP_RESULTS.infeasible, ldp_status)
 
     # Farkas certificate. LDP infeasible: ŷ_I = u and ŷ_E = -R_EE⁺ R_EI u
     # (the multiplier formula with z = 0); then R_G ŷ = 0, i.e. Ĝᵀŷ = 0, and

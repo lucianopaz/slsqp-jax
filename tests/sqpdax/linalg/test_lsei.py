@@ -1713,9 +1713,34 @@ def test_svd_floor_discards_noise_of_a_very_ill_conditioned_determined_system():
     ``rank_tol · σ_max`` the projected noise rows survive and the solve is no
     longer a certified ``infeasible``. After C16d the C16c wide-spread cases
     no longer separate the two floors; this one does (1 of 4800 random cases
-    over ``θ`` in 1e-2..1e-8, ``n`` in 5..20, 40 seeds).
+    over ``θ`` in 1e-2..1e-8, ``n`` in 5..20, 40 seeds). Before the
+    verification of the rows, Linux CI's rounding turned this case into a
+    ``feasible`` answer with violated rows; see
+    :func:`test_feasible_is_never_unverified_under_rounding_perturbations`.
     """
     g_t, h, m_eq, _ = determined_equalities_problem(1e-8, True, 19, n=12, k=6, m_i=4)
+    res = run(g_t, h, m_eq)
+    assert_exit_contract(res, g_t, h, m_eq)
+    assert bool(res.status == LDP_RESULTS.infeasible)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("theta", [1e-6, 1e-8, 1e-10])
+def test_feasible_is_never_unverified_under_rounding_perturbations(theta, seed):
+    """Violated in-span inequalities under ``k = 6`` equalities of condition ``1/θ``.
+
+    The projection noise of the in-span rows is ``eps · cond(R_EE)``, above
+    the ``√eps`` cap of the noise threshold once ``cond ≳ 1e8``; ldp then
+    exploits it with a ``‖w‖ ~ 1/eps`` step and, before the verification of
+    the rows and the uncapped retry, about half of these problems came back
+    ``feasible`` with violated rows (on Linux CI even the unperturbed
+    ``seed = 19`` case below). Each problem is perturbed by a few ulps (its
+    own seeded draw), so the outcome cannot hinge on one platform's rounding:
+    every case must be a certified ``infeasible``.
+    """
+    g_t, h, m_eq, _ = determined_equalities_problem(theta, True, seed, n=12, k=6, m_i=4)
+    rng = np.random.default_rng(1000 + seed)
+    g_t = g_t * (1.0 + 4.0 * np.finfo(float).eps * rng.standard_normal(g_t.shape))
     res = run(g_t, h, m_eq)
     assert_exit_contract(res, g_t, h, m_eq)
     assert bool(res.status == LDP_RESULTS.infeasible)
@@ -1876,7 +1901,11 @@ def test_elastic_with_two_equalities_and_few_free_variables(
 # well-conditioned unit equality rows (angle 0.1, cond ≈ 20) dependent, then
 # inconsistent. Only ``m × n`` data are formed, so n = 1e5 is O(n).
 
-RESIDUAL_FACTOR = 10.0  # equality residual ≤ RESIDUAL_FACTOR · eps · cond(rows)
+# Equality residual ≤ RESIDUAL_FACTOR · eps · cond(rows) · √(max(1, n / 1e3)).
+# The rounding of the length-n dot products and of the Householder QR grows
+# with n (√n typically); measured: ≤ 1.5 eps·cond at every n with Accelerate
+# (macOS), 10.3 eps·cond at n = 1e5 with OpenBLAS (Linux CI).
+RESIDUAL_FACTOR = 10.0
 # (dtype, angle between the two unit equality rows). θ = 1e-3 (cond 2e3) is
 # float64 only: in float32 the cut is capped at √eps ≈ 3.4e-4, close to
 # tan(θ/2) = 5e-4, so the pair is not a well-posed float32 problem.
@@ -1930,7 +1959,9 @@ def test_well_conditioned_equalities_are_feasible_at_large_n(dtype, theta, n):
     assert bool(res.status == LDP_RESULTS.feasible)
     resid = g_t[:, :2].astype(np.float64).T @ np.asarray(res.w, np.float64)
     resid -= h[:2].astype(np.float64)
-    assert np.max(np.abs(resid)) <= RESIDUAL_FACTOR * eps * cond
+    assert np.max(np.abs(resid)) <= RESIDUAL_FACTOR * eps * cond * np.sqrt(
+        max(1.0, n / 1e3)
+    )
 
 
 # (row perturbation in units of eps, rhs gap in units of eq_tol, expected
