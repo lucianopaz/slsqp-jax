@@ -8,24 +8,57 @@ on:
     branches:
     - main
 
+# The whole suite (slow tests included) runs once, on the newest Python, split
+# into groups that run in parallel; each group uploads its coverage and
+# Codecov merges them. The older Pythons run the "core" group without coverage
+# as a compatibility check (it imports every module through the doctests).
+# Local timings of the groups (M-series, with coverage): minimiser-lrh ~9 min,
+# minimiser ~7, subproblem ~9, core ~7.5, slow ~6.5.
 jobs:
   unit-tests:
+    name: ${{ matrix.group }} (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version:
-        - '3.11'
-        - '3.12'
-        - '3.13'
-        - '3.14'
-        # marker:
-        # - -m "not slow"
-        # include:
-        # - python-version: '3.14'
-        #   marker: -m "slow and not very_slow"
-        # - python-version: '3.14'
-        #   marker: -m "very_slow"
+        include:
+        - python-version: '3.14'
+          group: minimiser-lrh
+          args: -m "not slow" tests/sqpdax/minimiser/test_lrh_*.py
+        - python-version: '3.14'
+          group: minimiser
+          args: >-
+            -m "not slow" tests/sqpdax/minimiser
+            --ignore-glob=tests/sqpdax/minimiser/test_lrh_*.py
+        - python-version: '3.14'
+          group: subproblem
+          args: -m "not slow" tests/sqpdax/subproblem
+        - python-version: '3.14'
+          group: core
+          args: >-
+            -m "not slow" slsqp_jax/sqpdax benchmarks tests/sqpdax tests/benchmarks
+            --ignore=tests/sqpdax/minimiser --ignore=tests/sqpdax/subproblem
+        - python-version: '3.14'
+          group: slow
+          args: -m slow
+        - python-version: '3.11'
+          group: core
+          args: >-
+            -m "not slow" slsqp_jax/sqpdax benchmarks tests/sqpdax tests/benchmarks
+            --ignore=tests/sqpdax/minimiser --ignore=tests/sqpdax/subproblem
+          no-cov: true
+        - python-version: '3.12'
+          group: core
+          args: >-
+            -m "not slow" slsqp_jax/sqpdax benchmarks tests/sqpdax tests/benchmarks
+            --ignore=tests/sqpdax/minimiser --ignore=tests/sqpdax/subproblem
+          no-cov: true
+        - python-version: '3.13'
+          group: core
+          args: >-
+            -m "not slow" slsqp_jax/sqpdax benchmarks tests/sqpdax tests/benchmarks
+            --ignore=tests/sqpdax/minimiser --ignore=tests/sqpdax/subproblem
+          no-cov: true
 
     steps:
     - uses: actions/checkout@v5
@@ -40,11 +73,16 @@ jobs:
       run: uv sync --locked --all-extras --dev
 
     - name: Run tests
-      run: uv run pytest --cov-report=xml ${{ matrix.marker }}
+      run: >-
+        uv run pytest
+        ${{ matrix.no-cov && '--no-cov' || '--cov-report=xml' }}
+        ${{ matrix.args }}
 
     - name: Upload coverage to Codecov
+      if: ${{ !matrix.no-cov }}
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        name: py${{ matrix.python-version }}-${{ matrix.marker }}
+        name: py${{ matrix.python-version }}-${{ matrix.group }}
+        flags: ${{ matrix.group }}
         fail_ci_if_error: false

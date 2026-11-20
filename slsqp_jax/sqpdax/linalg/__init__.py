@@ -27,12 +27,61 @@ solver classes, so that every solver reuses one implementation:
   estimates of spectral norms used by the diagnostics
   (:func:`~slsqp_jax.sqpdax.linalg.operator_norm.power_iteration_norm`,
   :func:`~slsqp_jax.sqpdax.linalg.operator_norm.spectral_norm_estimate`).
+* :mod:`~slsqp_jax.sqpdax.linalg.reduced_hessian` — dense kernels of the
+  limited-memory reduced-Hessian secant: QR with a non-negative diagonal
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.positive_qr`) and
+  twice-iterated Gram–Schmidt
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.orthogonalize_against`),
+  the BFGS update of the reduced-Hessian factor
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.bfgs_factor_update`) and
+  the removal of the oldest basis vector
+  (:func:`~slsqp_jax.sqpdax.linalg.reduced_hessian.drop_oldest_basis_vector`).
+* :mod:`~slsqp_jax.sqpdax.linalg.free_set_factor` — the factor of the
+  free-variable block of a reduced-Hessian model for a bound working set
+  (:class:`~slsqp_jax.sqpdax.linalg.free_set_factor.FreeSetFactor`).
+* :mod:`~slsqp_jax.sqpdax.linalg.lawson_hanson` — Lawson–Hanson non-negative
+  least squares (:func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.nnls`,
+  :class:`~slsqp_jax.sqpdax.linalg.lawson_hanson.NNLSResult`) and the
+  least-distance problem built on it
+  (:func:`~slsqp_jax.sqpdax.linalg.lawson_hanson.ldp`).
+* :mod:`~slsqp_jax.sqpdax.linalg.lsei` — the least-distance problem with
+  equality and inequality constraints, reduced to an LDP on the constraint
+  count (:func:`~slsqp_jax.sqpdax.linalg.lsei.least_distance_lsei`,
+  :class:`~slsqp_jax.sqpdax.linalg.lsei.LSEIResult`) and its elastic
+  (relaxed, always-feasible) variant
+  (:func:`~slsqp_jax.sqpdax.linalg.lsei.elastic_least_distance_lsei`).
 """
 
-from . import box, operator_norm, projection, scaled_normal_equations, steihaug
+from . import (
+    box,
+    free_set_factor,
+    lawson_hanson,
+    lsei,
+    operator_norm,
+    projection,
+    reduced_hessian,
+    scaled_normal_equations,
+    steihaug,
+)
 from .box import box_fraction, box_ray_length
+from .free_set_factor import FreeSetFactor
+from .lawson_hanson import LDP_RESULTS, LDPResult, NNLSResult, ldp, nnls
+from .lsei import (
+    ElasticLSEIResult,
+    LSEIResult,
+    elastic_delta_column,
+    elastic_least_distance_lsei,
+    elastic_weight_scale,
+    least_distance_lsei,
+)
 from .operator_norm import power_iteration_norm, spectral_norm_estimate
 from .projection import cg_normal_equations, null_space_projector, pcg
+from .reduced_hessian import (
+    bfgs_factor_update,
+    drop_oldest_basis_vector,
+    orthogonalize_against,
+    positive_qr,
+)
 from .scaled_normal_equations import (
     NormalEquationsStrategy,
     ResolvedNormalEquationsStrategy,
@@ -50,12 +99,32 @@ from .steihaug import (
 
 __all__ = [
     "box",
+    "free_set_factor",
+    "lawson_hanson",
+    "lsei",
     "operator_norm",
     "projection",
+    "reduced_hessian",
     "scaled_normal_equations",
     "steihaug",
     "power_iteration_norm",
     "spectral_norm_estimate",
+    "FreeSetFactor",
+    "NNLSResult",
+    "nnls",
+    "LDP_RESULTS",
+    "LDPResult",
+    "ldp",
+    "ElasticLSEIResult",
+    "LSEIResult",
+    "elastic_delta_column",
+    "elastic_least_distance_lsei",
+    "elastic_weight_scale",
+    "least_distance_lsei",
+    "bfgs_factor_update",
+    "drop_oldest_basis_vector",
+    "orthogonalize_against",
+    "positive_qr",
     "NormalEquationsStrategy",
     "ResolvedNormalEquationsStrategy",
     "SchurNormalEquations",

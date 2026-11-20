@@ -15,6 +15,7 @@ from . import (
     diagnostics,
     interface,
     interior_point,
+    lrh_linesearch,
     optimistix_compat,
     proximal_active_set_linesearch,
     trust_funnel_interior_point,
@@ -30,6 +31,7 @@ from .base import AbstractConstrainedMinimiser, CommonMinimiser, OptimisationCon
 from .diagnostics import ActiveSetLineSearchDiagnostics, FunnelDiagnostics
 from .interface import minimise
 from .interior_point import InteriorPointMinimiser
+from .lrh_linesearch import LRHLineSearchMinimiser
 from .optimistix_compat import OptimistixMinimiser, as_optimistix_minimiser
 from .proximal_active_set_linesearch import ProximalActiveSetLineSearchMinimiser
 from .trust_funnel_interior_point import (
@@ -50,6 +52,7 @@ __all__ = [
     "diagnostics",
     "interface",
     "interior_point",
+    "lrh_linesearch",
     "optimistix_compat",
     "utils",
     "active_set_linesearch",
@@ -62,6 +65,7 @@ __all__ = [
     "InteriorPointMinimiser",
     "ActiveSetLineSearchMinimiser",
     "ProximalActiveSetLineSearchMinimiser",
+    "LRHLineSearchMinimiser",
     "TrustRegionInteriorPointMinimiser",
     "TrustFunnelInteriorPointMinimiser",
     "minimise",

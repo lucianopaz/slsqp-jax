@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
@@ -19,8 +20,10 @@ from slsqp_jax.sqpdax.minimiser import (
     TrustFunnelTerminationMetrics,
     minimise,
 )
-from slsqp_jax.sqpdax.primal import InteriorPointPrimal
+from slsqp_jax.sqpdax.primal import InteriorPointPrimal, Primal
 from slsqp_jax.sqpdax.problem import Problem
+from slsqp_jax.sqpdax.step_controller import StepResult
+from slsqp_jax.sqpdax.subproblem.solver import ACTIVE_SET_QP_RESULTS, RESULTS
 from slsqp_jax.sqpdax.types import Aux
 from tests.sqpdax.conftest import make_shifted_box_quadratic
 from tests.sqpdax.lagrangian.conftest import make_problem
@@ -101,6 +104,188 @@ def make_scaled_quartic(*, with_curvature: bool = True) -> Problem:
         meq=1,
         mineq=1,
     )
+
+
+# --- Hock-Schittkowski problems ----------------------------------------------------
+#
+# Written inline, with analytic gradients / Jacobians and no HVPs (the LRH model
+# is a secant). Inequalities follow the sqpdax convention ``h(x) <= 0``; ``None``
+# bounds are encoded with infinities and the matching ``null_*`` masks.
+
+
+def _hs_problem(
+    *,
+    fn: Callable[[Array], Array],
+    grad: Callable[[Array], Array],
+    eq: tuple[Callable[[Array], Array], Callable[[Array], Array]] | None = None,
+    ineq: tuple[Callable[[Array], Array], Callable[[Array], Array]] | None = None,
+    lb: list[float],
+    ub: list[float],
+) -> Problem:
+    """Assemble a no-HVP :class:`Problem` from ``(fn, jac)`` pairs."""
+    n = len(lb)
+    lb_a, ub_a = jnp.asarray(lb), jnp.asarray(ub)
+    empty = (
+        lambda x: jnp.zeros((0,), x.dtype),
+        lambda x: jnp.zeros((0, n), x.dtype),
+    )
+    eq_fn, eq_jac = eq if eq is not None else empty
+    ineq_fn, ineq_jac = ineq if ineq is not None else empty
+    return Problem(
+        fn=lambda x: (fn(x), None),
+        grad=grad,
+        hvp=None,
+        eq_fn=eq_fn,
+        ineq_fn=ineq_fn,
+        eq_fn_jac=eq_jac,
+        ineq_fn_jac=ineq_jac,
+        eq_fn_hvp=None,
+        ineq_fn_hvp=None,
+        lb=lb_a,
+        ub=ub_a,
+        null_lb=jnp.isinf(lb_a) & (lb_a < 0),
+        null_ub=jnp.isinf(ub_a) & (ub_a > 0),
+        n=n,
+        meq=0 if eq is None else int(eq_fn(jnp.zeros(n)).shape[0]),
+        mineq=0 if ineq is None else int(ineq_fn(jnp.zeros(n)).shape[0]),
+    )
+
+
+def make_hs21() -> Problem:
+    """HS21: ``0.01 x₀² + x₁² − 100`` s.t. ``10 x₀ − x₁ ≥ 10``, boxed.
+
+    Solution ``(2, 0)`` with ``f* = −99.96``.
+    """
+    return _hs_problem(
+        fn=lambda x: 0.01 * x[0] ** 2 + x[1] ** 2 - 100.0,
+        grad=lambda x: jnp.stack([0.02 * x[0], 2.0 * x[1]]),
+        ineq=(
+            lambda x: jnp.array([10.0 - 10.0 * x[0] + x[1]]),
+            lambda x: jnp.array([[-10.0, 1.0]], x.dtype),
+        ),
+        lb=[2.0, -50.0],
+        ub=[50.0, 50.0],
+    )
+
+
+def make_hs35() -> Problem:
+    """HS35 (Beale): convex quadratic on ``x₀ + x₁ + 2 x₂ ≤ 3``, ``x ≥ 0``.
+
+    Solution ``(4/3, 7/9, 4/9)`` with ``f* = 1/9``.
+    """
+    return _hs_problem(
+        fn=lambda x: (
+            9.0
+            - 8.0 * x[0]
+            - 6.0 * x[1]
+            - 4.0 * x[2]
+            + 2.0 * x[0] ** 2
+            + 2.0 * x[1] ** 2
+            + x[2] ** 2
+            + 2.0 * x[0] * x[1]
+            + 2.0 * x[0] * x[2]
+        ),
+        grad=lambda x: jnp.stack(
+            [
+                -8.0 + 4.0 * x[0] + 2.0 * x[1] + 2.0 * x[2],
+                -6.0 + 4.0 * x[1] + 2.0 * x[0],
+                -4.0 + 2.0 * x[2] + 2.0 * x[0],
+            ]
+        ),
+        ineq=(
+            lambda x: jnp.array([x[0] + x[1] + 2.0 * x[2] - 3.0]),
+            lambda x: jnp.array([[1.0, 1.0, 2.0]], x.dtype),
+        ),
+        lb=[0.0, 0.0, 0.0],
+        ub=[jnp.inf] * 3,
+    )
+
+
+def make_hs71() -> Problem:
+    """HS71: ``x₀x₃(x₀+x₁+x₂) + x₂`` s.t. ``Πx ≥ 25``, ``‖x‖² = 40``, ``1 ≤ x ≤ 5``.
+
+    Solution ``(1, 4.74299963, 3.82114998, 1.37940829)`` with
+    ``f* = 17.0140173``.
+    """
+
+    def grad(x: Array) -> Array:
+        return jnp.stack(
+            [
+                x[3] * (2.0 * x[0] + x[1] + x[2]),
+                x[0] * x[3],
+                x[0] * x[3] + 1.0,
+                x[0] * (x[0] + x[1] + x[2]),
+            ]
+        )
+
+    def prod_jac(x: Array) -> Array:
+        return -jnp.stack(
+            [
+                x[1] * x[2] * x[3],
+                x[0] * x[2] * x[3],
+                x[0] * x[1] * x[3],
+                x[0] * x[1] * x[2],
+            ]
+        )[None, :]
+
+    return _hs_problem(
+        fn=lambda x: x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2],
+        grad=grad,
+        eq=(
+            lambda x: jnp.array([jnp.sum(x**2) - 40.0]),
+            lambda x: 2.0 * x[None, :],
+        ),
+        ineq=(lambda x: jnp.array([25.0 - jnp.prod(x)]), prod_jac),
+        lb=[1.0] * 4,
+        ub=[5.0] * 4,
+    )
+
+
+def make_hs76() -> Problem:
+    """HS76: convex quadratic with three linear inequalities and ``x ≥ 0``.
+
+    Solution ``(3/11, 23/11, 0, 6/11)`` with ``f* = −4.681818181818``.
+    """
+    a = jnp.array([[1.0, 2.0, 1.0, 1.0], [3.0, 1.0, 2.0, -1.0], [0.0, -1.0, -4.0, 0.0]])
+    b = jnp.array([5.0, 4.0, -1.5])
+    q = jnp.array([2.0, 1.0, 2.0, 1.0])
+    c = jnp.array([-1.0, -3.0, 1.0, -1.0])
+    # Off-diagonal part of the Hessian: -x₀x₂ + x₂x₃.
+    return _hs_problem(
+        fn=lambda x: (
+            0.5 * jnp.sum(q * x**2) - x[0] * x[2] + x[2] * x[3] + jnp.dot(c, x)
+        ),
+        grad=lambda x: (
+            q * x + c + jnp.stack([-x[2], jnp.zeros_like(x[0]), x[3] - x[0], x[2]])
+        ),
+        ineq=(lambda x: a @ x - b, lambda x: a.astype(x.dtype)),
+        lb=[0.0] * 4,
+        ub=[jnp.inf] * 4,
+    )
+
+
+# ``(factory, x0, x_star, f_star)``; plain lists for the same reason as below.
+HS_CASES: dict[str, tuple[Callable[[], Problem], list[float], list[float], float]] = {
+    "hs21": (make_hs21, [-1.0, -1.0], [2.0, 0.0], -99.96),
+    "hs35": (
+        make_hs35,
+        [0.5, 0.5, 0.5],
+        [4.0 / 3.0, 7.0 / 9.0, 4.0 / 9.0],
+        1.0 / 9.0,
+    ),
+    "hs71": (
+        make_hs71,
+        [1.0, 5.0, 5.0, 1.0],
+        [1.0, 4.74299963, 3.82114998, 1.37940829],
+        17.0140172890,
+    ),
+    "hs76": (
+        make_hs76,
+        [0.5, 0.5, 0.5, 0.5],
+        [3.0 / 11.0, 23.0 / 11.0, 0.0, 6.0 / 11.0],
+        -51.5 / 11.0,
+    ),
+}
 
 
 # --- trust-funnel problems and shared runs -----------------------------------------
@@ -381,3 +566,72 @@ def infeasible_funnel_run() -> InfeasibleFunnelRun:
             sol.state._optimisation_context(problem)
         )
     return InfeasibleFunnelRun(problem, sol, handler, metrics)
+
+
+def _execute_synthetic_step(
+    solver,
+    problem,
+    *,
+    accepted: bool,
+    qp_success: bool,
+    qp_status,
+    x,
+    merit: float,
+    step_size: float | None = None,
+    proposed_step_norm: float = 1.0,
+    accepted_by_fallback: bool = False,
+    rounding_level: bool = False,
+):
+    """Exercise phase four with a controlled line-search/QP outcome."""
+    ctx = solver._init_subproblem(problem)
+    qp_result = ACTIVE_SET_QP_RESULTS.where(
+        jnp.asarray(qp_success),
+        ACTIVE_SET_QP_RESULTS.working_set_converged,
+        ACTIVE_SET_QP_RESULTS.where(
+            qp_status == RESULTS.max_steps_reached,
+            ACTIVE_SET_QP_RESULTS.max_iter_reached,
+            ACTIVE_SET_QP_RESULTS.kkt_solver_failure,
+        ),
+    )
+    state = eqx.tree_at(
+        lambda s: (s.success, s.status, s.qp_result),
+        solver.solver_state,
+        (jnp.asarray(qp_success), qp_status, qp_result),
+    )
+    result = StepResult(
+        x=Primal(jnp.asarray(x)),
+        accepted=jnp.asarray(accepted),
+        merit_val=jnp.asarray(merit),
+        solver_state=state,
+        step_size=jnp.asarray(
+            (1.0 if accepted else 0.0) if step_size is None else step_size
+        ),
+        proposed_step_norm=jnp.asarray(proposed_step_norm),
+        accepted_by_fallback=jnp.asarray(accepted_by_fallback),
+        rounding_level=jnp.asarray(rounding_level),
+    )
+    return solver._execute_step(ctx, solver.dual, result)
+
+
+def _indefinite_quadratic():
+    """``f(x) = 1/2 (x0^2 - 4 x1^2)`` with exact curvature, unconstrained."""
+    w = jnp.array([1.0, -4.0])
+    lb, ub = unbounded_box(2)
+    return Problem(
+        fn=lambda x: (0.5 * jnp.sum(w * x**2), None),
+        grad=lambda x: w * x,
+        hvp=lambda x, v: w * v,
+        eq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        ineq_fn=lambda x: jnp.zeros((0,), x.dtype),
+        eq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_jac=lambda x: jnp.zeros((0, 2), x.dtype),
+        eq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        ineq_fn_hvp=lambda x, v: jnp.zeros((0, 2), x.dtype),
+        lb=lb,
+        ub=ub,
+        null_lb=jnp.ones(2, dtype=bool),
+        null_ub=jnp.ones(2, dtype=bool),
+        n=2,
+        meq=0,
+        mineq=0,
+    )
